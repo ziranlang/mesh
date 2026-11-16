@@ -349,8 +349,16 @@ func TestPackageReleaseForOlderHosts(t *testing.T) {
 		versions[2].Sequence != 2007 {
 		t.Fatalf("history offered %d releases, want the newest three", len(versions))
 	}
-	// Eleven, newest first, is more than the node keeps.
-	writeHistory(append(append(ordered, far), forFive))
+	// More than 64, newest first, is more than the node keeps.
+	many := []ReleaseV2{}
+	for sequence := int64(3065); sequence >= 3001; sequence-- {
+		many = append(many, publish(sequence, fmt.Sprintf("4.0.%d", sequence-3000), 8, 2))
+	}
+	writeHistory(many[:64])
+	if versions := offered("?host_api=8", 200); len(versions) != 3 || versions[0].Sequence != 3065 {
+		t.Fatalf("a full history of 64 was not offered: %d", len(versions))
+	}
+	writeHistory(many)
 	offered("?host_api=8", 503)
 }
 
@@ -494,4 +502,160 @@ func TestPortableExecutablesAndLegacyBundles(t *testing.T) {
 		t.Fatal(err)
 	}
 	get(portable.Artifacts[0].SHA256+".zx", 403)
+}
+
+func TestPackageRevisionsAndWebAssemblyVariants(t *testing.T) {
+	server, database, _ := testServer(t)
+	private := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x66}, ed25519.SeedSize))
+	manifest := AppManifest{ManifestVersion: 1, AppID: "photos", DisplayName: "photos",
+		Status: "active", Keys: []AppKey{{KeyID: "release", Algorithm: "ed25519",
+			PublicKey: hex.EncodeToString(private.Public().(ed25519.PublicKey)), Status: "active"}}}
+	encoded, _ := json.Marshal(manifest)
+	if err := AppStore_UpsertSignedManifest(database.Database, context.Background(),
+		manifest, encoded, "photos-fixture", "fixture", "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	root := server.Cfg.DBPath + ".packages/photos"
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string, content []byte) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, name), content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sign := func(value ReleaseV2) ReleaseV2 {
+		value.Signature = hex.EncodeToString(ed25519.Sign(private,
+			[]byte(PackageRelease_SigningMessage(value))))
+		return value
+	}
+	artifact := func(data []byte) Artifact {
+		hash := sha256.Sum256(data)
+		return Artifact{Variant: "module", SHA256: hex.EncodeToString(hash[:]), Size: int64(len(data))}
+	}
+	variants := map[int64][]byte{}
+	// A release's .zx header names its ZX revision; a web variant is the
+	// same signed release with the module Ziran lowered from that .zx.
+	publish := func(sequence int64, revision uint32, hostAPI int64, web bool) ReleaseV2 {
+		t.Helper()
+		executable := []byte{'Z', 'X', 0, 0, byte(revision), byte(revision >> 8), byte(revision >> 16), byte(revision >> 24)}
+		executable = append(executable, []byte(fmt.Sprintf("photos %d", sequence))...)
+		value := sign(ReleaseV2{AppID: "photos", Sequence: sequence, Version: fmt.Sprintf("1.0.%d", sequence),
+			Runtime: "kryon-app-v1", HostAPI: hostAPI, ModuleAPI: 2, KeyID: "release",
+			Artifacts: []Artifact{artifact(executable)}, Dependencies: []Dependency{}})
+		metadata, _ := json.Marshal(value)
+		write("latest-v2.json", metadata)
+		write(fmt.Sprintf("release-%d.json", sequence), metadata)
+		write(value.Artifacts[0].SHA256+".zx", executable)
+		write(value.Artifacts[0].SHA256+".zx.release-v2.json", metadata)
+		if web {
+			module := append([]byte("\x00asm\x01\x00\x00\x00"), []byte(fmt.Sprintf("photos %d", sequence))...)
+			variant := value
+			variant.Artifacts = []Artifact{artifact(module)}
+			variant = sign(variant)
+			described, _ := json.Marshal(variant)
+			write(fmt.Sprintf("release-%d.wasm.json", sequence), described)
+			write(variant.Artifacts[0].SHA256+".wasm", module)
+			write(variant.Artifacts[0].SHA256+".wasm.release-v2.json", described)
+			variants[sequence] = module
+		}
+		return value
+	}
+	routes := server.Routes()
+	get := func(path string, status int) *httptest.ResponseRecorder {
+		t.Helper()
+		response := httptest.NewRecorder()
+		routes.ServeHTTP(response, httptest.NewRequest("GET", "/api/v2/packages/photos/"+path, nil))
+		if response.Code != status {
+			t.Fatalf("%s: got %d: %s", path, response.Code, response.Body.String())
+		}
+		return response
+	}
+	latest := func(query string) ReleaseV2 {
+		t.Helper()
+		var value ReleaseV2
+		if err := json.Unmarshal(get("latest"+query, 200).Body.Bytes(), &value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	released := publish(1, 26, 43, true)
+	lastReleased := publish(2, 26, 43, false)
+	web := publish(3, 28, 44, true)
+	current := publish(4, 28, 44, false)
+	// A revision-28 release mistakenly built for the released host interface.
+	mistaken := publish(5, 28, 43, false)
+	history, _ := json.Marshal(map[string][]ReleaseV2{"versions": {mistaken, current, web, lastReleased, released}})
+	write("history-v2.json", history)
+
+	// Released hosts name their interface but no revision: they never get a
+	// revision they cannot run, even one signed for their interface.
+	if value := latest("?host_api=43&module_api=2&bucket=0&format=zx"); value.Sequence != lastReleased.Sequence {
+		t.Fatalf("a released host got sequence %d", value.Sequence)
+	}
+	// Current hosts get only their revision, within their interfaces.
+	if value := latest("?host_api=44&oldest_host_api=44&module_api=2&format=zx&zx=28"); value.Sequence != current.Sequence {
+		t.Fatalf("a revision-28 host got sequence %d", value.Sequence)
+	}
+	if value := latest("?host_api=44&module_api=2&format=zx&zx=28"); value.Sequence != mistaken.Sequence {
+		t.Fatalf("a host without an oldest interface got sequence %d", value.Sequence)
+	}
+	if value := latest("?host_api=43&oldest_host_api=43&format=zx&zx=26"); value.Sequence != lastReleased.Sequence {
+		t.Fatalf("a host naming revision 26 got sequence %d", value.Sequence)
+	}
+	get("latest?host_api=44&format=zx&zx=27", 404)
+	get("history?host_api=44&format=zx&zx=27", 200)
+	// Publishing tools name no interface and see the newest release.
+	if value := latest("?bucket=0&format=zx"); value.Sequence != mistaken.Sequence {
+		t.Fatalf("a client naming no interface got sequence %d", value.Sequence)
+	}
+	for _, query := range []string{"?zx=28", "?format=zx&zx=0", "?format=zx&zx=x", "?format=wasm&zx=65536",
+		"?host_api=44&oldest_host_api=45&format=zx", "?oldest_host_api=0", "?format=WASM"} {
+		get("latest"+query, 400)
+		get("history"+query, 400)
+	}
+
+	// Web hosts get the newest signed WebAssembly variant they can run.
+	variant := latest("?host_api=44&oldest_host_api=44&module_api=2&format=wasm&zx=28")
+	if variant.Sequence != web.Sequence || variant.Artifacts[0].SHA256 == web.Artifacts[0].SHA256 ||
+		!ed25519.Verify(private.Public().(ed25519.PublicKey), []byte(PackageRelease_SigningMessage(variant)),
+			func() []byte {
+				signature, _ := hex.DecodeString(variant.Signature)
+				return signature
+			}()) {
+		t.Fatalf("a web host got sequence %d without its signed variant", variant.Sequence)
+	}
+	if value := latest("?host_api=43&module_api=2&format=wasm"); value.Sequence != released.Sequence ||
+		value.Artifacts[0].SHA256 == released.Artifacts[0].SHA256 {
+		t.Fatalf("a released web host got sequence %d", value.Sequence)
+	}
+	var offered struct {
+		Versions []ReleaseV2 `json:"versions"`
+	}
+	if err := json.Unmarshal(get("history?host_api=44&format=wasm&zx=28", 200).Body.Bytes(), &offered); err != nil {
+		t.Fatal(err)
+	}
+	if len(offered.Versions) != 1 || offered.Versions[0].Artifacts[0].SHA256 != variant.Artifacts[0].SHA256 {
+		t.Fatalf("web history offered %d releases", len(offered.Versions))
+	}
+	response := get(variant.Artifacts[0].SHA256+".wasm", 200)
+	if !bytes.Equal(response.Body.Bytes(), variants[web.Sequence]) ||
+		response.Header().Get("Content-Type") != "application/wasm" {
+		t.Fatal("incorrect WebAssembly module")
+	}
+	get(variant.Artifacts[0].SHA256+".zx", 404)
+	get(web.Artifacts[0].SHA256+".wasm", 404)
+	// A variant whose signature or fields differ from its release is never served.
+	forged := variant
+	forged.Version = "9.9.9"
+	described, _ := json.Marshal(forged)
+	write(fmt.Sprintf("release-%d.wasm.json", web.Sequence), described)
+	get("latest?host_api=44&format=wasm&zx=28", 404)
+	other := variant
+	other.HostAPI = 45
+	other = sign(other)
+	described, _ = json.Marshal(other)
+	write(fmt.Sprintf("release-%d.wasm.json", web.Sequence), described)
+	get("latest?host_api=45&format=wasm&zx=28", 404)
 }

@@ -5,9 +5,14 @@
 // Hosts that run ZX portable executables ask with `format=zx` and get only
 // `<sha>.zx` releases. Hosts released before that format ask without it and
 // get only their `<sha>.zib` releases, through 2027-10-23.
+// A host also names the ZX revision it runs (`zx=R`) and gets only releases
+// whose stored `.zx` header has that revision; one that names its interface
+// but no revision was released before hosts named it and gets only
+// revisions older than the first they named. Web hosts ask with
+// `format=wasm` and get the release's signed WebAssembly variant instead.
 // An artifact with a `<sha>.zx.product` file next to it is gated: it is
 // served only at `<sha>.zx/<grant>` with an unexpired grant for that product.
-// Legacy `<sha>.zib` artifacts are gated the same way.
+// Legacy `<sha>.zib` and `<sha>.wasm` artifacts are gated the same way.
 #import "std/go_types"
 http :: #import "std/http_go";
 url :: #import "std/url_go";
@@ -51,9 +56,14 @@ PayloadStatus :: struct {
 }
 Interfaces :: struct {
     host: s64
+    // The oldest host interface the host still runs; zero when it names none.
+    oldest: s64
     module: s64
-    // The artifact suffix the host runs: ".zx", or ".zib" for hosts released
-    // before the ZX format.
+    // The ZX executable revision the host runs; zero when it names none.
+    revision: s64
+    // The artifact suffix the host runs: ".zx", ".zib" for hosts released
+    // before the ZX format, or ".wasm" for web hosts that run the
+    // WebAssembly module lowered from a release's `.zx`.
     format: string
     valid: bool
 }
@@ -68,11 +78,15 @@ Rollout :: struct {
     Percent: s64 #go_tag "json:\"percent\""
     Until: s64 #go_tag "json:\"until\""
 }
-// The node keeps up to ten of an app's releases in its history, so a
-// device on an older host still finds one built for it. The history it
-// offers for going back lists at most three, the most released apps read.
-HistoryRetained :: 10
+// The node's history lists an app's newest ten releases and the newest of
+// every format, ZX revision and interface its hosts run, so a device on an
+// older host still finds one built for it. It holds at most 64. The history
+// it offers for going back lists at most three, the most released apps read.
+HistoryRetained :: 64
 HistoryOffered :: 3
+// The first ZX revision hosts name in their requests. Hosts that name an
+// interface but no revision were released before it and run only older ones.
+FirstNamedRevision :: 28
 
 // Each entry remains a publisher-signed descriptor. The index itself grants
 // no trust; host interfaces and active publisher keys are checked per entry.
@@ -94,10 +108,23 @@ PathResult :: struct {
     error: Error
 }
 PathComponent :: (value: string) -> PathResult #go_results #foreign native_paths "PathComponent";
+PayloadFile :: #type #foreign go_os "File";
+PayloadOpened :: struct {
+    value: *PayloadFile
+    error: Error
+}
+PayloadRead :: struct {
+    count: isize
+    error: Error
+}
+Open :: (path: string) -> PayloadOpened #go_results #foreign go_os "Open";
+ReadAt :: (file: *PayloadFile, bytes: []u8, offset: s64) -> PayloadRead #go_results #foreign go_os "(*File).ReadAt";
+Close :: (file: *PayloadFile) -> Error #foreign go_os "(*File).Close";
 
-// The release hash of a `<sha>.zx` or legacy `<sha>.zib` artifact name.
+// The release hash of a `<sha>.zx`, legacy `<sha>.zib` or WebAssembly
+// `<sha>.wasm` artifact name.
 ArtifactHash :: (asset: string) -> string {
-    suffixes: [2]string = .[".zx", ".zib"]
+    suffixes: [3]string = .[".zx", ".zib", ".wasm"]
     for suffix: suffixes {
         hash := TrimSuffix(asset, suffix)
         if asset == Join(hash, suffix) && release.HashValid(hash) {
@@ -152,32 +179,135 @@ Wanted :: (request: *http.Request) -> Interfaces {
     query := url.Query(http.RequestURL(request))
     result: Interfaces
     result.host = Interface(url.Value(query, "host_api"))
+    result.oldest = Interface(url.Value(query, "oldest_host_api"))
     result.module = Interface(url.Value(query, "module_api"))
+    result.revision = Interface(url.Value(query, "zx"))
     format := url.Value(query, "format")
     result.format = ".zib"
     if format == "zx" {
         result.format = ".zx"
     }
-    result.valid = result.host >= 0 && result.module >= 0 && (format == "" || format == "zx")
+    if format == "wasm" {
+        result.format = ".wasm"
+    }
+    known := format == "" || format == "zx" || format == "wasm"
+    // Legacy .zib bundles have no ZX revision.
+    revisioned := result.revision == 0 || format != ""
+    ordered := result.oldest == 0 || result.host == 0 || result.oldest <= result.host
+    result.valid = result.host >= 0 && result.oldest >= 0 && result.module >= 0 &&
+    result.revision >= 0 && known && revisioned && ordered
     return result
 }
 
-// A release is in a host's format when its module artifact is stored with
-// the suffix that host runs.
-InFormat :: (root: string, value: release.ReleaseV2, wanted: Interfaces) -> bool {
+// The module artifact's hash, or "" for a release without one.
+ModuleHash :: (value: release.ReleaseV2) -> string {
     for artifact: value.Artifacts {
         if artifact.Variant == "module" {
-            return Stat(Join(root, Join(artifact.SHA256, wanted.format))).error == null
+            return artifact.SHA256
         }
     }
-    return false
+    return ""
 }
 
-// A host runs releases built for its interface or an older one; module
-// interfaces must match exactly.
+// The executable revision of a stored `.zx`: the little-endian u32 after
+// its `ZX\0\0` magic. Zero when the file is missing, short or not ZX.
+Revision :: (path: string) -> s64 {
+    opened := Open(path)
+    if opened.error != null {
+        return 0
+    }
+    header: [8]u8
+    read := ReadAt(opened.value, header[:], 0)
+    unused Close(opened.value)
+    if read.count != 8 || header[0] != cast(u8)90 || header[1] != cast(u8)88 ||
+    header[2] != cast(u8)0 || header[3] != cast(u8)0 {
+        return 0
+    }
+    return cast(s64)header[4] | (cast(s64)header[5] << 8) |
+    (cast(s64)header[6] << 16) | (cast(s64)header[7] << 24)
+}
+
+// A host runs only its own ZX revision. One that names its interface but no
+// revision was released before hosts named it, so it runs only older ones.
+// A client that names neither takes any revision.
+RevisionFits :: (revision: s64, wanted: Interfaces) -> bool {
+    if wanted.revision > 0 {
+        return revision == wanted.revision
+    }
+    if wanted.host > 0 || wanted.oldest > 0 {
+        return revision > 0 && revision < FirstNamedRevision
+    }
+    return true
+}
+
+// A host runs releases built for an interface from its oldest to its own;
+// module interfaces must match exactly.
 Fits :: (value: release.ReleaseV2, wanted: Interfaces) -> bool {
     return (wanted.host == 0 || value.HostAPI <= wanted.host) &&
+    (wanted.oldest == 0 || value.HostAPI >= wanted.oldest) &&
     (wanted.module == 0 || value.ModuleAPI == wanted.module)
+}
+
+// A WebAssembly variant signs the same release with its module as the
+// artifact; it carries no dependencies of its own.
+SameRelease :: (variant: release.ReleaseV2, value: release.ReleaseV2) -> bool {
+    return variant.AppID == value.AppID && variant.Sequence == value.Sequence &&
+    variant.Version == value.Version && variant.Runtime == value.Runtime &&
+    variant.HostAPI == value.HostAPI && variant.ModuleAPI == value.ModuleAPI &&
+    variant.DataSchema == value.DataSchema && variant.KeyID == value.KeyID &&
+    variant.Channel == value.Channel && variant.Artifacts.count == 1 &&
+    variant.Dependencies.count == 0 && value.Dependencies.count == 0
+}
+
+// The release's signed WebAssembly variant: the module Ziran lowered from its
+// `.zx`, archived as `release-<sequence>.wasm.json` beside `<sha>.wasm`.
+WasmVariant :: (context: registry.Registry, request: *http.Request, root: string,
+    value: release.ReleaseV2) -> Selected {
+    result: Selected
+    name := Join(Join("release-", Sequence(value.Sequence)), ".wasm.json")
+    metadata := files.ReadFile(Join(root, name))
+    if metadata.error != null || metadata.value.count > 65536 {
+        return result
+    }
+    variant: release.ReleaseV2
+    if json.Unmarshal(metadata.value, *variant) != null ||
+    !release.Valid(variant, value.AppID) || !SameRelease(variant, value) {
+        return result
+    }
+    module := Join(root, Join(variant.Artifacts[0].SHA256, ".wasm"))
+    if Stat(module).error != null || !Trusted(context, request, variant) {
+        return result
+    }
+    result.value = variant
+    result.found = true
+    return result
+}
+
+// The signed descriptor a host downloads for this release: the release
+// itself when its module is stored in the host's format and ZX revision, or
+// for a web host the release's WebAssembly variant.
+Offered :: (context: registry.Registry, request: *http.Request, root: string,
+    value: release.ReleaseV2, wanted: Interfaces) -> Selected {
+    result: Selected
+    module := ModuleHash(value)
+    if module == "" {
+        return result
+    }
+    if wanted.format == ".zib" {
+        result.value = value
+        result.found = Stat(Join(root, Join(module, ".zib"))).error == null
+        return result
+    }
+    executable := Join(root, Join(module, ".zx"))
+    if Stat(executable).error != null || !RevisionFits(Revision(executable), wanted) {
+        return result
+    }
+    if wanted.format == ".wasm" {
+        return WasmVariant(context, request, root, value)
+    }
+    result.value = value
+    result.found = true
+    return result
 }
 
 Trusted :: (context: registry.Registry, request: *http.Request,
@@ -209,12 +339,13 @@ Older :: (context: registry.Registry, request: *http.Request, root: string,
             previous = value.Sequence
         }
         for value: history.Versions {
-            if value.Sequence < latest && Fits(value, wanted) && InFormat(root, value, wanted) &&
+            if value.Sequence < latest && Fits(value, wanted) &&
             Trusted(context, request, value) &&
             !HeldBack(root, value.Sequence, Bucket(request)) {
-                result.value = value
-                result.found = true
-                return result
+                offered := Offered(context, request, root, value, wanted)
+                if offered.found {
+                    return offered
+                }
             }
         }
         return result
@@ -225,11 +356,12 @@ Older :: (context: registry.Registry, request: *http.Request, root: string,
         if metadata.error == null && metadata.value.count <= 65536 {
             value: release.ReleaseV2
             if json.Unmarshal(metadata.value, *value) == null && value.Sequence == sequence &&
-            release.Valid(value, appID) && Fits(value, wanted) && InFormat(root, value, wanted) &&
+            release.Valid(value, appID) && Fits(value, wanted) &&
             Trusted(context, request, value) {
-                result.value = value
-                result.found = true
-                return result
+                offered := Offered(context, request, root, value, wanted)
+                if offered.found {
+                    return offered
+                }
             }
         }
         sequence -= 1
@@ -273,10 +405,13 @@ History :: (context: registry.Registry, writer: http.ResponseWriter,
             return
         }
         previous = value.Sequence
-        if count < HistoryOffered && Fits(value, wanted) && InFormat(root, value, wanted) &&
+        if count < HistoryOffered && Fits(value, wanted) &&
         Trusted(context, request, value) && !HeldBack(root, value.Sequence, bucket) {
-            selected[count] = value
-            count += 1
+            offered := Offered(context, request, root, value, wanted)
+            if offered.found {
+                selected[count] = offered.value
+                count += 1
+            }
         }
     }
     http.SetHeader(http.ResponseHeaders(writer), "Cache-Control", "no-store")
@@ -371,17 +506,19 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
             response.Error(writer, 400, "invalid interface version, format or bucket")
             return
         }
-        if !Fits(value, wanted) || !InFormat(root, value, wanted) ||
-        HeldBack(root, value.Sequence, bucket) {
-            older := Older(context, request, root, appID, value.Sequence, wanted)
-            if !older.found {
-                response.Error(writer, 404, "no release for this app version")
-                return
-            }
-            value = older.value
+        offered: Selected
+        if Fits(value, wanted) && !HeldBack(root, value.Sequence, bucket) {
+            offered = Offered(context, request, root, value, wanted)
+        }
+        if !offered.found {
+            offered = Older(context, request, root, appID, value.Sequence, wanted)
+        }
+        if !offered.found {
+            response.Error(writer, 404, "no release for this app version")
+            return
         }
         http.SetHeader(http.ResponseHeaders(writer), "Cache-Control", "no-store")
-        response.JSON(writer, 200, value)
+        response.JSON(writer, 200, offered.value)
         return
     }
     expected: s64 = 0
@@ -411,7 +548,12 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
     if gate.gated {
         caching = "private, no-store"
     }
-    http.SetHeader(http.ResponseHeaders(writer), "Content-Type", "application/octet-stream")
+    // Browsers compile a WebAssembly module while it streams only with its own type.
+    content := "application/octet-stream"
+    if TrimSuffix(asset, ".wasm") != asset {
+        content = "application/wasm"
+    }
+    http.SetHeader(http.ResponseHeaders(writer), "Content-Type", content)
     http.SetHeader(http.ResponseHeaders(writer), "Cache-Control", caching)
     http.SetHeader(http.ResponseHeaders(writer), "ETag", Join("\"", Join(hash, "\"")))
     unused Write(writer, bundle.value)

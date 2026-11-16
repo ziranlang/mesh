@@ -75,7 +75,7 @@ class StageReleaseTest(unittest.TestCase):
             stage('diary', 3, '01.0.0', expected=2)
             self.assertEqual(diary.read_bytes(), second)
 
-    def test_retains_three_release_choices_and_referenced_dependency_bytes(self):
+    def test_keeps_every_archived_release_and_blob(self):
         with tempfile.TemporaryDirectory(prefix='retained-apps-') as temporary:
             root = Path(temporary)
             key = Ed25519PrivateKey.generate()
@@ -100,15 +100,15 @@ class StageReleaseTest(unittest.TestCase):
             for number in range(2, 6):
                 stage('game', number)
             archives = sorted(p.name for p in (store / 'game').glob('release-*.json'))
-            self.assertEqual(archives, ['release-3.json', 'release-4.json', 'release-5.json'])
+            self.assertEqual(archives, [f'release-{number}.json' for number in range(1, 6)])
             history = json.loads((store / 'game/history-v2.json').read_text())['versions']
-            self.assertEqual([r['sequence'] for r in history], [5, 4, 3])
+            self.assertEqual([r['sequence'] for r in history], [5, 4, 3, 2, 1])
             for release in history:
                 key.public_key().verify(bytes.fromhex(release['signature']), signing_message(release))
             first_blob = store / 'game' / (first['artifacts'][0]['sha256'] + '.zib')
             self.assertTrue(first_blob.exists(), 'Retained parent still needs its exact dependency')
             second = __import__('hashlib').sha256(b'ZIB\0payload2').hexdigest()
-            self.assertFalse((store / 'game' / (second + '.zib')).exists())
+            self.assertTrue((store / 'game' / (second + '.zib')).exists())
             self.assertEqual(json.loads((store / 'game/latest-v2.json').read_text())['sequence'], 5)
 
     def test_portable_executables_keep_the_last_legacy_release(self):
@@ -120,33 +120,39 @@ class StageReleaseTest(unittest.TestCase):
                 serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
             store = root / 'packages'
 
-            def stage(number, signature, suffix, expected=0):
+            def stage(number, signature, suffix, expected=0, host_api=1):
                 bundle = root / ('lists' + suffix)
                 bundle.write_bytes(signature + b'lists ' + str(number).encode())
                 command = [sys.executable, SCRIPT, '--store', store, '--app', 'lists',
                     '--key-id', 'release', '--key', private, '--format-version', '2',
                     '--version', f'1.0.{number}', '--sequence', str(number),
-                    bundle]
+                    '--host-api', str(host_api), bundle]
                 result = subprocess.run(command, capture_output=True, timeout=10)
                 self.assertEqual(result.returncode, expected, result.stderr.decode())
                 return json.loads((store / 'lists/latest-v2.json').read_text())
 
+            # Each ZX header names its revision: 26 for the released host
+            # interface 43, 28 for hosts from interface 44.
             legacy = stage(1, b'ZIB\0', '.zib')
-            for number in range(2, 6):
-                portable = stage(number, b'ZX\0\0', '.zx')
+            released = stage(2, b'ZX\0\0' + (26).to_bytes(4, 'little'), '.zx', host_api=43)
+            for number in range(3, 15):
+                portable = stage(number, b'ZX\0\0' + (28).to_bytes(4, 'little'), '.zx', host_api=44)
             directory = store / 'lists'
             self.assertTrue((directory / (portable['artifacts'][0]['sha256'] + '.zx')).is_file())
             self.assertFalse((directory / (portable['artifacts'][0]['sha256'] + '.zib')).exists())
             history = json.loads((directory / 'history-v2.json').read_text())['versions']
-            self.assertEqual([r['sequence'] for r in history], [5, 4, 1])
+            # The newest of each format, revision and interface, then the newest others.
+            self.assertEqual([r['sequence'] for r in history], [14, 13, 12, 11, 10, 9, 8, 7, 2, 1])
             self.assertTrue((directory / (legacy['artifacts'][0]['sha256'] + '.zib')).is_file())
-            three = __import__('hashlib').sha256(b'ZX\0\0lists 3').hexdigest()
-            self.assertFalse((directory / (three + '.zx')).exists())
+            self.assertTrue((directory / (released['artifacts'][0]['sha256'] + '.zx')).is_file())
+            three = __import__('hashlib').sha256(b'ZX\0\0' + (28).to_bytes(4, 'little') + b'lists 3').hexdigest()
+            self.assertTrue((directory / (three + '.zx')).exists())
+            self.assertEqual(len(list(directory.glob('release-*.json'))), 14)
             unknown = root / 'unknown.zx'
             unknown.write_bytes(b'ZIR\0not portable')
             result = subprocess.run([sys.executable, SCRIPT, '--store', store, '--app', 'lists',
                 '--key-id', 'release', '--key', private, '--format-version', '2',
-                '--version', '1.0.6', '--sequence', '6', unknown], capture_output=True, timeout=10)
+                '--version', '1.0.15', '--sequence', '15', unknown], capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 2, result.stderr.decode())
             result = subprocess.run([sys.executable, SCRIPT, '--store', root / 'v1', '--app', 'lists',
                 '--key-id', 'release', '--key', private, '--version', '1.0.0', '--sequence', '1',

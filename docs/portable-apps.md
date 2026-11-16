@@ -17,13 +17,36 @@ Independently versioned applications use release v2:
 - `GET /api/v2/packages/APP_ID/latest`: signed metadata with compatibility
   versions, delivery variants and exact dependencies; never cached.
 - `GET /api/v2/packages/APP_ID/SHA256.zx`: an immutable signed delivery variant.
+- `GET /api/v2/packages/APP_ID/SHA256.wasm`: a release's signed WebAssembly
+  module, served as `application/wasm`.
 
-Portable executables are `.zx` files (header `ZX\0\0`). Hosts that run them
-add `format=zx` to their `latest` and `history` requests and are offered only
-releases stored as `SHA256.zx`. Hosts released before that format ask without
-it and are offered only their `SHA256.zib` releases, through 2027-10-23. The
-retained history always keeps the newest release in each format, so older
-hosts keep their last `.zib` release while newer hosts move on.
+Portable executables are `.zx` files (header `ZX\0\0`, then the executable
+revision as a little-endian u32). Hosts that run them add `format=zx` to their
+`latest` and `history` requests and are offered only releases stored as
+`SHA256.zx`. Hosts released before that format ask without it and are offered
+only their `SHA256.zib` releases, through 2027-10-23.
+
+A host offered a release must be able to run it. It names the ZX revision it
+runs with `zx=R` and is offered only releases whose stored `.zx` header has
+revision R. A host that names `host_api` but no revision was released before
+hosts named it and is offered only revisions before 28, even when a newer one
+is signed for its interface. `oldest_host_api` excludes releases built for an
+interface older than the host still runs. Clients that name no interface, such
+as publishing checks, see the newest release.
+
+Web hosts ask with `format=wasm` (and their `zx` revision) for the WebAssembly
+module Ziran lowered from a release's `.zx`. It is archived as
+`release-SEQUENCE.wasm.json`: the same signed release with that module as its
+artifact, beside `SHA256.wasm` and `SHA256.wasm.release-v2.json`. Its `.zx`
+must be stored too, and the node checks the variant's signature and that it
+signs the same release before offering it.
+
+Every archived release and blob stays on the node. `history-v2.json` (at most
+64 entries) lists the newest ten releases and the newest release of every
+compatibility group: payload format (`.zx`, `.zib` or the WebAssembly
+variant), ZX revision, `host_api` and `module_api`. So hosts released before a
+new format, revision or interface keep their last release while newer hosts
+move on.
 
 Release v2 uses runtime `kryon-app-v1`. It signs `host_api`, `module_api` and
 `data_schema`, an ordered list of `module` and optional `standalone` artifacts,
@@ -82,8 +105,8 @@ python3 scripts/stage-release.py --store PATH_TO_DB.packages \
   --host-api N --module-api N --sequence SEQUENCE --version VERSION APP.zx
 ```
 
-The helper reads the signing key directly, never logs it, retains immutable
-previous files, and publishes `latest.json` last through atomic renames and
+The helper reads the signing key directly, never logs it, retains every
+previous release and file, and publishes `latest.json` last through atomic renames and
 filesystem syncs. The key must already be registered with the node. Staging
 does not register an app or grant a new publishing approval. Live package
 publication and node deployment are operational actions separate from these

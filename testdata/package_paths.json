@@ -50,7 +50,7 @@
           "name": "asset",
           "in": "path",
           "required": true,
-          "description": "latest, history (up to three signed releases), or the release SHA-256 followed by .zx (.zib for releases built before the ZX format)",
+          "description": "latest, history (up to three signed releases), or the release SHA-256 followed by .zx (.zib for releases built before the ZX format, .wasm for a WebAssembly variant)",
           "schema": {
             "type": "string"
           }
@@ -59,6 +59,16 @@
           "name": "host_api",
           "in": "query",
           "description": "For latest/history: the newest host interface the app runs; an older archived release is served when the latest needs a newer one",
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        {
+          "name": "oldest_host_api",
+          "in": "query",
+          "description": "For latest/history: the oldest host interface the app still runs; releases built for an older one are not offered",
           "schema": {
             "type": "integer",
             "minimum": 1,
@@ -88,12 +98,23 @@
         {
           "name": "format",
           "in": "query",
-          "description": "For latest/history: zx for hosts that run ZX portable executables. Without it only .zib releases for hosts from before the ZX format are offered",
+          "description": "For latest/history: zx for hosts that run ZX portable executables, or wasm for web hosts that run the signed WebAssembly variant lowered from a .zx release. Without it only .zib releases for hosts from before the ZX format are offered",
           "schema": {
             "type": "string",
             "enum": [
-              "zx"
+              "zx",
+              "wasm"
             ]
+          }
+        },
+        {
+          "name": "zx",
+          "in": "query",
+          "description": "For latest/history with format zx or wasm: the ZX executable revision the app runs; only releases whose .zx header has it are offered. Apps that name host_api without it run only revisions before 28",
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
           }
         }
       ],
@@ -129,7 +150,7 @@
           "name": "asset",
           "in": "path",
           "required": true,
-          "description": "The artifact SHA-256 followed by .zx (.zib for releases built before the ZX format)",
+          "description": "The artifact SHA-256 followed by .zx (.zib for releases built before the ZX format, .wasm for a WebAssembly variant)",
           "schema": {
             "type": "string"
           }

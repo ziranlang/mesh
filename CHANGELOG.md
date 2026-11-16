@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Offer each host only package releases it can run: the ZX revision it names (`zx=R`, read from each stored `.zx` header), revisions before 28 for released hosts that name none, and nothing older than its `oldest_host_api`. Serve a release's signed WebAssembly variant to web hosts that ask with `format=wasm`. Package staging keeps every archived release and blob, and the history keeps the newest release of every format, revision and interface.
+
 - Have node-hosted Lumi read every referenced list item and propose one complete developer report with a single Send/Cancel preview; carry expanded tool arguments without truncation.
 
 - Accept full Lumi developer reports up to 32 KiB of UTF-8 text without truncation, preserving account privacy and retry identity.
