@@ -74,7 +74,10 @@ export async function deliver(request, env, context, fetchOrigin, cache) {
   // HEAD follows exactly the existing registry, publisher, signature, grant
   // and artifact-integrity checks. Never use a cache hit before this succeeds.
   const authorization = await fetchOrigin(authorizationRequest(request), {
-    cf: { cacheTtl: 0, cacheEverything: false },
+    // A zero TTL still forces caching and can replace the origin's policy.
+    // Bypass the fetch cache so every grant check reaches the node directly.
+    cache: "no-store",
+    cf: { cacheEverything: false },
   });
   if (authorization.status !== 200) {
     const headers = new Headers(authorization.headers);

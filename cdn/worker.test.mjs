@@ -34,13 +34,15 @@ function fixture(suffix = "zx") {
       },
     },
   };
-  async function origin(request) {
+  async function origin(request, options) {
     requests.push(request);
     if (request.method !== "HEAD") {
       return new Response(bytes, { headers: { "Cache-Control": state.policy } });
     }
     assert.equal(request.headers.get("If-None-Match"), null);
     assert.equal(request.redirect, "manual");
+    assert.equal(options.cache, "no-store", "authorization must bypass the fetch cache");
+    assert.equal(options.cf.cacheTtl, undefined, "zero TTL still forces caching and overrides origin policy");
     return new Response(null, {
       status: state.status,
       headers: {

@@ -26,7 +26,7 @@ function authorize(request) {
   return new Response(null, {
     status: allowed ? 200 : 403,
     headers: allowed ? {
-      "Content-Length": String(bytes.length),
+      // The installed node's HEAD response does not include a length.
       "ETag": `"${hash}"`,
       "Cache-Control": "private, no-store",
     } : { "Cache-Control": "no-store" },

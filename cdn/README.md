@@ -23,10 +23,10 @@ creates an R2 object, so download traffic cannot grow storage or write usage.
 
 ## Activation
 
-R2 must first be enabled in the existing Cloudflare account. The API currently
-rejects bucket operations with code 10042 until that account step is complete.
-Enabling R2 may require billing enrollment even when usage remains within its
-free allowance. This repository does not activate billing or upgrade a plan.
+R2 must be available in the existing Cloudflare account. If bucket operations
+return code 10042, account activation is still required. This repository does
+not activate billing or upgrade a plan. The Mesh rollout created the private
+bucket and deployed the Worker without a plan change.
 
 After activation, create the dedicated private bucket:
 

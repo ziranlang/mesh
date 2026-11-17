@@ -90,7 +90,8 @@ def mirror(artifacts, bucket, command, directory):
     result = wrangler(command, ["get", f"{bucket}/{INVENTORY}", "--file", str(inventory_path), "--remote"])
     if result.returncode:
         missing = any(message in result.stdout.lower() for message in (
-            "object does not exist", "object not found", "no such object", "[code: 10007]", "404"))
+            "object does not exist", "object not found", "no such object",
+            "the specified key does not exist", "[code: 10007]", "404"))
         if not missing:
             raise RuntimeError(f"Could not read the R2 mirror inventory:\n{result.stdout}")
         previous = {"schema": 1, "objects": {}}

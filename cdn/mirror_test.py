@@ -3,7 +3,9 @@ import importlib.util
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("mirror", Path(__file__).with_name("mirror.py"))
 mirror = importlib.util.module_from_spec(spec)
@@ -68,6 +70,25 @@ class MirrorTests(unittest.TestCase):
         initial = mirror.reserve_inventory({"schema": 1, "objects": {}}, [artifact])
         retried = mirror.reserve_inventory(initial, [artifact])
         self.assertEqual(sum(retried["objects"].values()), 123)
+
+    def test_wrangler_missing_key_starts_inventory_before_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.artifact(root)
+            artifacts = mirror.collect_artifacts(root)
+            result = SimpleNamespace(returncode=1, stdout="[ERROR] The specified key does not exist.")
+            with patch.object(mirror, "wrangler", return_value=result), patch.object(mirror, "upload") as upload:
+                size = mirror.mirror(artifacts, "daochi-packages", ["wrangler"], root)
+            self.assertEqual(size, artifacts[0].size)
+            self.assertEqual([call.args[2] for call in upload.call_args_list], [".mirror.json", artifacts[0].key])
+
+    def test_unreadable_inventory_never_overwrites_reserved_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            result = SimpleNamespace(returncode=1, stdout="Authentication error: token cannot read objects")
+            with patch.object(mirror, "wrangler", return_value=result), patch.object(mirror, "upload") as upload:
+                with self.assertRaisesRegex(RuntimeError, "Could not read"):
+                    mirror.mirror([], "daochi-packages", ["wrangler"], Path(temporary))
+            upload.assert_not_called()
 
 
 if __name__ == "__main__":
