@@ -30,7 +30,7 @@ func referenceBinaryField(value string) ([]byte, error) {
 	return nil, errors.New("field is neither hex nor base64")
 }
 
-// Decode exposes the unchanged reference result without sharing Daochi code.
+// Decode exposes the unchanged reference result without sharing Mesh code.
 func Decode(input string) (string, string) {
 	value, err := referenceBinaryField(input)
 	if err != nil {

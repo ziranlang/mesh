@@ -21,7 +21,7 @@ import (
 // Its control endpoints exist only in a Go test and only on loopback. Browser
 // tests proxy the fixed production audience to it; no real Telegram is used.
 func TestTelegramBrowserFixture(t *testing.T) {
-	reportPath := os.Getenv("DAOCHI_BROWSER_FIXTURE_REPORT")
+	reportPath := os.Getenv("MESH_BROWSER_FIXTURE_REPORT")
 	if reportPath == "" {
 		t.Skip("browser fixture is opt-in")
 	}

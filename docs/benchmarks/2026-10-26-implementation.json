@@ -1,6 +1,6 @@
 {
   "date": "2026-10-26",
-  "repository": "kryonlabs/daochi",
+  "repository": "ziranlang/mesh",
   "go": "1.26.10",
   "cpu": "AMD Ryzen 9 9950X",
   "gomaxprocs": 1,

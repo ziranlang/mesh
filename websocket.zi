@@ -106,7 +106,9 @@ Accept :: (writer: http.ResponseWriter, request: *http.Request) -> AcceptedSocke
     ]
     reply := Join(parts[:], "")
     protocol := http.HeaderValue(headers, "Sec-WebSocket-Protocol")
-    if ProtocolRequested(protocol, "daochi-sync-v1") {
+    if ProtocolRequested(protocol, "mesh-sync-v1") {
+        reply = AddText(reply, "\r\nSec-WebSocket-Protocol: mesh-sync-v1")
+    } else if ProtocolRequested(protocol, "daochi-sync-v1") {
         reply = AddText(reply, "\r\nSec-WebSocket-Protocol: daochi-sync-v1")
     } else if ProtocolRequested(protocol, "ksync-sync-v1") {
         reply = AddText(reply, "\r\nSec-WebSocket-Protocol: ksync-sync-v1")

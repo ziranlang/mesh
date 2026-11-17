@@ -282,7 +282,7 @@ func TestReferralGooglePackageAppMapping(t *testing.T) {
 	if Config_GoogleApp(cfg, "attacker.package") != "" {
 		t.Fatal("unknown package accepted")
 	}
-	t.Setenv("DAOCHI_GOOGLE_PACKAGE_APPS", "xyz.waozi.wurm=wurm,example.invalid=custom")
+	t.Setenv("MESH_GOOGLE_PACKAGE_APPS", "xyz.waozi.wurm=wurm,example.invalid=custom")
 	cfg = Config_Load()
 	if Config_GoogleApp(cfg, "example.invalid") != "custom" || cfg.GooglePackageApps["xyz.waozi.wurm"] != "wurm" {
 		t.Fatal("operator title config ignored")

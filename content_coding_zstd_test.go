@@ -57,7 +57,7 @@ func TestContentCodingSelectsNegotiatedRepresentation(t *testing.T) {
 	if got := ContentCoding_SelectEncoding(strings.Repeat("z", 4097)); got != "" {
 		t.Fatal("oversized negotiation accepted")
 	}
-	t.Setenv("DAOCHI_HTTP_ZSTD_RESPONSES", "0")
+	t.Setenv("MESH_HTTP_ZSTD_RESPONSES", "0")
 	if got := ContentCoding_SelectEncoding("zstd,gzip"); got != "gzip" {
 		t.Fatal("response rollback switch ignored", got)
 	}
@@ -96,7 +96,7 @@ func TestContentCodingZstdBoundsAndCorruption(t *testing.T) {
 			}
 		})
 	}
-	t.Setenv("DAOCHI_HTTP_ZSTD_REQUESTS", "0")
+	t.Setenv("MESH_HTTP_ZSTD_REQUESTS", "0")
 	request := httptest.NewRequest("POST", "/", bytes.NewReader(encoded))
 	request.Header.Set("Content-Encoding", "zstd")
 	if got := HttpBody_ReadJSON(httptest.NewRecorder(), request, 8192); got.Error == nil {
@@ -280,8 +280,8 @@ func TestRecordPagesZstdKeepsDecodedTransactionSignatures(t *testing.T) {
 		header := signedTxHeader(t, identity.UserID, "pageapp", "page-key", "POST", "/api/v1/sync", signedBody, key, fmt.Sprintf("zstd-page-tx-%d", trial))
 		request := httptest.NewRequest("POST", "/api/v1/sync", bytes.NewReader(wire))
 		request.Header.Set("Authorization", "Bearer "+identity.Token)
-		request.Header.Set("X-Daochi-User", identity.UserID)
-		request.Header.Set("X-Daochi-Tx", header)
+		request.Header.Set("X-Mesh-User", identity.UserID)
+		request.Header.Set("X-Mesh-Tx", header)
 		request.Header.Set("Content-Encoding", "zstd")
 		request.Header.Set("Accept-Encoding", "zstd")
 		recorder := httptest.NewRecorder()

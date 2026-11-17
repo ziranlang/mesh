@@ -16,7 +16,7 @@ func TestLeaderboardPublicAppearance(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
 		r.Header.Set("Authorization", "Bearer "+issueTestBearer(t, server, users[user], time.Now().Add(time.Hour)))
-		r.Header.Set("X-Daochi-User", users[user])
+		r.Header.Set("X-Mesh-User", users[user])
 		w := httptest.NewRecorder()
 		if method == "PUT" {
 			SocialHttp_PutStats(server.social(), w, r)

@@ -1,4 +1,4 @@
-//go:build daochi_embedded
+//go:build mesh_embedded
 
 // Platform ABI for the generated node core. No application merge rules live here.
 package main
@@ -179,7 +179,7 @@ func startEmbedded(root string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, name := range []string{"node-key", "daochi.sqlite"} {
+	for _, name := range []string{"node-key", "mesh.sqlite"} {
 		info, err := os.Lstat(filepath.Join(root, name))
 		if err == nil && (!info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0) {
 			return 0, errors.New("private node state required")
@@ -193,7 +193,7 @@ func startEmbedded(root string) (int64, error) {
 		return 0, identity.Error
 	}
 	config := Config{
-		Addr: "127.0.0.1:0", DBPath: filepath.Join(root, "daochi.sqlite"),
+		Addr: "127.0.0.1:0", DBPath: filepath.Join(root, "mesh.sqlite"),
 		TokenSecret: secret, AdminToken: hex.EncodeToString(admin),
 		NodeIdentityPrivateKey: identity.Value, NodeDisplayName: "Private app node",
 		ChallengeTTL: time.Minute, TokenTTL: time.Hour, MaxBodyBytes: 1 << 20,
@@ -317,7 +317,7 @@ func NodeRequest(handle C.longlong, method *C.char, path *C.char, body *C.char, 
 	request.RemoteAddr = "127.0.0.1:1"
 	request.Header.Set("Content-Type", "application/json")
 	// This in-process operator capability never crosses a peer transport.
-	request.Header.Set("X-Daochi-Admin", node.core.Server.Cfg.AdminToken)
+	request.Header.Set("X-Mesh-Admin", node.core.Server.Cfg.AdminToken)
 	recorder := httptest.NewRecorder()
 	embeddedHandler(node.core).ServeHTTP(recorder, request)
 	response := recorder.Result()

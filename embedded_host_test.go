@@ -1,4 +1,4 @@
-//go:build daochi_embedded
+//go:build mesh_embedded
 
 package main
 

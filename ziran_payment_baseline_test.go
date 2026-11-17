@@ -398,7 +398,7 @@ func baselinePaymentTokenAppFilter(r *http.Request) (string, bool, error) {
 }
 
 func (s *Server) baselinePaymentAuthorizeTokenApp(ctx context.Context, r *http.Request, body []byte, accountID, appID, assetID, permission string) (SignedTxEnvelope, bool, error) {
-	hasSignedTx := strings.TrimSpace(r.Header.Get("X-Daochi-Tx")) != ""
+	hasSignedTx := strings.TrimSpace(r.Header.Get("X-Mesh-Tx")) != ""
 	var signedTx SignedTxEnvelope
 	if hasSignedTx {
 		header := SignedTx_ReadHeader(r)

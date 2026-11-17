@@ -2,7 +2,7 @@
   "/api/v1/admin/game-maps": {
     "post": {
       "summary": "Register immutable approved map revisions",
-      "description": "Requires the configured X-Daochi-Admin token. Body: {game,source_version,maps:[{level,map_hash,map}]}. Accepts at most 512 maps and 1 MiB. Classic map_hash is SHA256 of shovey.classic.map.v1, LF, decimal level, LF, and the exact lowercase 1440-character cells+tiles+decorations encoding, with no trailing LF. Solutions are excluded. Old revisions remain after map updates or package cleanup. Account clients cannot register maps.",
+      "description": "Requires the configured X-Mesh-Admin token. Body: {game,source_version,maps:[{level,map_hash,map}]}. Accepts at most 512 maps and 1 MiB. Classic map_hash is SHA256 of shovey.classic.map.v1, LF, decimal level, LF, and the exact lowercase 1440-character cells+tiles+decorations encoding, with no trailing LF. Solutions are excluded. Old revisions remain after map updates or package cleanup. Account clients cannot register maps.",
       "responses": {
         "200": {
           "description": "Registered idempotently"

@@ -2,23 +2,23 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <link rel="canonical" href="https://daochi.net/apps.html">
+  <link rel="canonical" href="https://mesh.ziran-lang.org/apps.html">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daochi App Model</title>
-  <meta name="description" content="Daochi app registry, collection ownership, visibility classes, and app grants.">
+  <title>Mesh App Model</title>
+  <meta name="description" content="Mesh app registry, collection ownership, visibility classes, and app grants.">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://daochi.net/apps.html">
-  <meta property="og:title" content="Daochi App Model">
-  <meta property="og:description" content="Daochi app registry, collection ownership, visibility classes, and app grants.">
-  <meta property="og:image" content="https://daochi.net/assets/editorial/connected-islands.png">
-  <meta property="og:image:secure_url" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta property="og:url" content="https://mesh.ziran-lang.org/apps.html">
+  <meta property="og:title" content="Mesh App Model">
+  <meta property="og:description" content="Mesh app registry, collection ownership, visibility classes, and app grants.">
+  <meta property="og:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
+  <meta property="og:image:secure_url" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta property="og:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta property="og:image:width" content="1536">
   <meta property="og:image:height" content="1024">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Daochi App Model">
-  <meta name="twitter:description" content="Daochi app registry, collection ownership, visibility classes, and app grants.">
-  <meta name="twitter:image" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta name="twitter:title" content="Mesh App Model">
+  <meta name="twitter:description" content="Mesh app registry, collection ownership, visibility classes, and app grants.">
+  <meta name="twitter:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta name="twitter:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta name="theme-color" content="#f7f3eb">
   <link rel="icon" href="/favicon.ico" sizes="any">
@@ -31,7 +31,7 @@
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="topbar">
-    <a class="brand" href="/">Daochi</a>
+    <a class="brand" href="/">Mesh</a>
     <nav class="nav" aria-label="Primary">
       <a href="/protocol.html">Protocol</a>
       <a href="/mesh.html">Mesh</a>
@@ -46,12 +46,12 @@
     <section class="page-hero">
       <p class="eyebrow">Apps</p>
       <h1>Data belongs to apps, not to a hard-coded client.</h1>
-      <p class="lead">The registry lets Daochi understand which app owns which collection prefixes, which app keys can sign transactions, what visibility class records use, and which capabilities the app expects from the relay.</p>
+      <p class="lead">The registry lets Mesh understand which app owns which collection prefixes, which app keys can sign transactions, what visibility class records use, and which capabilities the app expects from the relay.</p>
     </section>
 
     <section>
       <h2>Registry</h2>
-      <p><code>GET /api/v1/apps</code> lists registered apps. Admin registration can add or update apps when the server admin token is configured and the request supplies <code>X-Daochi-Admin</code>. <code>X-Ksync-Admin</code> remains accepted for shipped clients. New clients should prefer <code>POST /api/v1/apps/register-signed</code>, which accepts a signed manifest plus a node registry approval signature.</p>
+      <p><code>GET /api/v1/apps</code> lists registered apps. Admin registration can add or update apps when the server admin token is configured and the request supplies <code>X-Mesh-Admin</code>. <code>X-Ksync-Admin</code> remains accepted for shipped clients. New clients should prefer <code>POST /api/v1/apps/register-signed</code>, which accepts a signed manifest plus a node registry approval signature.</p>
       <p>Registrations describe protocol ownership only. Product UI, business rules, and app-specific behavior stay outside the relay. App records should declare private, shared, friends, and public hierarchy prefixes according to the data they own.</p>
       <div class="grid">
         <article class="card">
@@ -75,7 +75,7 @@
 
     <section>
       <h2>Signed manifests</h2>
-      <p>A signed manifest contains <code>manifest_version</code>, <code>app_id</code>, display metadata, active Ed25519 app keys, collection prefixes, capabilities, and optional token policies. The manifest is signed by one of its active app keys, then approved by the node registry key configured on that Daochi node.</p>
+      <p>A signed manifest contains <code>manifest_version</code>, <code>app_id</code>, display metadata, active Ed25519 app keys, collection prefixes, capabilities, and optional token policies. The manifest is signed by one of its active app keys, then approved by the node registry key configured on that Mesh node.</p>
       <p>Registration is per node. A node operator chooses which registry approval public key to trust, so a self-hosted node can accept a local registry while a public node can use a stricter review process. The same manifest format works across command-line, terminal UI, browser, mobile, and desktop clients.</p>
       <div class="panel">
         <div class="panel-row"><strong>Register</strong><span><code>POST /api/v1/apps/register-signed</code></span></div>
@@ -89,7 +89,7 @@
       <div class="split">
         <div>
           <h2>App grants</h2>
-          <p>App grants let an account allow a target app to read a selected shared collection prefix from a source app. Daochi validates the source app, target app, collection prefix, and permission before creating the grant.</p>
+          <p>App grants let an account allow a target app to read a selected shared collection prefix from a source app. Mesh validates the source app, target app, collection prefix, and permission before creating the grant.</p>
           <p><code>GET /api/v1/account/app-records</code> returns authorized records for the account when the grant exists. Revocation deletes the grant without deleting the underlying app records. New clients can use the signed grant endpoint so the account and app identity are both bound to the grant request.</p>
         </div>
         <div class="panel">
@@ -104,9 +104,9 @@
   </main>
 
   <footer class="footer">
-    <span>Daochi · A <a href="https://kryonlabs.com">Kryon Labs</a> project</span>
+    <span>Mesh · A <a href="https://ziran-lang.org">Ziran</a> project</span>
     <a href="https://waozi.xyz/#labs">More from Waozi ↗</a>
-    <a href="https://github.com/kryonlabs/daochi">Source</a>
+    <a href="https://github.com/ziranlang/mesh">Source</a>
   </footer>
 </body>
 </html>

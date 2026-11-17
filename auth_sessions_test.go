@@ -155,7 +155,7 @@ func TestBearerSessionRevocation(t *testing.T) {
 
 	wrongAccount := httptest.NewRequest(http.MethodGet, "/api/v1/devices", nil)
 	wrongAccount.Header.Set("Authorization", "Bearer "+current)
-	wrongAccount.Header.Set("X-Daochi-User", strings.Repeat("b", 64))
+	wrongAccount.Header.Set("X-Mesh-User", strings.Repeat("b", 64))
 	if result := HttpAuth_BearerUser(store.Database, wrongAccount, secret); result.Value != "" ||
 		result.Authentication.Status == 0 {
 		t.Fatal("wrong-account bearer accepted")

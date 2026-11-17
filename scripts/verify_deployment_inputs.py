@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify native build and SSH inputs before a Daochi deployment."""
+"""Verify native build and SSH inputs before a Mesh deployment."""
 
 import argparse
 from hashlib import sha256
@@ -31,7 +31,7 @@ def run_command(arguments, error):
 
 
 def atomic_write(path, data, mode):
-    descriptor, temporary_name = tempfile.mkstemp(prefix=".daochi-", dir=path.parent)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".mesh-", dir=path.parent)
     temporary_path = Path(temporary_name)
     try:
         os.fchmod(descriptor, mode)
@@ -179,7 +179,7 @@ def validate_native_paths(source_directory, build_directory):
 
 
 def native_metadata_path(build_directory):
-    return build_directory / ".daochi-native-build.json"
+    return build_directory / ".mesh-native-build.json"
 
 
 def check_native_build(source_directory, build_directory, artifact, cmake, cmake_options):
@@ -305,7 +305,7 @@ def known_host_entries(host, lines):
     for line in lines:
         if line.lstrip().startswith("@"):
             raise VerificationError("trusted SSH host key entries must be literal host keys")
-    with tempfile.TemporaryDirectory(prefix="daochi-known-hosts-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="mesh-known-hosts-") as temporary:
         known_hosts = Path(temporary) / "trusted"
         known_hosts.write_text("\n".join(lines) + "\n")
         output = run_command(
@@ -343,7 +343,7 @@ def configure_ssh(host, user, trusted_lines, ssh_directory):
     atomic_write(known_hosts, ("\n".join(trusted_lines) + "\n").encode(), 0o600)
     configuration = "\n".join(
         (
-            "Host daochi-origin",
+            "Host mesh-origin",
             f"  HostName {host}",
             f"  User {user}",
             "  IdentityFile ~/.ssh/id_ed25519",

@@ -110,7 +110,7 @@ func TestZiranMeshWorkerLifecycleAgainstBaseline(t *testing.T) {
 }
 
 func TestZiranMeshWorkerNilContextAgainstBaseline(t *testing.T) {
-	implementation := os.Getenv("DAOCHI_MESH_WORKER_IMPLEMENTATION")
+	implementation := os.Getenv("MESH_MESH_WORKER_IMPLEMENTATION")
 	if implementation != "" {
 		server := meshHTTPFixture(t)
 		server.Cfg.NodeSyncInterval = time.Hour
@@ -136,11 +136,11 @@ func TestZiranMeshWorkerNilContextAgainstBaseline(t *testing.T) {
 		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 		command := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestZiranMeshWorkerNilContextAgainstBaseline$")
 		for _, entry := range os.Environ() {
-			if !strings.HasPrefix(entry, "DISPLAY=") && !strings.HasPrefix(entry, "WAYLAND_DISPLAY=") && !strings.HasPrefix(entry, "DAOCHI_MESH_WORKER_IMPLEMENTATION=") {
+			if !strings.HasPrefix(entry, "DISPLAY=") && !strings.HasPrefix(entry, "WAYLAND_DISPLAY=") && !strings.HasPrefix(entry, "MESH_MESH_WORKER_IMPLEMENTATION=") {
 				command.Env = append(command.Env, entry)
 			}
 		}
-		command.Env = append(command.Env, "DAOCHI_MESH_WORKER_IMPLEMENTATION="+implementation)
+		command.Env = append(command.Env, "MESH_MESH_WORKER_IMPLEMENTATION="+implementation)
 		output, err := command.CombinedOutput()
 		cancel()
 		if err != nil {

@@ -45,12 +45,12 @@
   }},
   "/api/v1/delegated/sync": {"post": {
     "summary": "Read or write one exact approved encrypted collection/key generation",
-    "description": "Authorization: Delegate ds1.<session-id> plus X-Daochi-Delegate Ed25519 proof. Proof binds grant/session/account/app/client/node/audience/challenge, method, normalized path/query, body SHA-256, expiry and unique nonce. Replay claim and mutations commit together. Scoped validation reuses sync v6. Reads, cursors and truncation filter key_id; delegates cannot overwrite records rotated to another key. No full snapshots, plaintext data, deletion or extra routes. This custom proof protocol is not OAuth DPoP. Other nodes and partitions fail closed.",
+    "description": "Authorization: Delegate ds1.<session-id> plus X-Mesh-Delegate Ed25519 proof. Proof binds grant/session/account/app/client/node/audience/challenge, method, normalized path/query, body SHA-256, expiry and unique nonce. Replay claim and mutations commit together. Scoped validation reuses sync v6. Reads, cursors and truncation filter key_id; delegates cannot overwrite records rotated to another key. No full snapshots, plaintext data, deletion or extra routes. This custom proof protocol is not OAuth DPoP. Other nodes and partitions fail closed.",
     "responses": {"200": {"description": "Scoped records and cursor"}, "401": {"description": "Invalid proof or inactive session/grant"}, "403": {"description": "Operation, collection, app policy or key generation outside scope"}, "409": {"description": "Request replayed"}}
   }},
   "/api/v1/delegated/ws": {"get": {
     "summary": "Observe one approved collection/key generation",
-    "description": "Fresh signed GET proof with normalized collection query is consumed atomically. Browser credentials are supplied in daochi.delegate.<base64url-proof> and daochi.session.<session-id> subprotocols, never URLs. Events expose only the approved collection generation's version; grants, app policy, node and session expiry are checked before notifications. Revocation closes the socket.",
+    "description": "Fresh signed GET proof with normalized collection query is consumed atomically. Browser credentials are supplied in mesh.delegate.<base64url-proof> and mesh.session.<session-id> subprotocols, never URLs. Events expose only the approved collection generation's version; grants, app policy, node and session expiry are checked before notifications. Revocation closes the socket.",
     "parameters": [{"name": "collection", "in": "query", "required": true, "schema": {"type": "string"}}],
     "responses": {"101": {"description": "Scoped socket"}, "401": {"description": "Key proof or active session required"}, "403": {"description": "Collection outside grant"}, "409": {"description": "Handshake proof replayed"}}
   }}

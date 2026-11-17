@@ -16,8 +16,8 @@ import (
 // Account signature verification is stubbed by testServer. Device verification,
 // signed-transaction storage, SQL, response generation and middleware are real.
 func TestSyncPerformanceAudit(t *testing.T) {
-	if os.Getenv("DAOCHI_PERFORMANCE_AUDIT") != "1" {
-		t.Skip("set DAOCHI_PERFORMANCE_AUDIT=1 for the bounded local timing audit")
+	if os.Getenv("MESH_PERFORMANCE_AUDIT") != "1" {
+		t.Skip("set MESH_PERFORMANCE_AUDIT=1 for the bounded local timing audit")
 	}
 	var rows []map[string]any
 	var usageRows []map[string]any
@@ -58,8 +58,8 @@ func TestSyncPerformanceAudit(t *testing.T) {
 				header := signedTxHeader(t, identity.UserID, "pageapp", "page-key", "POST", "/api/v1/sync", body, key, fmt.Sprintf("performance-audit-%08d", sequence))
 				request := httptest.NewRequest("POST", "/api/v1/sync", bytes.NewReader(body))
 				request.Header.Set("Authorization", "Bearer "+identity.Token)
-				request.Header.Set("X-Daochi-User", identity.UserID)
-				request.Header.Set("X-Daochi-Tx", header)
+				request.Header.Set("X-Mesh-User", identity.UserID)
+				request.Header.Set("X-Mesh-Tx", header)
 				request.Header.Set("Content-Type", "application/json")
 				recorder := httptest.NewRecorder()
 				start := time.Now()

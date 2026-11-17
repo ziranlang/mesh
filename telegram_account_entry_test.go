@@ -424,7 +424,7 @@ func TestTelegramAccountEntryBindRequiresExactV6OwnerAndDevice(t *testing.T) {
 			}
 			result := authorizationCall(t, fixture.owner.handler, entryPath+"bind", input,
 				map[string]string{"Authorization": "Bearer " + fixture.owner.owner.Token,
-					"X-Daochi-User": fixture.owner.owner.UserID, "X-Daochi-Tx": string(header)})
+					"X-Mesh-User": fixture.owner.owner.UserID, "X-Mesh-Tx": string(header)})
 			if result.Code == 200 {
 				t.Fatal("invalid owner/device authorization bound entry")
 			}

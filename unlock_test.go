@@ -619,12 +619,12 @@ func TestDewRatioAddsMissingProducts(t *testing.T) {
 			t.Fatalf("balance: %+v, want %d", got, want)
 		}
 	}
-	t.Setenv("DAOCHI_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000")
+	t.Setenv("MESH_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000")
 	printed, err := runDewRatio(t, configuration, "rescale-v2", "1000000000000", "1000000000", "dew_100:100")
-	if err != nil || printed != "Dew ratio unchanged\nDAOCHI_TOKEN_PRODUCTS=dew_small:5000000:1000000000000,dew_100:100000000:100000000000\n" {
+	if err != nil || printed != "Dew ratio unchanged\nMESH_TOKEN_PRODUCTS=dew_small:5000000:1000000000000,dew_100:100000000:100000000000\n" {
 		t.Fatalf("added product: %q, %v", printed, err)
 	}
-	t.Setenv("DAOCHI_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000,dew_100:100000000:100000000000")
+	t.Setenv("MESH_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000,dew_100:100000000:100000000000")
 	if printed, err := runDewRatio(t, configuration, "rescale-v2", "1000000000000", "1000000000", "dew_100:100"); err != nil || printed != "Dew ratio unchanged\n" {
 		t.Fatalf("product already sold: %q, %v", printed, err)
 	}
@@ -640,7 +640,7 @@ func TestDewRatioAddsMissingProducts(t *testing.T) {
 	// A raise scales the products the node sells and adds the rest at the new ratio.
 	printed, err = runDewRatio(t, configuration, "rescale-v2", "1000000000000", "10000000000", "dew_100:100,dew_500:500")
 	if err != nil || !strings.HasSuffix(printed, "MONERO_RATE_ATOMIC_AMOUNT=1000000000000\n"+
-		"MONERO_RATE_TOKEN_UNITS=10000000000\nDAOCHI_TOKEN_PRODUCTS=dew_small:50000000:1000000000000,"+
+		"MONERO_RATE_TOKEN_UNITS=10000000000\nMESH_TOKEN_PRODUCTS=dew_small:50000000:1000000000000,"+
 		"dew_100:1000000000:100000000000,dew_500:500000000:50000000000\n") {
 		t.Fatalf("raised ratio: %q, %v", printed, err)
 	}
@@ -655,7 +655,7 @@ func TestDewRatioRaisesTheRatioOnce(t *testing.T) {
 	configuration := server.Cfg
 	configuration.MoneroRateAtomicAmount = 1000000000000
 	configuration.MoneroRateTokenUnits = 1000 * UnitsPerDew
-	t.Setenv("DAOCHI_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000")
+	t.Setenv("MESH_TOKEN_PRODUCTS", "dew_small:5000000:1000000000000")
 	run := func(arguments ...string) (string, Error) {
 		t.Helper()
 		return runDewRatio(t, configuration, arguments...)
@@ -685,7 +685,7 @@ func TestDewRatioRaisesTheRatioOnce(t *testing.T) {
 	balance(3 * UnitsPerDew)
 	printed, err := run("rescale-v2", "1000000000000", "10000000000")
 	if err != nil || !strings.HasSuffix(printed, "MONERO_RATE_ATOMIC_AMOUNT=1000000000000\n"+
-		"MONERO_RATE_TOKEN_UNITS=10000000000\nDAOCHI_TOKEN_PRODUCTS=dew_small:50000000:1000000000000\n") {
+		"MONERO_RATE_TOKEN_UNITS=10000000000\nMESH_TOKEN_PRODUCTS=dew_small:50000000:1000000000000\n") {
 		t.Fatalf("raised ratio: %q, %v", printed, err)
 	}
 	balance(30 * UnitsPerDew)

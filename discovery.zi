@@ -25,6 +25,7 @@ RegisterService :: #type (instance: string, service: string, domain: string, por
 ShutdownService :: #type (service: *Advertiser) -> void;
 
 #scope_file
+// Durable discovery service ID for installed clients. Public product name is Mesh.
 ServiceName :: "_daochi._tcp";
 Domain :: "local.";
 TrimSpace :: (value: string) -> string #foreign go_strings;
@@ -62,7 +63,7 @@ Run :: (configuration: *config.Config, identity: *NodeIdentity, value: context.C
         LogWarning("LAN discovery unavailable", "error", registered.error)
         return
     }
-    LogAdvertisement("advertising Daochi node on LAN", "node_id", identity.ID, "port", port.value)
+    LogAdvertisement("advertising Mesh node on LAN", "node_id", identity.ID, "port", port.value)
     ShutdownAtReturn(shutdown, registered.value)
     cases: [1]selection.Case
     cases[0] = selection.Receive(context.Done(value))
@@ -82,7 +83,7 @@ ListenerPort :: (address: string) -> PortResult {
 InstanceName :: (displayName: string, nodeID: string) -> string {
     name := TrimSpace(displayName)
     if name == "" {
-        name = "Daochi Node"
+        name = "Mesh Node"
     }
     if nodeID.count > 12 {
         nodeID = nodeID[:12]

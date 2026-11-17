@@ -1,7 +1,7 @@
 # Signed portable app delivery
 
 Registered applications may publish portable releases in a node-owned package
-directory alongside the database: `DAOCHI_DB.packages/APP_ID/`. These are code
+directory alongside the database: `MESH_DB.packages/APP_ID/`. These are code
 artifacts, separate from account records and sync collections. This does not
 change app registration, registry approvals, private-data scopes or tokens.
 

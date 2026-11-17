@@ -1,6 +1,6 @@
-# Daochi Small Node Operations
+# Mesh Small Node Operations
 
-Daochi should remain practical on modest machines and home nodes. These targets
+Mesh should remain practical on modest machines and home nodes. These targets
 turn that value into an operational checklist.
 
 ## Small Node Target
@@ -10,14 +10,14 @@ A small node is expected to run with:
 - one Go server process;
 - SQLite storage on local disk;
 - a reverse proxy terminating TLS;
-- no background job queue beyond Daochi's own sync workers;
+- no background job queue beyond Mesh's own sync workers;
 - enough memory to run comfortably on a 1 GB VM or small home server.
 
 ## Default Posture
 
-- Keep `DAOCHI_ADDR` bound to loopback behind a reverse proxy.
-- Set a stable `DAOCHI_TOKEN_SECRET_HEX` before production use.
-- Set `DAOCHI_NODE_IDENTITY_KEY_FILE` explicitly so node identity survives
+- Keep `MESH_ADDR` bound to loopback behind a reverse proxy.
+- Set a stable `MESH_TOKEN_SECRET_HEX` before production use.
+- Set `MESH_NODE_IDENTITY_KEY_FILE` explicitly so node identity survives
   process restarts and deploys.
 - Leave direct purchases, LAN discovery, and node sync disabled until the node
   operator intentionally enables them.
@@ -59,7 +59,7 @@ Before exposing a node publicly:
 - `GET /healthz` returns 200;
 - `GET /readyz` returns 200;
 - `GET /api/v1/node` shows the expected node name and protocol bounds;
-- `/metrics` is protected by `X-Daochi-Admin` when an admin token is set;
+- `/metrics` is protected by `X-Mesh-Admin` when an admin token is set;
 - backups include the SQLite database and node identity key;
 - the `<database>.blobs` and `<database>.held` folders sit beside the database
   on the same filesystem: a deleted account is moved to `.held` for 30 days,
@@ -67,6 +67,6 @@ Before exposing a node publicly:
   at once, set its `purge_after` in `server_account_holds` to 0; the hourly
   retention job removes it;
 - blobs an account moves to its trash stop counting toward its storage and are
-  deleted after `DAOCHI_TRASH_PURGE_DAYS` (30 by default); a private node that
+  deleted after `MESH_TRASH_PURGE_DAYS` (30 by default); a private node that
   archives the owner's photos sets it to 0 and keeps them;
 - restore has been tested on a separate machine or directory.

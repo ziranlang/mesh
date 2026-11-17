@@ -198,11 +198,11 @@ func TestZiranHTTPAuthenticationAgainstBaseline(t *testing.T) {
 			case "whitespace":
 				request.Header.Set("Authorization", "\u2003Bearer \t"+token+"\u2003")
 			case "header mismatch":
-				request.Header.Set("X-Daochi-User", strings.Repeat("b", 64))
+				request.Header.Set("X-Mesh-User", strings.Repeat("b", 64))
 			case "legacy user":
 				request.Header.Set("X-Inbe-User", "\u2003"+strings.ToUpper(user)+"\t")
 			case "header precedence":
-				request.Header.Set("X-Daochi-User", user)
+				request.Header.Set("X-Mesh-User", user)
 				request.Header.Set("X-Ksync-User", strings.Repeat("b", 64))
 			case "missing account", "bootstrap", "deleted bootstrap":
 				if _, err := server.Store.Database.Exec("DELETE FROM server_users WHERE user_id_hash=?1", user); err != nil {
@@ -292,7 +292,7 @@ func TestZiranRegistryHTTPAgainstBaseline(t *testing.T) {
 				case "admin disabled":
 					server.Cfg.AdminToken = ""
 				case "admin rejected":
-					request.Header.Set("X-Daochi-Admin", "wrong")
+					request.Header.Set("X-Mesh-Admin", "wrong")
 				case "body limit":
 					server.Cfg.MaxBodyBytes = 1
 				case "closed":
@@ -530,7 +530,7 @@ func TestZiranRegistrySignedRequestCleanupAgainstBaseline(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					request.Header.Set("X-Daochi-Tx", string(header))
+					request.Header.Set("X-Mesh-Tx", string(header))
 				}
 				rand.Reader = bytes.NewReader(bytes.Repeat([]byte{0x42}, 16))
 				writer := httptest.NewRecorder()

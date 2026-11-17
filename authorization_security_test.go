@@ -368,7 +368,7 @@ func TestAuthorizationWebSocketRevocation(t *testing.T) {
 		BodySHA256: Signing_SHA256Hex(nil), ExpiresAt: time.Now().Unix() + 30, Nonce: strings.Repeat("9", 32)}
 	proof.Signature = hex.EncodeToString(ed25519.Sign(fixture.delegate, []byte(Session_ProofMessage(proof))))
 	raw, _ := json.Marshal(proof)
-	protocol := "daochi-sync-v1, daochi.delegate." + base64.RawURLEncoding.EncodeToString(raw) + ", daochi.session." + fixture.credential.SessionID
+	protocol := "daochi-sync-v1, mesh.delegate." + base64.RawURLEncoding.EncodeToString(raw) + ", mesh.session." + fixture.credential.SessionID
 	_, err = fmt.Fprintf(connection, "GET %s?%s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: %s\r\n\r\n", proof.Path, proof.Query, parsed.Host, protocol)
 	if err != nil {
 		t.Fatal(err)

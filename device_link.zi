@@ -1,7 +1,7 @@
 // A short-lived mailbox that connects a device by QR code. The device showing
 // the code chooses a random link ID; the scanning device and the showing
 // device then exchange at most one request and one response through it. The
-// messages are sealed between the two devices, so Daochi relays opaque text
+// messages are sealed between the two devices, so Mesh relays opaque text
 // and never sees an account key. Links live in memory and expire after ten
 // minutes; a restart only asks the user to show the code again.
 #import "std/go_types"

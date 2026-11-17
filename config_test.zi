@@ -15,15 +15,15 @@ EncodeHexRaw :: (value: []u8) -> string #foreign hex "EncodeToString";
 #program_export "TestLoadConfigUsesCanonicalEnv"
 LoadConfigUsesCanonicalEnv :: (test: *testing.Test) {
     secret := RepeatRaw("11", cast(isize)32)
-    testing.Setenv(test, "DAOCHI_TOKEN_SECRET_HEX", secret)
-    testing.Setenv(test, "DAOCHI_ADDR", "0.0.0.0:18080")
-    testing.Setenv(test, "DAOCHI_BASE_URL", "http://192.168.100.97:18080")
-    testing.Setenv(test, "DAOCHI_DB", "/data/daochi.db")
-    testing.Setenv(test, "DAOCHI_KNOWN_NODES", "Waozi=https://api.waozi.xyz;sync=pull;apps=inbe+ukuvota;collections=inbe.*+profile.public;data=encrypted_records+app_registry")
-    testing.Setenv(test, "DAOCHI_NODE_SYNC_TOKEN", "node-secret")
-    testing.Setenv(test, "DAOCHI_NODE_SYNC_INTERVAL_SECONDS", "30")
-    testing.Setenv(test, "DAOCHI_NODE_SYNC_BATCH_LIMIT", "250")
-    testing.Setenv(test, "DAOCHI_TOKEN_TTL_SECONDS", "90")
+    testing.Setenv(test, "MESH_TOKEN_SECRET_HEX", secret)
+    testing.Setenv(test, "MESH_ADDR", "0.0.0.0:18080")
+    testing.Setenv(test, "MESH_BASE_URL", "http://192.168.100.97:18080")
+    testing.Setenv(test, "MESH_DB", "/data/mesh.db")
+    testing.Setenv(test, "MESH_KNOWN_NODES", "Waozi=https://api.waozi.xyz;sync=pull;apps=inbe+ukuvota;collections=inbe.*+profile.public;data=encrypted_records+app_registry")
+    testing.Setenv(test, "MESH_NODE_SYNC_TOKEN", "node-secret")
+    testing.Setenv(test, "MESH_NODE_SYNC_INTERVAL_SECONDS", "30")
+    testing.Setenv(test, "MESH_NODE_SYNC_BATCH_LIMIT", "250")
+    testing.Setenv(test, "MESH_TOKEN_TTL_SECONDS", "90")
     testing.Setenv(test, "MONERO_WALLET_RPC_URL", "http://127.0.0.1:18083")
     testing.Setenv(test, "MONERO_RATE_ATOMIC_AMOUNT", "1000000000000")
     testing.Setenv(test, "MONERO_RATE_TOKEN_UNITS", "5000000")
@@ -32,11 +32,11 @@ LoadConfigUsesCanonicalEnv :: (test: *testing.Test) {
     encoded := EncodeHexRaw(cfg.TokenSecret)
     if encoded != secret {
         arguments: [1]Any = .[encoded]
-        testing.Fatalf(test, "TokenSecret=%q, want DAOCHI secret", arguments[:])
+        testing.Fatalf(test, "TokenSecret=%q, want MESH secret", arguments[:])
     }
-    if cfg.Addr != "0.0.0.0:18080" || cfg.BaseURL != "http://192.168.100.97:18080" || cfg.DBPath != "/data/daochi.db" {
+    if cfg.Addr != "0.0.0.0:18080" || cfg.BaseURL != "http://192.168.100.97:18080" || cfg.DBPath != "/data/mesh.db" {
         arguments: [1]Any = .[cfg]
-        testing.Fatalf(test, "config did not prefer DAOCHI env: %+v", arguments[:])
+        testing.Fatalf(test, "config did not prefer MESH env: %+v", arguments[:])
     }
     if cfg.TokenTTL != cast(clock.Duration)90000000000 {
         arguments: [1]Any = .[cfg.TokenTTL]
@@ -44,7 +44,7 @@ LoadConfigUsesCanonicalEnv :: (test: *testing.Test) {
     }
     if cfg.NodeSyncToken != "node-secret" || cfg.NodeSyncInterval != cast(clock.Duration)30000000000 || cfg.NodeSyncBatchLimit != 250 {
         arguments: [3]Any = .[cfg.NodeSyncToken, cfg.NodeSyncInterval, cfg.NodeSyncBatchLimit]
-        testing.Fatalf(test, "node sync config=%q/%s/%d, want DAOCHI values", arguments[:])
+        testing.Fatalf(test, "node sync config=%q/%s/%d, want MESH values", arguments[:])
     }
     if cfg.MoneroWalletRPCURL != "http://127.0.0.1:18083" || cfg.MoneroRateAtomicAmount != 1000000000000 || cfg.MoneroRateTokenUnits != 5000000 {
         arguments: [1]Any = .[cfg]
@@ -52,7 +52,7 @@ LoadConfigUsesCanonicalEnv :: (test: *testing.Test) {
     }
     if cfg.KnownNodes.count != 1 || cfg.KnownNodes[0].Name != "Waozi" || cfg.KnownNodes[0].URL != "https://api.waozi.xyz" {
         arguments: [1]Any = .[cfg.KnownNodes]
-        testing.Fatalf(test, "KnownNodes=%+v, want DAOCHI_KNOWN_NODES", arguments[:])
+        testing.Fatalf(test, "KnownNodes=%+v, want MESH_KNOWN_NODES", arguments[:])
     }
     if cfg.KnownNodes[0].Sync == null ||
         cfg.KnownNodes[0].Sync.Direction != "pull" ||

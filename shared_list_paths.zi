@@ -14,7 +14,7 @@ Document :: #string JSON
   "/api/v1/lists": {
     "get": {
       "summary": "Read accepted shared lists and list invitations",
-      "description": "Requires the account bearer and X-Daochi-User. Pending recipients see invitation metadata only. List contents are stored on this node. Lists notifications are scoped to the Lists app.",
+      "description": "Requires the account bearer and X-Mesh-User. Pending recipients see invitation metadata only. List contents are stored on this node. Lists notifications are scoped to the Lists app.",
       "responses": {
         "200": {"description": "Account-scoped lists and invitations arrays; deleted owner lists are tombstones"},
         "401": {"description": "Account authentication required"}

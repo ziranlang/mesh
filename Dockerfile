@@ -14,14 +14,14 @@ COPY --from=liboqs /usr/local /usr/local
 WORKDIR /src
 COPY . .
 ENV CGO_ENABLED=1
-RUN go build -mod=mod -ldflags "-X main.BuildVersion=${VERSION}" -o /out/daochi . && mkdir -p /out/data
+RUN go build -mod=mod -ldflags "-X main.BuildVersion=${VERSION}" -o /out/mesh . && mkdir -p /out/data
 
 FROM gcr.io/distroless/base-nossl-debian13:nonroot@sha256:6a2a3346335b94d3be0732472245f42ca3ce3cc1135a9521a2bda4b677f2ef0d
 COPY --from=build --chown=65532:65532 /out/data /data
 COPY --from=liboqs /usr/local/lib/liboqs.so* /usr/local/lib/
-COPY --from=build /out/daochi /usr/local/bin/daochi
+COPY --from=build /out/mesh /usr/local/bin/mesh
 ENV LD_LIBRARY_PATH=/usr/local/lib
 WORKDIR /data
 EXPOSE 8080
 USER 65532:65532
-CMD ["/usr/local/bin/daochi"]
+CMD ["/usr/local/bin/mesh"]

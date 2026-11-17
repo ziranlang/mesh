@@ -106,7 +106,7 @@ func TestIslandLaunchConfiguration(t *testing.T) {
 	if Config_Load().ShoveyIslandLaunchAt != 0 {
 		t.Fatal("sale starts only when configured")
 	}
-	t.Setenv("DAOCHI_SHOVEY_ISLAND_LAUNCH_AT", "1793491200")
+	t.Setenv("MESH_SHOVEY_ISLAND_LAUNCH_AT", "1793491200")
 	if Config_Load().ShoveyIslandLaunchAt != 1793491200 {
 		t.Fatal("launch timestamp not loaded")
 	}

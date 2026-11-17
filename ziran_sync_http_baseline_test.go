@@ -375,7 +375,7 @@ func (s *Server) baselineSyncHTTPHandleEncryptedSyncEnvelope(w http.ResponseWrit
 	userHeader := HttpAuth_UserHeader(r)
 	userID, headerName := userHeader.Value, userHeader.Name
 	if userID == "" {
-		Response_Error(w, http.StatusBadRequest, "missing X-Daochi-User")
+		Response_Error(w, http.StatusBadRequest, "missing X-Mesh-User")
 		return false
 	}
 	if !Identity_ValidUserID(userID) {
@@ -391,16 +391,16 @@ func (s *Server) baselineSyncHTTPHandleEncryptedSyncEnvelope(w http.ResponseWrit
 		s.baselineWriteAuthError(w, authError{status: http.StatusUnauthorized, message: "token user mismatch"})
 		return false
 	}
-	clientID := HttpAuth_HeaderAlias(r, []string{"X-Daochi-Client", "X-Ksync-Client"})
+	clientID := HttpAuth_HeaderAlias(r, []string{"X-Mesh-Client", "X-Ksync-Client"})
 	if clientID != "" && !Identity_ValidClientID(clientID) {
-		Response_Error(w, http.StatusBadRequest, "invalid X-Daochi-Client")
+		Response_Error(w, http.StatusBadRequest, "invalid X-Mesh-Client")
 		return false
 	}
 	sinceVersion := int64(0)
-	if text := HttpAuth_HeaderAlias(r, []string{"X-Daochi-Since-Version", "X-Ksync-Since-Version"}); text != "" {
+	if text := HttpAuth_HeaderAlias(r, []string{"X-Mesh-Since-Version", "X-Ksync-Since-Version"}); text != "" {
 		parsed, err := strconv.ParseInt(text, 10, 64)
 		if err != nil || parsed < 0 {
-			Response_Error(w, http.StatusBadRequest, "invalid X-Daochi-Since-Version")
+			Response_Error(w, http.StatusBadRequest, "invalid X-Mesh-Since-Version")
 			return false
 		}
 		sinceVersion = parsed

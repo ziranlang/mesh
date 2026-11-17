@@ -1,13 +1,13 @@
 # Lumi conversation and app feedback
 
 Inbe and Harmony send Lumi requests to `POST /api/v1/chat/completions` with
-their existing Daochi account token. Daochi keeps the model key on the node,
+their existing Mesh account token. Mesh keeps the model key on the node,
 adds Lumi's instructions, and forwards bounded conversation, app context and
 tool definitions. The app validates and executes tool calls against its current
 state, then returns their results for the next model reply.
 
-Configure `DAOCHI_CHAT_API_KEY_FILE`, `DAOCHI_CHAT_MODEL` and optionally
-`DAOCHI_CHAT_ENDPOINT`. The default endpoint is the standard Z.ai API. The
+Configure `MESH_CHAT_API_KEY_FILE`, `MESH_CHAT_MODEL` and optionally
+`MESH_CHAT_ENDPOINT`. The default endpoint is the standard Z.ai API. The
 coding endpoint is `https://api.z.ai/api/coding/paas/v4/chat/completions`;
 use it only with the account's applicable provider entitlement. GLM-5 models
 use enabled thinking and low reasoning effort, with a 1,536-token reasoning
@@ -22,7 +22,7 @@ It preserves unrelated node configuration. Restart the service after deploying
 the tested server binary. Never put the provider key into an app bundle.
 
 Daily allowances default to 20 model requests per account and 1,000 per node.
-`DAOCHI_CHAT_DAILY_LIMIT` and `DAOCHI_CHAT_GLOBAL_DAILY_LIMIT` override them.
+`MESH_CHAT_DAILY_LIMIT` and `MESH_CHAT_GLOBAL_DAILY_LIMIT` override them.
 Each provider attempt or tool continuation consumes one unit; usage persists
 across restarts. Feedback delivery is independent of the chat allowance.
 The node keeps each day's counts for 30 days and deletes an account's counts
@@ -61,15 +61,15 @@ Explicit `fix ...`, `please fix ...` and `/feedback ...` messages work offline.
 Reports contain the user's message and app diagnostics, without copying diary,
 task or habit content into diagnostics.
 
-The developer harness reads `GET /api/v1/admin/feedback` with `X-Daochi-Admin`.
+The developer harness reads `GET /api/v1/admin/feedback` with `X-Mesh-Admin`.
 The inbox includes `account_id` and the account's public `account_alias` (empty
 when it has none). Reply through
 `POST /api/v1/admin/feedback/reply` with `account_id`, `id` and `reply`. Without
 `reply_id` the reply is the report's single reply, as before. With its own
 64-character hexadecimal `reply_id` a reply is added beside the report's earlier
 replies; retrying the same `reply_id` and text adds nothing.
-Both operator endpoints are disabled unless `DAOCHI_FEEDBACK_TOKEN_FILE`,
-`DAOCHI_FEEDBACK_TOKEN` or the existing `DAOCHI_ADMIN_TOKEN` is configured.
+Both operator endpoints are disabled unless `MESH_FEEDBACK_TOKEN_FILE`,
+`MESH_FEEDBACK_TOKEN` or the existing `MESH_ADMIN_TOKEN` is configured.
 The installer creates a private feedback token when none exists, keeping other
 node administration settings intact.
 Replies are scoped to the reporting account, including when two accounts use
@@ -110,7 +110,7 @@ Commands addressed to another bot are ignored; addressed Lumi commands preserve
 their argument text. Empty required arguments receive usage instructions.
 
 The owner can also enable Lumi in the private Agent Lab group with
-`DAOCHI_LUMI_GROUP_ID` (the negative Telegram group ID).
+`MESH_LUMI_GROUP_ID` (the negative Telegram group ID).
 It defaults to disabled. A local regex check runs before typing or spending
 model allowance. Unrelated group chatter is ignored. Inner Breeze questions
 can use the existing model; breathing, meditation, habit and journal questions
@@ -138,8 +138,8 @@ an uncertain delivery is never replayed automatically.
 
 Check the menu and profile with `python3 scripts/configure-lumi-bot.py --host
 USER@NODE`; add `--apply` to update and verify them. The helper reads the node's
-existing `/etc/daochi/daochi.env` or a supplied `--env-file`, including
-`DAOCHI_LUMI_BOT_TOKEN_FILE`. A local `--token-file` is also supported. It verifies
+existing `/etc/mesh/mesh.env` or a supplied `--env-file`, including
+`MESH_LUMI_BOT_TOKEN_FILE`. A local `--token-file` is also supported. It verifies
 the bot's identity before making changes and never prints the credential.
-Configure `DAOCHI_LUMI_WEBHOOK_SECRET_FILE` and register the authenticated
+Configure `MESH_LUMI_WEBHOOK_SECRET_FILE` and register the authenticated
 `/api/v1/lumi/telegram/webhook` endpoint separately after deploying the server.

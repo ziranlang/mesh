@@ -224,9 +224,9 @@ func TestZiranDiscoveryNativeRegistrationValidation(t *testing.T) {
 		instance, service, domain string
 		port                      int
 	}{
-		{"", "_daochi._tcp", "local.", 8080},
+		{"", "_mesh._tcp", "local.", 8080},
 		{"node", "", "local.", 8080},
-		{"node", "_daochi._tcp", "local.", 0},
+		{"node", "_mesh._tcp", "local.", 0},
 	} {
 		got := Discovery_Register(input.instance, input.service, input.domain, input.port, nil, nil)
 		want, err := zeroconf.Register(input.instance, input.service, input.domain, input.port, nil, nil)

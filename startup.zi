@@ -116,7 +116,9 @@ PrintReward :: (format: string, reward: string, status: string, dew: s64, accoun
 PrintNote :: (format: string) #foreign go_format "Printf";
 PrintSetting :: (format: string, value: s64) #foreign go_format "Printf";
 PrintText :: (format: string, value: string) #foreign go_format "Printf";
-Getenv :: (key: string) -> string #foreign go_os "Getenv";
+Getenv :: (key: string) -> string {
+    return config.EnvString(key, "")
+}
 Minute :: 60000000000;
 Second :: 1000000000;
 
@@ -236,7 +238,7 @@ NewHTTPServer :: (address: string, handler: middleware.Handler) -> *HTTPServer {
     SetReadTimeout(server, cast(clock.Duration)(15 * Second))
     SetWriteTimeout(server, cast(clock.Duration)(15 * Second))
     SetIdleTimeout(server, cast(clock.Duration)(60 * Second))
-    // Daochi's headers are small; Go's 1 MiB default lets each request park
+    // Mesh's headers are small; Go's 1 MiB default lets each request park
     // large values in rate-limit and challenge keys.
     SetMaxHeaderBytes(server, cast(isize)65536)
     SetErrorLog(server, NewLogger(StandardError(), "http: ", StandardLogFlags()))
@@ -262,7 +264,7 @@ Serve :: (server: *HTTPServer, configuration: config.Config, context: ctx.Contex
     task.context = context
     task.shutdown = shutdown
     SpawnShutdown(RunShutdown, task)
-    LogListening("Daochi sync server listening", "url", LocalHTTPURL(configuration.Addr), "addr", configuration.Addr,
+    LogListening("Mesh sync server listening", "url", LocalHTTPURL(configuration.Addr), "addr", configuration.Addr,
         "base_url", configuration.BaseURL, "db", configuration.DBPath)
     error := listen(server)
     if error != null && error != ServerClosed() {
@@ -321,7 +323,7 @@ ApplyRescale :: (configuration: config.Config, name: string, factor: s64) -> Err
 // Run once with the service stopped, after the node's Dew per XMR ratio changes.
 // NAME is new for each ratio change, so the same rescale never applies twice.
 RescaleDew :: (configuration: config.Config, arguments: []string) -> Error {
-    usage := errors.New("usage: daochi rescale-dew NAME FACTOR")
+    usage := errors.New("usage: mesh rescale-dew NAME FACTOR")
     if arguments.count != 2 {
         return usage
     }
@@ -334,12 +336,12 @@ RescaleDew :: (configuration: config.Config, arguments: []string) -> Error {
 
 // Run by the deploy with the service stopped, to move the node to ATOMIC Monero
 // atomic units per UNITS Dew units. A whole-factor raise rescales Dew once under
-// NAME and prints the node's new MONERO_RATE_* and DAOCHI_TOKEN_PRODUCTS lines.
+// NAME and prints the node's new MONERO_RATE_* and MESH_TOKEN_PRODUCTS lines.
 // PRODUCTS ("id:Dew" items joined by commas) adds each product the node does
-// not sell yet at that ratio and prints the new DAOCHI_TOKEN_PRODUCTS line.
+// not sell yet at that ratio and prints the new MESH_TOKEN_PRODUCTS line.
 // The node's current ratio and products print nothing to change.
 DewRatio :: (configuration: config.Config, arguments: []string) -> Error {
-    usage := errors.New("usage: daochi dew-ratio NAME ATOMIC UNITS [PRODUCTS]")
+    usage := errors.New("usage: mesh dew-ratio NAME ATOMIC UNITS [PRODUCTS]")
     if arguments.count != 3 && arguments.count != 4 {
         return usage
     }
@@ -363,7 +365,7 @@ DewRatio :: (configuration: config.Config, arguments: []string) -> Error {
         }
         factor = units.value / currentUnits
     }
-    rawProducts := Getenv("DAOCHI_TOKEN_PRODUCTS")
+    rawProducts := Getenv("MESH_TOKEN_PRODUCTS")
     products: rescales.ProductsResult
     products.value = rawProducts
     if raised {
@@ -387,14 +389,14 @@ DewRatio :: (configuration: config.Config, arguments: []string) -> Error {
         PrintNote("Dew ratio unchanged\n")
     }
     if products.value != rawProducts || (raised && rawProducts != "") {
-        PrintText("DAOCHI_TOKEN_PRODUCTS=%s\n", products.value)
+        PrintText("MESH_TOKEN_PRODUCTS=%s\n", products.value)
     }
     return null
 }
 
 // Run with the service stopped. The same REWARD never credits an account twice.
 RewardDew :: (configuration: config.Config, arguments: []string) -> Error {
-    usage := errors.New("usage: daochi reward-dew REWARD ACCOUNT DEW")
+    usage := errors.New("usage: mesh reward-dew REWARD ACCOUNT DEW")
     if arguments.count != 3 {
         return usage
     }

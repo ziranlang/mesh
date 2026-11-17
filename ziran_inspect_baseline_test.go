@@ -25,7 +25,7 @@ func baselineRunInspect(ctx context.Context, args []string, opts InspectOptions)
 		return err
 	}
 	if opts.DBPath == "" {
-		opts.DBPath = Config_EnvString("DAOCHI_DB", "daochi.db")
+		opts.DBPath = Config_EnvString("MESH_DB", "daochi.db")
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
@@ -45,12 +45,12 @@ func baselineRunInspect(ctx context.Context, args []string, opts InspectOptions)
 		return baselineInspectUsers(ctx, db, opts.Out, opts.Full)
 	case "doctor":
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: daochi inspect doctor <user_id_hash>")
+			return fmt.Errorf("usage: mesh inspect doctor <user_id_hash>")
 		}
 		return baselineInspectDoctor(ctx, db, opts.Out, rest[1], opts.Full)
 	case "user":
 		if len(rest) != 2 {
-			return fmt.Errorf("usage: daochi inspect user <user_id_hash>")
+			return fmt.Errorf("usage: mesh inspect user <user_id_hash>")
 		}
 		return baselineInspectUser(ctx, db, opts.Out, rest[1], opts.Full)
 	default:
@@ -83,7 +83,7 @@ func baselineInspectSummary(ctx context.Context, db *sql.DB, out io.Writer) erro
 		"server_encrypted_payloads",
 		"server_sync_audit",
 	}
-	_, _ = fmt.Fprintln(out, "Daochi data summary")
+	_, _ = fmt.Fprintln(out, "Mesh data summary")
 	for _, table := range tables {
 		n, err := baselineInspectCount(ctx, db, table, "")
 		if err != nil {
@@ -181,7 +181,7 @@ SELECT compacted_through_version
 FROM server_sync_compaction
 WHERE user_id_hash=?1`, userID).Scan(&compactedThrough)
 
-	_, _ = fmt.Fprintf(out, "Daochi doctor %s\n", baselineRedactID(userID, full))
+	_, _ = fmt.Fprintf(out, "Mesh doctor %s\n", baselineRedactID(userID, full))
 	_, _ = fmt.Fprintf(out, "status=ok server_version=%d compacted_through=%d\n", version, compactedThrough)
 	_, _ = fmt.Fprintf(out, "created=%s last_seen=%s\n", createdAt, lastSeenAt)
 

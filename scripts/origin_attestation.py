@@ -43,28 +43,34 @@ def openssl_with_key(arguments, key, payload=None):
 
 
 def attest(nonce):
-    pid = subprocess.check_output(["systemctl", "show", "daochi.service", "-p", "MainPID", "--value"], timeout=10).strip().decode()
+    pid = subprocess.check_output(["systemctl", "show", "mesh.service", "-p", "MainPID", "--value"], timeout=10).strip().decode()
     if not pid.isdecimal() or int(pid) <= 1:
-        raise ValueError("Daochi service is not running")
+        pid = subprocess.check_output(["systemctl", "show", "daochi.service", "-p", "MainPID", "--value"], timeout=10).strip().decode()
+    if not pid.isdecimal() or int(pid) <= 1:
+        raise ValueError("Mesh service is not running")
     process = Path("/proc") / pid
     with (process / "environ").open("rb") as stream:
         raw = stream.read(1024 * 1024 + 1)
     if len(raw) > 1024 * 1024:
         raise ValueError("service environment exceeds limit")
-    wanted = {"DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", "DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE",
-              "DAOCHI_NODE_IDENTITY_KEY_FILE", "DAOCHI_DB"}
+    wanted = {"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE",
+              "MESH_NODE_IDENTITY_KEY_FILE", "MESH_DB"}
+    wanted |= {name.replace("MESH_", "DAOCHI_", 1) for name in wanted}
     environment = {}
     for entry in raw.split(b"\0"):
         name, separator, value = entry.partition(b"=")
         if separator and name.decode(errors="replace") in wanted:
             environment[name.decode()] = value.decode()
+    for name, value in list(environment.items()):
+        if name.startswith("DAOCHI_"):
+            environment.setdefault(name.replace("DAOCHI_", "MESH_", 1), value)
     del raw
     working = (process / "cwd").resolve(strict=True)
-    encoded = environment.get("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", "")
+    encoded = environment.get("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "")
     if not encoded:
-        path = environment.get("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE")
+        path = environment.get("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE")
         if not path:
-            path = environment.get("DAOCHI_NODE_IDENTITY_KEY_FILE") or environment.get("DAOCHI_DB", "daochi.db") + ".node-key"
+            path = environment.get("MESH_NODE_IDENTITY_KEY_FILE") or environment.get("MESH_DB", "daochi.db") + ".node-key"
         with (working / path).open() as stream:
             encoded = stream.read(257).strip()
     if not re.fullmatch(r"(?:[0-9a-fA-F]{64}|[0-9a-fA-F]{128})", encoded):

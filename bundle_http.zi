@@ -18,7 +18,7 @@ strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 fmt :: #system_library "go:fmt";
 go_http :: #system_library "go:net/http";
-native_paths :: #system_library "go:daochi/native";
+native_paths :: #system_library "go:mesh/native";
 
 Release :: struct {
     AppID: string #go_tag "json:\"app_id\""

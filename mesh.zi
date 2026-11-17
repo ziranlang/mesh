@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "std/go_types"
 #import "protocol"
 #import "mesh_types"
@@ -65,7 +66,7 @@ EqualFold :: (left: string, right: string) -> bool #foreign go_strings;
 Join :: (values: []string, separator: string) -> string #foreign go_strings;
 AllocatePeers :: (count: isize) -> []NodePeer #foreign builtin "make";
 AppendPeer :: (peers: []NodePeer, peer: NodePeer) -> []NodePeer #foreign builtin "append";
-headerNames: [2]string = .["X-Daochi-Node-Token", "X-Ksync-Node-Token"];
+headerNames: [2]string = .["X-Mesh-Node-Token", "X-Ksync-Node-Token"];
 LogError :: (message: string, key: string, error: Error) #foreign go_slog "Error";
 LogWarning :: (message: string, key: string, error: Error) #foreign go_slog "Warn";
 LogPeerWarning :: (message: string, peerKey: string, peer: string, urlKey: string, url: string, errorKey: string, error: Error) #foreign go_slog "Warn";
@@ -100,7 +101,7 @@ RequestTokenCredential :: (mesh: Mesh, request: *http.Request) -> TokenCredentia
     headers := http.Headers(request)
     provided := TrimSpace(http_auth.HeaderAlias(request, headerNames[:]))
     if provided == "" {
-        provided = BearerToken(http.HeaderValue(headers, "Authorization"))
+        provided = BearerToken(wire.Value(headers, "Authorization"))
     }
     candidate := ParseTokenCredential(provided)
     if !candidate.valid || !constant_time.ConstantTimeTextEqual(candidate.value, configured.value) {
@@ -252,7 +253,7 @@ Authorize :: (mesh: Mesh, writer: http.ResponseWriter, request: *http.Request, b
         return false
     }
     headers := http.Headers(request)
-    if TrimSpace(http.HeaderValue(headers, "X-Daochi-Node-ID")) != "" {
+    if TrimSpace(wire.Value(headers, "X-Mesh-Node-ID")) != "" {
         error := node_auth.Verify(mesh.database, http.Context(request), request, body)
         if error != null {
             response.Error(writer, cast(isize)401, errors.Message(error))
@@ -281,7 +282,7 @@ Authorize :: (mesh: Mesh, writer: http.ResponseWriter, request: *http.Request, b
 }
 
 AuthorizePolicy :: (mesh: Mesh, writer: http.ResponseWriter, request: *http.Request, requested: NodeSyncPolicy, operation: string) -> bool {
-    nodeID := TrimSpace(http.HeaderValue(http.Headers(request), "X-Daochi-Node-ID"))
+    nodeID := TrimSpace(wire.Value(http.Headers(request), "X-Mesh-Node-ID"))
     if nodeID == "" {
         credential := RequestTokenCredential(mesh, request)
         if !credential.valid {

@@ -42,7 +42,7 @@ HeaderUser :: (request: *http.Request, bodyUser: string) -> HeaderUserResult {
     result: HeaderUserResult
     header := auth.UserHeader(request)
     if header.value == "" {
-        result.error = errors.New("missing X-Daochi-User")
+        result.error = errors.New("missing X-Mesh-User")
         return result
     }
     if bodyUser == "" {

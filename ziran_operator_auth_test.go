@@ -35,7 +35,7 @@ func TestZiranAdminAuthenticationAgainstBaseline(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			server := &Server{Cfg: Config{AdminToken: test.expected}, Signer: signAccountProof}
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/tokens/manual-credit", nil)
-			request.Header.Set("X-Daochi-Admin", test.current)
+			request.Header.Set("X-Mesh-Admin", test.current)
 			request.Header.Set("X-Ksync-Admin", test.legacy)
 			actual, expected := httptest.NewRecorder(), httptest.NewRecorder()
 			got := HttpAuth_RequireAdmin(actual, request, test.expected)
@@ -85,9 +85,9 @@ func TestZiranLocalOperatorAuthenticationAgainstBaseline(t *testing.T) {
 					allowed = mode == "correct token"
 					switch mode {
 					case "correct token":
-						request.Header.Set("X-Daochi-Admin", "operator-secret")
+						request.Header.Set("X-Mesh-Admin", "operator-secret")
 					case "wrong token":
-						request.Header.Set("X-Daochi-Admin", "wrong-secret")
+						request.Header.Set("X-Mesh-Admin", "wrong-secret")
 					}
 					if !allowed {
 						status = http.StatusUnauthorized
@@ -157,7 +157,7 @@ func TestLocalOperatorRejectsProxiedAndCrossSiteRequests(t *testing.T) {
 			}
 			// With an admin token, the token alone decides, even through a proxy.
 			withToken := httptest.NewRecorder()
-			request.Header.Set("X-Daochi-Admin", "operator-secret")
+			request.Header.Set("X-Mesh-Admin", "operator-secret")
 			if !HttpAuth_RequireLocalOperator(withToken, request, "operator-secret") {
 				t.Fatalf("admin token rejected: %d", withToken.Code)
 			}

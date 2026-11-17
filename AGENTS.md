@@ -1,14 +1,16 @@
-# Daochi Repository Rules
+# Mesh Repository Rules
 
-Daochi is a local-first sync and trusted-node network. Keep the protocol secure,
+Mesh is a local-first sync and trusted-node network. Keep the protocol secure,
 the public-node path convenient, and the implementation easy to audit.
 
 ## Clean Naming Rule
 
-Use direct names inside the Daochi codebase. Do not prefix internal types and
-functions with `Daochi` when package or protocol context already makes their
-meaning clear. Keep `Daochi` only where it prevents wire-level ambiguity, such
-as `X-Daochi-*` headers and `daochi://` URIs. Do not add new `Ksync` or `Inbe`
+Use direct names inside the Mesh codebase. Do not prefix internal types and
+functions with `Mesh` when package or protocol context already makes their
+meaning clear. Keep `Mesh` only where it prevents wire-level ambiguity, such
+as `X-Mesh-*` headers and `mesh://` URIs. Preserve the durable Daochi
+signature/encryption domains and installed-client aliases documented in
+`docs/mesh-migration.md`; never rename persisted cryptographic labels. Do not add new `Ksync` or `Inbe`
 compatibility names; migrate maintained callers to the clean surface.
 
 ## Readability Rule

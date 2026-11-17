@@ -66,7 +66,7 @@ try {
     assert.equal(response.status, 200);
     assert.equal(response.headers.get("Cache-Control"), "private, no-store");
     assert.equal(digest(Buffer.from(await response.arrayBuffer())), hash);
-    delivery = response.headers.get("X-Daochi-Delivery");
+    delivery = response.headers.get("X-Mesh-Delivery");
     if (delivery === "edge") break;
     assert.equal(delivery, "r2");
     await new Promise(resolve => setTimeout(resolve, 20));

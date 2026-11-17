@@ -17,6 +17,7 @@ func TestReleasedClientRealKeyLoginAndSync(t *testing.T) {
 	for _, format := range []struct{ header, context string }{
 		{"X-Inbe", "inbe-sync-v1"},
 		{"X-Ksync", "ksync-sync-v1"},
+		{"X-Mesh", "daochi-sync-v1"},
 		{"X-Daochi", "daochi-sync-v1"},
 	} {
 		t.Run(format.header, func(t *testing.T) {

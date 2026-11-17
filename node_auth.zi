@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "std/go_types"
 codec :: #import "codec";
 identity :: #import "identity";
@@ -51,17 +52,21 @@ Sign :: (nodeID: string, key: keys.PrivateKey, request: *http.Request, body: []u
     signature := keys.Sign(key, text.ToBytes(message))
     encoded := codec.EncodeBase64(text.FromBytes(signature), true, false)
     header := http.Headers(request)
+    http.SetHeader(header, "X-Mesh-Node-ID", nodeID)
     http.SetHeader(header, "X-Daochi-Node-ID", nodeID)
+    http.SetHeader(header, "X-Mesh-Node-Time", timestamp)
     http.SetHeader(header, "X-Daochi-Node-Time", timestamp)
+    http.SetHeader(header, "X-Mesh-Node-Nonce", nonce)
     http.SetHeader(header, "X-Daochi-Node-Nonce", nonce)
+    http.SetHeader(header, "X-Mesh-Node-Signature", encoded.value)
     http.SetHeader(header, "X-Daochi-Node-Signature", encoded.value)
 }
 
 Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request, body: []u8) -> Error {
     header := http.Headers(request)
-    nodeID := TrimSpace(http.HeaderValue(header, "X-Daochi-Node-ID"))
-    timestampText := TrimSpace(http.HeaderValue(header, "X-Daochi-Node-Time"))
-    nonce := TrimSpace(http.HeaderValue(header, "X-Daochi-Node-Nonce"))
+    nodeID := TrimSpace(wire.Value(header, "X-Mesh-Node-ID"))
+    timestampText := TrimSpace(wire.Value(header, "X-Mesh-Node-Time"))
+    nonce := TrimSpace(wire.Value(header, "X-Mesh-Node-Nonce"))
     if !identity.ValidUserID(nodeID) || nonce == "" || nonce.count > 128 {
         return errors.New("invalid node authentication")
     }
@@ -81,7 +86,7 @@ Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request
     if !peer.found {
         return errors.New("node is not paired")
     }
-    signature := codec.DecodeBase64(http.HeaderValue(header, "X-Daochi-Node-Signature"), true, false)
+    signature := codec.DecodeBase64(wire.Value(header, "X-Mesh-Node-Signature"), true, false)
     if signature.error != "" || signature.value.count != 64 {
         return errors.New("invalid node signature")
     }

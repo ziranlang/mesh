@@ -1,0 +1,17 @@
+// New public header names share the original authenticated wire format.
+// Old clients and nodes remain valid; Mesh takes precedence when both exist.
+http :: #import "std/http_go";
+go_strings :: #system_library "go:strings";
+
+#scope_file
+HasPrefix :: (value: string, prefix: string) -> bool #foreign go_strings;
+Replace :: (value: string, before: string, after: string) -> string #foreign go_strings "ReplaceAll";
+
+#scope_export
+Value :: (header: http.Header, name: string) -> string {
+    value := http.HeaderValue(header, name)
+    if value == "" && HasPrefix(name, "X-Mesh-") {
+        return http.HeaderValue(header, Replace(name, "X-Mesh-", "X-Daochi-"))
+    }
+    return value
+}

@@ -140,17 +140,17 @@ func TestZiranSocialHTTPAgainstBaseline(t *testing.T) {
 					body := &httpPortBody{Reader: strings.NewReader(bodyText)}
 					request := httptest.NewRequest(endpoint.method, endpoint.path, body)
 					request.Header.Set("Authorization", "Bearer "+issueTestBearer(t, server, user, time.Now().Add(time.Hour)))
-					request.Header.Set("X-Daochi-User", user)
+					request.Header.Set("X-Mesh-User", user)
 					switch mode {
 					case "legacy header":
-						request.Header.Del("X-Daochi-User")
+						request.Header.Del("X-Mesh-User")
 						request.Header.Set("X-Ksync-User", " \u2003"+strings.ToUpper(user)+"\n")
 					case "missing user header":
-						request.Header.Del("X-Daochi-User")
+						request.Header.Del("X-Mesh-User")
 					case "missing bearer":
 						request.Header.Del("Authorization")
 					case "mismatched bearer":
-						request.Header.Set("X-Daochi-User", strings.Repeat("f", 64))
+						request.Header.Set("X-Mesh-User", strings.Repeat("f", 64))
 					case "body limit":
 						server.Cfg.MaxBodyBytes = 1
 					case "cancelled":

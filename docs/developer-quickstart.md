@@ -1,6 +1,6 @@
-# Daochi Developer Quickstart
+# Mesh Developer Quickstart
 
-This is the shortest path for a new app to use Daochi without depending on a
+This is the shortest path for a new app to use Mesh without depending on a
 server-owned account secret.
 
 ## 1. Create an Account Key
@@ -14,7 +14,7 @@ signatures, not the private key.
 ## 2. Request a Challenge
 
 ```sh
-curl "$DAOCHI/api/v1/sync/challenge?user_id=$ACCOUNT_ID"
+curl "$MESH/api/v1/sync/challenge?user_id=$ACCOUNT_ID"
 ```
 
 The response contains a single-use nonce. Sign the canonical message with the
@@ -33,7 +33,7 @@ POST
 Post the signed login JSON to receive a bearer token and server time:
 
 ```sh
-curl -X POST "$DAOCHI/api/v1/sync/login" \
+curl -X POST "$MESH/api/v1/sync/login" \
   -H "Content-Type: application/json" \
   -d @login.json
 ```
@@ -46,7 +46,7 @@ repeat challenge and login as long as the local account key still exists.
 New apps should use signed manifests:
 
 ```sh
-curl -X POST "$DAOCHI/api/v1/apps/register-signed" \
+curl -X POST "$MESH/api/v1/apps/register-signed" \
   -H "Content-Type: application/json" \
   -d @manifest.json
 ```
@@ -81,25 +81,25 @@ Use the encrypted record profile for the ciphertext envelope, then sync it:
 }
 ```
 
-Protocol v6 strict requests also include `X-Daochi-Tx`, signed by the account
+Protocol v6 strict requests also include `X-Mesh-Tx`, signed by the account
 key and an active app key.
 
 ## 6. Read It Back
 
-Call sync again with the last seen server version. Daochi returns records newer
+Call sync again with the last seen server version. Mesh returns records newer
 than that version and does not need to parse the ciphertext.
 
 ```sh
-curl --compressed -X POST "$DAOCHI/api/v1/sync" \
+curl --compressed -X POST "$MESH/api/v1/sync" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -H "X-Daochi-User: $ACCOUNT_ID" \
-  -H "X-Daochi-Since-Version: $SERVER_VERSION" \
+  -H "X-Mesh-User: $ACCOUNT_ID" \
+  -H "X-Mesh-Since-Version: $SERVER_VERSION" \
   -d @sync.json
 ```
 
 `--compressed` negotiates a supported response encoding and decodes it for the
-caller. Daochi prefers Zstandard when accepted and retains gzip and identity
+caller. Mesh prefers Zstandard when accepted and retains gzip and identity
 for other clients. The node advertises `http-zstd-v1` when it also accepts
 compressed Zstandard request bodies. If compressing an upload, sign the exact
 uncompressed JSON bytes first, then compress and set `Content-Encoding`.

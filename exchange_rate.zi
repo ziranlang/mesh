@@ -236,7 +236,7 @@ Fetch :: (context: ctx.Context, client: *http.Client, source: RateSource) -> Rat
         return result
     }
     http.SetHeader(http.Headers(request.value), "Accept", "application/json")
-    http.SetHeader(http.Headers(request.value), "User-Agent", "daochi-rates/1")
+    http.SetHeader(http.Headers(request.value), "User-Agent", "mesh-rates/1")
     reply := http.Do(client, request.value)
     result.error = reply.error
     if result.error != null {

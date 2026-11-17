@@ -64,11 +64,11 @@ test("R2 and edge responses keep paid bytes private and reauthorize every hit", 
   const f = fixture();
   const first = await f.get();
   assert.deepEqual(new Uint8Array(await first.arrayBuffer()), bytes);
-  assert.equal(first.headers.get("X-Daochi-Delivery"), "r2");
+  assert.equal(first.headers.get("X-Mesh-Delivery"), "r2");
   assert.equal(first.headers.get("Cache-Control"), "private, no-store");
   const second = await f.get("/another-valid-grant");
   assert.deepEqual(new Uint8Array(await second.arrayBuffer()), bytes);
-  assert.equal(second.headers.get("X-Daochi-Delivery"), "edge");
+  assert.equal(second.headers.get("X-Mesh-Delivery"), "edge");
   assert.equal(second.headers.get("Cache-Control"), "private, no-store");
   assert.equal(f.state.reads, 1);
   assert.deepEqual(f.requests.map(request => request.method), ["HEAD", "HEAD"]);
@@ -110,7 +110,7 @@ test("CORS headers belong to the current request, including on an edge hit", asy
   const f = fixture();
   await (await f.get("/first", { headers: { Origin: "https://first.example" } })).arrayBuffer();
   const response = await f.get("/second", { headers: { Origin: "https://second.example" } });
-  assert.equal(response.headers.get("X-Daochi-Delivery"), "edge");
+  assert.equal(response.headers.get("X-Mesh-Delivery"), "edge");
   assert.equal(response.headers.get("Access-Control-Allow-Origin"), "https://second.example");
 });
 
@@ -141,7 +141,7 @@ test("missing objects and storage outages preserve origin delivery", async () =>
     f.state.missing = true;
     if (outage) f.env.ARTIFACTS.get = async () => { throw new Error("storage unavailable"); };
     const response = await f.get();
-    assert.equal(response.headers.get("X-Daochi-Delivery"), "origin");
+    assert.equal(response.headers.get("X-Mesh-Delivery"), "origin");
     assert.deepEqual(new Uint8Array(await response.arrayBuffer()), bytes);
     assert.deepEqual(f.requests.map(request => request.method), ["HEAD", "GET"]);
   }
@@ -151,7 +151,7 @@ test("wrong-size objects are discarded in favor of the verified origin", async (
   const f = fixture();
   f.env.ARTIFACTS.get = async () => ({ size: bytes.length + 1, body: new Blob([bytes]).stream() });
   const response = await f.get();
-  assert.equal(response.headers.get("X-Daochi-Delivery"), "origin");
+  assert.equal(response.headers.get("X-Mesh-Delivery"), "origin");
   assert.equal(f.stored.size, 0);
 });
 

@@ -106,7 +106,7 @@ func TestLumiTelegramLinkRaces(t *testing.T) {
 func lumiRequest(handler http.Handler, identity testIdentity, method, path, body string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+identity.Token)
-	req.Header.Set("X-Daochi-User", identity.UserID)
+	req.Header.Set("X-Mesh-User", identity.UserID)
 	req.Header.Set("Content-Type", "application/json")
 	out := httptest.NewRecorder()
 	handler.ServeHTTP(out, req)

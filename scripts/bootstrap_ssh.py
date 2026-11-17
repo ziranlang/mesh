@@ -45,8 +45,8 @@ def verify_proof(proof, nonce, host_key, node_public_key, directory):
 
 
 def main():
-    host = os.environ["DAOCHI_HOST"]
-    user = os.environ["DAOCHI_USER"]
+    host = os.environ["MESH_HOST"]
+    user = os.environ["MESH_USER"]
     validate_host_name(host)
     validate_user_name(user)
     # HTTPS certificate verification remains enabled. This public identity is
@@ -56,9 +56,9 @@ def main():
     public_key = node["node_public_key"]
     if len(bytes.fromhex(public_key)) != 32 or hashlib.sha256(bytes.fromhex(public_key)).hexdigest() != node["node_id"]:
         raise ValueError("invalid public API node identity")
-    output_directory = Path(os.environ["RUNNER_TEMP"]) / "daochi-origin-proof"
+    output_directory = Path(os.environ["RUNNER_TEMP"]) / "mesh-origin-proof"
     output_directory.mkdir(mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="daochi-ssh-proof-", dir=os.environ["RUNNER_TEMP"]) as temporary:
+    with tempfile.TemporaryDirectory(prefix="mesh-ssh-proof-", dir=os.environ["RUNNER_TEMP"]) as temporary:
         directory = Path(temporary)
         candidates = bounded_command(["ssh-keyscan", "-T", "10", "-t", "ed25519", host]).decode().splitlines()
         entries = set(known_host_entries(host, candidates))
@@ -70,7 +70,7 @@ def main():
         candidate.write_text("\n".join(candidates) + "\n")
         key_file = directory / "identity"
         key_file.touch(mode=0o600)
-        key_file.write_text(os.environ["DAOCHI_SSH_KEY"].strip() + "\n")
+        key_file.write_text(os.environ["MESH_SSH_KEY"].strip() + "\n")
         nonce = secrets.token_hex(32)
         remote_source = Path(__file__).with_name("origin_attestation.py").read_bytes()
         # The candidate is pinned for this read-only proof request. It is never
@@ -86,7 +86,7 @@ def main():
         ], data=remote_source))
         verify_proof(proof, nonce, host_key, public_key, directory)
         recipient = directory / "recipient.pem"
-        recipient.write_text(os.environ["DAOCHI_SSH_BOOTSTRAP_RECIPIENT"])
+        recipient.write_text(os.environ["MESH_SSH_BOOTSTRAP_RECIPIENT"])
         # Encrypt the address as well as the pin so the artifact reveals no secret destination.
         pin = (host + " " + host_key + "\n").encode()
         encrypted = bounded_command([

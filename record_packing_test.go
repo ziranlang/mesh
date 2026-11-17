@@ -114,8 +114,8 @@ func TestSignedRecordPackingUploadRetainsIdentityAndScopesNegotiatedReply(t *tes
 	}
 	request := httptest.NewRequest("POST", "/api/v1/sync", bytes.NewReader(body))
 	request.Header.Set("Authorization", "Bearer "+identity.Token)
-	request.Header.Set("X-Daochi-User", identity.UserID)
-	request.Header.Set("X-Daochi-Tx", signedTxHeader(t, identity.UserID, "pageapp", "page-key", "POST", "/api/v1/sync", body, key, "packed-upload-transaction"))
+	request.Header.Set("X-Mesh-User", identity.UserID)
+	request.Header.Set("X-Mesh-Tx", signedTxHeader(t, identity.UserID, "pageapp", "page-key", "POST", "/api/v1/sync", body, key, "packed-upload-transaction"))
 	reply := httptest.NewRecorder()
 	server.Routes().ServeHTTP(reply, request)
 	var response RecordSyncResponse

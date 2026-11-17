@@ -28,7 +28,7 @@ func blobRequest(t *testing.T, server *Server, user string, key ed25519.PrivateK
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("X-Daochi-Tx", string(encoded))
+	request.Header.Set("X-Mesh-Tx", string(encoded))
 	return request
 }
 
@@ -64,18 +64,18 @@ func TestPrivateBlobsPreserveBinaryBytesAndRejectUnauthorizedReplayCorruption(t 
 			case "no token":
 				request.Header.Del("Authorization")
 			case "no signature":
-				request.Header.Del("X-Daochi-Tx")
+				request.Header.Del("X-Mesh-Tx")
 			case "bad hash":
 				request.URL.Path = "/api/v1/blobs/target/" + strings.Repeat("0", 64)
 			case "expired":
 				var tx SignedTxEnvelope
-				if err := json.Unmarshal([]byte(request.Header.Get("X-Daochi-Tx")), &tx); err != nil {
+				if err := json.Unmarshal([]byte(request.Header.Get("X-Mesh-Tx")), &tx); err != nil {
 					t.Fatal(err)
 				}
 				tx.ExpiresAt = 1
 				signDeviceTransaction(&tx, key)
 				value, _ := json.Marshal(tx)
-				request.Header.Set("X-Daochi-Tx", string(value))
+				request.Header.Set("X-Mesh-Tx", string(value))
 			case "traversal":
 				request.URL.Path = "/api/v1/blobs/target/../../secret"
 			case "other user":

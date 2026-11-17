@@ -40,7 +40,7 @@ func TestGameEvidenceHTTPAuthenticatesMapPublisherAndAccountOwner(t *testing.T) 
 	admin := func(value MapRegistration, key string, status int) {
 		t.Helper()
 		request := httptest.NewRequest(http.MethodPost, "/api/v1/admin/game-maps", bytes.NewReader(encode(value)))
-		request.Header.Set("X-Daochi-Admin", key)
+		request.Header.Set("X-Mesh-Admin", key)
 		response := httptest.NewRecorder()
 		handler.ServeHTTP(response, request)
 		if response.Code != status {

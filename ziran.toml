@@ -1,5 +1,5 @@
 [package]
-name = "Daochi"
+name = "Mesh"
 module_roots = ["."]
 
 [toolchain]

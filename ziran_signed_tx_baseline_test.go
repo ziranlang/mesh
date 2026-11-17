@@ -22,7 +22,7 @@ const (
 )
 
 func baselineReadSignedTxHeader(r *http.Request) (SignedTxEnvelope, error) {
-	value := strings.TrimSpace(r.Header.Get("X-Daochi-Tx"))
+	value := strings.TrimSpace(r.Header.Get("X-Mesh-Tx"))
 	if value == "" {
 		return SignedTxEnvelope{}, authError{status: http.StatusUnauthorized, message: "signed transaction required"}
 	}

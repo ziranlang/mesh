@@ -110,23 +110,23 @@ func TestZiranOperationalHTTPAgainstBaseline(t *testing.T) {
 						}
 					}}))
 					request := httptest.NewRequest(http.MethodGet, test.path, nil)
-					request.Header.Set("X-Daochi-Admin", server.Cfg.AdminToken)
+					request.Header.Set("X-Mesh-Admin", server.Cfg.AdminToken)
 					request.Header.Set("Authorization", "Bearer "+token.Value)
-					request.Header.Set("X-Daochi-User", user)
+					request.Header.Set("X-Mesh-User", user)
 					switch mode {
 					case "admin missing":
-						request.Header.Del("X-Daochi-Admin")
+						request.Header.Del("X-Mesh-Admin")
 					case "admin wrong":
-						request.Header.Set("X-Daochi-Admin", "wrong")
+						request.Header.Set("X-Mesh-Admin", "wrong")
 					case "admin legacy":
-						request.Header.Del("X-Daochi-Admin")
+						request.Header.Del("X-Mesh-Admin")
 						request.Header.Set("X-Ksync-Admin", server.Cfg.AdminToken)
 					case "token missing":
 						request.Header.Del("Authorization")
 					case "token wrong":
 						request.Header.Set("Authorization", "Bearer invalid")
 					case "user mismatch":
-						request.Header.Set("X-Daochi-User", strings.Repeat("b", 64))
+						request.Header.Set("X-Mesh-User", strings.Repeat("b", 64))
 					case "cancelled":
 						ctx, cancel := context.WithCancel(t.Context())
 						cancel()

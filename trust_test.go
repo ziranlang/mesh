@@ -370,7 +370,7 @@ func TestPairingHandlersRequireOperatorAndConsumeInvite(t *testing.T) {
 	}
 	inviteRequest := httptest.NewRequest(http.MethodPost,
 		"/api/v1/node/pairing/invites", bytes.NewReader(requestBody))
-	inviteRequest.Header.Set("X-Daochi-Admin", "operator-secret")
+	inviteRequest.Header.Set("X-Mesh-Admin", "operator-secret")
 	inviteResponse := httptest.NewRecorder()
 	source.Routes().ServeHTTP(inviteResponse, inviteRequest)
 	if inviteResponse.Code != http.StatusOK {
@@ -388,7 +388,7 @@ func TestPairingHandlersRequireOperatorAndConsumeInvite(t *testing.T) {
 		}
 		req := httptest.NewRequest(http.MethodPost,
 			"/api/v1/node/pairing/accept", bytes.NewReader(body))
-		req.Header.Set("X-Daochi-Admin", "operator-secret")
+		req.Header.Set("X-Mesh-Admin", "operator-secret")
 		response := httptest.NewRecorder()
 		target.Routes().ServeHTTP(response, req)
 		return response

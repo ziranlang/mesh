@@ -149,7 +149,7 @@ func (s *Server) baselineTrustAcceptInvite(w http.ResponseWriter, r *http.Reques
 func (s *Server) baselineTrustAcceptance(invite PairingInvite) (PairingAcceptance, error) {
 	addresses := []string{strings.TrimRight(strings.TrimSpace(s.Cfg.BaseURL), "/")}
 	if err := NodeIdentity_ValidateAddresses(addresses); err != nil {
-		return PairingAcceptance{}, errors.New("this node needs a reachable DAOCHI_BASE_URL")
+		return PairingAcceptance{}, errors.New("this node needs a reachable MESH_BASE_URL")
 	}
 	acceptance := PairingAcceptance{
 		Version:     1,
@@ -362,7 +362,7 @@ func (s *Server) baselineTrustResolveName(w http.ResponseWriter, r *http.Request
 		return
 	}
 	Response_JSON(w, http.StatusOK, map[string]any{
-		"uri":         "daochi://" + spaceID + "/" + name,
+		"uri":         "mesh://" + spaceID + "/" + name,
 		"claim":       claim,
 		"ttl_seconds": claim.ExpiresAt - time.Now().Unix(),
 	})

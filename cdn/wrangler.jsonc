@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "daochi-packages",
+  "name": "mesh-packages",
   "main": "worker.mjs",
   "compatibility_date": "2026-10-02",
   "workers_dev": false,

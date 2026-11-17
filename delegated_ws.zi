@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 // Delegated sockets report changes in one approved collection only. They do
 // not subscribe to the account-wide hub or disclose unrelated state versions.
 #import "std/go_types"
@@ -173,5 +174,5 @@ Handle :: (value: service.Authorizations, writer: http.ResponseWriter, request: 
 
 #scope_file
 ReadProof :: (request: *http.Request, proof: *session.RequestProof) -> bool {
-    return strict.Decode(text.ToBytes(http.HeaderValue(http.Headers(request), "X-Daochi-Delegate")), proof) == null
+    return strict.Decode(text.ToBytes(wire.Value(http.Headers(request), "X-Mesh-Delegate")), proof) == null
 }

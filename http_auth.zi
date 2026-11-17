@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "std/go_types"
 #import "metrics"
 ctx :: #import "std/context_go";
@@ -84,14 +85,14 @@ DirectLocalRequest :: (request: *http.Request) -> bool {
         "X-Real-IP", "Forwarded", "CF-Connecting-IP", "True-Client-IP", "Via"]
     headers := http.Headers(request)
     for name: proxyHeaders {
-        if http.HeaderValue(headers, name) != "" {
+        if wire.Value(headers, name) != "" {
             return false
         }
     }
     if !LoopbackHost(RequestHost(request)) {
         return false
     }
-    origin := TrimSpace(http.HeaderValue(headers, "Origin"))
+    origin := TrimSpace(wire.Value(headers, "Origin"))
     return origin == "" || LoopbackOrigin(origin)
 }
 
@@ -99,7 +100,7 @@ DirectLocalRequest :: (request: *http.Request) -> bool {
 HeaderAlias :: (request: *http.Request, names: []string) -> string {
     headers := http.Headers(request)
     for name: names {
-        value := TrimSpace(http.HeaderValue(headers, name))
+        value := TrimSpace(wire.Value(headers, name))
         if value != "" {
             return value
         }
@@ -110,9 +111,9 @@ HeaderAlias :: (request: *http.Request, names: []string) -> string {
 UserHeader :: (request: *http.Request) -> UserHeaderResult {
     result: UserHeaderResult
     headers := http.Headers(request)
-    names: [3]string = .["X-Daochi-User", "X-Ksync-User", "X-Inbe-User"]
+    names: [3]string = .["X-Mesh-User", "X-Ksync-User", "X-Inbe-User"]
     for name: names {
-        value := ToLower(TrimSpace(http.HeaderValue(headers, name)))
+        value := ToLower(TrimSpace(wire.Value(headers, name)))
         if value != "" {
             result.value = value
             result.name = name
@@ -127,7 +128,7 @@ RequireAdmin :: (writer: http.ResponseWriter, request: *http.Request, expected: 
         response.Error(writer, cast(isize)403, "admin disabled")
         return false
     }
-    names: [2]string = .["X-Daochi-Admin", "X-Ksync-Admin"]
+    names: [2]string = .["X-Mesh-Admin", "X-Ksync-Admin"]
     provided := HeaderAlias(request, names[:])
     if !constant_time.ConstantTimeTextEqual(provided, expected) {
         response.Error(writer, cast(isize)401, "admin token required")
@@ -142,7 +143,7 @@ RequireLocalOperator :: (writer: http.ResponseWriter, request: *http.Request, ad
     }
     if !DirectLocalRequest(request) {
         response.Error(writer, cast(isize)403,
-            "administration requires loopback access or DAOCHI_ADMIN_TOKEN")
+            "administration requires loopback access or MESH_ADMIN_TOKEN")
         return false
     }
     return true
@@ -150,7 +151,7 @@ RequireLocalOperator :: (writer: http.ResponseWriter, request: *http.Request, ad
 
 AuthenticateToken :: (database: *sql.Database, request: *http.Request, secret: []u8) -> UserAuthenticationResult {
     result: UserAuthenticationResult
-    header := TrimSpace(http.HeaderValue(http.Headers(request), "Authorization"))
+    header := TrimSpace(wire.Value(http.Headers(request), "Authorization"))
     bearer := CutPrefix(header, "Bearer ")
     if !bearer.found || TrimSpace(bearer.value) == "" {
         result.authentication = auth.Failure(cast(isize)401, "bearer token required")

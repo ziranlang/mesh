@@ -11,7 +11,7 @@ def install(request):
     if not isinstance(request, dict) or any(not isinstance(request.get(name), str) for name in names):
         raise ValueError("invalid deployment request")
     subprocess.run(
-        ["sh", "/opt/daochi-src/deploy/install.sh", request["stamp"], request["source_commit"], request["native_commit"]],
+        ["sh", "/opt/mesh-src/deploy/install.sh", request["stamp"], request["source_commit"], request["native_commit"]],
         input=request["mesh_token"].encode(),
         check=True,
     )

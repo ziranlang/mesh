@@ -509,7 +509,7 @@ EncryptedEnvelope :: (sync: Synchronization, writer: http.ResponseWriter, reques
     header := http_auth.UserHeader(request)
     user := header.value
     if user == "" {
-        response.Error(writer, cast(isize)400, "missing X-Daochi-User")
+        response.Error(writer, cast(isize)400, "missing X-Mesh-User")
         return false
     }
     if !identity.ValidUserID(user) {
@@ -530,19 +530,19 @@ EncryptedEnvelope :: (sync: Synchronization, writer: http.ResponseWriter, reques
         response.Error(writer, cast(isize)429, "rate limit exceeded")
         return false
     }
-    clientNames: [2]string = .["X-Daochi-Client", "X-Ksync-Client"]
+    clientNames: [2]string = .["X-Mesh-Client", "X-Ksync-Client"]
     client := http_auth.HeaderAlias(request, clientNames[:])
     if client != "" && !identity.ValidClientID(client) {
-        response.Error(writer, cast(isize)400, "invalid X-Daochi-Client")
+        response.Error(writer, cast(isize)400, "invalid X-Mesh-Client")
         return false
     }
     sinceVersion: s64 = 0
-    versionNames: [2]string = .["X-Daochi-Since-Version", "X-Ksync-Since-Version"]
+    versionNames: [2]string = .["X-Mesh-Since-Version", "X-Ksync-Since-Version"]
     versionText := http_auth.HeaderAlias(request, versionNames[:])
     if versionText != "" {
         parsed := ParseInteger(versionText, cast(isize)10, cast(isize)64)
         if parsed.error != null || parsed.value < 0 {
-            response.Error(writer, cast(isize)400, "invalid X-Daochi-Since-Version")
+            response.Error(writer, cast(isize)400, "invalid X-Mesh-Since-Version")
             return false
         }
         sinceVersion = parsed.value

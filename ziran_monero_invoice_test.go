@@ -423,7 +423,7 @@ func TestZiranMoneroInvoiceReplayCleanupMatchesBaseline(t *testing.T) {
 					}
 				}
 				request := paymentHTTPRequest(t, server, account, http.MethodPost, path, body)
-				request.Header.Set("X-Daochi-Tx", header)
+				request.Header.Set("X-Mesh-Tx", header)
 				var writer http.ResponseWriter = httptest.NewRecorder()
 				if strings.Contains(mode, "response panic") {
 					writer = &httpPortWriter{header: make(http.Header), panicValue: panicValue}

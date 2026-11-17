@@ -31,10 +31,10 @@ func TestFeedbackExpandedReportHTTPRoundtrip(t *testing.T) {
 		req.Header.Set("Content-Type", "application/json")
 		if identity.Token != "" {
 			req.Header.Set("Authorization", "Bearer "+identity.Token)
-			req.Header.Set("X-Daochi-User", identity.UserID)
+			req.Header.Set("X-Mesh-User", identity.UserID)
 		}
 		if operator {
-			req.Header.Set("X-Daochi-Admin", "local-feedback-test")
+			req.Header.Set("X-Mesh-Admin", "local-feedback-test")
 		}
 		out, err := client.Do(req)
 		if err != nil {

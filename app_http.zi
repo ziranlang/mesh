@@ -135,7 +135,7 @@ AuthenticateAdmin :: (writer: http.ResponseWriter, request: *http.Request, expec
         response.Error(writer, cast(isize)403, "admin registration disabled")
         return false
     }
-    names: [2]string = .["X-Daochi-Admin", "X-Ksync-Admin"]
+    names: [2]string = .["X-Mesh-Admin", "X-Ksync-Admin"]
     if !constant_time.ConstantTimeTextEqual(http_auth.HeaderAlias(request, names[:]), expected) {
         response.Error(writer, cast(isize)401, "admin token required")
         return false

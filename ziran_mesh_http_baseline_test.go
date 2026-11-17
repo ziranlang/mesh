@@ -129,7 +129,7 @@ func (s *Server) baselineMeshAuthorizeNodeSync(w http.ResponseWriter, r *http.Re
 		Response_Error(w, http.StatusForbidden, "app manifests forbid this node network scope")
 		return false
 	}
-	if nodeID := strings.TrimSpace(r.Header.Get("X-Daochi-Node-ID")); nodeID != "" {
+	if nodeID := strings.TrimSpace(r.Header.Get("X-Mesh-Node-ID")); nodeID != "" {
 		if err := NodeAuth_Verify(s.Store.Database, r.Context(), r, body); err != nil {
 			Response_Error(w, http.StatusUnauthorized, err.Error())
 			return false
@@ -141,7 +141,7 @@ func (s *Server) baselineMeshAuthorizeNodeSync(w http.ResponseWriter, r *http.Re
 		Response_Error(w, http.StatusServiceUnavailable, "node sync disabled")
 		return false
 	}
-	got := strings.TrimSpace(HttpAuth_HeaderAlias(r, []string{"X-Daochi-Node-Token", "X-Ksync-Node-Token"}))
+	got := strings.TrimSpace(HttpAuth_HeaderAlias(r, []string{"X-Mesh-Node-Token", "X-Ksync-Node-Token"}))
 	if got == "" {
 		got = baselineMeshBearerToken(r.Header.Get("Authorization"))
 	}
@@ -158,7 +158,7 @@ func (s *Server) baselineMeshAuthorizeRequestedPolicy(
 	requested NodeSyncPolicy,
 	operation string,
 ) bool {
-	nodeID := strings.TrimSpace(r.Header.Get("X-Daochi-Node-ID"))
+	nodeID := strings.TrimSpace(r.Header.Get("X-Mesh-Node-ID"))
 	if nodeID == "" {
 		return true
 	}

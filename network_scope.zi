@@ -6,7 +6,7 @@ clock :: #import "std/time_go";
 errors :: #import "std/errors_go";
 go_net :: #system_library "go:net";
 go_http :: #system_library "go:net/http";
-go_native :: #system_library "go:daochi/native";
+go_native :: #system_library "go:mesh/native";
 go_strings :: #system_library "go:strings";
 builtin :: #system_library "go:builtin";
 

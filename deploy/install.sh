@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install the verified build with data backups and restore on a failed migration.
 set -eu
+umask 077
 STAMP=${1:?backup timestamp required}
 source_commit=${2:?source revision required}
 expected_commit=${3:?native revision required}
@@ -17,70 +18,88 @@ finish() {
   result=$?
   trap - 0
   if [ "$result" -ne 0 ] && [ "$rollback_ready" -eq 1 ]; then
-    printf '%s' "$STAMP" | sh /opt/daochi-src/deploy/rollback.sh
+    printf '%s' "$STAMP" | sh /opt/mesh-src/deploy/rollback.sh
   elif [ "$result" -ne 0 ] && [ "$service_stopped" -eq 1 ]; then
-    systemctl start daochi.service
+    systemctl start mesh.service
+  fi
+  if [ "$result" -ne 0 ]; then
+    python3 /opt/mesh-src/deploy/migrate-install.py restore "$STAMP"
   fi
   exit "$result"
 }
 trap finish 0
-python3 /opt/daochi-src/scripts/verify_deployment_inputs.py verify-artifact-manifest \
-  --output /opt/daochi-src/daochi \
-  --manifest /opt/daochi-src/build/daochi.manifest.json \
+python3 /opt/mesh-src/scripts/verify_deployment_inputs.py verify-artifact-manifest \
+  --output /opt/mesh-src/mesh \
+  --manifest /opt/mesh-src/build/mesh.manifest.json \
   --expected-source-commit "$source_commit" \
   --expected-liboqs-commit "$expected_commit"
-mkdir -p /var/lib/daochi/backups
-cp /opt/daochi/daochi "/var/lib/daochi/backups/daochi.pre-upgrade.$STAMP"
-if [ -f /opt/daochi/daochi.manifest.json ]; then
-  cp /opt/daochi/daochi.manifest.json "/var/lib/daochi/backups/daochi.manifest.$STAMP"
+python3 /opt/mesh-src/deploy/migrate-install.py prepare "$STAMP"
+mkdir -p /var/lib/mesh/backups
+database=$(python3 /opt/mesh-src/deploy/database-path.py /etc/mesh/mesh.env)
+test -f "$database"
+printf '%s\n' "$database" > "/var/lib/mesh/backups/mesh.database-path.$STAMP"
+cp /opt/mesh/mesh "/var/lib/mesh/backups/mesh.pre-upgrade.$STAMP"
+if [ -f /opt/mesh/mesh.manifest.json ]; then
+  cp /opt/mesh/mesh.manifest.json "/var/lib/mesh/backups/mesh.manifest.$STAMP"
 fi
-systemctl stop daochi.service
+systemctl stop mesh.service
 service_stopped=1
-sqlite3 /var/lib/daochi/daochi.db ".backup '/var/lib/daochi/backups/daochi.db.$STAMP'"
-test -s "/var/lib/daochi/backups/daochi.db.$STAMP"
-install -m 600 /etc/daochi/daochi.env "/var/lib/daochi/backups/daochi.env.$STAMP"
-if [ -f /etc/systemd/system/daochi.service.d/20-daochi-mesh.conf ]; then
-  cp /etc/systemd/system/daochi.service.d/20-daochi-mesh.conf "/var/lib/daochi/backups/daochi.mesh.$STAMP"
+sqlite3 "$database" ".backup '/var/lib/mesh/backups/mesh.db.$STAMP'"
+test -s "/var/lib/mesh/backups/mesh.db.$STAMP"
+install -m 600 /etc/mesh/mesh.env "/var/lib/mesh/backups/mesh.env.$STAMP"
+if [ -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf ]; then
+  cp /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf "/var/lib/mesh/backups/mesh.mesh.$STAMP"
 else
-  touch "/var/lib/daochi/backups/daochi.mesh-absent.$STAMP"
+  touch "/var/lib/mesh/backups/mesh.mesh-absent.$STAMP"
 fi
 rollback_ready=1
-# A daily timer deletes backups older than 28 days, also between deploys.
-install -m 644 /opt/daochi-src/deploy/daochi-backup-prune.service /opt/daochi-src/deploy/daochi-backup-prune.timer /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable --now daochi-backup-prune.timer
-systemctl start daochi-backup-prune.service
-cp /opt/daochi-src/daochi /opt/daochi/daochi.new
-cp /opt/daochi-src/build/daochi.manifest.json /opt/daochi/daochi.manifest.new
-mv /opt/daochi/daochi.new /opt/daochi/daochi
-mv /opt/daochi/daochi.manifest.new /opt/daochi/daochi.manifest.json
+# Replace the existing backup maintenance unit only when it was already enabled.
+if systemctl is-enabled --quiet daochi-backup-prune.timer || systemctl is-enabled --quiet mesh-backup-prune.timer; then
+  if systemctl is-enabled --quiet daochi-backup-prune.timer; then
+    touch "/var/lib/mesh/backups/mesh.legacy-prune-enabled.$STAMP"
+    if systemctl is-active --quiet daochi-backup-prune.timer; then
+      touch "/var/lib/mesh/backups/mesh.legacy-prune-active.$STAMP"
+    fi
+    systemctl disable --now daochi-backup-prune.timer
+  fi
+  install -m 644 /opt/mesh-src/deploy/mesh-backup-prune.service /opt/mesh-src/deploy/mesh-backup-prune.timer /etc/systemd/system/
+  systemctl daemon-reload
+  systemctl enable mesh-backup-prune.timer
+  if [ -f "/var/lib/mesh/backups/mesh.legacy-prune-active.$STAMP" ]; then
+    systemctl start mesh-backup-prune.timer
+  fi
+fi
+install -m 755 /opt/mesh-src/mesh /opt/mesh/mesh.new
+install -m 644 /opt/mesh-src/build/mesh.manifest.json /opt/mesh/mesh.manifest.new
+mv /opt/mesh/mesh.new /opt/mesh/mesh
+mv /opt/mesh/mesh.manifest.new /opt/mesh/mesh.manifest.json
 if [ -n "$mesh_token" ]; then
-  install -d -m 755 /etc/systemd/system/daochi.service.d
+  install -d -m 755 /etc/systemd/system/mesh.service.d
   printf '%s' "$mesh_token" | python3 -c '
 import os, pathlib, sys
 value = sys.stdin.read().strip()
 if any(c in value for c in "\r\n\0"):
     sys.exit("invalid mesh credential line")
 value = value.replace("\\", "\\\\").replace(chr(34), "\\" + chr(34)).replace("%", "%%")
-path = pathlib.Path("/etc/systemd/system/daochi.service.d/20-daochi-mesh.conf")
+path = pathlib.Path("/etc/systemd/system/mesh.service.d/20-mesh-mesh.conf")
 temporary = path.with_suffix(".new")
 fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 with os.fdopen(fd, "w") as output:
-    output.write("[Service]\nEnvironment=" + chr(34) + "DAOCHI_NODE_SYNC_TOKEN=" + value + chr(34) + "\n")
+    output.write("[Service]\nEnvironment=" + chr(34) + "MESH_NODE_SYNC_TOKEN=" + value + chr(34) + "\n")
 os.replace(temporary, path)
 '
   systemctl daemon-reload
 fi
-python3 /opt/daochi-src/scripts/migrate-legacy-env.py /etc/daochi/daochi.env --apply --canonical-only
-sh /opt/daochi-src/deploy/set-environment.sh /opt/daochi-src/deploy/node.env /etc/daochi/daochi.env
-if [ -s /etc/daochi/google-play-service-account.json ]; then
-  echo DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE=/etc/daochi/google-play-service-account.json |
-    sh /opt/daochi-src/deploy/set-environment.sh - /etc/daochi/daochi.env
+python3 /opt/mesh-src/scripts/migrate-legacy-env.py /etc/mesh/mesh.env --apply --canonical-only
+sh /opt/mesh-src/deploy/set-environment.sh /opt/mesh-src/deploy/node.env /etc/mesh/mesh.env
+if [ -s /etc/mesh/google-play-service-account.json ]; then
+  echo MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE=/etc/mesh/google-play-service-account.json |
+    sh /opt/mesh-src/deploy/set-environment.sh - /etc/mesh/mesh.env
 fi
 # A raised Dew ratio or a new Dew product in deploy/dew-ratio.env
 # rewrites the environment; if that fails, the previous node comes back.
-sh /opt/daochi-src/deploy/apply-dew-ratio.sh /opt/daochi-src/deploy/dew-ratio.env /etc/daochi/daochi.env /opt/daochi/daochi /var/lib/daochi/daochi.db
-systemctl start daochi.service
+sh /opt/mesh-src/deploy/apply-dew-ratio.sh /opt/mesh-src/deploy/dew-ratio.env /etc/mesh/mesh.env /opt/mesh/mesh "$database"
+systemctl start mesh.service
 sleep 3
-systemctl is-active --quiet daochi.service
+systemctl is-active --quiet mesh.service
 rollback_ready=0

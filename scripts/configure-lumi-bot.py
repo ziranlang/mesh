@@ -57,9 +57,9 @@ def token_from_configuration(env_file, token_file):
                 name, separator, value = line.partition("=")
                 if separator:
                     values[name] = value.strip().strip("\"'")
-    token = values.get("DAOCHI_LUMI_BOT_TOKEN", "").strip()
-    if not token and values.get("DAOCHI_LUMI_BOT_TOKEN_FILE"):
-        token = Path(values["DAOCHI_LUMI_BOT_TOKEN_FILE"]).read_text().strip()
+    token = values.get("MESH_LUMI_BOT_TOKEN", "").strip()
+    if not token and values.get("MESH_LUMI_BOT_TOKEN_FILE"):
+        token = Path(values["MESH_LUMI_BOT_TOKEN_FILE"]).read_text().strip()
     if not token:
         raise ValueError("Lumi bot token is not configured")
     return token
@@ -144,7 +144,7 @@ def main():
             (Path(__file__).resolve().parent.parent / "lumi_commands.zi").read_text()))
         if args.host:
             arguments = ["python3", "-c", Path(__file__).read_text(), "--from-stdin",
-                         "--env-file", str(args.env_file or "/etc/daochi/daochi.env")]
+                         "--env-file", str(args.env_file or "/etc/mesh/mesh.env")]
             if args.apply:
                 arguments.append("--apply")
             completed = subprocess.run(

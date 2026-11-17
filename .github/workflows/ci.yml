@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: daochi-ci-${{ github.workflow }}-${{ github.ref }}
+  group: mesh-ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,6 +24,12 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: "1.26.x"
+      - name: Test Mesh migration and site
+        run: |
+          mkdir -p build/test-tmp
+          TMPDIR="$PWD/build/test-tmp" python3 -m unittest discover -s scripts -p 'test_mesh*.py'
+          python3 -B scripts/test_migrate_env.py
+          python3 -B scripts/test_provision_mesh_site.py
       - name: Validate workflow permissions and dependencies
         run: |
           go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
@@ -115,7 +121,7 @@ jobs:
           CGO_ENABLED=1 GOFLAGS="-mod=mod" \
             CGO_CFLAGS="-I$(pwd)/build/liboqs/install/include" \
             CGO_LDFLAGS="-L$(pwd)/build/liboqs/install/lib -loqs" \
-            GOCACHE=/tmp/daochi-gocache \
+            GOCACHE=/tmp/mesh-gocache \
             go test -coverprofile=coverage.out ./...
           go tool cover -func=coverage.out | tail -1
 
@@ -134,15 +140,15 @@ jobs:
         uses: ./.github/actions/generate
 
       - name: Build container image
-        run: docker build --pull --build-arg VERSION=ci-${{ github.sha }} -t daochi:ci .
+        run: docker build --pull --build-arg VERSION=ci-${{ github.sha }} -t mesh:ci .
 
       - name: Verify container starts as a non-root user
         env:
           EXPECTED_VERSION: ci-${{ github.sha }}
         run: |
-          DAOCHI_TOKEN_SECRET_HEX=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
-          export DAOCHI_TOKEN_SECRET_HEX
-          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e DAOCHI_TOKEN_SECRET_HEX -e DAOCHI_DB=/data/test.db -e DAOCHI_ADDR=:8080 -p 127.0.0.1::8080 daochi:ci)
+          MESH_TOKEN_SECRET_HEX=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          export MESH_TOKEN_SECRET_HEX
+          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e MESH_TOKEN_SECRET_HEX -e MESH_DB=/data/test.db -e MESH_ADDR=:8080 -p 127.0.0.1::8080 mesh:ci)
           trap 'docker logs "$container"; docker rm -f "$container"' EXIT
           test "$(docker inspect --format '{{.Config.User}}' "$container")" = '65532:65532'
           port=$(docker port "$container" 8080/tcp)

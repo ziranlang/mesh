@@ -78,7 +78,7 @@ isolation with a 31 MiB synthetic artifact by default. It uses Miniflare 5;
 dependency. Set `CDN_TEST_ARTIFACT` to verify a real already published pack.
 
 After deployment, verify the actual package URL twice: delivery should change
-from `r2` to `edge` in `X-Daochi-Delivery`, with identical SHA-256 bytes. Verify
+from `r2` to `edge` in `X-Mesh-Delivery`, with identical SHA-256 bytes. Verify
 that an expired/forged grant still returns 403 after warming the cache, and that
 latest/history remain uncached. Compare origin and cached download timings
 before claiming an improvement. A successful local build is not a deployment.

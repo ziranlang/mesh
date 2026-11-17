@@ -21,7 +21,7 @@ strings :: #system_library "go:strings";
 os :: #system_library "go:os";
 native_http :: #system_library "go:net/http";
 fmt :: #system_library "go:fmt";
-native_paths :: #system_library "go:daochi/native";
+native_paths :: #system_library "go:mesh/native";
 
 MaxBlobBytes :: 16777216;
 File :: #type #foreign os "File";

@@ -15,7 +15,7 @@ native :: #system_library "go:database/sql";
 go_time :: #system_library "go:time";
 
 // The free allowance is not fixed here: it is the node's account storage
-// limit (DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES), passed in as free.
+// limit (MESH_ACCOUNT_STORAGE_LIMIT_BYTES), passed in as free.
 PaidBytes :: 1073741824
 LargeBytes :: 5368709120
 Sizes: [2]string = .["1gb", "5gb"];

@@ -276,7 +276,7 @@ func TestZiranAccountExportHTTPMatchesBaseline(t *testing.T) {
 					t.Fatal(err)
 				}
 			case "mismatched account":
-				request.Header.Set("X-Daochi-User", strings.Repeat("a", 64))
+				request.Header.Set("X-Mesh-User", strings.Repeat("a", 64))
 			case "cancelled":
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()

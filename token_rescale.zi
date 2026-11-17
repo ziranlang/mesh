@@ -90,7 +90,7 @@ ValidProductID :: (id: string) -> bool {
     return true
 }
 
-// The IDs of the DAOCHI_TOKEN_PRODUCTS items the node sells.
+// The IDs of the MESH_TOKEN_PRODUCTS items the node sells.
 ProductIDs :: (raw: string) -> Map(string, bool) {
     result: Map(string, bool)
     MapInit(result)
@@ -171,7 +171,7 @@ ProductsResult :: struct {
     error: Error
 }
 
-// DAOCHI_TOKEN_PRODUCTS ("id:units[:atomic]" items joined by commas) with each
+// MESH_TOKEN_PRODUCTS ("id:units[:atomic]" items joined by commas) with each
 // product's Dew multiplied by factor, so every product keeps its Monero price.
 // Items the node skips are kept as they are.
 ScaleProducts :: (raw: string, factor: s64) -> ProductsResult {
@@ -197,7 +197,7 @@ ScaleProducts :: (raw: string, factor: s64) -> ProductsResult {
     return result
 }
 
-// DAOCHI_TOKEN_PRODUCTS with each "id:Dew" item of wanted that the node does not
+// MESH_TOKEN_PRODUCTS with each "id:Dew" item of wanted that the node does not
 // sell yet added at rateAtomic Monero atomic units per rateTokens Dew units.
 // Products the node sells keep their amounts, which a raised ratio scales.
 AddProducts :: (raw: string, wanted: string, rateAtomic: s64, rateTokens: s64) -> ProductsResult {

@@ -32,7 +32,7 @@ def atomic_write(path, data):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--store', required=True, type=Path, help='DAOCHI_DB followed by .packages')
+    parser.add_argument('--store', required=True, type=Path, help='MESH_DB followed by .packages')
     parser.add_argument('--app', required=True)
     parser.add_argument('--key-id', required=True)
     parser.add_argument('--key', required=True, type=Path, help='private Ed25519 PEM file; never printed')

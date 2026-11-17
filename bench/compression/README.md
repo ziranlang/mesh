@@ -1,4 +1,4 @@
-# Daochi compression study
+# Mesh compression study
 
 The [compression guide](../../docs/compression.md) documents the implemented
 behavior and deployment verification. Open the
@@ -6,14 +6,14 @@ behavior and deployment verification. Open the
 workloads, codecs and modeled bandwidth. JSON, CSV and a PNG plot are adjacent.
 
 These files are benchmark tooling, not production implementation. The nested
-Go module isolates experimental codec dependencies from Daochi's parent module.
+Go module isolates experimental codec dependencies from Mesh's parent module.
 Production changes remain authored in Ziran. The experiment uses generated
 structured JSON and pseudorandom simulated ciphertext, never private databases.
 
 ## Reproduce
 
-From the canonical Daochi checkout, execute through Harmony `desktop_run` with
-project `kryonlabs/daochi`. Keep commands supervised; poll the returned command
+From the canonical Mesh checkout, execute through Harmony `desktop_run` with
+project `ziranlang/mesh`. Keep commands supervised; poll the returned command
 ID rather than detaching a process. The run used one worker, a managed two-CPU
 quota, a 6 GiB process-scope memory ceiling, and no display access. Do not raise
 the managed limits or run the stages concurrently.

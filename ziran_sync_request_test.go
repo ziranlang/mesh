@@ -58,10 +58,10 @@ func TestZiranSyncRequestHeaderPrecedenceAgainstBaseline(t *testing.T) {
 		for _, legacy := range values {
 			for _, oldest := range values {
 				request := httptest.NewRequest(http.MethodPost, "/api/v1/login", nil)
-				request.Header.Set("X-Daochi-User", current)
+				request.Header.Set("X-Mesh-User", current)
 				request.Header.Set("X-Ksync-User", legacy)
 				request.Header.Set("X-Inbe-User", oldest)
-				request.Header.Set("X-Daochi-Signature", current)
+				request.Header.Set("X-Mesh-Signature", current)
 				request.Header.Set("X-Ksync-Signature", legacy)
 				request.Header.Set("X-Inbe-Signature", oldest)
 				for _, body := range values {
@@ -78,7 +78,7 @@ func TestZiranSyncRequestHeaderPrecedenceAgainstBaseline(t *testing.T) {
 					t.Fatalf("signature header differs: %#v, baseline %q, %q", signed, value, context)
 				}
 				for _, limit := range []string{current, "0", "-1", "+2", "02", "9223372036854775808", " 2 ", "42"} {
-					request.Header.Set("X-Daochi-Limit", limit)
+					request.Header.Set("X-Mesh-Limit", limit)
 					request.Header.Set("X-Ksync-Limit", legacy)
 					for _, maximum := range []int{-1, 0, 1, 10, 100} {
 						got := SyncRequest_EncryptedPayloadLimit(request, maximum)

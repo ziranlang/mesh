@@ -133,8 +133,8 @@ func TestSignedRecordPageRejectsUnsignedReplayMixedAndAheadCursor(t *testing.T) 
 		}
 		request := httptest.NewRequest("POST", "/api/v1/sync", bytes.NewReader(body))
 		request.Header.Set("Authorization", "Bearer "+identity.Token)
-		request.Header.Set("X-Daochi-User", identity.UserID)
-		request.Header.Set("X-Daochi-Tx", header)
+		request.Header.Set("X-Mesh-User", identity.UserID)
+		request.Header.Set("X-Mesh-Tx", header)
 		recorder := httptest.NewRecorder()
 		server.Routes().ServeHTTP(recorder, request)
 		return recorder, header

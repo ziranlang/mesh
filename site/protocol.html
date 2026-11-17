@@ -2,23 +2,23 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <link rel="canonical" href="https://daochi.net/protocol.html">
+  <link rel="canonical" href="https://mesh.ziran-lang.org/protocol.html">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daochi Protocol</title>
-  <meta name="description" content="Daochi protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
+  <title>Mesh Protocol</title>
+  <meta name="description" content="Mesh protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://daochi.net/protocol.html">
-  <meta property="og:title" content="Daochi Protocol">
-  <meta property="og:description" content="Daochi protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
-  <meta property="og:image" content="https://daochi.net/assets/editorial/connected-islands.png">
-  <meta property="og:image:secure_url" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta property="og:url" content="https://mesh.ziran-lang.org/protocol.html">
+  <meta property="og:title" content="Mesh Protocol">
+  <meta property="og:description" content="Mesh protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
+  <meta property="og:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
+  <meta property="og:image:secure_url" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta property="og:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta property="og:image:width" content="1536">
   <meta property="og:image:height" content="1024">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Daochi Protocol">
-  <meta name="twitter:description" content="Daochi protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
-  <meta name="twitter:image" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta name="twitter:title" content="Mesh Protocol">
+  <meta name="twitter:description" content="Mesh protocol details for offline-first account keys, post-quantum signed identity, encrypted records, sync compatibility, and remote events.">
+  <meta name="twitter:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta name="twitter:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta name="theme-color" content="#f7f3eb">
   <link rel="icon" href="/favicon.ico" sizes="any">
@@ -31,7 +31,7 @@
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="topbar">
-    <a class="brand" href="/">Daochi</a>
+    <a class="brand" href="/">Mesh</a>
     <nav class="nav" aria-label="Primary">
       <a href="/protocol.html" aria-current="page">Protocol</a>
       <a href="/mesh.html">Mesh</a>
@@ -53,7 +53,7 @@
       <div class="split">
         <div>
           <h2>Identity and authentication</h2>
-          <p>A client account starts with key material created and retained by the client. The ML-DSA-44 keypair is the root account authority. The account is identified by the hash of its public key, so a device can create the durable identity before it ever contacts the relay. First sync or login registers the public key. Later login starts with a single-use challenge for that account, then the client signs a canonical request body with ML-DSA-44. Daochi verifies the post-quantum proof of control and returns a bearer token for ordinary sync and social endpoints.</p>
+          <p>A client account starts with key material created and retained by the client. The ML-DSA-44 keypair is the root account authority. The account is identified by the hash of its public key, so a device can create the durable identity before it ever contacts the relay. First sync or login registers the public key. Later login starts with a single-use challenge for that account, then the client signs a canonical request body with ML-DSA-44. Mesh verifies the post-quantum proof of control and returns a bearer token for ordinary sync and social endpoints.</p>
           <p>Bearer tokens are operational credentials, not the durable account identity. Clients should repeat the challenge and login flow when a token expires, receives a <code>401</code>, or the server restarts with a new development token secret.</p>
         </div>
         <div class="panel">
@@ -83,17 +83,17 @@
         </article>
         <article class="card">
           <h3>v6 signed mode</h3>
-          <p>Strict requests include a registered <code>app_id</code>, an app-owned collection prefix, and an <code>X-Daochi-Tx</code> envelope signed by both the account key and an active app key.</p>
+          <p>Strict requests include a registered <code>app_id</code>, an app-owned collection prefix, and an <code>X-Mesh-Tx</code> envelope signed by both the account key and an active app key.</p>
         </article>
       </div>
     </section>
 
     <section>
       <h2>Signed transactions</h2>
-      <p>Protocol v6 uses <code>X-Daochi-Tx</code> to bind the account, app, HTTP method, path, exact request body hash, nonce, and expiry into one replay-protected transaction. The account signature proves user authority. The app signature proves the request came from software holding an active key from the signed app manifest.</p>
+      <p>Protocol v6 uses <code>X-Mesh-Tx</code> to bind the account, app, HTTP method, path, exact request body hash, nonce, and expiry into one replay-protected transaction. The account signature proves user authority. The app signature proves the request came from software holding an active key from the signed app manifest.</p>
       <p>The envelope is JSON or base64url JSON. It is verified the same way for CLI, TUI, mobile, desktop, and browser clients because the signed material is protocol data, not a platform-specific package identifier. Transactions expire quickly and are stored by <code>tx_id</code> and nonce so replayed requests are rejected.</p>
       <div class="panel">
-        <div class="panel-row"><strong>Header</strong><span><code>X-Daochi-Tx</code></span></div>
+        <div class="panel-row"><strong>Header</strong><span><code>X-Mesh-Tx</code></span></div>
         <div class="panel-row"><strong>Context</strong><span><code>daochi-tx-v1</code></span></div>
         <div class="panel-row"><strong>Account</strong><span>ML-DSA-44 signature over the canonical transaction</span></div>
         <div class="panel-row"><strong>App</strong><span>Ed25519 signature from an active manifest key</span></div>
@@ -103,15 +103,15 @@
     <section>
       <h2>Private key boundary</h2>
       <p>Normal login, sync, signed transactions, and account deletion do not upload the account private key. The website deletion helper can accept an exported account key file for recovery and support cases; it signs a fixed deletion proof, verifies that proof against the registered public key, deletes the account data, and does not store the uploaded key.</p>
-      <p>This distinction matters for the security claim: Daochi's account authority is post-quantum through ML-DSA-44 signatures, while encrypted record confidentiality is provided by client-side ciphertext that the relay is designed to move without reading.</p>
+      <p>This distinction matters for the security claim: Mesh's account authority is post-quantum through ML-DSA-44 signatures, while encrypted record confidentiality is provided by client-side ciphertext that the relay is designed to move without reading.</p>
     </section>
 
     <section>
       <h2>Developer path</h2>
       <p>A new app should be able to create an account key, login, register a signed manifest, write one encrypted record, read it back, and inspect trust state without learning every legacy surface first.</p>
       <div class="panel">
-        <div class="panel-row"><strong>Profile</strong><span><a href="https://github.com/kryonlabs/daochi/blob/master/docs/encrypted-record-profile-v1.md">Encrypted record profile v1</a></span></div>
-        <div class="panel-row"><strong>Quickstart</strong><span><a href="https://github.com/kryonlabs/daochi/blob/master/docs/developer-quickstart.md">Developer quickstart</a></span></div>
+        <div class="panel-row"><strong>Profile</strong><span><a href="https://github.com/ziranlang/mesh/blob/master/docs/encrypted-record-profile-v1.md">Encrypted record profile v1</a></span></div>
+        <div class="panel-row"><strong>Quickstart</strong><span><a href="https://github.com/ziranlang/mesh/blob/master/docs/developer-quickstart.md">Developer quickstart</a></span></div>
         <div class="panel-row"><strong>Contract</strong><span><a href="https://api.waozi.xyz/openapi.json">OpenAPI JSON</a></span></div>
       </div>
     </section>
@@ -123,8 +123,8 @@
 
     <section>
       <h2>Remote event stream</h2>
-      <p><code>GET /api/v1/sync/ws</code> upgrades to a small event stream that tells clients when newer sync data is available. Native clients authenticate with <code>Authorization: Bearer &lt;token&gt;</code>. Browser clients can use <code>Sec-WebSocket-Protocol: daochi-sync-v1, bearer.&lt;token&gt;</code> because browser WebSocket APIs cannot set arbitrary headers. Legacy Ksync and Inbe subprotocols remain accepted.</p>
-      <p>Daochi rejects <code>?token=</code> WebSocket URLs so bearer tokens do not leak through request URLs, browser history, proxy logs, or crash reports.</p>
+      <p><code>GET /api/v1/sync/ws</code> upgrades to a small event stream that tells clients when newer sync data is available. Native clients authenticate with <code>Authorization: Bearer &lt;token&gt;</code>. Browser clients can use <code>Sec-WebSocket-Protocol: mesh-sync-v1, bearer.&lt;token&gt;</code> because browser WebSocket APIs cannot set arbitrary headers. Legacy Ksync and Inbe subprotocols remain accepted.</p>
+      <p>Mesh rejects <code>?token=</code> WebSocket URLs so bearer tokens do not leak through request URLs, browser history, proxy logs, or crash reports.</p>
       <pre>challenge
 sign canonical body
 login
@@ -135,9 +135,9 @@ sync again</pre>
   </main>
 
   <footer class="footer">
-    <span>Daochi · A <a href="https://kryonlabs.com">Kryon Labs</a> project</span>
+    <span>Mesh · A <a href="https://ziran-lang.org">Ziran</a> project</span>
     <a href="https://waozi.xyz/#labs">More from Waozi ↗</a>
-    <a href="https://github.com/kryonlabs/daochi">Source</a>
+    <a href="https://github.com/ziranlang/mesh">Source</a>
   </footer>
 </body>
 </html>

@@ -1,10 +1,10 @@
 package main
 
 import (
-	released "daochi/testdata/binary_field_oracle"
 	"encoding/json"
 	"errors"
 	"io"
+	released "mesh/testdata/binary_field_oracle"
 	"net/http"
 	"strconv"
 	"strings"
@@ -26,10 +26,10 @@ func baselineBoundaryReadJSON(w http.ResponseWriter, r *http.Request, maxBody in
 
 func baselineBoundaryEncryptedPayloadLimit(r *http.Request, configuredMax int) (int, error) {
 	limit := configuredMax
-	if text := HttpAuth_HeaderAlias(r, []string{"X-Daochi-Limit", "X-Ksync-Limit"}); text != "" {
+	if text := HttpAuth_HeaderAlias(r, []string{"X-Mesh-Limit", "X-Ksync-Limit"}); text != "" {
 		parsed, err := strconv.Atoi(text)
 		if err != nil || parsed <= 0 {
-			return 0, errors.New("invalid X-Daochi-Limit")
+			return 0, errors.New("invalid X-Mesh-Limit")
 		}
 		limit = parsed
 	}
@@ -85,7 +85,7 @@ func baselineBoundaryApplyHeaderUser(r *http.Request, bodyUser *string) error {
 	userHeader := HttpAuth_UserHeader(r)
 	headerUser, headerName := userHeader.Value, userHeader.Name
 	if headerUser == "" {
-		return errors.New("missing X-Daochi-User")
+		return errors.New("missing X-Mesh-User")
 	}
 	if *bodyUser == "" {
 		*bodyUser = headerUser
@@ -99,8 +99,8 @@ func baselineBoundaryApplyHeaderUser(r *http.Request, bodyUser *string) error {
 }
 
 func baselineBoundaryRequestSignatureHeader(r *http.Request) (string, string) {
-	if value := strings.TrimSpace(r.Header.Get("X-Daochi-Signature")); value != "" {
-		return value, daochiSignatureContext
+	if value := strings.TrimSpace(r.Header.Get("X-Mesh-Signature")); value != "" {
+		return value, meshSignatureContext
 	}
 	if value := strings.TrimSpace(r.Header.Get("X-Ksync-Signature")); value != "" {
 		return value, legacySyncSignatureContext

@@ -390,9 +390,9 @@ func syncHTTPRun(t *testing.T, test syncHTTPCase, original bool, failAt int, sen
 		data = []byte("{bad")
 	}
 	request := httptest.NewRequest(http.MethodPost, "/api/v1/sync", bytes.NewReader(data))
-	request.Header.Set("X-Daochi-User", user)
-	request.Header.Set("X-Daochi-Client", input.ClientID)
-	request.Header.Set("X-Daochi-Limit", "1")
+	request.Header.Set("X-Mesh-User", user)
+	request.Header.Set("X-Mesh-Client", input.ClientID)
+	request.Header.Set("X-Mesh-Limit", "1")
 	request.Header.Set("Authorization", "Bearer "+bearerFor(user))
 	if test.version >= 6 && !test.envelope {
 		tx := SignedTxEnvelope{ProtocolVersion: 6, TxID: "transaction-1", AccountID: user, AppID: input.AppID, DeviceKeyID: "device-key",
@@ -403,7 +403,7 @@ func syncHTTPRun(t *testing.T, test syncHTTPCase, original bool, failAt int, sen
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Header.Set("X-Daochi-Tx", string(raw))
+		request.Header.Set("X-Mesh-Tx", string(raw))
 		if test.mode == "replay" {
 			lifecycleExecute(t, store, "INSERT INTO server_signed_transactions(account_id,tx_id,app_id,nonce,expires_at) VALUES(?1,?2,?3,?4,?5)", user, tx.TxID, tx.AppID, tx.Nonce, tx.ExpiresAt)
 		}
@@ -412,28 +412,28 @@ func syncHTTPRun(t *testing.T, test syncHTTPCase, original bool, failAt int, sen
 		request.Header.Del("Authorization")
 	}
 	if test.mode == "unsigned" {
-		request.Header.Del("X-Daochi-Tx")
+		request.Header.Del("X-Mesh-Tx")
 	}
 	if test.mode == "token mismatch" {
 		request.Header.Set("Authorization", "Bearer "+bearerFor(other))
 	}
 	if test.mode == "missing header" {
-		request.Header.Del("X-Daochi-User")
+		request.Header.Del("X-Mesh-User")
 	}
 	if test.mode == "legacy header" {
-		request.Header.Del("X-Daochi-User")
+		request.Header.Del("X-Mesh-User")
 		request.Header.Set("X-Inbe-User", user)
 	}
 	if test.mode == "invalid client" {
 		if test.envelope {
-			request.Header.Set("X-Daochi-Client", "!")
+			request.Header.Set("X-Mesh-Client", "!")
 		} else {
 			input.ClientID = "!"
 			data, _ = json.Marshal(input)
 		}
 	}
 	if test.mode == "invalid since" {
-		request.Header.Set("X-Daochi-Since-Version", "-1")
+		request.Header.Set("X-Mesh-Since-Version", "-1")
 	}
 	if test.mode == "quota" {
 		server.Cfg.EncryptedPayloadMaxAccountBytes = int64(len(data) - 1)

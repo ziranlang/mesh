@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "protocol"
 #import "std/go_types"
 #import "std/map_go"
@@ -70,7 +71,7 @@ ShortHash :: (value: string) -> string {
 
 Authorize :: (database: *sql.Database, context: ctx.Context, request: *http.Request, body: []u8, accountID: string, appID: string, assetID: string, permission: string, verify: auth.VerifySignature, replayError: Error) -> TokenAuthorizationResult {
     result: TokenAuthorizationResult
-    hasSignature := TrimSpace(http.HeaderValue(http.Headers(request), "X-Daochi-Tx")) != ""
+    hasSignature := TrimSpace(wire.Value(http.Headers(request), "X-Mesh-Tx")) != ""
     if hasSignature {
         header := signed.ReadHeader(request)
         result.authentication = header.authentication

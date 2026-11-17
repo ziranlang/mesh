@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 // Five-minute issuing-node-only sessions require an Ed25519 request proof.
 // This custom protocol uses sender-constrained proof/replay principles; it is
 // not an implementation of OAuth DPoP and is never accepted by BearerUser.
@@ -114,17 +115,17 @@ ValidQuery :: (request: *http.Request, query: string) -> bool {
 
 SocketHeaders :: (request: *http.Request) -> bool {
     headers := http.Headers(request)
-    proof := http.HeaderValue(headers, "X-Daochi-Delegate")
-    credential := http.HeaderValue(headers, "Authorization")
-    for protocol: Split(http.HeaderValue(headers, "Sec-WebSocket-Protocol"), ",") {
+    proof := wire.Value(headers, "X-Mesh-Delegate")
+    credential := wire.Value(headers, "Authorization")
+    for protocol: Split(wire.Value(headers, "Sec-WebSocket-Protocol"), ",") {
         fields := Split(TrimSpace(protocol), ".")
-        if fields.count == 3 && fields[0] == "daochi" && fields[1] == "delegate" {
+        if fields.count == 3 && (fields[0] == "mesh" || fields[0] == "daochi") && fields[1] == "delegate" {
             decoded := codec.DecodeBase64(fields[2], true, false)
             if decoded.error != "" || proof != "" || decoded.value.count > 4096 {
                 return false
             }
             proof = decoded.value
-        } else if fields.count == 3 && fields[0] == "daochi" && fields[1] == "session" {
+        } else if fields.count == 3 && (fields[0] == "mesh" || fields[0] == "daochi") && fields[1] == "session" {
             if !authorization.HexID(fields[2], 32) || credential != "" {
                 return false
             }
@@ -132,7 +133,7 @@ SocketHeaders :: (request: *http.Request) -> bool {
             credential = Join(parts[:], "")
         }
     }
-    http.SetHeader(headers, "X-Daochi-Delegate", proof)
+    http.SetHeader(headers, "X-Mesh-Delegate", proof)
     http.SetHeader(headers, "Authorization", credential)
     return proof != "" && credential != ""
 }
@@ -143,7 +144,7 @@ AuthenticateTx :: (transaction: *sql.Transaction, context: ctx.Context,
     request: *http.Request, body: []u8, nodeID: string, audience: string) -> ScopedPrincipal {
     result: ScopedPrincipal
     headers := http.Headers(request)
-    header := http.HeaderValue(headers, "X-Daochi-Delegate")
+    header := wire.Value(headers, "X-Mesh-Delegate")
     proof: RequestProof
     now := clock.Unix(clock.Now())
     if header.count == 0 || header.count > 4096 ||
@@ -161,7 +162,7 @@ AuthenticateTx :: (transaction: *sql.Transaction, context: ctx.Context,
         return result
     }
     credential: [2]string = .["Delegate ds1.", proof.sessionID]
-    if http.HeaderValue(headers, "Authorization") != Join(credential[:], "") {
+    if wire.Value(headers, "Authorization") != Join(credential[:], "") {
         result.authentication = auth.Failure(401, "delegate session required")
         return result
     }
@@ -198,7 +199,7 @@ AuthenticateTx :: (transaction: *sql.Transaction, context: ctx.Context,
         result.authentication = auth.Failure(401, "delegate signature rejected")
         return result
     }
-    userHeader := http.HeaderValue(headers, "X-Daochi-User")
+    userHeader := wire.Value(headers, "X-Mesh-User")
     if userHeader != "" && userHeader != grant.accountID {
         result.authentication = auth.Failure(401, "delegate account mismatch")
         return result

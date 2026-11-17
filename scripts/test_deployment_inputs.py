@@ -137,7 +137,7 @@ class DeploymentInputTest(unittest.TestCase):
             native_artifact = build / "liboqs.a"
             native_artifact.write_bytes(b"native artifact")
             native_metadata = build / "native.json"
-            output = build / "daochi"
+            output = build / "mesh"
             output.write_bytes(b"deployment artifact")
             manifest = build / "manifest.json"
             native_identity = deployment_inputs.native_build_identity(
@@ -185,7 +185,7 @@ class DeploymentInputTest(unittest.TestCase):
             "native build directory must be inside build/",
         ):
             deployment_inputs.validate_native_paths(
-                Path("vendor/liboqs"), Path("/temporary-daochi-build")
+                Path("vendor/liboqs"), Path("/temporary-mesh-build")
             )
         with self.assertRaisesRegex(
             deployment_inputs.VerificationError,
@@ -273,7 +273,7 @@ class DeploymentInputTest(unittest.TestCase):
         self.assertEqual(deploy_checkout.get("with"), {"submodules": "recursive"})
         self.assertNotIn("ssh-keyscan", workflow_text)
         self.assertNotIn("--exclude='vendor/liboqs'", workflow_text)
-        self.assertNotIn('cp -a "/opt/daochi-src/$keep"', workflow_text)
+        self.assertNotIn('cp -a "/opt/mesh-src/$keep"', workflow_text)
         step_names = [step.get("name") for step in checkouts]
         self.assertLess(
             step_names.index("Verify the pinned native source"),
@@ -285,11 +285,11 @@ class DeploymentInputTest(unittest.TestCase):
             if line.strip().startswith("ssh ")
         ]
         self.assertTrue(ssh_commands)
-        self.assertTrue(all("daochi-origin" in line for line in ssh_commands))
+        self.assertTrue(all("mesh-origin" in line for line in ssh_commands))
         deployment = Path(__file__).resolve().parents[1] / "deploy"
-        self.assertEqual(workflow_text.count("sh /opt/daochi-src/deploy/rollback.sh"), 2)
+        self.assertEqual(workflow_text.count("sh /opt/mesh-src/deploy/rollback.sh"), 2)
         self.assertIn("trap finish 0", (deployment / "install.sh").read_text())
-        self.assertIn("rm -f /opt/daochi/daochi.manifest.json", (deployment / "rollback.sh").read_text())
+        self.assertIn("rm -f /opt/mesh/mesh.manifest.json", (deployment / "rollback.sh").read_text())
 
 
 if __name__ == "__main__":

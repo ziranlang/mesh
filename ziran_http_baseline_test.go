@@ -286,7 +286,7 @@ func (s *Server) baselineAuthenticateAdmin(w http.ResponseWriter, r *http.Reques
 		baselineWriteError(w, http.StatusForbidden, "admin registration disabled")
 		return false
 	}
-	if baselineRequestHeaderAlias(r, "X-Daochi-Admin", "X-Ksync-Admin") != s.Cfg.AdminToken {
+	if baselineRequestHeaderAlias(r, "X-Mesh-Admin", "X-Ksync-Admin") != s.Cfg.AdminToken {
 		baselineWriteError(w, http.StatusUnauthorized, "admin token required")
 		return false
 	}
@@ -420,8 +420,8 @@ func (s *Server) baselineAuthenticateToken(r *http.Request) (string, error) {
 }
 
 func baselineRequestUserHeader(r *http.Request) (string, string) {
-	if value := strings.ToLower(baselineRequestHeaderAlias(r, "X-Daochi-User")); value != "" {
-		return value, "X-Daochi-User"
+	if value := strings.ToLower(baselineRequestHeaderAlias(r, "X-Mesh-User")); value != "" {
+		return value, "X-Mesh-User"
 	}
 	if value := strings.ToLower(strings.TrimSpace(r.Header.Get("X-Ksync-User"))); value != "" {
 		return value, "X-Ksync-User"

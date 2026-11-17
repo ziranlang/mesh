@@ -6,7 +6,7 @@ oracle :: #import "token_oracle_test";
 strings :: #system_library "go:strings";
 numbers :: #system_library "go:strconv";
 builtin :: #system_library "go:builtin";
-released :: #system_library "go:daochi/testdata/token_oracle";
+released :: #system_library "go:mesh/testdata/token_oracle";
 native_testing :: #system_library "go:testing";
 
 #scope_file

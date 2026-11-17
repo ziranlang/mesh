@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Rename Daochi to Mesh at mesh.ziran-lang.org, preserving existing account keys, encrypted records and installed-client access.
+
 - Offer each host only package releases it can run: the ZX revision it names (`zx=R`, read from each stored `.zx` header), revisions before 28 for released hosts that name none, and nothing older than its `oldest_host_api`. Serve a release's signed WebAssembly variant to web hosts that ask with `format=wasm`. Package staging keeps every archived release and blob, and the history keeps the newest release of every format, revision and interface.
 
 - Have node-hosted Lumi read every referenced list item and propose one complete developer report with a single Send/Cancel preview; carry expanded tool arguments without truncation.
@@ -16,7 +18,7 @@
 
 - Keep a password-sealed account backup the node cannot open, released for a login proof; unknown accounts get the same answer as wrong passwords.
 
-- Store passkey-sealed account copies the node can't open, and find an account from a linked Google account when a node sets `DAOCHI_GOOGLE_SIGNIN_CLIENT_IDS`.
+- Store passkey-sealed account copies the node can't open, and find an account from a linked Google account when a node sets `MESH_GOOGLE_SIGNIN_CLIENT_IDS`.
 
 - Add Shovey Island as an account unlock with a confirmed Dew price, a 40% launch offer and purchase restoration across devices.
 

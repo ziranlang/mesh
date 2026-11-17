@@ -10,7 +10,7 @@ GOFLAGS ?= -mod=mod
 VERSION ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 SOURCE_COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 LIBOQS_COMMIT ?= $(shell git -C $(LIBOQS_DIR) rev-parse HEAD 2>/dev/null || echo unknown)
-DEPLOYMENT_MANIFEST := $(BUILD_DIR)/daochi.manifest.json
+DEPLOYMENT_MANIFEST := $(BUILD_DIR)/mesh.manifest.json
 LIBOQS_CMAKE_OPTIONS := -DCMAKE_INSTALL_PREFIX=$(abspath $(LIBOQS_PREFIX)) \
 	-DCMAKE_INSTALL_LIBDIR=lib -DBUILD_SHARED_LIBS=OFF \
 	-DOQS_BUILD_ONLY_LIB=ON -DOQS_USE_OPENSSL=OFF \
@@ -39,7 +39,7 @@ $(GENERATED): $(wildcard *.zi) ziran.lock
 test-ziran: test test-ziran-ir
 
 test-ziran-ir: liboqs $(GENERATED)
-	$(CGO_ENV) ZIRAN="$(ZIRAN)" GOCACHE=/tmp/daochi-gocache python3 scripts/test_saved_ir.py
+	$(CGO_ENV) ZIRAN="$(ZIRAN)" GOCACHE=$(abspath $(BUILD_DIR)/gocache) python3 scripts/test_saved_ir.py
 
 liboqs:
 	set -e; \
@@ -63,17 +63,17 @@ liboqs:
 	fi
 
 build: liboqs $(GENERATED)
-	$(CGO_ENV) $(GO) build -ldflags "-X main.BuildVersion=$(VERSION)" -o daochi .
+	$(CGO_ENV) $(GO) build -ldflags "-X main.BuildVersion=$(VERSION)" -o mesh .
 	$(CGO_ENV) python3 -B scripts/verify_deployment_inputs.py record-artifact-manifest \
-		--output daochi --manifest "$(DEPLOYMENT_MANIFEST)" \
+		--output mesh --manifest "$(DEPLOYMENT_MANIFEST)" \
 		--source-commit "$(SOURCE_COMMIT)" --liboqs-commit "$(LIBOQS_COMMIT)" \
-		--native-metadata "$(LIBOQS_BUILD_DIR)/.daochi-native-build.json"
+		--native-metadata "$(LIBOQS_BUILD_DIR)/.mesh-native-build.json"
 
 test: liboqs $(GENERATED)
-	$(CGO_ENV) GO="$(GO)" GOCACHE=/tmp/daochi-gocache python3 scripts/test_go.py
+	$(CGO_ENV) GO="$(GO)" GOCACHE=$(abspath $(BUILD_DIR)/gocache) python3 scripts/test_go.py
 
 run: liboqs $(GENERATED)
 	$(CGO_ENV) $(GO) run .
 
 clean:
-	rm -rf $(BUILD_DIR) daochi ksync *.zi.go *.zi_test.go
+	rm -rf $(BUILD_DIR) mesh ksync *.zi.go *.zi_test.go

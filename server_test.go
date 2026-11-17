@@ -103,7 +103,7 @@ func TestDocsEndpoints(t *testing.T) {
 	if root.Code != http.StatusOK {
 		t.Fatalf("root status = %d", root.Code)
 	}
-	if !strings.Contains(root.Body.String(), "Daochi") {
+	if !strings.Contains(root.Body.String(), "Mesh") {
 		t.Fatalf("root docs missing title: %s", root.Body.String())
 	}
 	for _, want := range []string{"Users", "Storage", "/"} {
@@ -128,8 +128,8 @@ func TestDocsEndpoints(t *testing.T) {
 }
 
 func TestEnvNodePeers(t *testing.T) {
-	t.Setenv("DAOCHI_KNOWN_NODES", "Alpha=https://alpha.example/, Beta|https://beta.example, https://alpha.example")
-	peers := ConfigValues_Peers(os.Getenv("DAOCHI_KNOWN_NODES"))
+	t.Setenv("MESH_KNOWN_NODES", "Alpha=https://alpha.example/, Beta|https://beta.example, https://alpha.example")
+	peers := ConfigValues_Peers(os.Getenv("MESH_KNOWN_NODES"))
 	if len(peers) != 2 {
 		t.Fatalf("peer count = %d peers=%#v", len(peers), peers)
 	}
@@ -696,7 +696,7 @@ func TestPostAccountDeleteRouteMatchesKryonClient(t *testing.T) {
 	}
 }
 
-func TestDaochiHeaderAliases(t *testing.T) {
+func TestMeshHeaderAliases(t *testing.T) {
 	server, _, verifier := testServer(t)
 	server.Cfg.AdminToken = "admin-test-token"
 	handler := server.Routes()
@@ -709,16 +709,16 @@ func TestDaochiHeaderAliases(t *testing.T) {
 	loginBody := []byte(`{"user_id_hash":"` + userID + `","client_id":"test-client-1","public_key":"` + hex.EncodeToString(publicKey) + `"}`)
 	loginReq := httptest.NewRequest(http.MethodPost, "/api/v1/sync/login", bytes.NewReader(loginBody))
 	loginReq.Header.Set("Content-Type", "application/json")
-	loginReq.Header.Set("X-Daochi-User", userID)
-	loginReq.Header.Set("X-Daochi-Signature", signature)
+	loginReq.Header.Set("X-Mesh-User", userID)
+	loginReq.Header.Set("X-Mesh-Signature", signature)
 	loginRes := httptest.NewRecorder()
 	handler.ServeHTTP(loginRes, loginReq)
 	if loginRes.Code != http.StatusOK {
-		t.Fatalf("daochi login status = %d body=%s", loginRes.Code, loginRes.Body.String())
+		t.Fatalf("mesh login status = %d body=%s", loginRes.Code, loginRes.Body.String())
 	}
-	wantMessage := string(Signing_CanonicalMessageWithContext(daochiSignatureContext, mustDecodeHex(t, nonce), http.MethodPost, "/api/v1/sync/login", loginBody))
+	wantMessage := string(Signing_CanonicalMessageWithContext(meshSignatureContext, mustDecodeHex(t, nonce), http.MethodPost, "/api/v1/sync/login", loginBody))
 	if string(verifier.message) != wantMessage {
-		t.Fatalf("daochi signed message mismatch\n got: %q\nwant: %q", string(verifier.message), wantMessage)
+		t.Fatalf("mesh signed message mismatch\n got: %q\nwant: %q", string(verifier.message), wantMessage)
 	}
 	var login LoginResponse
 	if err := json.Unmarshal(loginRes.Body.Bytes(), &login); err != nil {
@@ -727,25 +727,25 @@ func TestDaochiHeaderAliases(t *testing.T) {
 
 	envelopeReq := httptest.NewRequest(http.MethodPost, "/api/v1/sync", bytes.NewReader([]byte(`{"v":1,"nonce":"n1","ciphertext":"payload"}`)))
 	envelopeReq.Header.Set("Content-Type", "application/json")
-	envelopeReq.Header.Set("X-Daochi-User", userID)
-	envelopeReq.Header.Set("X-Daochi-Client", "test-client-1")
-	envelopeReq.Header.Set("X-Daochi-Since-Version", "0")
-	envelopeReq.Header.Set("X-Daochi-Limit", "10")
+	envelopeReq.Header.Set("X-Mesh-User", userID)
+	envelopeReq.Header.Set("X-Mesh-Client", "test-client-1")
+	envelopeReq.Header.Set("X-Mesh-Since-Version", "0")
+	envelopeReq.Header.Set("X-Mesh-Limit", "10")
 	envelopeReq.Header.Set("Authorization", "Bearer "+login.AuthToken)
 	envelopeRes := httptest.NewRecorder()
 	handler.ServeHTTP(envelopeRes, envelopeReq)
 	if envelopeRes.Code != http.StatusOK {
-		t.Fatalf("daochi encrypted envelope status = %d body=%s", envelopeRes.Code, envelopeRes.Body.String())
+		t.Fatalf("mesh encrypted envelope status = %d body=%s", envelopeRes.Code, envelopeRes.Body.String())
 	}
 
-	registerBody := []byte(`{"app_id":"daochialias","display_name":"Daochi Alias","status":"active","collections":[{"collection_prefix":"private.daochialias.v1.*","visibility":"private","schema_version":1}],"capabilities":["encrypted-records"]}`)
+	registerBody := []byte(`{"app_id":"meshalias","display_name":"Mesh Alias","status":"active","collections":[{"collection_prefix":"private.meshalias.v1.*","visibility":"private","schema_version":1}],"capabilities":["encrypted-records"]}`)
 	registerReq := httptest.NewRequest(http.MethodPost, "/api/v1/apps", bytes.NewReader(registerBody))
 	registerReq.Header.Set("Content-Type", "application/json")
-	registerReq.Header.Set("X-Daochi-Admin", "admin-test-token")
+	registerReq.Header.Set("X-Mesh-Admin", "admin-test-token")
 	registerRes := httptest.NewRecorder()
 	handler.ServeHTTP(registerRes, registerReq)
 	if registerRes.Code != http.StatusOK {
-		t.Fatalf("daochi admin register status = %d body=%s", registerRes.Code, registerRes.Body.String())
+		t.Fatalf("mesh admin register status = %d body=%s", registerRes.Code, registerRes.Body.String())
 	}
 }
 
@@ -1156,7 +1156,7 @@ func TestSignedAppRegistrationAndProtocolV6Sync(t *testing.T) {
 	signed.Header.Set("Content-Type", "application/json")
 	signed.Header.Set("X-Ksync-User", identity.UserID)
 	signed.Header.Set("Authorization", "Bearer "+identity.Token)
-	signed.Header.Set("X-Daochi-Tx", signedTxHeader(t, identity.UserID, "testapp", "key-main1", http.MethodPost, "/api/v1/sync", v6Body, appPrivate, "tx-v6-good-1"))
+	signed.Header.Set("X-Mesh-Tx", signedTxHeader(t, identity.UserID, "testapp", "key-main1", http.MethodPost, "/api/v1/sync", v6Body, appPrivate, "tx-v6-good-1"))
 	signedRes := httptest.NewRecorder()
 	handler.ServeHTTP(signedRes, signed)
 	if signedRes.Code != http.StatusOK {
@@ -1175,7 +1175,7 @@ func TestSignedAppRegistrationAndProtocolV6Sync(t *testing.T) {
 	replay.Header.Set("Content-Type", "application/json")
 	replay.Header.Set("X-Ksync-User", identity.UserID)
 	replay.Header.Set("Authorization", "Bearer "+identity.Token)
-	replay.Header.Set("X-Daochi-Tx", signed.Header.Get("X-Daochi-Tx"))
+	replay.Header.Set("X-Mesh-Tx", signed.Header.Get("X-Mesh-Tx"))
 	replayRes := httptest.NewRecorder()
 	handler.ServeHTTP(replayRes, replay)
 	if replayRes.Code != http.StatusConflict || !strings.Contains(replayRes.Body.String(), "replay") {
@@ -1236,7 +1236,7 @@ func TestAppRegistrySeedsInbeAndExposesCollections(t *testing.T) {
 				t.Fatalf("inbe capabilities missing encrypted-records: %#v", app)
 			}
 			if containsString(app.Capabilities, "friends") {
-				t.Fatalf("friends should be a Daochi server capability, not an inbe app capability: %#v", app)
+				t.Fatalf("friends should be a Mesh server capability, not an inbe app capability: %#v", app)
 			}
 			hasReleasedV4 := false
 			hasShared := false
@@ -1264,9 +1264,9 @@ func TestAppRegistrySeedsInbeAndExposesCollections(t *testing.T) {
 			}
 		}
 		// Inbe's released formats and the account's own entity data are the
-		// only registrations Daochi seeds; every other app registers itself.
+		// only registrations Mesh seeds; every other app registers itself.
 		if app.AppID != "inbe" && app.AppID != "entity" {
-			t.Fatalf("only Inbe and entity data may be seeded by Daochi: %#v", registry.Apps)
+			t.Fatalf("only Inbe and entity data may be seeded by Mesh: %#v", registry.Apps)
 		}
 	}
 	if !foundInbe {
@@ -1364,7 +1364,7 @@ func TestInbeLegacyCompatibilityPolicyKeepsOldClientsWorking(t *testing.T) {
 	v5Ukuvota := []byte(`{"protocol_version":5,"app_id":"ukuvota","user_id_hash":"` + identity.UserID + `","client_id":"ukuvota-v5-client","encrypted_records":[{"collection":"public.ukuvota.v1.processes.test","id":"process-1","key_id":"main","nonce":"n3","ciphertext":"ciphertext-v3","updated_at":"2026-08-29T12:00:02Z"}]}`)
 	req = httptest.NewRequest(http.MethodPost, "/api/v1/sync", bytes.NewReader(v5Ukuvota))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Daochi-User", identity.UserID)
+	req.Header.Set("X-Mesh-User", identity.UserID)
 	req.Header.Set("Authorization", "Bearer "+identity.Token)
 	res = httptest.NewRecorder()
 	handler.ServeHTTP(res, req)
@@ -1471,7 +1471,7 @@ func TestAppGrantsGateCrossAppEncryptedRecords(t *testing.T) {
 	allowed := httptest.NewRequest(http.MethodGet, queryPath, nil)
 	allowed.Header.Set("Authorization", "Bearer "+identity.Token)
 	allowed.Header.Set("X-Ksync-User", identity.UserID)
-	allowed.Header.Set("X-Daochi-Tx", signedTxHeader(t, identity.UserID, "ukuvota", "main-key", http.MethodGet, "/api/v1/account/app-records", nil, appPrivate, "tx-app-records-1"))
+	allowed.Header.Set("X-Mesh-Tx", signedTxHeader(t, identity.UserID, "ukuvota", "main-key", http.MethodGet, "/api/v1/account/app-records", nil, appPrivate, "tx-app-records-1"))
 	allowedRes := httptest.NewRecorder()
 	handler.ServeHTTP(allowedRes, allowed)
 	if allowedRes.Code != http.StatusOK {
@@ -1692,13 +1692,13 @@ func TestReadinessMetricsDiagnosticsAndEncryptedRecords(t *testing.T) {
 	metrics := httptest.NewRecorder()
 	handler.ServeHTTP(metrics, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if metrics.Code != http.StatusOK ||
-		!strings.Contains(metrics.Body.String(), "daochi_sync_encrypted_records_applied_total 1") ||
-		!strings.Contains(metrics.Body.String(), `daochi_http_requests_total{method="POST",route="/api/v1/sync",status="200"} 1`) ||
-		!strings.Contains(metrics.Body.String(), "daochi_registered_users 1") ||
-		!strings.Contains(metrics.Body.String(), "daochi_active_users_30d 1") ||
-		!strings.Contains(metrics.Body.String(), "daochi_storage_logical_bytes") ||
-		!strings.Contains(metrics.Body.String(), `daochi_storage_app_logical_bytes{app_id="inbe"}`) ||
-		!strings.Contains(metrics.Body.String(), `daochi_storage_collection_logical_bytes{app_id="inbe",collection="inbe.habits"}`) ||
+		!strings.Contains(metrics.Body.String(), "mesh_sync_encrypted_records_applied_total 1") ||
+		!strings.Contains(metrics.Body.String(), `mesh_http_requests_total{method="POST",route="/api/v1/sync",status="200"} 1`) ||
+		!strings.Contains(metrics.Body.String(), "mesh_registered_users 1") ||
+		!strings.Contains(metrics.Body.String(), "mesh_active_users_30d 1") ||
+		!strings.Contains(metrics.Body.String(), "mesh_storage_logical_bytes") ||
+		!strings.Contains(metrics.Body.String(), `mesh_storage_app_logical_bytes{app_id="inbe"}`) ||
+		!strings.Contains(metrics.Body.String(), `mesh_storage_collection_logical_bytes{app_id="inbe",collection="inbe.habits"}`) ||
 		!strings.Contains(metrics.Body.String(), "ksync_sync_encrypted_records_applied_total 1") ||
 		!strings.Contains(metrics.Body.String(), `ksync_http_requests_total{method="POST",route="/api/v1/sync",status="200"} 1`) {
 		t.Fatalf("unexpected metrics status=%d body=%s", metrics.Code, metrics.Body.String())
@@ -3437,7 +3437,7 @@ func TestFirstAccountBearerBootstrapAndLogout(t *testing.T) {
 	}
 	unrecordedBody := []byte(`{"user_id_hash":"` + userID + `","client_id":"test-client-1"}`)
 	unrecordedRequest := httptest.NewRequest(http.MethodPost, "/api/v1/sync", bytes.NewReader(unrecordedBody))
-	unrecordedRequest.Header.Set("X-Daochi-User", userID)
+	unrecordedRequest.Header.Set("X-Mesh-User", userID)
 	unrecordedRequest.Header.Set("Authorization", "Bearer "+unrecorded.Value)
 	unrecordedResponse := httptest.NewRecorder()
 	handler.ServeHTTP(unrecordedResponse, unrecordedRequest)
@@ -3466,7 +3466,7 @@ func TestFirstAccountBearerBootstrapAndLogout(t *testing.T) {
 	}
 
 	logout := httptest.NewRequest(http.MethodPost, "/api/v1/sync/logout", nil)
-	logout.Header.Set("X-Daochi-User", userID)
+	logout.Header.Set("X-Mesh-User", userID)
 	logout.Header.Set("Authorization", "Bearer "+token)
 	logoutResponse := httptest.NewRecorder()
 	handler.ServeHTTP(logoutResponse, logout)
@@ -3475,7 +3475,7 @@ func TestFirstAccountBearerBootstrapAndLogout(t *testing.T) {
 	}
 
 	rejected := httptest.NewRequest(http.MethodGet, "/api/v1/tokens/balance", nil)
-	rejected.Header.Set("X-Daochi-User", userID)
+	rejected.Header.Set("X-Mesh-User", userID)
 	rejected.Header.Set("Authorization", "Bearer "+token)
 	rejectedResponse := httptest.NewRecorder()
 	handler.ServeHTTP(rejectedResponse, rejected)
@@ -4428,10 +4428,8 @@ func testTableHasColumn(t *testing.T, store *Store, table, column string) bool {
 
 func TestAllowedCORSOrigin(t *testing.T) {
 	allowed := []string{
-		"https://daochi.pages.dev",
-		"https://daochi.kryonlabs.com",
-		"https://daochi.net",
-		"https://www.daochi.net",
+		"https://mesh-bew.pages.dev",
+		"https://mesh.ziran-lang.org",
 		"https://inbe.waozi.xyz",
 		"https://uku.waozi.xyz",
 		"https://shovey.waozi.xyz",
@@ -4447,6 +4445,8 @@ func TestAllowedCORSOrigin(t *testing.T) {
 		}
 	}
 	denied := []string{
+		"https://mesh.kryonlabs.com",
+		"https://www.mesh.ziran-lang.org",
 		"https://evil.example.com",
 		"https://uku.waozi.xyz.evil.com",
 		"https://shovey.waozi.xyz.evil.com",

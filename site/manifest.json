@@ -1,6 +1,6 @@
 {
-  "name": "Daochi",
-  "short_name": "Daochi",
+  "name": "Mesh",
+  "short_name": "Mesh",
   "description": "Mesh-native sync with offline-first account keys and post-quantum proof of account authority.",
   "start_url": "/",
   "display": "standalone",

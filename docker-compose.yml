@@ -1,16 +1,16 @@
 services:
-  daochi:
+  mesh:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
     environment:
-      DAOCHI_ADDR: 0.0.0.0:8080
-      DAOCHI_BASE_URL: https://api.example.com
-      DAOCHI_DB: /data/daochi.db
-      DAOCHI_TOKEN_SECRET_HEX: ${DAOCHI_TOKEN_SECRET_HEX:?set DAOCHI_TOKEN_SECRET_HEX to a stable 32-byte hex secret}
+      MESH_ADDR: 0.0.0.0:8080
+      MESH_BASE_URL: https://api.example.com
+      MESH_DB: /data/daochi.db
+      MESH_TOKEN_SECRET_HEX: ${MESH_TOKEN_SECRET_HEX:-${DAOCHI_TOKEN_SECRET_HEX:?set MESH_TOKEN_SECRET_HEX to a stable 32-byte hex secret}}
     volumes:
-      - daochi-data:/data
+      - mesh-data:/data
     ports:
       - "127.0.0.1:8080:8080"
     read_only: true
@@ -22,4 +22,6 @@ services:
       - no-new-privileges:true
 
 volumes:
-  daochi-data:
+  mesh-data:
+    external: true
+    name: ${MESH_DATA_VOLUME:-daochi_daochi-data}

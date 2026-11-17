@@ -33,24 +33,24 @@ except Exception as error:
 if not success:
     sys.exit(1)
 if configuration["install"]:
-    directory = Path("/etc/daochi")
+    directory = Path("/etc/mesh")
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     secret = directory / "chat-api-key"
     descriptor = __import__("os").open(secret, __import__("os").O_WRONLY | __import__("os").O_CREAT | __import__("os").O_TRUNC, 0o600)
     with __import__("os").fdopen(descriptor, "w") as output:
         output.write(key + "\n")
     secret.chmod(0o600)
-    env_path = directory / "daochi.env"
+    env_path = directory / "mesh.env"
     original = env_path.read_text() if env_path.exists() else ""
-    lines = [line for line in original.splitlines() if not line.startswith(("DAOCHI_CHAT_API_KEY=", "DAOCHI_CHAT_API_KEY_FILE=", "DAOCHI_CHAT_ENDPOINT=", "DAOCHI_CHAT_MODEL=", "DAOCHI_CHAT_DAILY_LIMIT=", "DAOCHI_CHAT_GLOBAL_DAILY_LIMIT="))]
+    lines = [line for line in original.splitlines() if not line.startswith(("MESH_CHAT_API_KEY=", "MESH_CHAT_API_KEY_FILE=", "MESH_CHAT_ENDPOINT=", "MESH_CHAT_MODEL=", "MESH_CHAT_DAILY_LIMIT=", "MESH_CHAT_GLOBAL_DAILY_LIMIT="))]
     values = dict(line.split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
-    if not any(values.get(name) for name in ("DAOCHI_FEEDBACK_TOKEN", "DAOCHI_FEEDBACK_TOKEN_FILE", "DAOCHI_ADMIN_TOKEN", "KSYNC_ADMIN_TOKEN")):
+    if not any(values.get(name) for name in ("MESH_FEEDBACK_TOKEN", "MESH_FEEDBACK_TOKEN_FILE", "MESH_ADMIN_TOKEN", "KSYNC_ADMIN_TOKEN")):
         feedback_secret = directory / "feedback-token"
         descriptor = __import__("os").open(feedback_secret, __import__("os").O_WRONLY | __import__("os").O_CREAT | __import__("os").O_TRUNC, 0o600)
         with __import__("os").fdopen(descriptor, "w") as output:
             output.write(__import__("secrets").token_hex(32) + "\n")
-        lines.append("DAOCHI_FEEDBACK_TOKEN_FILE=/etc/daochi/feedback-token")
-    lines += ["DAOCHI_CHAT_API_KEY_FILE=/etc/daochi/chat-api-key", "DAOCHI_CHAT_ENDPOINT=" + configuration["endpoint"], "DAOCHI_CHAT_MODEL=" + configuration["model"], "DAOCHI_CHAT_DAILY_LIMIT=20", "DAOCHI_CHAT_GLOBAL_DAILY_LIMIT=1000"]
+        lines.append("MESH_FEEDBACK_TOKEN_FILE=/etc/mesh/feedback-token")
+    lines += ["MESH_CHAT_API_KEY_FILE=/etc/mesh/chat-api-key", "MESH_CHAT_ENDPOINT=" + configuration["endpoint"], "MESH_CHAT_MODEL=" + configuration["model"], "MESH_CHAT_DAILY_LIMIT=20", "MESH_CHAT_GLOBAL_DAILY_LIMIT=1000"]
     env_path.write_text("\n".join(lines) + "\n")
     env_path.chmod(0o600)
     print("Installed private chat configuration; service restart is separate.")

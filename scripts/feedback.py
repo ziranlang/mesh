@@ -13,24 +13,24 @@ import json, sys, urllib.request, urllib.error
 from pathlib import Path
 operation = json.load(sys.stdin)
 values = {}
-for line in Path("/etc/daochi/daochi.env").read_text().splitlines():
+for line in Path("/etc/mesh/mesh.env").read_text().splitlines():
     name, separator, value = line.partition("=")
     if separator:
         values[name.strip()] = value.strip().strip("\"'")
-token = values.get("DAOCHI_FEEDBACK_TOKEN", "")
-if not token and values.get("DAOCHI_FEEDBACK_TOKEN_FILE"):
-    token = Path(values["DAOCHI_FEEDBACK_TOKEN_FILE"]).read_text().strip()
+token = values.get("MESH_FEEDBACK_TOKEN", "")
+if not token and values.get("MESH_FEEDBACK_TOKEN_FILE"):
+    token = Path(values["MESH_FEEDBACK_TOKEN_FILE"]).read_text().strip()
 if not token:
-    token = values.get("DAOCHI_ADMIN_TOKEN", "")
+    token = values.get("MESH_ADMIN_TOKEN", "")
 if not token:
-    print("Developer inbox is disabled: configure DAOCHI_ADMIN_TOKEN.", file=sys.stderr)
+    print("Developer inbox is disabled: configure MESH_ADMIN_TOKEN.", file=sys.stderr)
     sys.exit(1)
 base = "http://127.0.0.1:8080/api/v1/admin/feedback"
 payload = None
 if operation["action"] == "reply":
     base += "/reply"
     payload = json.dumps(operation["reply"]).encode()
-request = urllib.request.Request(base, data=payload, headers={"X-Daochi-Admin": token, "Content-Type": "application/json"})
+request = urllib.request.Request(base, data=payload, headers={"X-Mesh-Admin": token, "Content-Type": "application/json"})
 try:
     with urllib.request.urlopen(request, timeout=10) as response:
         result = json.load(response)

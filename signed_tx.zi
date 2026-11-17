@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "std/go_types"
 #import "transaction"
 auth :: #import "authentication";
@@ -44,7 +45,7 @@ Delete :: (database: *sql.Database, context: ctx.Context, query: string, account
 #scope_export
 ReadHeader :: (request: *http.Request) -> SignedHeaderResult {
     result: SignedHeaderResult
-    value := TrimSpace(http.HeaderValue(http.Headers(request), "X-Daochi-Tx"))
+    value := TrimSpace(wire.Value(http.Headers(request), "X-Mesh-Tx"))
     if value == "" {
         result.authentication = auth.Failure(cast(isize)401, "signed transaction required")
         return result

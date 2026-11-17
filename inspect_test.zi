@@ -120,7 +120,7 @@ InspectSummaryAndUser :: (test: *testing.Test) {
     doctorOptions := inspect.InspectOptions.{Out = cast(io.Writer)*doctor}
     CheckError(test, inspect.Run(context.Background(), doctorArguments[:], doctorOptions))
     doctorText := BufferTextRaw(*doctor)
-    expected: [7]string = .["Daochi doctor", "Warnings", "legacy clients below protocol 5",
+    expected: [7]string = .["Mesh doctor", "Warnings", "legacy clients below protocol 5",
         "server_sync_audit", "server_encrypted_payloads", "protocol=5", "full_snapshot=true"]
     for fragment: expected[:] {
         if !ContainsRaw(doctorText, fragment) {

@@ -41,7 +41,7 @@ func aliasRequest(t *testing.T, server *Server, handler http.Handler, user, meth
 	request := httptest.NewRequest(method, path, strings.NewReader(body))
 	if user != "" {
 		request.Header.Set("Authorization", "Bearer "+issueTestBearer(t, server, user, time.Now().Add(time.Hour)))
-		request.Header.Set("X-Daochi-User", user)
+		request.Header.Set("X-Mesh-User", user)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
@@ -102,11 +102,11 @@ func TestPremiumAliasCatalogAndMinimum(t *testing.T) {
 
 func TestPremiumAliasConfigurationAndQuotes(t *testing.T) {
 	clearConfigEnvironment(t)
-	t.Setenv("DAOCHI_PREMIUM_ALIASES_ENABLED", "")
+	t.Setenv("MESH_PREMIUM_ALIASES_ENABLED", "")
 	if Config_Load().PremiumAliasesEnabled {
 		t.Fatal("other nodes unexpectedly enabled premium names")
 	}
-	t.Setenv("DAOCHI_PREMIUM_ALIASES_ENABLED", "true")
+	t.Setenv("MESH_PREMIUM_ALIASES_ENABLED", "true")
 	if !Config_Load().PremiumAliasesEnabled {
 		t.Fatal("production setting did not enable premium names")
 	}

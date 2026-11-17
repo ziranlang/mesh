@@ -340,7 +340,7 @@ func TestZiranPaymentAuthorizationAndReplayMatchBaseline(t *testing.T) {
 			}
 			for index, request := range requests {
 				if mode != "unsigned" && mode != "legacy" && mode != "signed required" {
-					request.Header.Set("X-Daochi-Tx", string(wire))
+					request.Header.Set("X-Mesh-Tx", string(wire))
 				}
 				if mode == "cancelled" {
 					ctx, cancel := context.WithCancel(t.Context())
@@ -397,7 +397,7 @@ func TestZiranPaymentSpendFailureCleanupMatchesBaseline(t *testing.T) {
 					}
 				}
 				request := paymentHTTPRequest(t, server, account, "POST", "/api/v1/tokens/spend", body)
-				request.Header.Set("X-Daochi-Tx", header)
+				request.Header.Set("X-Mesh-Tx", header)
 				var writer http.ResponseWriter = responses[index]
 				if strings.Contains(mode, "response panic") {
 					writer = &httpPortWriter{header: make(http.Header), panicValue: panicValue}
@@ -501,7 +501,7 @@ CREATE TRIGGER reject_admin_checkpoint BEFORE INSERT ON token_checkpoints BEGIN 
 					cryptorand.Reader = bytes.NewReader(bytes.Repeat([]byte{0x42}, 4096))
 					request := httptest.NewRequest("POST", path, bytes.NewReader(body))
 					if mode != "unauthenticated" {
-						request.Header.Set("X-Daochi-Admin", server.Cfg.AdminToken)
+						request.Header.Set("X-Mesh-Admin", server.Cfg.AdminToken)
 					}
 					if mode == "cancelled" {
 						ctx, cancel := context.WithCancel(t.Context())

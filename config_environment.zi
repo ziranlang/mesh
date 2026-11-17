@@ -1,0 +1,25 @@
+// Mesh settings take precedence, including an explicitly empty value.
+// DAOCHI_* is a deployment compatibility alias; values are never rewritten.
+go_os :: #system_library "go:os";
+go_strings :: #system_library "go:strings";
+
+#scope_file
+LookupResult :: struct {
+    value: string
+    present: bool
+}
+LookupEnv :: (key: string) -> LookupResult #go_results #foreign go_os;
+HasPrefix :: (value: string, prefix: string) -> bool #foreign go_strings;
+Replace :: (value: string, before: string, after: string) -> string #foreign go_strings "ReplaceAll";
+
+#scope_export
+Get :: (key: string) -> string {
+    result := LookupEnv(key)
+    if result.present {
+        return result.value
+    }
+    if HasPrefix(key, "MESH_") {
+        return LookupEnv(Replace(key, "MESH_", "DAOCHI_")).value
+    }
+    return ""
+}

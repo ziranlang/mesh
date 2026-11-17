@@ -14,32 +14,48 @@ class MigrationTest(unittest.TestCase):
         original = "# production\nKSYNC_TOKEN_SECRET_HEX=example\nKSYNC_DB=/data/existing.db\n"
         updated = migration.migrate(original)
         self.assertTrue(updated.startswith(original))
-        self.assertIn("DAOCHI_TOKEN_SECRET_HEX=example\n", updated)
-        self.assertIn("DAOCHI_DB=/data/existing.db\n", updated)
+        self.assertIn("MESH_TOKEN_SECRET_HEX=example\n", updated)
+        self.assertIn("MESH_DB=/data/existing.db\n", updated)
         self.assertEqual(migration.migrate(updated), updated)
 
     def test_conflict_does_not_silently_switch_database(self):
         with self.assertRaises(ValueError):
-            migration.migrate("KSYNC_DB=/data/old.db\nDAOCHI_DB=/data/new.db\n")
+            migration.migrate("KSYNC_DB=/data/old.db\nMESH_DB=/data/new.db\n")
+
+    def test_daochi_credentials_and_paths_survive(self):
+        original = "DAOCHI_DB=/var/lib/daochi/daochi.db\nDAOCHI_NODE_IDENTITY_KEY_FILE=/etc/daochi/node.key\nDAOCHI_TOKEN_SECRET_HEX=abc123\n"
+        updated = migration.migrate(original, canonical_only=True)
+        self.assertEqual(updated, original.replace("DAOCHI_", "MESH_"))
+        self.assertEqual(migration.migrate(updated, canonical_only=True), updated)
+        with self.assertRaises(ValueError):
+            migration.migrate("DAOCHI_TOKEN_SECRET_HEX=old\nMESH_TOKEN_SECRET_HEX=new\n")
 
     def test_canonical_only_is_unchanged(self):
-        original = "DAOCHI_DB=/data/existing.db\nMONERO_NETWORK=mainnet\n"
+        original = "MESH_DB=/data/existing.db\nMONERO_NETWORK=mainnet\n"
         self.assertEqual(migration.migrate(original), original)
+
+    def test_existing_non_product_setting_conflict_is_refused(self):
+        with self.assertRaises(ValueError):
+            migration.migrate(
+                "DAOCHI_MONERO_WALLET_RPC_URL=http://old-wallet\n"
+                "MONERO_WALLET_RPC_URL=http://other-wallet\n",
+                canonical_only=True,
+            )
 
     def test_canonical_only_removes_legacy_and_renamed_keys(self):
         original = (
             "# production\n"
             "KSYNC_TOKEN_SECRET_HEX=example\n"
-            "DAOCHI_TOKEN_SECRET_HEX=example\n"
-            "DAOCHI_WAOZI_ISSUER_PRIVATE_KEY_HEX_FILE=/private/issuer.key\n"
-            "DAOCHI_MONERO_WALLET_RPC_URL=http://127.0.0.1:18082/json_rpc\n"
+            "MESH_TOKEN_SECRET_HEX=example\n"
+            "MESH_WAOZI_ISSUER_PRIVATE_KEY_HEX_FILE=/private/issuer.key\n"
+            "MESH_MONERO_WALLET_RPC_URL=http://127.0.0.1:18082/json_rpc\n"
         )
         updated = migration.migrate(original, canonical_only=True)
         self.assertNotIn("KSYNC_", updated)
-        self.assertNotIn("DAOCHI_WAOZI_", updated)
-        self.assertNotIn("DAOCHI_MONERO_WALLET_RPC_URL", updated)
-        self.assertIn("DAOCHI_TOKEN_SECRET_HEX=example\n", updated)
-        self.assertIn("DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE=/private/issuer.key\n", updated)
+        self.assertNotIn("MESH_WAOZI_", updated)
+        self.assertNotIn("MESH_MONERO_WALLET_RPC_URL", updated)
+        self.assertIn("MESH_TOKEN_SECRET_HEX=example\n", updated)
+        self.assertIn("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE=/private/issuer.key\n", updated)
         self.assertIn("MONERO_WALLET_RPC_URL=http://127.0.0.1:18082/json_rpc\n", updated)
 
 

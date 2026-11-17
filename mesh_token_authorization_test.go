@@ -114,7 +114,7 @@ func TestMeshTokenCannotClaimSignedNodeIdentity(t *testing.T) {
 	server := meshHTTPFixture(t)
 	server.Cfg.NodeSyncToken = meshTokenCredential(server.Node.ID)
 	request := httptest.NewRequest("POST", "/api/v1/node/mesh/import", nil)
-	request.Header.Set("X-Daochi-Node-ID", strings.Repeat("d", 64))
+	request.Header.Set("X-Mesh-Node-ID", strings.Repeat("d", 64))
 	request.Header.Set("Authorization", "Bearer "+server.Cfg.NodeSyncToken)
 	writer := httptest.NewRecorder()
 	if Mesh_Authorize(server.mesh(), writer, request, []byte("body")) {
@@ -255,12 +255,12 @@ func TestMeshSignedAuthenticationSurvivesReconnectionWithoutReplay(t *testing.T)
 		t.Fatal("valid signed request rejected")
 	}
 	reconnected := signed()
-	reconnected.Header.Set("X-Daochi-Node-Time", "1")
+	reconnected.Header.Set("X-Mesh-Node-Time", "1")
 	if Mesh_Authorize(server.mesh(), httptest.NewRecorder(), reconnected, body) {
 		t.Fatal("expired reconnection accepted")
 	}
 	malformed := signed()
-	malformed.Header.Set("X-Daochi-Node-Signature", "malformed")
+	malformed.Header.Set("X-Mesh-Node-Signature", "malformed")
 	if Mesh_Authorize(server.mesh(), httptest.NewRecorder(), malformed, body) {
 		t.Fatal("malformed signature accepted")
 	}

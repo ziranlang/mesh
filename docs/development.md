@@ -1,6 +1,6 @@
 # Development
 
-Daochi's canonical server implementation is written in Ziran. Source files at
+Mesh's canonical server implementation is written in Ziran. Source files at
 the repository root define HTTP handlers, protocol values, storage, node trust,
 sync and account services. The build generates their Go output; generated
 `.zi.go` and `.zi_test.go` files are ignored and must not be edited by hand.
@@ -52,9 +52,9 @@ experimental dependencies and is excluded from application package discovery.
 
 ## Ownership and boundaries
 
-- Daochi owns node and server policy, authenticated protocol handling, storage,
+- Mesh owns node and server policy, authenticated protocol handling, storage,
   quotas, replication and operational endpoints.
-- Daochi Client is the independent Ziran protocol library. Applications supply
+- Mesh Client is the independent Ziran protocol library. Applications supply
   key storage, merge policy and platform transport; the server does not receive
   client private keys.
 - Reusable language, codec, I/O and native binding capabilities belong in Ziran.

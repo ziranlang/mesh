@@ -18,7 +18,7 @@ ValidAddress :: (value: string) -> string {
 
 #scope_export
 // Proxies append the address they saw, so only the last X-Forwarded-For
-// entry comes from the proxy in front of Daochi. Earlier entries are
+// entry comes from the proxy in front of Mesh. Earlier entries are
 // whatever the client sent and must never choose a rate-limit bucket.
 LastForwardedFor :: (values: []string) -> string {
     if values.count == 0 {

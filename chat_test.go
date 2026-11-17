@@ -16,7 +16,7 @@ func chatRequest(handler http.Handler, identity testIdentity, path, data string)
 	req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(data))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+identity.Token)
-	req.Header.Set("X-Daochi-User", identity.UserID)
+	req.Header.Set("X-Mesh-User", identity.UserID)
 	out := httptest.NewRecorder()
 	handler.ServeHTTP(out, req)
 	return out
@@ -207,7 +207,7 @@ func TestFeedbackRepliesStayAccountScopedAndBounded(t *testing.T) {
 		}
 	}
 	reply := httptest.NewRequest(http.MethodPost, "/api/v1/admin/feedback/reply", strings.NewReader(`{"account_id":"`+first.UserID+`","id":"`+id+`","reply":"Thanks, I will investigate."}`))
-	reply.Header.Set("X-Daochi-Admin", "developer-token")
+	reply.Header.Set("X-Mesh-Admin", "developer-token")
 	out := httptest.NewRecorder()
 	handler.ServeHTTP(out, reply)
 	if out.Code != 200 {
@@ -216,7 +216,7 @@ func TestFeedbackRepliesStayAccountScopedAndBounded(t *testing.T) {
 	for _, identity := range []testIdentity{first, second} {
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/feedback?replies=1&offset=0", nil)
 		req.Header.Set("Authorization", "Bearer "+identity.Token)
-		req.Header.Set("X-Daochi-User", identity.UserID)
+		req.Header.Set("X-Mesh-User", identity.UserID)
 		out := httptest.NewRecorder()
 		handler.ServeHTTP(out, req)
 		if out.Code != 200 || strings.Contains(out.Body.String(), "Switching apps freezes") {
@@ -261,7 +261,7 @@ func TestFeedbackReportCarriesEveryReplyInOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/feedback/reply", bytes.NewReader(data))
-		req.Header.Set("X-Daochi-Admin", "developer-token")
+		req.Header.Set("X-Mesh-Admin", "developer-token")
 		out := httptest.NewRecorder()
 		handler.ServeHTTP(out, req)
 		return out.Code
@@ -295,7 +295,7 @@ func TestFeedbackReportCarriesEveryReplyInOrder(t *testing.T) {
 		for offset := 0; ; offset += 2 {
 			req := httptest.NewRequest(http.MethodGet, "/api/v1/feedback?replies=1&offset="+strconv.Itoa(offset), nil)
 			req.Header.Set("Authorization", "Bearer "+identity.Token)
-			req.Header.Set("X-Daochi-User", identity.UserID)
+			req.Header.Set("X-Mesh-User", identity.UserID)
 			out := httptest.NewRecorder()
 			handler.ServeHTTP(out, req)
 			var page struct {
@@ -330,13 +330,13 @@ func TestFeedbackReportCarriesEveryReplyInOrder(t *testing.T) {
 	out := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/feedback", nil)
 	req.Header.Set("Authorization", "Bearer "+first.Token)
-	req.Header.Set("X-Daochi-User", first.UserID)
+	req.Header.Set("X-Mesh-User", first.UserID)
 	handler.ServeHTTP(out, req)
 	if out.Code != 200 || !strings.Contains(out.Body.String(), "Thanks again for the idea.") || strings.Contains(out.Body.String(), "Added in 2.1.34.") {
 		t.Fatalf("report list reply: %d %s", out.Code, out.Body.String())
 	}
 	inbox := httptest.NewRequest(http.MethodGet, "/api/v1/admin/feedback", nil)
-	inbox.Header.Set("X-Daochi-Admin", "developer-token")
+	inbox.Header.Set("X-Mesh-Admin", "developer-token")
 	out = httptest.NewRecorder()
 	handler.ServeHTTP(out, inbox)
 	if out.Code != 200 || !strings.Contains(out.Body.String(), "Thanks again for the idea.") {
@@ -416,7 +416,7 @@ func TestFeedbackRetryPrivacyAndDeveloperReply(t *testing.T) {
 		}
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		req.Header.Set("Authorization", "Bearer "+identity.Token)
-		req.Header.Set("X-Daochi-User", identity.UserID)
+		req.Header.Set("X-Mesh-User", identity.UserID)
 		out := httptest.NewRecorder()
 		handler.ServeHTTP(out, req)
 		return out
@@ -428,7 +428,7 @@ func TestFeedbackRetryPrivacyAndDeveloperReply(t *testing.T) {
 		t.Fatalf("non-developer inbox: %d", out.Code)
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/feedback/reply", bytes.NewBufferString(`{"account_id":"`+first.UserID+`","id":"`+id+`","reply":"Fixed in the next update"}`))
-	req.Header.Set("X-Daochi-Admin", "developer-token")
+	req.Header.Set("X-Mesh-Admin", "developer-token")
 	out := httptest.NewRecorder()
 	handler.ServeHTTP(out, req)
 	if out.Code != 200 {
@@ -440,7 +440,7 @@ func TestFeedbackRetryPrivacyAndDeveloperReply(t *testing.T) {
 	}
 	alias := httptest.NewRequest(http.MethodPost, "/api/v1/account/alias", strings.NewReader(`{"user_id_hash":"`+first.UserID+`","alias":"@reporter"}`))
 	alias.Header.Set("Content-Type", "application/json")
-	alias.Header.Set("X-Daochi-User", first.UserID)
+	alias.Header.Set("X-Mesh-User", first.UserID)
 	alias.Header.Set("Authorization", "Bearer "+first.Token)
 	out = httptest.NewRecorder()
 	handler.ServeHTTP(out, alias)
@@ -448,7 +448,7 @@ func TestFeedbackRetryPrivacyAndDeveloperReply(t *testing.T) {
 		t.Fatalf("reporter alias: %d %s", out.Code, out.Body.String())
 	}
 	inbox := httptest.NewRequest(http.MethodGet, "/api/v1/admin/feedback", nil)
-	inbox.Header.Set("X-Daochi-Admin", "developer-token")
+	inbox.Header.Set("X-Mesh-Admin", "developer-token")
 	out = httptest.NewRecorder()
 	handler.ServeHTTP(out, inbox)
 	if out.Code != 200 || !strings.Contains(out.Body.String(), `"account_id":"`+first.UserID+`","account_alias":"reporter"`) {

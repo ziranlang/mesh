@@ -108,7 +108,7 @@ func TestEntityBlobsBelongToTheAccount(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		request.Header.Set("X-Daochi-Tx", string(encoded))
+		request.Header.Set("X-Mesh-Tx", string(encoded))
 		return request
 	}
 	recorder := httptest.NewRecorder()

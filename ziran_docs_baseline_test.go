@@ -38,7 +38,7 @@ func (s *Server) baselineHandleDocs(w http.ResponseWriter, r *http.Request, read
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Daochi</title>
+<title>Mesh</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Mono:ital,wght@0,300;0,400;0,600;1,400&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
 body{font-family:"Noto Sans Mono",ui-monospace,Menlo,monospace;margin:0;line-height:1.85;color:#4a4038;background:linear-gradient(180deg,#f7ede2 0%%,#f2e2d0 60%%,#f7ede2 100%%);font-size:13.5px}
@@ -75,11 +75,11 @@ a{color:#0b625d}
 <main>
 <section class="hero">
 <p class="eyebrow">Offline-first keys for mesh-native sync</p>
-<h1>Daochi</h1>
+<h1>Mesh</h1>
 <p class="lead">Device-created account keys, post-quantum proof of account authority, encrypted records, and remote events for native and web apps. Server-assisted today, built toward a mesh-native network.</p>
 <div class="actions"><a class="button" href="/openapi.json">OpenAPI JSON</a><a class="button secondary" href="/healthz">Health check</a><a class="button secondary" href="/readyz">Readiness</a></div>
 </section>
-<section class="grid" aria-label="Daochi capabilities">
+<section class="grid" aria-label="Mesh capabilities">
 <article class="card"><h2>Offline-first keys</h2><p>Clients create the durable ML-DSA-44 account key locally. The relay sees the public key, account hash, and signatures, not the private key.</p></article>
 <article class="card"><h2>Post-quantum account authority</h2><p>The durable account key is ML-DSA-44. Clients prove control with short-lived challenges before receiving operational bearer tokens.</p></article>
 <article class="card"><h2>App-owned records</h2><p>Applications keep ownership of their data while the relay stores versions, opaque encrypted payloads, and shared projections.</p></article>
@@ -88,11 +88,11 @@ a{color:#0b625d}
 </section>
 <section class="security" aria-label="Security posture">
 <p><strong>Key creation starts offline.</strong> A device can create its account key before the first network request; first login registers the public key, and later logins prove control with fresh signatures.</p>
-<p><strong>Private records stay client encrypted.</strong> Daochi validates metadata and versions ciphertext, but plaintext and record encryption choices remain with clients and apps.</p>
-<p><strong>The post-quantum proof is account authority.</strong> Daochi uses ML-DSA-44 signatures for identity and account authorization; app manifest keys and token issuer keys are separate Ed25519 authorities.</p>
+<p><strong>Private records stay client encrypted.</strong> Mesh validates metadata and versions ciphertext, but plaintext and record encryption choices remain with clients and apps.</p>
+<p><strong>The post-quantum proof is account authority.</strong> Mesh uses ML-DSA-44 signatures for identity and account authorization; app manifest keys and token issuer keys are separate Ed25519 authorities.</p>
 </section>
 <h2 class="section-title">Implementation guides</h2>
-<section class="grid" aria-label="Daochi implementation guides">
+<section class="grid" aria-label="Mesh implementation guides">
 <article class="card"><h2>Encrypted record profile</h2><p>Recommended private-record envelope, nonce rules, AAD, key rotation, and test-vector shape.</p></article>
 <article class="card"><h2>Developer quickstart</h2><p>Shortest path from account key to login, signed app manifest, encrypted sync, and diagnostics.</p></article>
 <article class="card"><h2>Small node operations</h2><p>Low-resource deployment targets, trust inspection checklist, and rollout checks for home or modest nodes.</p></article>
@@ -100,10 +100,10 @@ a{color:#0b625d}
 <h2 class="section-title">API surface</h2>
 <p>Protocol v5 makes encrypted records the primary private-data surface while legacy typed rows remain available for compatibility. Protocol v1 through v5 remain valid through 2027-09-01.</p>
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/apps</code><p>Lists registered apps, collection prefixes, visibility classes, and capabilities.</p></section>
-<section class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>Registers or updates an app when the admin token is set and <code>X-Daochi-Admin</code> matches it. <code>X-Ksync-Admin</code> remains accepted for compatibility.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>Registers or updates an app when the admin token is set and <code>X-Mesh-Admin</code> matches it. <code>X-Ksync-Admin</code> remains accepted for compatibility.</p></section>
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/challenge?user_id=&lt;sha256-public-key-hex&gt;</code><p>Issues a single-use 32-byte challenge nonce encoded as lowercase hex.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/sync/login</code><p>Verifies the challenge signature and returns a cacheable bearer token plus server clock time.</p></section>
-<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/ws</code><p>Upgrades to a WebSocket event stream authenticated with <code>Authorization: Bearer &lt;token&gt;</code>, or browser subprotocols <code>daochi-sync-v1, bearer.&lt;token&gt;</code>.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/ws</code><p>Upgrades to a WebSocket event stream authenticated with <code>Authorization: Bearer &lt;token&gt;</code>, or browser subprotocols <code>mesh-sync-v1, bearer.&lt;token&gt;</code>.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/sync</code><p>Applies typed local changes or stores an encrypted envelope, then returns remote changes newer than the requested server version.</p></section>
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/diagnostics</code><p>Returns bearer-authenticated sync state, table counts, compaction position, legacy client hints, and recent sync audit metadata.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/node/pairing/invites</code><p>Creates a short-lived signed pairing payload with explicit replication scope.</p></section>
@@ -142,9 +142,9 @@ a{color:#0b625d}
 &lt;HTTP_PATH&gt;
 &lt;sha256 hex of exact raw request body bytes&gt;
 &lt;challenge nonce hex&gt;</pre>
-<p>Signed requests use <code>X-Daochi-User</code>, <code>X-Daochi-Signature</code>, and <code>Content-Type: application/json</code>. The older Ksync and Inbe signature headers remain accepted for shipped clients.</p>
+<p>Signed requests use <code>X-Mesh-User</code>, <code>X-Mesh-Signature</code>, and <code>Content-Type: application/json</code>. The older Ksync and Inbe signature headers remain accepted for shipped clients.</p>
 %s
-<footer class="footer">&copy; 2026 <a href="https://kryonlabs.com">Kryon Labs</a></footer>
+<footer class="footer">&copy; 2026 <a href="https://ziran-lang.org">Ziran</a></footer>
 </main>
 </body>
 </html>`, statusHTML)
@@ -170,10 +170,10 @@ func baselineOpenAPISpec() map[string]any {
 	result := map[string]any{
 		"openapi": "3.1.0",
 		"info": map[string]any{
-			"title":       "Daochi API",
+			"title":       "Mesh API",
 			"version":     "1.0.0",
 			"description": "Mesh-native sync API for app-owned data. Protocol v1 through v5 remain valid through 2027-09-01; after any future deprecation, the immediately previous version stays valid for at least one additional year.",
-			"x-daochi-protocol-policy": map[string]any{
+			"x-mesh-protocol-policy": map[string]any{
 				"min_supported_protocol":          MinSupportedProtocol,
 				"latest_protocol":                 LatestProtocol,
 				"v1_v5_valid_through":             CompatibilityDeadline,
@@ -385,7 +385,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/tokens/spend": map[string]any{
 				"post": map[string]any{
 					"summary":     "Spend tokens",
-					"description": "If the app has token policies, this endpoint requires the matching app asset permission. X-Daochi-Tx is validated when present.",
+					"description": "If the app has token policies, this endpoint requires the matching app asset permission. X-Mesh-Tx is validated when present.",
 					"security":    []map[string]any{{"bearerAuth": []string{}}},
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Signed debit receipt"},
@@ -397,7 +397,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/tokens/purchases/google/verify": map[string]any{
 				"post": map[string]any{
 					"summary":     "Verify app-store purchase and credit tokens",
-					"description": "If the app has token policies, this endpoint requires a purchase permission. X-Daochi-Tx is validated when present.",
+					"description": "If the app has token policies, this endpoint requires a purchase permission. X-Mesh-Tx is validated when present.",
 					"security":    []map[string]any{{"bearerAuth": []string{}}},
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Signed credit receipt"},
@@ -407,7 +407,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/tokens/purchases/monero/invoices": map[string]any{
 				"post": map[string]any{
 					"summary":     "Create direct token invoice",
-					"description": "If the app has token policies, this endpoint requires a purchase permission. X-Daochi-Tx is validated when present.",
+					"description": "If the app has token policies, this endpoint requires a purchase permission. X-Mesh-Tx is validated when present.",
 					"security":    []map[string]any{{"bearerAuth": []string{}}},
 					"responses": map[string]any{
 						"201": map[string]any{"description": "Direct payment invoice"},
@@ -507,7 +507,7 @@ func baselineOpenAPISpec() map[string]any {
 				},
 				"post": map[string]any{
 					"summary":     "Register or update an app",
-					"description": "Requires the server admin token and matching X-Daochi-Admin header. X-Ksync-Admin remains accepted for compatibility.",
+					"description": "Requires the server admin token and matching X-Mesh-Admin header. X-Ksync-Admin remains accepted for compatibility.",
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Registered app", "content": map[string]any{"application/json": map[string]any{"schema": map[string]any{"$ref": "#/components/schemas/AppRegistration"}}}},
 						"401": map[string]any{"description": "Invalid admin token"},
@@ -539,7 +539,7 @@ func baselineOpenAPISpec() map[string]any {
 				},
 				"put": map[string]any{
 					"summary":     "Register or update an app",
-					"description": "Requires the server admin token and matching X-Daochi-Admin header. X-Ksync-Admin remains accepted for compatibility.",
+					"description": "Requires the server admin token and matching X-Mesh-Admin header. X-Ksync-Admin remains accepted for compatibility.",
 					"parameters": []map[string]any{
 						{"name": "app_id", "in": "path", "required": true, "schema": map[string]any{"type": "string"}},
 					},
@@ -580,7 +580,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/account/app-grants/signed": map[string]any{
 				"post": map[string]any{
 					"summary":     "Create cross-app grant with a signed transaction",
-					"description": "The grant payload is bound to an X-Daochi-Tx-equivalent transaction signed by the account key and target app key.",
+					"description": "The grant payload is bound to an X-Mesh-Tx-equivalent transaction signed by the account key and target app key.",
 					"security":    []map[string]any{{"bearerAuth": []string{}}},
 					"responses": map[string]any{
 						"201": map[string]any{"description": "Created app grant"},
@@ -645,7 +645,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/sync/login": map[string]any{
 				"post": map[string]any{
 					"summary":     "Create bearer token",
-					"description": "Body is signed through X-Daochi-Signature over the exact raw request body bytes. Legacy X-Ksync-Signature and X-Inbe-Signature headers remain accepted. The response includes server_time for client token-expiry clock skew compensation.",
+					"description": "Body is signed through X-Mesh-Signature over the exact raw request body bytes. Legacy X-Ksync-Signature and X-Inbe-Signature headers remain accepted. The response includes server_time for client token-expiry clock skew compensation.",
 					"parameters":  baselineSignedHeaderParameters(),
 					"requestBody": map[string]any{
 						"required": true,
@@ -663,7 +663,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/sync": map[string]any{
 				"post": map[string]any{
 					"summary":     "Apply sync changes",
-					"description": "Applies typed sync changes for existing clients. Protocol v6 requires app_id plus X-Daochi-Tx. If the JSON body has v, nonce, and ciphertext fields, Daochi stores and relays it as an opaque encrypted envelope authenticated by bearer token.",
+					"description": "Applies typed sync changes for existing clients. Protocol v6 requires app_id plus X-Mesh-Tx. If the JSON body has v, nonce, and ciphertext fields, Mesh stores and relays it as an opaque encrypted envelope authenticated by bearer token.",
 					"parameters":  baselineSyncHeaderParameters(),
 					"requestBody": map[string]any{
 						"required": true,
@@ -684,7 +684,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/sync/ws": map[string]any{
 				"get": map[string]any{
 					"summary":     "Subscribe to sync change events",
-					"description": "WebSocket endpoint. Send Authorization: Bearer <auth_token>. Browser clients may use Sec-WebSocket-Protocol: daochi-sync-v1, bearer.<auth_token>. Legacy ksync-sync-v1 and inbe-sync-v1 remain accepted. The server emits sync_ready after connect and sync_changed whenever another client applies changes.",
+					"description": "WebSocket endpoint. Send Authorization: Bearer <auth_token>. Browser clients may use Sec-WebSocket-Protocol: mesh-sync-v1, bearer.<auth_token>. Legacy daochi-sync-v1, ksync-sync-v1 and inbe-sync-v1 remain accepted. The server emits sync_ready after connect and sync_changed whenever another client applies changes.",
 					"parameters": []map[string]any{
 						{
 							"name":        "Authorization",
@@ -740,7 +740,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/account/export": map[string]any{
 				"get": map[string]any{
 					"summary":     "Export authenticated account data",
-					"description": "Bearer-authenticated read-only dump of all Daochi rows owned by or directly attached to the authenticated account.",
+					"description": "Bearer-authenticated read-only dump of all Mesh rows owned by or directly attached to the authenticated account.",
 					"parameters":  baselineBearerHeaderParameters(),
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Account data export"},
@@ -850,7 +850,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/friends": map[string]any{
 				"get": map[string]any{
 					"summary":     "List accepted friends",
-					"description": "Bearer-authenticated. Returns account-level Daochi friends.",
+					"description": "Bearer-authenticated. Returns account-level Mesh friends.",
 					"parameters":  baselineBearerHeaderParameters(),
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Friends list"},
@@ -908,7 +908,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/profile/stats": map[string]any{
 				"put": map[string]any{
 					"summary":     "Publish app-neutral profile stats",
-					"description": "Bearer-authenticated aggregate stats. Daochi stores only app/practice/metric/value rows.",
+					"description": "Bearer-authenticated aggregate stats. Mesh stores only app/practice/metric/value rows.",
 					"parameters":  baselineBearerHeaderParameters(),
 					"requestBody": map[string]any{
 						"required": true,
@@ -1166,7 +1166,7 @@ func baselineOpenAPISpec() map[string]any {
 				},
 				"EncryptedSyncEnvelope": map[string]any{
 					"type":        "object",
-					"description": "Opaque whole-payload encrypted sync envelope. Daochi authenticates the account and relays the JSON body unchanged as encrypted_payloads.",
+					"description": "Opaque whole-payload encrypted sync envelope. Mesh authenticates the account and relays the JSON body unchanged as encrypted_payloads.",
 					"required":    []string{"v", "nonce", "ciphertext"},
 					"properties": map[string]any{
 						"v":          map[string]any{"type": "integer", "enum": []int{1, 2}},
@@ -1464,14 +1464,14 @@ func baselineOpenAPISpec() map[string]any {
 func baselineSignedHeaderParameters() []map[string]any {
 	return []map[string]any{
 		{
-			"name":        "X-Daochi-User",
+			"name":        "X-Mesh-User",
 			"in":          "header",
 			"required":    true,
 			"description": "SHA-256 hash of the ML-DSA-44 public key. Legacy X-Ksync-User and X-Inbe-User are also accepted.",
 			"schema":      map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
 		},
 		{
-			"name":        "X-Daochi-Signature",
+			"name":        "X-Mesh-Signature",
 			"in":          "header",
 			"required":    true,
 			"description": "ML-DSA-44 signature as hex or base64. Legacy X-Ksync-Signature and X-Inbe-Signature are also accepted.",
@@ -1490,31 +1490,31 @@ func baselineSyncHeaderParameters() []map[string]any {
 			"schema":      map[string]any{"type": "string"},
 		},
 		{
-			"name":        "X-Daochi-User",
+			"name":        "X-Mesh-User",
 			"in":          "header",
 			"required":    true,
 			"description": "SHA-256 hash of the ML-DSA-44 public key. Legacy X-Ksync-User and X-Inbe-User are also accepted.",
 			"schema":      map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
 		},
 		{
-			"name":        "X-Daochi-Client",
+			"name":        "X-Mesh-Client",
 			"in":          "header",
 			"required":    false,
 			"description": "Optional client ID for encrypted envelope metadata. X-Ksync-Client remains accepted.",
 			"schema":      map[string]any{"type": "string"},
 		},
 		{
-			"name":        "X-Daochi-Since-Version",
+			"name":        "X-Mesh-Since-Version",
 			"in":          "header",
 			"required":    false,
 			"description": "Optional last-seen server version for encrypted envelope delta reads. X-Ksync-Since-Version remains accepted.",
 			"schema":      map[string]any{"type": "integer"},
 		},
 		{
-			"name":        "X-Daochi-Limit",
+			"name":        "X-Mesh-Limit",
 			"in":          "header",
 			"required":    false,
-			"description": "Optional encrypted envelope page size. X-Ksync-Limit remains accepted. The server may clamp this with DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN.",
+			"description": "Optional encrypted envelope page size. X-Ksync-Limit remains accepted. The server may clamp this with MESH_ENCRYPTED_PAYLOAD_MAX_RETURN.",
 			"schema":      map[string]any{"type": "integer"},
 		},
 	}

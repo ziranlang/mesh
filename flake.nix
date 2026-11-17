@@ -1,5 +1,5 @@
 {
-  description = "Daochi sync server development shell";
+  description = "Mesh sync server development shell";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 

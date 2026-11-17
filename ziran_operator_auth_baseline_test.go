@@ -12,7 +12,7 @@ func (s *Server) baselineRequireAdmin(w http.ResponseWriter, r *http.Request) bo
 		Response_Error(w, http.StatusForbidden, "admin disabled")
 		return false
 	}
-	provided := HttpAuth_HeaderAlias(r, []string{"X-Daochi-Admin", "X-Ksync-Admin"})
+	provided := HttpAuth_HeaderAlias(r, []string{"X-Mesh-Admin", "X-Ksync-Admin"})
 	if subtle.ConstantTimeCompare([]byte(provided), []byte(s.Cfg.AdminToken)) != 1 {
 		Response_Error(w, http.StatusUnauthorized, "admin token required")
 		return false
@@ -31,7 +31,7 @@ func (s *Server) baselineRequireLocalOperator(w http.ResponseWriter, r *http.Req
 	ip := net.ParseIP(host)
 	if ip == nil || !ip.IsLoopback() {
 		Response_Error(w, http.StatusForbidden,
-			"administration requires loopback access or DAOCHI_ADMIN_TOKEN")
+			"administration requires loopback access or MESH_ADMIN_TOKEN")
 		return false
 	}
 	return true

@@ -2,7 +2,7 @@
   "/api/v1/chat/completions": {
     "post": {
       "summary": "Account-limited online app conversation",
-      "description": "Requires a Daochi bearer token and X-Daochi-User. The node keeps the provider key private, bounds context and output, and enforces persistent daily account and node limits. Each model request, including tool continuations and failed provider attempts, uses one allowance unit. Tools execute only in the client harness. A disabled or unavailable provider returns 503; exhausted allowances return 429.",
+      "description": "Requires a Mesh bearer token and X-Mesh-User. The node keeps the provider key private, bounds context and output, and enforces persistent daily account and node limits. Each model request, including tool continuations and failed provider attempts, uses one allowance unit. Tools execute only in the client harness. A disabled or unavailable provider returns 503; exhausted allowances return 429.",
       "security": [
         {
           "bearerAuth": []
@@ -148,7 +148,7 @@
   "/api/v1/admin/feedback": {
     "get": {
       "summary": "Private developer feedback inbox",
-      "description": "Requires X-Daochi-Admin with the feedback token or the existing admin token. Disabled when neither is configured.",
+      "description": "Requires X-Mesh-Admin with the feedback token or the existing admin token. Disabled when neither is configured.",
       "responses": {
         "200": {
           "description": "Up to 100 newest reports"
@@ -165,7 +165,7 @@
   "/api/v1/admin/feedback/reply": {
     "post": {
       "summary": "Reply to an app feedback report",
-      "description": "Requires X-Daochi-Admin and the account_id returned by the private inbox. Replies target exactly one account's report. Without reply_id, the reply is the report's single reply and replaces an earlier one. With a 64-character hexadecimal reply_id, it is added beside the report's earlier replies; retrying the same reply_id and reply changes nothing, and reusing a reply_id for another reply returns 409. The reporting account can read replies through GET /api/v1/feedback. Use replies=1 and a numeric offset to retrieve at most two replies per page, oldest first and without report diagnostics; each reply carries its own id (the report's ID for the single reply) and its report's title.",
+      "description": "Requires X-Mesh-Admin and the account_id returned by the private inbox. Replies target exactly one account's report. Without reply_id, the reply is the report's single reply and replaces an earlier one. With a 64-character hexadecimal reply_id, it is added beside the report's earlier replies; retrying the same reply_id and reply changes nothing, and reusing a reply_id for another reply returns 409. The reporting account can read replies through GET /api/v1/feedback. Use replies=1 and a numeric offset to retrieve at most two replies per page, oldest first and without report diagnostics; each reply carries its own id (the report's ID for the single reply) and its report's title.",
       "requestBody": {
         "required": true,
         "content": {
@@ -223,7 +223,7 @@
   "/api/v1/chat/spelling": {
     "post": {
       "summary": "Account-limited spelling correction",
-      "description": "Requires a Daochi bearer token and X-Daochi-User. Corrects only misspelled words in one text of up to 8192 bytes and returns the whole text with its surrounding blank space unchanged. The text is not stored. Each request uses one unit of the same daily account and node allowance as online chat. A disabled or unavailable provider returns 503; exhausted allowances return 429.",
+      "description": "Requires a Mesh bearer token and X-Mesh-User. Corrects only misspelled words in one text of up to 8192 bytes and returns the whole text with its surrounding blank space unchanged. The text is not stored. Each request uses one unit of the same daily account and node allowance as online chat. A disabled or unavailable provider returns 503; exhausted allowances return 429.",
       "security": [
         {
           "bearerAuth": []
@@ -270,7 +270,7 @@
   "/api/v1/chat/habit-icons": {
     "post": {
       "summary": "Account-limited habit icon choice",
-      "description": "Requires a Daochi bearer token and X-Daochi-User. Chooses, for each habit in order, one of the offered icon names that obviously fits it, or an empty string when none clearly fits. Offer 1 to 64 distinct icon names of 1 to 32 lowercase letters, digits or underscores, and 1 to 32 habits with a non-blank name of up to 64 bytes and an optional description of up to 256 bytes. Habits and answers are not stored. Each request uses one unit of the same daily account and node allowance as online chat. A disabled or unavailable provider or an unusable model answer returns 503; exhausted allowances return 429.",
+      "description": "Requires a Mesh bearer token and X-Mesh-User. Chooses, for each habit in order, one of the offered icon names that obviously fits it, or an empty string when none clearly fits. Offer 1 to 64 distinct icon names of 1 to 32 lowercase letters, digits or underscores, and 1 to 32 habits with a non-blank name of up to 64 bytes and an optional description of up to 256 bytes. Habits and answers are not stored. Each request uses one unit of the same daily account and node allowance as online chat. A disabled or unavailable provider or an unusable model answer returns 503; exhausted allowances return 429.",
       "security": [
         {
           "bearerAuth": []

@@ -148,7 +148,7 @@ func (f *fakeGooglePlay) serviceAccountJSON(t *testing.T) string {
 	}
 	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
 	payload, err := json.Marshal(GoogleServiceAccount{
-		ClientEmail: "daochi-test@example.iam.gserviceaccount.com",
+		ClientEmail: "mesh-test@example.iam.gserviceaccount.com",
 		PrivateKey:  pemKey,
 		TokenURI:    f.Token.URL,
 	})

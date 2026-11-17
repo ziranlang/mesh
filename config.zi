@@ -1,3 +1,4 @@
+environment :: #import "config_environment";
 #import "protocol"
 #import "config_values"
 #import "std/map_go"
@@ -105,7 +106,9 @@ RandomResult :: struct {
     count: isize
     error: Error
 }
-Getenv :: (key: string) -> string #foreign go_os;
+Getenv :: (key: string) -> string {
+    return environment.Get(key)
+}
 ReadFile :: (path: string) -> FileResult #go_results #foreign go_os;
 TrimSpace :: (value: string) -> string #foreign go_strings;
 SplitText :: (value: string, separator: string) -> []string #foreign go_strings "Split";
@@ -250,13 +253,13 @@ ClientIDList :: (value: string) -> []string {
 
 Load :: () -> Config {
     empty: []u8
-    secret := EnvBytesHex("DAOCHI_TOKEN_SECRET_HEX", empty)
+    secret := EnvBytesHex("MESH_TOKEN_SECRET_HEX", empty)
     ephemeralSecret := false
     if secret.count < 32 {
-        if !Bool(Getenv("DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET"), false) {
-            Fatal("DAOCHI_TOKEN_SECRET_HEX must be at least 32 bytes; set DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET=1 only for local development")
+        if !Bool(Getenv("MESH_ALLOW_EPHEMERAL_TOKEN_SECRET"), false) {
+            Fatal("MESH_TOKEN_SECRET_HEX must be at least 32 bytes; set MESH_ALLOW_EPHEMERAL_TOKEN_SECRET=1 only for local development")
         }
-        Warn("DAOCHI_TOKEN_SECRET_HEX is missing or too short; using an ephemeral token secret suitable only for local development")
+        Warn("MESH_TOKEN_SECRET_HEX is missing or too short; using an ephemeral token secret suitable only for local development")
         secret = AllocateBytes(cast(isize)32)
         random := ReadRandom(secret)
         if random.error != null {
@@ -264,9 +267,9 @@ Load :: () -> Config {
         }
         ephemeralSecret = true
     }
-    nodeRegistryPublic := cast(PublicKey)EnvBytesHexOrFile("DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX", "DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE", empty)
-    issuerPublic := EnvBytesHexOrFile("DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX", "DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", empty)
-    issuerPrivateBytes := EnvBytesHexOrFile("DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX", "DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE", empty)
+    nodeRegistryPublic := cast(PublicKey)EnvBytesHexOrFile("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE", empty)
+    issuerPublic := EnvBytesHexOrFile("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", empty)
+    issuerPrivateBytes := EnvBytesHexOrFile("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE", empty)
     issuerPrivate: PrivateKey
     if issuerPrivateBytes.count == 32 {
         issuerPrivate = NewKeyFromSeed(issuerPrivateBytes)
@@ -280,57 +283,57 @@ Load :: () -> Config {
             issuerPublic[index] = privateBytes[index + 32]
         }
     }
-    baseURL := EnvString("DAOCHI_BASE_URL", "https://api.example.com")
-    nodeKeyBytes := EnvBytesHexOrFile("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", "DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE", empty)
+    baseURL := EnvString("MESH_BASE_URL", "https://api.example.com")
+    nodeKeyBytes := EnvBytesHexOrFile("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE", empty)
     nodePrivateKey: PrivateKey
     if nodeKeyBytes.count == 32 {
         nodePrivateKey = NewKeyFromSeed(nodeKeyBytes)
     } else if nodeKeyBytes.count == 64 {
         nodePrivateKey = cast(PrivateKey)nodeKeyBytes
     } else if nodeKeyBytes.count != 0 {
-        Fatal("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
+        Fatal("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
     }
     result: Config
-    result.Addr = EnvString("DAOCHI_ADDR", "127.0.0.1:8080")
+    result.Addr = EnvString("MESH_ADDR", "127.0.0.1:8080")
     result.BaseURL = baseURL
-    result.DBPath = EnvString("DAOCHI_DB", "daochi.db")
-    result.AdminToken = EnvString("DAOCHI_ADMIN_TOKEN", "")
-    result.ChallengeTTL = EnvDurationSeconds("DAOCHI_CHALLENGE_TTL_SECONDS", cast(clock.Duration)60000000000)
-    result.TokenTTL = EnvDurationSeconds("DAOCHI_TOKEN_TTL_SECONDS", cast(clock.Duration)3600000000000)
+    result.DBPath = EnvString("MESH_DB", "daochi.db")
+    result.AdminToken = EnvString("MESH_ADMIN_TOKEN", "")
+    result.ChallengeTTL = EnvDurationSeconds("MESH_CHALLENGE_TTL_SECONDS", cast(clock.Duration)60000000000)
+    result.TokenTTL = EnvDurationSeconds("MESH_TOKEN_TTL_SECONDS", cast(clock.Duration)3600000000000)
     result.TokenSecret = secret
     result.TokenSecretEphemeral = ephemeralSecret
-    result.MaxBodyBytes = EnvInt64("DAOCHI_MAX_BODY_BYTES", cast(s64)1048576)
-    result.EncryptedPayloadMaxReturn = EnvInt("DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN", cast(isize)0)
-    result.EncryptedPayloadMaxAccountBytes = EnvInt64("DAOCHI_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES", cast(s64)0)
-    result.EncryptedPayloadRetention = EnvDurationDays("DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS", cast(clock.Duration)0)
+    result.MaxBodyBytes = EnvInt64("MESH_MAX_BODY_BYTES", cast(s64)1048576)
+    result.EncryptedPayloadMaxReturn = EnvInt("MESH_ENCRYPTED_PAYLOAD_MAX_RETURN", cast(isize)0)
+    result.EncryptedPayloadMaxAccountBytes = EnvInt64("MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES", cast(s64)0)
+    result.EncryptedPayloadRetention = EnvDurationDays("MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS", cast(clock.Duration)0)
     // Zero keeps account storage unlimited; the public node sets its free allowance.
-    result.AccountStorageLimitBytes = EnvInt64("DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES", cast(s64)0)
-    result.TrashPurgeDays = EnvInt("DAOCHI_TRASH_PURGE_DAYS", cast(isize)30)
-    result.StoragePlansEnabled = Bool(EnvString("DAOCHI_STORAGE_PLANS_ENABLED", ""), false)
-    result.PremiumAliasesEnabled = Bool(EnvString("DAOCHI_PREMIUM_ALIASES_ENABLED", ""), false)
-    result.DewGiftsEnabled = Bool(EnvString("DAOCHI_DEW_GIFTS_ENABLED", ""), false)
-    result.UnlockTrialUntil = EnvInt64("DAOCHI_UNLOCK_TRIAL_UNTIL", cast(s64)0)
-    result.ShoveyIslandLaunchAt = EnvInt64("DAOCHI_SHOVEY_ISLAND_LAUNCH_AT", cast(s64)0)
+    result.AccountStorageLimitBytes = EnvInt64("MESH_ACCOUNT_STORAGE_LIMIT_BYTES", cast(s64)0)
+    result.TrashPurgeDays = EnvInt("MESH_TRASH_PURGE_DAYS", cast(isize)30)
+    result.StoragePlansEnabled = Bool(EnvString("MESH_STORAGE_PLANS_ENABLED", ""), false)
+    result.PremiumAliasesEnabled = Bool(EnvString("MESH_PREMIUM_ALIASES_ENABLED", ""), false)
+    result.DewGiftsEnabled = Bool(EnvString("MESH_DEW_GIFTS_ENABLED", ""), false)
+    result.UnlockTrialUntil = EnvInt64("MESH_UNLOCK_TRIAL_UNTIL", cast(s64)0)
+    result.ShoveyIslandLaunchAt = EnvInt64("MESH_SHOVEY_ISLAND_LAUNCH_AT", cast(s64)0)
     result.NodeRegistryPublicKey = nodeRegistryPublic
-    result.KnownNodes = Peers(EnvString("DAOCHI_KNOWN_NODES", ""))
-    result.NodeSyncToken = EnvString("DAOCHI_NODE_SYNC_TOKEN", "")
-    result.NodeSyncInterval = EnvDurationSeconds("DAOCHI_NODE_SYNC_INTERVAL_SECONDS", cast(clock.Duration)0)
-    result.NodeSyncBatchLimit = EnvInt("DAOCHI_NODE_SYNC_BATCH_LIMIT", cast(isize)500)
-    result.NodeIdentityKeyFile = EnvString("DAOCHI_NODE_IDENTITY_KEY_FILE", FormatKeyPath("%s.node-key", EnvString("DAOCHI_DB", "daochi.db")))
+    result.KnownNodes = Peers(EnvString("MESH_KNOWN_NODES", ""))
+    result.NodeSyncToken = EnvString("MESH_NODE_SYNC_TOKEN", "")
+    result.NodeSyncInterval = EnvDurationSeconds("MESH_NODE_SYNC_INTERVAL_SECONDS", cast(clock.Duration)0)
+    result.NodeSyncBatchLimit = EnvInt("MESH_NODE_SYNC_BATCH_LIMIT", cast(isize)500)
+    result.NodeIdentityKeyFile = EnvString("MESH_NODE_IDENTITY_KEY_FILE", FormatKeyPath("%s.node-key", EnvString("MESH_DB", "daochi.db")))
     result.NodeIdentityPrivateKey = nodePrivateKey
-    result.NodeDisplayName = EnvString("DAOCHI_NODE_NAME", "Daochi Node")
-    result.LANDiscovery = Bool(Getenv("DAOCHI_LAN_DISCOVERY"), true)
-    result.NodeLANOnly = Bool(Getenv("DAOCHI_LAN_ONLY"), false)
-    result.NodeLANNetworks = network.ParseNetworks(Getenv("DAOCHI_LAN_NETWORKS"))
+    result.NodeDisplayName = EnvString("MESH_NODE_NAME", "Mesh Node")
+    result.LANDiscovery = Bool(Getenv("MESH_LAN_DISCOVERY"), true)
+    result.NodeLANOnly = Bool(Getenv("MESH_LAN_ONLY"), false)
+    result.NodeLANNetworks = network.ParseNetworks(Getenv("MESH_LAN_NETWORKS"))
     result.WaoziIssuerPublicKey = cast(PublicKey)issuerPublic
     result.WaoziIssuerPrivateKey = issuerPrivate
-    result.TokenProducts = Products(EnvString("DAOCHI_TOKEN_PRODUCTS", ""))
-    result.GooglePackageNames = FromEnvironment(EnvString("DAOCHI_GOOGLE_PACKAGE_NAMES", ""))
-    result.GooglePackageApps = GoogleApps(EnvString("DAOCHI_GOOGLE_PACKAGE_APPS", ""))
-    result.GoogleServiceAccountJSON = EnvStringOrFile("DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON", "DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", "")
-    result.GoogleOAuthClientJSON = EnvStringOrFile("DAOCHI_GOOGLE_OAUTH_CLIENT_JSON", "DAOCHI_GOOGLE_OAUTH_CLIENT_JSON_FILE", "")
-    result.GoogleSignInClientIDs = ClientIDList(Getenv("DAOCHI_GOOGLE_SIGNIN_CLIENT_IDS"))
-    result.GoogleOAuthRefreshToken = EnvStringOrFile("DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN", "DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", "")
+    result.TokenProducts = Products(EnvString("MESH_TOKEN_PRODUCTS", ""))
+    result.GooglePackageNames = FromEnvironment(EnvString("MESH_GOOGLE_PACKAGE_NAMES", ""))
+    result.GooglePackageApps = GoogleApps(EnvString("MESH_GOOGLE_PACKAGE_APPS", ""))
+    result.GoogleServiceAccountJSON = EnvStringOrFile("MESH_GOOGLE_SERVICE_ACCOUNT_JSON", "MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", "")
+    result.GoogleOAuthClientJSON = EnvStringOrFile("MESH_GOOGLE_OAUTH_CLIENT_JSON", "MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE", "")
+    result.GoogleSignInClientIDs = ClientIDList(Getenv("MESH_GOOGLE_SIGNIN_CLIENT_IDS"))
+    result.GoogleOAuthRefreshToken = EnvStringOrFile("MESH_GOOGLE_OAUTH_REFRESH_TOKEN", "MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", "")
     result.MoneroWalletRPCURL = EnvString("MONERO_WALLET_RPC_URL", "")
     result.MoneroWalletRPCUser = EnvString("MONERO_WALLET_RPC_USER", "")
     result.MoneroWalletRPCPassword = EnvStringOrFile("MONERO_WALLET_RPC_PASSWORD", "MONERO_WALLET_RPC_PASSWORD_FILE", "")
@@ -339,26 +342,26 @@ Load :: () -> Config {
     result.MoneroRateTokenUnits = EnvInt64("MONERO_RATE_TOKEN_UNITS", cast(s64)0)
     result.MoneroMinimumAtomicAmount = EnvInt64("MONERO_MINIMUM_ATOMIC_AMOUNT", cast(s64)1)
     result.MoneroConfirmationsRequired = EnvInt64("MONERO_CONFIRMATIONS_REQUIRED", cast(s64)10)
-    result.TokenDirectPurchasesEnabled = Bool(Getenv("DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED"), false)
-    result.ChatAPIKey = EnvStringOrFile("DAOCHI_CHAT_API_KEY", "DAOCHI_CHAT_API_KEY_FILE", "")
-    result.ChatAPIEndpoint = EnvString("DAOCHI_CHAT_ENDPOINT", "")
-    result.FeedbackToken = EnvStringOrFile("DAOCHI_FEEDBACK_TOKEN", "DAOCHI_FEEDBACK_TOKEN_FILE", "")
-    result.LumiBotToken = EnvStringOrFile("DAOCHI_LUMI_BOT_TOKEN", "DAOCHI_LUMI_BOT_TOKEN_FILE", "")
-    result.LumiWebhookSecret = EnvStringOrFile("DAOCHI_LUMI_WEBHOOK_SECRET", "DAOCHI_LUMI_WEBHOOK_SECRET_FILE", "")
-    result.LumiOwnerID = EnvString("DAOCHI_LUMI_OWNER_ID", "")
-    group := Getenv("DAOCHI_LUMI_GROUP_ID")
+    result.TokenDirectPurchasesEnabled = Bool(Getenv("MESH_TOKEN_DIRECT_PURCHASES_ENABLED"), false)
+    result.ChatAPIKey = EnvStringOrFile("MESH_CHAT_API_KEY", "MESH_CHAT_API_KEY_FILE", "")
+    result.ChatAPIEndpoint = EnvString("MESH_CHAT_ENDPOINT", "")
+    result.FeedbackToken = EnvStringOrFile("MESH_FEEDBACK_TOKEN", "MESH_FEEDBACK_TOKEN_FILE", "")
+    result.LumiBotToken = EnvStringOrFile("MESH_LUMI_BOT_TOKEN", "MESH_LUMI_BOT_TOKEN_FILE", "")
+    result.LumiWebhookSecret = EnvStringOrFile("MESH_LUMI_WEBHOOK_SECRET", "MESH_LUMI_WEBHOOK_SECRET_FILE", "")
+    result.LumiOwnerID = EnvString("MESH_LUMI_OWNER_ID", "")
+    group := Getenv("MESH_LUMI_GROUP_ID")
     if group != "" {
         parsed := ParseInt(group, 10, 64)
         if parsed.error != null {
-            FatalValue("invalid %s: not an integer: %q", "DAOCHI_LUMI_GROUP_ID", group)
+            FatalValue("invalid %s: not an integer: %q", "MESH_LUMI_GROUP_ID", group)
         }
         result.LumiGroupID = parsed.value
     }
-    result.TelegramAccountsEnabled = Bool(Getenv("DAOCHI_TELEGRAM_ACCOUNTS_ENABLED"), false)
-    result.LumiCanvasURL = EnvString("DAOCHI_LUMI_CANVAS_URL", "https://inbe.waozi.xyz/build/telegram/index.html")
-    result.ChatModel = EnvString("DAOCHI_CHAT_MODEL", "glm-4.7-flash")
-    result.ChatDailyLimit = EnvInt64("DAOCHI_CHAT_DAILY_LIMIT", cast(s64)20)
-    result.ChatGlobalDailyLimit = EnvInt64("DAOCHI_CHAT_GLOBAL_DAILY_LIMIT", cast(s64)1000)
+    result.TelegramAccountsEnabled = Bool(Getenv("MESH_TELEGRAM_ACCOUNTS_ENABLED"), false)
+    result.LumiCanvasURL = EnvString("MESH_LUMI_CANVAS_URL", "https://inbe.waozi.xyz/build/telegram/index.html")
+    result.ChatModel = EnvString("MESH_CHAT_MODEL", "glm-4.7-flash")
+    result.ChatDailyLimit = EnvInt64("MESH_CHAT_DAILY_LIMIT", cast(s64)20)
+    result.ChatGlobalDailyLimit = EnvInt64("MESH_CHAT_GLOBAL_DAILY_LIMIT", cast(s64)1000)
     return result
 }
 

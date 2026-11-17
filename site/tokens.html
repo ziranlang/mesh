@@ -2,23 +2,23 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <link rel="canonical" href="https://daochi.net/tokens.html">
+  <link rel="canonical" href="https://mesh.ziran-lang.org/tokens.html">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Daochi Tokens</title>
-  <meta name="description" content="Daochi token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
+  <title>Mesh Tokens</title>
+  <meta name="description" content="Mesh token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://daochi.net/tokens.html">
-  <meta property="og:title" content="Daochi Tokens">
-  <meta property="og:description" content="Daochi token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
-  <meta property="og:image" content="https://daochi.net/assets/editorial/connected-islands.png">
-  <meta property="og:image:secure_url" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta property="og:url" content="https://mesh.ziran-lang.org/tokens.html">
+  <meta property="og:title" content="Mesh Tokens">
+  <meta property="og:description" content="Mesh token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
+  <meta property="og:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
+  <meta property="og:image:secure_url" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta property="og:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta property="og:image:width" content="1536">
   <meta property="og:image:height" content="1024">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Daochi Tokens">
-  <meta name="twitter:description" content="Daochi token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
-  <meta name="twitter:image" content="https://daochi.net/assets/editorial/connected-islands.png">
+  <meta name="twitter:title" content="Mesh Tokens">
+  <meta name="twitter:description" content="Mesh token assets, signed receipts, purchases, spends, app IDs, and ledger checkpoints.">
+  <meta name="twitter:image" content="https://mesh.ziran-lang.org/assets/editorial/connected-islands.png">
   <meta name="twitter:image:alt" content="Quiet islands joined by small bridges, illustrated in ink and sage watercolor.">
   <meta name="theme-color" content="#f7f3eb">
   <link rel="icon" href="/favicon.ico" sizes="any">
@@ -31,7 +31,7 @@
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="topbar">
-    <a class="brand" href="/">Daochi</a>
+    <a class="brand" href="/">Mesh</a>
     <nav class="nav" aria-label="Primary">
       <a href="/protocol.html">Protocol</a>
       <a href="/mesh.html">Mesh</a>
@@ -46,7 +46,7 @@
     <section class="page-hero">
       <p class="eyebrow">Tokens</p>
       <h1>Signed receipts for app purchases and spends.</h1>
-      <p class="lead">Daochi can issue configured asset receipts after verifying a payment provider or admin credit. The ledger is append-only, account-scoped, app-tagged, and readable as either account-wide or app-filtered history.</p>
+      <p class="lead">Mesh can issue configured asset receipts after verifying a payment provider or admin credit. The ledger is append-only, account-scoped, app-tagged, and readable as either account-wide or app-filtered history.</p>
     </section>
 
     <section>
@@ -65,8 +65,8 @@
 
     <section>
       <h2>App scoping</h2>
-      <p>Product purchases, spends, invoices, receipts, and spend nonces can carry <code>app_id</code>. Permanent-address Monero deposits credit the global account balance because the address identifies a person rather than an app. Daochi validates that an app is registered before accepting app-scoped spending or purchasing. Passing <code>app_id</code> returns only token events for that app.</p>
-      <p>Signed app manifests can define token policies for <code>spend</code> and <code>purchase</code>. Once policies exist for an app, token actions need the matching app asset permission. A supplied <code>X-Daochi-Tx</code> envelope is verified, but unsigned token requests remain supported while token client integration is still pending.</p>
+      <p>Product purchases, spends, invoices, receipts, and spend nonces can carry <code>app_id</code>. Permanent-address Monero deposits credit the global account balance because the address identifies a person rather than an app. Mesh validates that an app is registered before accepting app-scoped spending or purchasing. Passing <code>app_id</code> returns only token events for that app.</p>
+      <p>Signed app manifests can define token policies for <code>spend</code> and <code>purchase</code>. Once policies exist for an app, token actions need the matching app asset permission. A supplied <code>X-Mesh-Tx</code> envelope is verified, but unsigned token requests remain supported while token client integration is still pending.</p>
       <div class="callout">
         <p>Token ledger and payment intent rows are financial audit records. App-filtered balances are audit views over those rows, not separate allocation pools. Explicit account-to-app allocation events are still needed before per-app token distribution is complete.</p>
       </div>
@@ -75,7 +75,7 @@
     <section>
       <h2>Buy or gift with Monero</h2>
       <p>Each account receives one permanent Monero subaddress. Sending XMR to your own address buys tokens for you. Sending XMR to the address resolved from another account's alias or public ID gifts tokens to that account. Both actions use the same settlement path.</p>
-      <p>Daochi records the transfer, waits for the configured confirmation threshold and an unlocked, non-double-spent output, then converts the atomic XMR amount with integer arithmetic and issues one idempotent signed credit.</p>
+      <p>Mesh records the transfer, waits for the configured confirmation threshold and an unlocked, non-double-spent output, then converts the atomic XMR amount with integer arithmetic and issues one idempotent signed credit.</p>
       <div class="panel">
         <div class="panel-row"><strong>My address</strong><span><code>GET /api/v1/tokens/purchases/monero/address</code></span></div>
         <div class="panel-row"><strong>Gift address</strong><span><code>GET /api/v1/tokens/purchases/monero/address/@alias</code></span></div>
@@ -88,9 +88,9 @@
   </main>
 
   <footer class="footer">
-    <span>Daochi · A <a href="https://kryonlabs.com">Kryon Labs</a> project</span>
+    <span>Mesh · A <a href="https://ziran-lang.org">Ziran</a> project</span>
     <a href="https://waozi.xyz/#labs">More from Waozi ↗</a>
-    <a href="https://github.com/kryonlabs/daochi">Source</a>
+    <a href="https://github.com/ziranlang/mesh">Source</a>
   </footer>
 </body>
 </html>

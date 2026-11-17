@@ -9,7 +9,7 @@ strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 random :: #system_library "go:math/rand";
 regexp :: #system_library "go:regexp";
-released :: #system_library "go:daochi/testdata/binary_field_oracle";
+released :: #system_library "go:mesh/testdata/binary_field_oracle";
 builtin :: #system_library "go:builtin";
 native_testing :: #system_library "go:testing";
 

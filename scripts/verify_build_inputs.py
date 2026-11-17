@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify immutable Daochi build-tool and base-image inputs.
+"""Verify immutable Mesh build-tool and base-image inputs.
 
 To update a pin, resolve the new official registry index digest or upstream
 release checksum, update the corresponding expected identity here, verify the

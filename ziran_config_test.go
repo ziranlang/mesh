@@ -76,22 +76,22 @@ type BaselineConfig struct {
 }
 
 func baselineLoadConfig() BaselineConfig {
-	secret := baselineEnvBytesHex("DAOCHI_TOKEN_SECRET_HEX", nil)
+	secret := baselineEnvBytesHex("MESH_TOKEN_SECRET_HEX", nil)
 	ephemeralSecret := false
 	if len(secret) < 32 {
-		if !ConfigValues_Bool(os.Getenv("DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET"), false) {
-			log.Fatal("DAOCHI_TOKEN_SECRET_HEX must be at least 32 bytes; set DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET=1 only for local development")
+		if !ConfigValues_Bool(os.Getenv("MESH_ALLOW_EPHEMERAL_TOKEN_SECRET"), false) {
+			log.Fatal("MESH_TOKEN_SECRET_HEX must be at least 32 bytes; set MESH_ALLOW_EPHEMERAL_TOKEN_SECRET=1 only for local development")
 		}
-		slog.Warn("DAOCHI_TOKEN_SECRET_HEX is missing or too short; using an ephemeral token secret suitable only for local development")
+		slog.Warn("MESH_TOKEN_SECRET_HEX is missing or too short; using an ephemeral token secret suitable only for local development")
 		secret = make([]byte, 32)
 		if _, err := rand.Read(secret); err != nil {
 			panic(err)
 		}
 		ephemeralSecret = true
 	}
-	nodeRegistryPublic := ed25519.PublicKey(baselineEnvBytesHexOrFile("DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX", "DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE", nil))
-	issuerPublic := baselineEnvBytesHexOrFile("DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX", "DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", nil)
-	issuerPrivateBytes := baselineEnvBytesHexOrFile("DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX", "DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE", nil)
+	nodeRegistryPublic := ed25519.PublicKey(baselineEnvBytesHexOrFile("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE", nil))
+	issuerPublic := baselineEnvBytesHexOrFile("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", nil)
+	issuerPrivateBytes := baselineEnvBytesHexOrFile("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE", nil)
 	var issuerPrivate ed25519.PrivateKey
 	if len(issuerPrivateBytes) == ed25519.SeedSize {
 		issuerPrivate = ed25519.NewKeyFromSeed(issuerPrivateBytes)
@@ -101,48 +101,48 @@ func baselineLoadConfig() BaselineConfig {
 	if len(issuerPrivate) == ed25519.PrivateKeySize && len(issuerPublic) == 0 {
 		issuerPublic = issuerPrivate.Public().(ed25519.PublicKey)
 	}
-	baseURL := baselineEnvString("DAOCHI_BASE_URL", "https://api.example.com")
-	nodeKeyBytes := baselineEnvBytesHexOrFile("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", "DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE", nil)
+	baseURL := baselineEnvString("MESH_BASE_URL", "https://api.example.com")
+	nodeKeyBytes := baselineEnvBytesHexOrFile("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE", nil)
 	var nodePrivateKey ed25519.PrivateKey
 	if len(nodeKeyBytes) == ed25519.SeedSize {
 		nodePrivateKey = ed25519.NewKeyFromSeed(nodeKeyBytes)
 	} else if len(nodeKeyBytes) == ed25519.PrivateKeySize {
 		nodePrivateKey = ed25519.PrivateKey(nodeKeyBytes)
 	} else if len(nodeKeyBytes) != 0 {
-		log.Fatal("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
+		log.Fatal("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
 	}
 	return BaselineConfig{
-		Addr:                            baselineEnvString("DAOCHI_ADDR", "127.0.0.1:8080"),
+		Addr:                            baselineEnvString("MESH_ADDR", "127.0.0.1:8080"),
 		BaseURL:                         baseURL,
-		DBPath:                          baselineEnvString("DAOCHI_DB", "daochi.db"),
-		AdminToken:                      baselineEnvString("DAOCHI_ADMIN_TOKEN", ""),
-		ChallengeTTL:                    baselineEnvDurationSeconds("DAOCHI_CHALLENGE_TTL_SECONDS", 60*time.Second),
-		TokenTTL:                        baselineEnvDurationSeconds("DAOCHI_TOKEN_TTL_SECONDS", 3600*time.Second),
+		DBPath:                          baselineEnvString("MESH_DB", "daochi.db"),
+		AdminToken:                      baselineEnvString("MESH_ADMIN_TOKEN", ""),
+		ChallengeTTL:                    baselineEnvDurationSeconds("MESH_CHALLENGE_TTL_SECONDS", 60*time.Second),
+		TokenTTL:                        baselineEnvDurationSeconds("MESH_TOKEN_TTL_SECONDS", 3600*time.Second),
 		TokenSecret:                     secret,
 		TokenSecretEphemeral:            ephemeralSecret,
-		MaxBodyBytes:                    baselineEnvInt64("DAOCHI_MAX_BODY_BYTES", 1<<20),
-		EncryptedPayloadMaxReturn:       baselineEnvInt("DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN", 0),
-		EncryptedPayloadMaxAccountBytes: baselineEnvInt64("DAOCHI_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES", 0),
-		EncryptedPayloadRetention:       baselineEnvDurationDays("DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS", 0),
-		AccountStorageLimitBytes:        baselineEnvInt64("DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES", 0),
+		MaxBodyBytes:                    baselineEnvInt64("MESH_MAX_BODY_BYTES", 1<<20),
+		EncryptedPayloadMaxReturn:       baselineEnvInt("MESH_ENCRYPTED_PAYLOAD_MAX_RETURN", 0),
+		EncryptedPayloadMaxAccountBytes: baselineEnvInt64("MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES", 0),
+		EncryptedPayloadRetention:       baselineEnvDurationDays("MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS", 0),
+		AccountStorageLimitBytes:        baselineEnvInt64("MESH_ACCOUNT_STORAGE_LIMIT_BYTES", 0),
 		NodeRegistryPublicKey:           nodeRegistryPublic,
-		KnownNodes:                      ConfigValues_Peers(baselineEnvString("DAOCHI_KNOWN_NODES", "")),
-		NodeSyncToken:                   baselineEnvString("DAOCHI_NODE_SYNC_TOKEN", ""),
-		NodeSyncInterval:                baselineEnvDurationSeconds("DAOCHI_NODE_SYNC_INTERVAL_SECONDS", 0),
-		NodeSyncBatchLimit:              baselineEnvInt("DAOCHI_NODE_SYNC_BATCH_LIMIT", 500),
-		NodeIdentityKeyFile:             baselineEnvString("DAOCHI_NODE_IDENTITY_KEY_FILE", baselineEnvString("DAOCHI_DB", "daochi.db")+".node-key"),
+		KnownNodes:                      ConfigValues_Peers(baselineEnvString("MESH_KNOWN_NODES", "")),
+		NodeSyncToken:                   baselineEnvString("MESH_NODE_SYNC_TOKEN", ""),
+		NodeSyncInterval:                baselineEnvDurationSeconds("MESH_NODE_SYNC_INTERVAL_SECONDS", 0),
+		NodeSyncBatchLimit:              baselineEnvInt("MESH_NODE_SYNC_BATCH_LIMIT", 500),
+		NodeIdentityKeyFile:             baselineEnvString("MESH_NODE_IDENTITY_KEY_FILE", baselineEnvString("MESH_DB", "daochi.db")+".node-key"),
 		NodeIdentityPrivateKey:          nodePrivateKey,
-		NodeDisplayName:                 baselineEnvString("DAOCHI_NODE_NAME", "Daochi Node"),
-		LANDiscovery:                    ConfigValues_Bool(os.Getenv("DAOCHI_LAN_DISCOVERY"), true),
-		NodeLANOnly:                     ConfigValues_Bool(os.Getenv("DAOCHI_LAN_ONLY"), false),
-		NodeLANNetworks:                 NetworkScope_ParseNetworks(os.Getenv("DAOCHI_LAN_NETWORKS")),
+		NodeDisplayName:                 baselineEnvString("MESH_NODE_NAME", "Mesh Node"),
+		LANDiscovery:                    ConfigValues_Bool(os.Getenv("MESH_LAN_DISCOVERY"), true),
+		NodeLANOnly:                     ConfigValues_Bool(os.Getenv("MESH_LAN_ONLY"), false),
+		NodeLANNetworks:                 NetworkScope_ParseNetworks(os.Getenv("MESH_LAN_NETWORKS")),
 		WaoziIssuerPublicKey:            issuerPublic,
 		WaoziIssuerPrivateKey:           issuerPrivate,
-		TokenProducts:                   ConfigValues_Products(baselineEnvString("DAOCHI_TOKEN_PRODUCTS", "")),
-		GooglePackageNames:              Sets_FromEnvironment(baselineEnvString("DAOCHI_GOOGLE_PACKAGE_NAMES", "")),
-		GoogleServiceAccountJSON:        baselineEnvStringOrFile("DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON", "DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", ""),
-		GoogleOAuthClientJSON:           baselineEnvStringOrFile("DAOCHI_GOOGLE_OAUTH_CLIENT_JSON", "DAOCHI_GOOGLE_OAUTH_CLIENT_JSON_FILE", ""),
-		GoogleOAuthRefreshToken:         baselineEnvStringOrFile("DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN", "DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", ""),
+		TokenProducts:                   ConfigValues_Products(baselineEnvString("MESH_TOKEN_PRODUCTS", "")),
+		GooglePackageNames:              Sets_FromEnvironment(baselineEnvString("MESH_GOOGLE_PACKAGE_NAMES", "")),
+		GoogleServiceAccountJSON:        baselineEnvStringOrFile("MESH_GOOGLE_SERVICE_ACCOUNT_JSON", "MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", ""),
+		GoogleOAuthClientJSON:           baselineEnvStringOrFile("MESH_GOOGLE_OAUTH_CLIENT_JSON", "MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE", ""),
+		GoogleOAuthRefreshToken:         baselineEnvStringOrFile("MESH_GOOGLE_OAUTH_REFRESH_TOKEN", "MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", ""),
 		MoneroWalletRPCURL:              baselineEnvString("MONERO_WALLET_RPC_URL", ""),
 		MoneroWalletRPCUser:             baselineEnvString("MONERO_WALLET_RPC_USER", ""),
 		MoneroWalletRPCPassword:         baselineEnvStringOrFile("MONERO_WALLET_RPC_PASSWORD", "MONERO_WALLET_RPC_PASSWORD_FILE", ""),
@@ -151,18 +151,18 @@ func baselineLoadConfig() BaselineConfig {
 		MoneroRateTokenUnits:            baselineEnvInt64("MONERO_RATE_TOKEN_UNITS", 0),
 		MoneroMinimumAtomicAmount:       baselineEnvInt64("MONERO_MINIMUM_ATOMIC_AMOUNT", 1),
 		MoneroConfirmationsRequired:     baselineEnvInt64("MONERO_CONFIRMATIONS_REQUIRED", 10),
-		TokenDirectPurchasesEnabled:     ConfigValues_Bool(os.Getenv("DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED"), false),
-		ChatAPIKey:                      baselineEnvStringOrFile("DAOCHI_CHAT_API_KEY", "DAOCHI_CHAT_API_KEY_FILE", ""),
-		ChatAPIEndpoint:                 baselineEnvString("DAOCHI_CHAT_ENDPOINT", ""),
-		FeedbackToken:                   baselineEnvStringOrFile("DAOCHI_FEEDBACK_TOKEN", "DAOCHI_FEEDBACK_TOKEN_FILE", ""),
-		LumiBotToken:                    baselineEnvStringOrFile("DAOCHI_LUMI_BOT_TOKEN", "DAOCHI_LUMI_BOT_TOKEN_FILE", ""),
-		LumiWebhookSecret:               baselineEnvStringOrFile("DAOCHI_LUMI_WEBHOOK_SECRET", "DAOCHI_LUMI_WEBHOOK_SECRET_FILE", ""),
-		LumiOwnerID:                     baselineEnvString("DAOCHI_LUMI_OWNER_ID", ""),
-		TelegramAccountsEnabled:         ConfigValues_Bool(os.Getenv("DAOCHI_TELEGRAM_ACCOUNTS_ENABLED"), false),
-		LumiCanvasURL:                   baselineEnvString("DAOCHI_LUMI_CANVAS_URL", "https://inbe.waozi.xyz/build/telegram/index.html"),
-		ChatModel:                       baselineEnvString("DAOCHI_CHAT_MODEL", "glm-4.7-flash"),
-		ChatDailyLimit:                  baselineEnvInt64("DAOCHI_CHAT_DAILY_LIMIT", 20),
-		ChatGlobalDailyLimit:            baselineEnvInt64("DAOCHI_CHAT_GLOBAL_DAILY_LIMIT", 1000),
+		TokenDirectPurchasesEnabled:     ConfigValues_Bool(os.Getenv("MESH_TOKEN_DIRECT_PURCHASES_ENABLED"), false),
+		ChatAPIKey:                      baselineEnvStringOrFile("MESH_CHAT_API_KEY", "MESH_CHAT_API_KEY_FILE", ""),
+		ChatAPIEndpoint:                 baselineEnvString("MESH_CHAT_ENDPOINT", ""),
+		FeedbackToken:                   baselineEnvStringOrFile("MESH_FEEDBACK_TOKEN", "MESH_FEEDBACK_TOKEN_FILE", ""),
+		LumiBotToken:                    baselineEnvStringOrFile("MESH_LUMI_BOT_TOKEN", "MESH_LUMI_BOT_TOKEN_FILE", ""),
+		LumiWebhookSecret:               baselineEnvStringOrFile("MESH_LUMI_WEBHOOK_SECRET", "MESH_LUMI_WEBHOOK_SECRET_FILE", ""),
+		LumiOwnerID:                     baselineEnvString("MESH_LUMI_OWNER_ID", ""),
+		TelegramAccountsEnabled:         ConfigValues_Bool(os.Getenv("MESH_TELEGRAM_ACCOUNTS_ENABLED"), false),
+		LumiCanvasURL:                   baselineEnvString("MESH_LUMI_CANVAS_URL", "https://inbe.waozi.xyz/build/telegram/index.html"),
+		ChatModel:                       baselineEnvString("MESH_CHAT_MODEL", "glm-4.7-flash"),
+		ChatDailyLimit:                  baselineEnvInt64("MESH_CHAT_DAILY_LIMIT", 20),
+		ChatGlobalDailyLimit:            baselineEnvInt64("MESH_CHAT_GLOBAL_DAILY_LIMIT", 1000),
 	}
 }
 
@@ -271,63 +271,63 @@ func baselineEnvBytesHexOrFile(key, fileKey string, fallback []byte) []byte {
 }
 
 var configEnvironmentKeys = []string{
-	"DAOCHI_LUMI_BOT_TOKEN",
-	"DAOCHI_LUMI_BOT_TOKEN_FILE",
-	"DAOCHI_LUMI_WEBHOOK_SECRET",
-	"DAOCHI_LUMI_WEBHOOK_SECRET_FILE",
-	"DAOCHI_LUMI_OWNER_ID",
-	"DAOCHI_LUMI_GROUP_ID",
-	"DAOCHI_LUMI_CANVAS_URL",
-	"DAOCHI_TELEGRAM_ACCOUNTS_ENABLED",
-	"DAOCHI_ADDR",
-	"DAOCHI_ADMIN_TOKEN",
-	"DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET",
-	"DAOCHI_BASE_URL",
-	"DAOCHI_CHALLENGE_TTL_SECONDS",
-	"DAOCHI_CHAT_API_KEY",
-	"DAOCHI_CHAT_API_KEY_FILE",
-	"DAOCHI_CHAT_ENDPOINT",
-	"DAOCHI_CHAT_MODEL",
-	"DAOCHI_CHAT_DAILY_LIMIT",
-	"DAOCHI_CHAT_GLOBAL_DAILY_LIMIT",
-	"DAOCHI_FEEDBACK_TOKEN",
-	"DAOCHI_FEEDBACK_TOKEN_FILE",
-	"DAOCHI_DB",
-	"DAOCHI_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES",
-	"DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN",
-	"DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS",
-	"DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES",
-	"DAOCHI_TRASH_PURGE_DAYS",
-	"DAOCHI_GOOGLE_OAUTH_CLIENT_JSON",
-	"DAOCHI_GOOGLE_OAUTH_CLIENT_JSON_FILE",
-	"DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN",
-	"DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN_FILE",
-	"DAOCHI_GOOGLE_PACKAGE_NAMES",
-	"DAOCHI_GOOGLE_PACKAGE_APPS",
-	"DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON",
-	"DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE",
-	"DAOCHI_KNOWN_NODES",
-	"DAOCHI_LAN_DISCOVERY",
-	"DAOCHI_MAX_BODY_BYTES",
-	"DAOCHI_NODE_IDENTITY_KEY_FILE",
-	"DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX",
-	"DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE",
-	"DAOCHI_NODE_NAME",
-	"DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX",
-	"DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE",
-	"DAOCHI_NODE_SYNC_BATCH_LIMIT",
-	"DAOCHI_NODE_SYNC_INTERVAL_SECONDS",
-	"DAOCHI_NODE_SYNC_TOKEN",
-	"DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED",
-	"DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX",
-	"DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE",
-	"DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX",
-	"DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE",
-	"DAOCHI_TOKEN_PRODUCTS",
-	"DAOCHI_TOKEN_SECRET_HEX",
-	"DAOCHI_TOKEN_TTL_SECONDS",
-	"DAOCHI_STORAGE_PLANS_ENABLED",
-	"DAOCHI_UNLOCK_TRIAL_UNTIL",
+	"MESH_LUMI_BOT_TOKEN",
+	"MESH_LUMI_BOT_TOKEN_FILE",
+	"MESH_LUMI_WEBHOOK_SECRET",
+	"MESH_LUMI_WEBHOOK_SECRET_FILE",
+	"MESH_LUMI_OWNER_ID",
+	"MESH_LUMI_GROUP_ID",
+	"MESH_LUMI_CANVAS_URL",
+	"MESH_TELEGRAM_ACCOUNTS_ENABLED",
+	"MESH_ADDR",
+	"MESH_ADMIN_TOKEN",
+	"MESH_ALLOW_EPHEMERAL_TOKEN_SECRET",
+	"MESH_BASE_URL",
+	"MESH_CHALLENGE_TTL_SECONDS",
+	"MESH_CHAT_API_KEY",
+	"MESH_CHAT_API_KEY_FILE",
+	"MESH_CHAT_ENDPOINT",
+	"MESH_CHAT_MODEL",
+	"MESH_CHAT_DAILY_LIMIT",
+	"MESH_CHAT_GLOBAL_DAILY_LIMIT",
+	"MESH_FEEDBACK_TOKEN",
+	"MESH_FEEDBACK_TOKEN_FILE",
+	"MESH_DB",
+	"MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES",
+	"MESH_ENCRYPTED_PAYLOAD_MAX_RETURN",
+	"MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS",
+	"MESH_ACCOUNT_STORAGE_LIMIT_BYTES",
+	"MESH_TRASH_PURGE_DAYS",
+	"MESH_GOOGLE_OAUTH_CLIENT_JSON",
+	"MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE",
+	"MESH_GOOGLE_OAUTH_REFRESH_TOKEN",
+	"MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE",
+	"MESH_GOOGLE_PACKAGE_NAMES",
+	"MESH_GOOGLE_PACKAGE_APPS",
+	"MESH_GOOGLE_SERVICE_ACCOUNT_JSON",
+	"MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE",
+	"MESH_KNOWN_NODES",
+	"MESH_LAN_DISCOVERY",
+	"MESH_MAX_BODY_BYTES",
+	"MESH_NODE_IDENTITY_KEY_FILE",
+	"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX",
+	"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE",
+	"MESH_NODE_NAME",
+	"MESH_NODE_REGISTRY_PUBLIC_KEY_HEX",
+	"MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE",
+	"MESH_NODE_SYNC_BATCH_LIMIT",
+	"MESH_NODE_SYNC_INTERVAL_SECONDS",
+	"MESH_NODE_SYNC_TOKEN",
+	"MESH_TOKEN_DIRECT_PURCHASES_ENABLED",
+	"MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX",
+	"MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE",
+	"MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX",
+	"MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE",
+	"MESH_TOKEN_PRODUCTS",
+	"MESH_TOKEN_SECRET_HEX",
+	"MESH_TOKEN_TTL_SECONDS",
+	"MESH_STORAGE_PLANS_ENABLED",
+	"MESH_UNLOCK_TRIAL_UNTIL",
 	"MONERO_CONFIRMATIONS_REQUIRED",
 	"MONERO_MINIMUM_ATOMIC_AMOUNT",
 	"MONERO_NETWORK",
@@ -344,7 +344,7 @@ func clearConfigEnvironment(t *testing.T) {
 	for _, key := range configEnvironmentKeys {
 		t.Setenv(key, "")
 	}
-	t.Setenv("DAOCHI_TOKEN_SECRET_HEX", strings.Repeat("11", 32))
+	t.Setenv("MESH_TOKEN_SECRET_HEX", strings.Repeat("11", 32))
 }
 
 func assertConfigurationMatchesBaseline(t *testing.T) Config {
@@ -378,7 +378,7 @@ func TestLumiGroupConfiguration(t *testing.T) {
 	if configuration.LumiGroupID != 0 {
 		t.Fatal("group replies enabled by default")
 	}
-	t.Setenv("DAOCHI_LUMI_GROUP_ID", "-1001234")
+	t.Setenv("MESH_LUMI_GROUP_ID", "-1001234")
 	configuration = Config_Load()
 	if configuration.LumiGroupID != -1001234 {
 		t.Fatal("explicit group route was not loaded")
@@ -389,7 +389,7 @@ func TestZiranConfigDefaultsAndKeyIdentity(t *testing.T) {
 	clearConfigEnvironment(t)
 	assertConfigurationMatchesBaseline(t)
 	for _, privateKeySize := range []int{1, 31, 32, 33, 64, 65} {
-		t.Setenv("DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX", strings.Repeat("22", privateKeySize))
+		t.Setenv("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", strings.Repeat("22", privateKeySize))
 		actual := assertConfigurationMatchesBaseline(t)
 		if len(actual.WaoziIssuerPrivateKey) == ed25519.PrivateKeySize {
 			before := append([]byte(nil), actual.WaoziIssuerPrivateKey...)
@@ -402,14 +402,14 @@ func TestZiranConfigDefaultsAndKeyIdentity(t *testing.T) {
 			}
 		}
 	}
-	t.Setenv("DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX", "abcdef")
-	t.Setenv("DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX", "111213")
+	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "abcdef")
+	t.Setenv("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "111213")
 	for _, nodeKeySize := range []int{0, 32, 64} {
-		t.Setenv("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", strings.Repeat("33", nodeKeySize))
+		t.Setenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", strings.Repeat("33", nodeKeySize))
 		assertConfigurationMatchesBaseline(t)
 	}
-	t.Setenv("DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX", "")
-	t.Setenv("DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX", "malformed")
+	t.Setenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "")
+	t.Setenv("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "malformed")
 	assertConfigurationMatchesBaseline(t)
 }
 
@@ -448,21 +448,21 @@ func TestZiranConfigEnvironmentAndFiles(t *testing.T) {
 			t.Fatalf("strict hexadecimal decoding: got %#v, want %#v", got, want)
 		}
 	}
-	t.Setenv("DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", file)
-	t.Setenv("DAOCHI_GOOGLE_OAUTH_CLIENT_JSON_FILE", file)
-	t.Setenv("DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", file)
+	t.Setenv("MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE", file)
+	t.Setenv("MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE", file)
+	t.Setenv("MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", file)
 	t.Setenv("MONERO_WALLET_RPC_PASSWORD_FILE", file)
-	t.Setenv("DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX", "malformed")
-	t.Setenv("DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", file)
-	t.Setenv("DAOCHI_DB", "database\nname")
-	t.Setenv("DAOCHI_NODE_NAME", "node😀")
-	t.Setenv("DAOCHI_ADDR", "[::1]:8090")
-	t.Setenv("DAOCHI_BASE_URL", " https://example.test ")
-	t.Setenv("DAOCHI_KNOWN_NODES", "Node=https://peer.test;mode=pull;apps=a+b")
-	t.Setenv("DAOCHI_TOKEN_PRODUCTS", "coins:100:999")
-	t.Setenv("DAOCHI_GOOGLE_PACKAGE_NAMES", " com.a , com.b ")
-	t.Setenv("DAOCHI_LAN_DISCOVERY", "OFF")
-	t.Setenv("DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED", "yes")
+	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "malformed")
+	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", file)
+	t.Setenv("MESH_DB", "database\nname")
+	t.Setenv("MESH_NODE_NAME", "node😀")
+	t.Setenv("MESH_ADDR", "[::1]:8090")
+	t.Setenv("MESH_BASE_URL", " https://example.test ")
+	t.Setenv("MESH_KNOWN_NODES", "Node=https://peer.test;mode=pull;apps=a+b")
+	t.Setenv("MESH_TOKEN_PRODUCTS", "coins:100:999")
+	t.Setenv("MESH_GOOGLE_PACKAGE_NAMES", " com.a , com.b ")
+	t.Setenv("MESH_LAN_DISCOVERY", "OFF")
+	t.Setenv("MESH_TOKEN_DIRECT_PURCHASES_ENABLED", "yes")
 	assertConfigurationMatchesBaseline(t)
 }
 
@@ -483,9 +483,9 @@ func TestZiranConfigIntegerAndDurationBoundaries(t *testing.T) {
 			t.Fatalf("days %q: got %d, want %d", value, got, want)
 		}
 	}
-	t.Setenv("DAOCHI_TOKEN_TTL_SECONDS", "9223372036854775807")
-	t.Setenv("DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS", "9223372036854775807")
-	t.Setenv("DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES", "10485760")
+	t.Setenv("MESH_TOKEN_TTL_SECONDS", "9223372036854775807")
+	t.Setenv("MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS", "9223372036854775807")
+	t.Setenv("MESH_ACCOUNT_STORAGE_LIMIT_BYTES", "10485760")
 	t.Setenv("MONERO_CONFIRMATIONS_REQUIRED", "9223372036854775807")
 	actual := assertConfigurationMatchesBaseline(t)
 	if actual.MoneroConfirmationsRequired != math.MaxInt64 {
@@ -495,8 +495,8 @@ func TestZiranConfigIntegerAndDurationBoundaries(t *testing.T) {
 
 func TestZiranConfigEphemeralSecret(t *testing.T) {
 	clearConfigEnvironment(t)
-	t.Setenv("DAOCHI_TOKEN_SECRET_HEX", "11")
-	t.Setenv("DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET", "true")
+	t.Setenv("MESH_TOKEN_SECRET_HEX", "11")
+	t.Setenv("MESH_ALLOW_EPHEMERAL_TOKEN_SECRET", "true")
 	first := Config_Load()
 	second := Config_Load()
 	if !first.TokenSecretEphemeral || len(first.TokenSecret) != 32 || bytes.Equal(first.TokenSecret, second.TokenSecret) {
@@ -560,10 +560,10 @@ func TestZiranConfigFatalMessagesAgainstBaseline(t *testing.T) {
 		operation string
 		settings  map[string]string
 	}{
-		{"load", map[string]string{"DAOCHI_TOKEN_SECRET_HEX": ""}},
-		{"load", map[string]string{"DAOCHI_TOKEN_SECRET_HEX": "11"}},
-		{"load", map[string]string{"DAOCHI_TOKEN_SECRET_HEX": "malformed", "DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET": "1"}},
-		{"load", map[string]string{"DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX": "11"}},
+		{"load", map[string]string{"MESH_TOKEN_SECRET_HEX": ""}},
+		{"load", map[string]string{"MESH_TOKEN_SECRET_HEX": "11"}},
+		{"load", map[string]string{"MESH_TOKEN_SECRET_HEX": "malformed", "MESH_ALLOW_EPHEMERAL_TOKEN_SECRET": "1"}},
+		{"load", map[string]string{"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX": "11"}},
 		{"seconds", map[string]string{"CONFIG_TEST_VALUE": " 1"}},
 		{"days", map[string]string{"CONFIG_TEST_VALUE": "1.5"}},
 		{"integer", map[string]string{"CONFIG_TEST_VALUE": "9223372036854775808"}},

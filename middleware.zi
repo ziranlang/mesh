@@ -1,3 +1,4 @@
+wire :: #import "wire_headers";
 #import "std/go_types"
 http :: #import "std/http_go";
 url :: #import "std/url_go";
@@ -111,13 +112,13 @@ ServeHTTP :: (middleware: *Middleware, output: http.ResponseWriter,
     FinishAtReturn(Finish, writer, middleware.metrics, request, start)
     http.SetHeader(Header(writer), "X-Content-Type-Options", "nosniff")
     http.SetHeader(Header(writer), "Cache-Control", "no-store")
-    origin := AllowedOrigin(http.HeaderValue(http.Headers(request), "Origin"))
+    origin := AllowedOrigin(wire.Value(http.Headers(request), "Origin"))
     if origin != "" {
         http.SetHeader(Header(writer), "Access-Control-Allow-Origin", origin)
         http.SetHeader(Header(writer), "Vary", "Origin")
     }
     http.SetHeader(Header(writer), "Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-    http.SetHeader(Header(writer), "Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Encoding, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature")
+    http.SetHeader(Header(writer), "Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Encoding, X-Mesh-User, X-Mesh-Signature, X-Mesh-Tx, X-Mesh-Delegate, X-Mesh-Client, X-Mesh-Since-Version, X-Mesh-Limit, X-Mesh-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin")
     if http.Method(request) == "OPTIONS" {
         WriteHeader(writer, cast(isize)204)
         return
@@ -135,10 +136,8 @@ AllowedOrigin :: (origin: string) -> string {
         RawQuery(value) != "" || Fragment(value) != "" || User(value) != null {
         return ""
     }
-    if origin == "https://daochi.pages.dev" ||
-        origin == "https://daochi.kryonlabs.com" ||
-        origin == "https://daochi.net" ||
-        origin == "https://www.daochi.net" ||
+    if origin == "https://mesh-bew.pages.dev" ||
+        origin == "https://mesh.ziran-lang.org" ||
         origin == "https://inbe.waozi.xyz" ||
         origin == "https://uku.waozi.xyz" ||
         origin == "https://shovey.waozi.xyz" ||

@@ -394,9 +394,9 @@ func TestZiranStartupStoreCleanupOnPanicAgainstBaseline(t *testing.T) {
 			}
 			failures[implementation] = boundaryRecover(func() {
 				if implementation == 0 {
-					Startup_Run(cfg, []string{"daochi"}, factory, signAccountProof)
+					Startup_Run(cfg, []string{"mesh"}, factory, signAccountProof)
 				} else {
-					baselineStartupRun(cfg, []string{"daochi"}, factory, signAccountProof)
+					baselineStartupRun(cfg, []string{"mesh"}, factory, signAccountProof)
 				}
 			})
 			if descriptors := startupStoreDescriptors(t, cfg.DBPath); len(descriptors) != 0 {

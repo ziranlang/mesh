@@ -61,7 +61,7 @@ func (s *middlewareBaseline) withCommonHeaders(next http.Handler) http.Handler {
 			w.Header().Set("Vary", "Origin")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Encoding, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-Encoding, X-Mesh-User, X-Mesh-Signature, X-Mesh-Tx, X-Mesh-Delegate, X-Mesh-Client, X-Mesh-Since-Version, X-Mesh-Limit, X-Mesh-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -76,10 +76,8 @@ func baselineAllowedOrigin(origin string) string {
 		u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 		return ""
 	}
-	if origin == "https://daochi.pages.dev" ||
-		origin == "https://daochi.kryonlabs.com" ||
-		origin == "https://daochi.net" ||
-		origin == "https://www.daochi.net" ||
+	if origin == "https://mesh-bew.pages.dev" ||
+		origin == "https://mesh.ziran-lang.org" ||
 		origin == "https://inbe.waozi.xyz" ||
 		origin == "https://uku.waozi.xyz" {
 		return origin

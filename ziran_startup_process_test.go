@@ -27,7 +27,7 @@ type startupArgumentReader struct {
 }
 
 func (reader startupArgumentReader) Read(value []byte) (int, error) {
-	os.Args = []string{"daochi", "inspect", "summary"}
+	os.Args = []string{"mesh", "inspect", "summary"}
 	return reader.source.Read(value)
 }
 
@@ -45,15 +45,15 @@ func TestZiranStartupProcessHelper(t *testing.T) {
 			return attribute
 		},
 	})))
-	os.Args = []string{"daochi"}
+	os.Args = []string{"mesh"}
 	if strings.HasPrefix(mode, "inspect") || mode == "key error" || mode == "invalid key file" || mode == "configuration error" {
-		os.Args = []string{"daochi", "inspect", "summary"}
+		os.Args = []string{"mesh", "inspect", "summary"}
 	}
 	if mode == "inspect invalid" {
-		os.Args = []string{"daochi", "inspect", "unknown-command"}
+		os.Args = []string{"mesh", "inspect", "unknown-command"}
 	}
 	if mode == "inspect argument timing" {
-		os.Args = []string{"daochi"}
+		os.Args = []string{"mesh"}
 		secureRandom.Reader = startupArgumentReader{source: secureRandom.Reader}
 	}
 	baseline := os.Getenv("STARTUP_PORT_BASELINE") == "1"
@@ -95,30 +95,30 @@ func startupProcess(t *testing.T, mode string, baseline bool, root string, addre
 		"PATH=" + os.Getenv("PATH"),
 		"STARTUP_PORT_CASE=" + mode,
 		fmt.Sprintf("STARTUP_PORT_BASELINE=%d", boolCount(baseline)),
-		"DAOCHI_TOKEN_SECRET_HEX=" + strings.Repeat("11", 32),
-		"DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX=" + hex.EncodeToString(ed25519.NewKeyFromSeed(bytes.Repeat([]byte{42}, ed25519.SeedSize))),
-		"DAOCHI_NODE_IDENTITY_KEY_FILE=" + filepath.Join(root, "node.key"),
-		"DAOCHI_DB=" + filepath.Join(root, "startup.sqlite"),
-		"DAOCHI_ADDR=" + address,
-		"DAOCHI_BASE_URL=https://example.com",
-		"DAOCHI_LAN_DISCOVERY=0",
-		"DAOCHI_NODE_SYNC_INTERVAL_SECONDS=0",
-		"DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED=0",
+		"MESH_TOKEN_SECRET_HEX=" + strings.Repeat("11", 32),
+		"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX=" + hex.EncodeToString(ed25519.NewKeyFromSeed(bytes.Repeat([]byte{42}, ed25519.SeedSize))),
+		"MESH_NODE_IDENTITY_KEY_FILE=" + filepath.Join(root, "node.key"),
+		"MESH_DB=" + filepath.Join(root, "startup.sqlite"),
+		"MESH_ADDR=" + address,
+		"MESH_BASE_URL=https://example.com",
+		"MESH_LAN_DISCOVERY=0",
+		"MESH_NODE_SYNC_INTERVAL_SECONDS=0",
+		"MESH_TOKEN_DIRECT_PURCHASES_ENABLED=0",
 	}
 	// Each replacement is appended deliberately; exec.Cmd uses the final value.
 	switch mode {
 	case "signal":
-		command.Env = append(command.Env, "DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED=1")
+		command.Env = append(command.Env, "MESH_TOKEN_DIRECT_PURCHASES_ENABLED=1")
 	case "key error":
-		command.Env = append(command.Env, "DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX=", "DAOCHI_NODE_IDENTITY_KEY_FILE= ")
+		command.Env = append(command.Env, "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX=", "MESH_NODE_IDENTITY_KEY_FILE= ")
 	case "invalid key file", "inspect create key", "inspect argument timing":
-		command.Env = append(command.Env, "DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX=")
+		command.Env = append(command.Env, "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX=")
 	case "configuration error":
-		command.Env = append(command.Env, "DAOCHI_TOKEN_SECRET_HEX=11")
+		command.Env = append(command.Env, "MESH_TOKEN_SECRET_HEX=11")
 	case "store error":
-		command.Env = append(command.Env, "DAOCHI_DB="+root)
+		command.Env = append(command.Env, "MESH_DB="+root)
 	case "inspect missing":
-		command.Env = append(command.Env, "DAOCHI_DB="+filepath.Join(root, "missing.sqlite"))
+		command.Env = append(command.Env, "MESH_DB="+filepath.Join(root, "missing.sqlite"))
 	}
 	return command
 }

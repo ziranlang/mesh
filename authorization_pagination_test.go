@@ -158,7 +158,7 @@ func TestAuthorizationDelegatedOversizedRecordRollsBackNonceAndWrites(t *testing
 	}
 	request := fixture.delegateRequest(t, input)
 	var proof RequestProof
-	if err := json.Unmarshal([]byte(request.Header.Get("X-Daochi-Delegate")), &proof); err != nil {
+	if err := json.Unmarshal([]byte(request.Header.Get("X-Mesh-Delegate")), &proof); err != nil {
 		t.Fatal(err)
 	}
 	result := authorizationServe(fixture, request)

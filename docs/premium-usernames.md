@@ -3,7 +3,7 @@
 Usernames (account aliases) accept **4–32 characters** from `a-z`, `0-9` and
 `_`. Whitespace and a leading `@` are removed and letters become lowercase.
 
-The Waozi public node enables `DAOCHI_PREMIUM_ALIASES_ENABLED=true` through
+The Waozi public node enables `MESH_PREMIUM_ALIASES_ENABLED=true` through
 `deploy/node.env`. Other nodes keep free claims unless their operator enables
 the policy. Prices are one-time DEW charges for a new claim:
 

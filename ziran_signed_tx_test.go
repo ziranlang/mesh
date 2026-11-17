@@ -71,7 +71,7 @@ func TestZiranSignedTransactionHeaderAgainstBaseline(t *testing.T) {
 	}
 	for _, value := range values {
 		request := httptest.NewRequest(http.MethodPost, "/signed", nil)
-		request.Header.Set("X-Daochi-Tx", value)
+		request.Header.Set("X-Mesh-Tx", value)
 		got := SignedTx_ReadHeader(request)
 		want, err := baselineReadSignedTxHeader(request)
 		if !reflect.DeepEqual(got.Value, want) || !equalAuthenticationError(AuthenticationError_Convert(got.Authentication), err) {
@@ -360,7 +360,7 @@ func TestZiranSignedHeaderJSONKeepsReleasedTags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request.Header.Set("X-Daochi-Tx", string(raw))
+	request.Header.Set("X-Mesh-Tx", string(raw))
 	got := SignedTx_ReadHeader(request)
 	if err := AuthenticationError_Convert(got.Authentication); err != nil || !reflect.DeepEqual(got.Value, tx) {
 		t.Fatalf("signed header JSON = %#v, %v", got, err)

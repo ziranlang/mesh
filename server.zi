@@ -68,7 +68,7 @@ payment :: #import "payment_state";
 go_http :: #system_library "go:net/http";
 builtin :: #system_library "go:builtin";
 
-daochiSignatureContext :: "daochi-sync-v1";
+meshSignatureContext :: "daochi-sync-v1";
 legacySyncSignatureContext :: "ksync-sync-v1";
 legacyInbeSignatureContext :: "inbe-sync-v1";
 errSignedTxReplay: Error = errors.New("signed transaction replay");

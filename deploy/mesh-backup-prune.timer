@@ -1,5 +1,5 @@
 [Unit]
-Description=Delete Daochi deploy backups older than 28 days, daily
+Description=Delete Mesh deploy backups older than 28 days, daily
 
 [Timer]
 OnCalendar=daily

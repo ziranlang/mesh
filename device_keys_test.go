@@ -84,7 +84,7 @@ func TestDeviceKeyRegistrationReplayAndRevocation(t *testing.T) {
 		t.Fatalf("revoked device remains active: found=%v err=%v", active.Found, active.Error)
 	}
 	revokedRequest := httptest.NewRequest(http.MethodGet, "/api/v1/tokens/balance", nil)
-	revokedRequest.Header.Set("X-Daochi-User", identity.UserID)
+	revokedRequest.Header.Set("X-Mesh-User", identity.UserID)
 	revokedRequest.Header.Set("Authorization", "Bearer "+identity.Token)
 	revokedResponse := httptest.NewRecorder()
 	handler.ServeHTTP(revokedResponse, revokedRequest)

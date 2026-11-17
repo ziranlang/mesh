@@ -18,7 +18,7 @@ import (
 // Opt-in loopback fixture: real ML-DSA auth and production referral routes.
 // Synthetic control endpoints exist only in this test, never in the server.
 func TestReferralBrowserFixture(t *testing.T) {
-	report := os.Getenv("DAOCHI_REFERRAL_FIXTURE_REPORT")
+	report := os.Getenv("MESH_REFERRAL_FIXTURE_REPORT")
 	if report == "" {
 		t.Skip("opt-in referral browser fixture")
 	}

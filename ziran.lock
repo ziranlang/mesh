@@ -137,7 +137,7 @@
   "root": {
     "dependencies": {"shovey": "p996a48e854c61f5a"},
     "dependency_refs": {"shovey": "master"},
-    "name": "Daochi"
+    "name": "Mesh"
   },
   "toolchain": {
     "commit": "e4e8efa4a92f36e2fb0cea1d56b11471afa68621",

@@ -58,7 +58,7 @@ func baselineStartupRun(cfg Config, arguments []string, create VerifierFactory, 
 		log.Fatalf("create verifier: %v", err)
 	}
 
-	daochi := Server_New(cfg, store, verifier, signer)
+	mesh := Server_New(cfg, store, verifier, signer)
 	runtimeContext, stopRuntime := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopRuntime()
 	var workers sync.WaitGroup
@@ -69,20 +69,20 @@ func baselineStartupRun(cfg Config, arguments []string, create VerifierFactory, 
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			MoneroInvoices_Run(daochi.monero(), runtimeContext, time.Minute)
+			MoneroInvoices_Run(mesh.monero(), runtimeContext, time.Minute)
 		}()
 	}
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		Mesh_Run(daochi.mesh(), runtimeContext)
+		Mesh_Run(mesh.mesh(), runtimeContext)
 	}()
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
-		Discovery_Run(&daochi.Cfg, &daochi.Node, runtimeContext, Discovery_Register, Discovery_Shutdown)
+		Discovery_Run(&mesh.Cfg, &mesh.Node, runtimeContext, Discovery_Register, Discovery_Shutdown)
 	}()
-	handler := daochi.Routes()
+	handler := mesh.Routes()
 	server := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
@@ -101,7 +101,7 @@ func baselineStartupRun(cfg Config, arguments []string, create VerifierFactory, 
 		}
 	}()
 
-	slog.Info("Daochi sync server listening", "url", baselineLocalHTTPURL(cfg.Addr), "addr", cfg.Addr, "base_url", cfg.BaseURL, "db", cfg.DBPath)
+	slog.Info("Mesh sync server listening", "url", baselineLocalHTTPURL(cfg.Addr), "addr", cfg.Addr, "base_url", cfg.BaseURL, "db", cfg.DBPath)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		slog.Error("serve failed", "error", err)
 	}
@@ -164,7 +164,7 @@ func baselineShutdownOnCancel(server *HTTPServer, ctx context.Context, shutdown 
 
 func baselineServe(server *HTTPServer, cfg Config, ctx context.Context, stop context.CancelFunc, group *WorkerGroup, listen Listen, shutdown Shutdown) {
 	go baselineShutdownOnCancel(server, ctx, shutdown)
-	slog.Info("Daochi sync server listening", "url", baselineLocalHTTPURL(cfg.Addr), "addr", cfg.Addr, "base_url", cfg.BaseURL, "db", cfg.DBPath)
+	slog.Info("Mesh sync server listening", "url", baselineLocalHTTPURL(cfg.Addr), "addr", cfg.Addr, "base_url", cfg.BaseURL, "db", cfg.DBPath)
 	if err := listen(server); err != nil && err != http.ErrServerClosed {
 		slog.Error("serve failed", "error", err)
 	}

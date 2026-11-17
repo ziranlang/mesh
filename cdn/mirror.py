@@ -126,7 +126,7 @@ def main():
         private.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("WRANGLER_LOG_PATH", str(private / "wrangler.log"))
         with (private / f"{options.bucket}.lock").open("a") as lock, \
-                tempfile.TemporaryDirectory(prefix="daochi-r2-mirror-") as temporary:
+                tempfile.TemporaryDirectory(prefix="mesh-r2-mirror-") as temporary:
             fcntl.flock(lock, fcntl.LOCK_EX)
             size = mirror(artifacts, options.bucket, shlex.split(options.wrangler), Path(temporary))
     print(json.dumps({"uploaded": options.execute, "artifacts": len(artifacts), "reserved_bytes": size}))

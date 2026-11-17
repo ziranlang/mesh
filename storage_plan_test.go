@@ -183,7 +183,7 @@ func TestStoragePlansConfigIsOptIn(t *testing.T) {
 	if Config_Load().StoragePlansEnabled {
 		t.Fatal("storage plans enabled without node configuration")
 	}
-	t.Setenv("DAOCHI_STORAGE_PLANS_ENABLED", "true")
+	t.Setenv("MESH_STORAGE_PLANS_ENABLED", "true")
 	if !Config_Load().StoragePlansEnabled {
 		t.Fatal("configured storage plans disabled")
 	}

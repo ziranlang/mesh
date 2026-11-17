@@ -321,7 +321,7 @@ func baselineSocialHttpApplyHeaderUser(r *http.Request, bodyUser *string) error 
 	userHeader := HttpAuth_UserHeader(r)
 	headerUser, headerName := userHeader.Value, userHeader.Name
 	if headerUser == "" {
-		return errors.New("missing X-Daochi-User")
+		return errors.New("missing X-Mesh-User")
 	}
 	if *bodyUser == "" {
 		*bodyUser = headerUser

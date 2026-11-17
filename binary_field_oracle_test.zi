@@ -7,7 +7,7 @@ hex :: #system_library "go:encoding/hex";
 base64 :: #system_library "go:encoding/base64";
 
 // Keep the native Go decoding order, Unicode trimming and non-strict trailing
-// base64 bits as an independent oracle for Daochi's canonical codec.
+// base64 bits as an independent oracle for Mesh's canonical codec.
 #scope_file
 BinaryFieldOracleEncoding :: #type #foreign base64 "Encoding";
 BinaryFieldOracleBytes :: struct {

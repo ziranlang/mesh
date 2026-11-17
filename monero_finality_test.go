@@ -54,7 +54,7 @@ func newF03MoneroWalletRPC(t *testing.T) *f03MoneroWalletRPC {
 		}
 		authorization := request.Header.Get("Authorization")
 		if !strings.HasPrefix(authorization, "Digest ") {
-			writer.Header().Set("WWW-Authenticate", `Digest realm="daochi-test", qop="auth", nonce="f03-nonce", algorithm=SHA-256`)
+			writer.Header().Set("WWW-Authenticate", `Digest realm="mesh-test", qop="auth", nonce="f03-nonce", algorithm=SHA-256`)
 			writer.WriteHeader(http.StatusUnauthorized)
 			return
 		}
@@ -131,7 +131,7 @@ func f03AuthorizationField(authorization string, name string) string {
 }
 
 func f03Digest(authorization string, method string) string {
-	ha1 := f03SHA256("user:daochi-test:digest-password")
+	ha1 := f03SHA256("user:mesh-test:digest-password")
 	ha2 := f03SHA256(method + ":" + f03AuthorizationField(authorization, "uri"))
 	return f03SHA256(strings.Join([]string{
 		ha1,
@@ -150,7 +150,7 @@ func f03SHA256(value string) string {
 
 func f03DigestValid(authorization string, uri string) bool {
 	return f03AuthorizationField(authorization, "username") == "user" &&
-		f03AuthorizationField(authorization, "realm") == "daochi-test" &&
+		f03AuthorizationField(authorization, "realm") == "mesh-test" &&
 		f03AuthorizationField(authorization, "nonce") == "f03-nonce" &&
 		f03AuthorizationField(authorization, "uri") == uri &&
 		f03AuthorizationField(authorization, "algorithm") == "SHA-256" &&

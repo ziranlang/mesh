@@ -106,8 +106,8 @@ func (fixture *authorizationFixture) ownerCall(t *testing.T, path string, input 
 	tx.DeviceSignature = hex.EncodeToString(ed25519.Sign(fixture.device, message))
 	header, _ := json.Marshal(tx)
 	return authorizationCall(t, fixture.handler, path, input, map[string]string{
-		"Authorization": "Bearer " + fixture.owner.Token, "X-Daochi-User": fixture.owner.UserID,
-		"X-Daochi-Tx": string(header),
+		"Authorization": "Bearer " + fixture.owner.Token, "X-Mesh-User": fixture.owner.UserID,
+		"X-Mesh-Tx": string(header),
 	})
 }
 
@@ -180,7 +180,7 @@ func (fixture *authorizationFixture) delegateRequest(t *testing.T, input Delegat
 	proof.Signature = hex.EncodeToString(ed25519.Sign(fixture.delegate, []byte(Session_ProofMessage(proof))))
 	header, _ := json.Marshal(proof)
 	request := httptest.NewRequest("POST", proof.Path, bytes.NewReader(raw))
-	request.Header.Set("X-Daochi-Delegate", string(header))
+	request.Header.Set("X-Mesh-Delegate", string(header))
 	request.Header.Set("Authorization", "Delegate ds1."+fixture.credential.SessionID)
 	return request
 }
@@ -279,7 +279,7 @@ func TestAuthorizationGrantSignatureAndRequestTampering(t *testing.T) {
 		t.Run("request-"+field, func(t *testing.T) {
 			request := fixture.delegateRequest(t, fixture.syncInput())
 			var proof map[string]any
-			if err := json.Unmarshal([]byte(request.Header.Get("X-Daochi-Delegate")), &proof); err != nil {
+			if err := json.Unmarshal([]byte(request.Header.Get("X-Mesh-Delegate")), &proof); err != nil {
 				t.Fatal(err)
 			}
 			if field == "expires_at" {
@@ -288,7 +288,7 @@ func TestAuthorizationGrantSignatureAndRequestTampering(t *testing.T) {
 				proof[field] = "tampered"
 			}
 			header, _ := json.Marshal(proof)
-			request.Header.Set("X-Daochi-Delegate", string(header))
+			request.Header.Set("X-Mesh-Delegate", string(header))
 			result := httptest.NewRecorder()
 			fixture.handler.ServeHTTP(result, request)
 			if result.Code != 401 {
@@ -297,7 +297,7 @@ func TestAuthorizationGrantSignatureAndRequestTampering(t *testing.T) {
 		})
 	}
 	request := fixture.delegateRequest(t, fixture.syncInput())
-	request.Header.Del("X-Daochi-Delegate")
+	request.Header.Del("X-Mesh-Delegate")
 	result := httptest.NewRecorder()
 	fixture.handler.ServeHTTP(result, request)
 	if result.Code != 401 {
@@ -362,14 +362,14 @@ func TestAuthorizationRejectsCaseFoldedProtocolFields(t *testing.T) {
 	fixture := authorizationSetup(t)
 	fixture.connect(t)
 	request := fixture.delegateRequest(t, fixture.syncInput())
-	proof := request.Header.Get("X-Daochi-Delegate")
+	proof := request.Header.Get("X-Mesh-Delegate")
 	for _, malformed := range []string{
 		strings.Replace(proof, `"grant_id":`, `"GRANT_ID":`, 1),
 		strings.Replace(proof, `"grant_id":`, `"GRANT_ID":"ignored","grant_id":`, 1),
 		strings.Replace(proof, `"grant_id":`, `"\u0047rant_id":`, 1),
 	} {
 		clone := fixture.delegateRequest(t, fixture.syncInput())
-		clone.Header.Set("X-Daochi-Delegate", malformed)
+		clone.Header.Set("X-Mesh-Delegate", malformed)
 		if result := authorizationServe(fixture, clone); result.Code != 401 {
 			t.Fatalf("case-folded request field accepted: %d", result.Code)
 		}

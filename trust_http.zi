@@ -149,7 +149,7 @@ NewAcceptance :: (trust: Trust, invite: PairingInvite) -> PairingAcceptanceResul
     addresses := AllocateAddresses(cast(isize)1)
     addresses[0] = TrimRight(TrimSpace(trust.configuration.BaseURL), "/")
     if node.ValidateAddresses(addresses) != null {
-        result.error = errors.New("this node needs a reachable DAOCHI_BASE_URL")
+        result.error = errors.New("this node needs a reachable MESH_BASE_URL")
         return result
     }
     result.value.Version = cast(isize)1
@@ -393,7 +393,7 @@ ResolveName :: (trust: Trust, writer: http.ResponseWriter, request: *http.Reques
     value: NameResponse
     value.claim = resolved.value
     value.ttlSeconds = resolved.value.ExpiresAt - clock.Unix(clock.Now())
-    uriParts: [4]string = .["daochi://", spaceID, "/", name]
+    uriParts: [4]string = .["mesh://", spaceID, "/", name]
     value.uri = Join(uriParts[:], "")
     response.JSON(writer, cast(isize)200, value)
 }

@@ -171,7 +171,7 @@ func TestZiranDeviceHTTPAgainstBaseline(t *testing.T) {
 					case "missing token":
 						request.Header.Del("Authorization")
 					case "user mismatch":
-						request.Header.Set("X-Daochi-User", strings.Repeat("b", 64))
+						request.Header.Set("X-Mesh-User", strings.Repeat("b", 64))
 					case "body limit":
 						server.Cfg.MaxBodyBytes = 1
 					case "closed":

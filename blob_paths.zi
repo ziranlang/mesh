@@ -18,7 +18,7 @@ Document :: #string JSON
     "parameters": [
       {"name":"app_id","in":"path","required":true,"schema":{"type":"string"}},
       {"name":"sha256","in":"path","required":true,"schema":{"type":"string","pattern":"^[0-9a-f]{64}$"}},
-      {"name":"X-Daochi-Tx","in":"header","required":true,"schema":{"type":"string"}}
+      {"name":"X-Mesh-Tx","in":"header","required":true,"schema":{"type":"string"}}
     ],
     "put": {
       "summary":"Store immutable private encrypted bytes on this node",
@@ -53,7 +53,7 @@ TrashDocument :: #string JSON
     "parameters": [
       {"name":"app_id","in":"path","required":true,"schema":{"type":"string"}},
       {"name":"sha256","in":"path","required":true,"schema":{"type":"string","pattern":"^[0-9a-f]{64}$"}},
-      {"name":"X-Daochi-Tx","in":"header","required":true,"schema":{"type":"string"}}
+      {"name":"X-Mesh-Tx","in":"header","required":true,"schema":{"type":"string"}}
     ],
     "post": {
       "summary":"Move an account-private blob to the trash",
@@ -66,7 +66,7 @@ TrashDocument :: #string JSON
     "parameters": [
       {"name":"app_id","in":"path","required":true,"schema":{"type":"string"}},
       {"name":"sha256","in":"path","required":true,"schema":{"type":"string","pattern":"^[0-9a-f]{64}$"}},
-      {"name":"X-Daochi-Tx","in":"header","required":true,"schema":{"type":"string"}}
+      {"name":"X-Mesh-Tx","in":"header","required":true,"schema":{"type":"string"}}
     ],
     "post": {
       "summary":"Take an account-private blob out of the trash",

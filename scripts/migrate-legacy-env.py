@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Preserve deployed settings when migrating Ksync environment names to Daochi."""
+"""Preserve deployed settings when migrating Daochi/Ksync names to Mesh."""
 
 import argparse
 import os
@@ -10,9 +10,9 @@ import time
 
 
 RENAMED_SETTINGS = {
-    "DAOCHI_WAOZI_ISSUER_PRIVATE_KEY_HEX_FILE": "DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE",
-    "DAOCHI_WAOZI_ISSUER_PUBLIC_KEY_HEX_FILE": "DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE",
-    "DAOCHI_MONERO_WALLET_RPC_URL": "MONERO_WALLET_RPC_URL",
+    "MESH_WAOZI_ISSUER_PRIVATE_KEY_HEX_FILE": "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE",
+    "MESH_WAOZI_ISSUER_PUBLIC_KEY_HEX_FILE": "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE",
+    "MESH_MONERO_WALLET_RPC_URL": "MONERO_WALLET_RPC_URL",
 }
 
 
@@ -21,13 +21,13 @@ def migrate(text, canonical_only=False):
     settings = {}
     for line in lines:
         key, separator, value = line.partition("=")
-        if separator and key.startswith(("KSYNC_", "DAOCHI_")):
+        if separator and (key.startswith(("KSYNC_", "DAOCHI_", "MESH_")) or key in RENAMED_SETTINGS.values()):
             settings[key] = value.rstrip("\r\n")
     canonical = dict(settings)
     for key, value in settings.items():
-        if not key.startswith("KSYNC_"):
+        if not key.startswith(("KSYNC_", "DAOCHI_")):
             continue
-        replacement = "DAOCHI_" + key[len("KSYNC_"):]
+        replacement = "MESH_" + key.split("_", 1)[1]
         if replacement in canonical:
             if canonical[replacement] != value:
                 raise ValueError("conflicting settings: " + key + " and " + replacement)
@@ -48,8 +48,8 @@ def migrate(text, canonical_only=False):
                 output.append(line)
                 continue
             replacement = key
-            if key.startswith("KSYNC_"):
-                replacement = "DAOCHI_" + key[len("KSYNC_"):]
+            if key.startswith(("KSYNC_", "DAOCHI_")):
+                replacement = "MESH_" + key.split("_", 1)[1]
             replacement = RENAMED_SETTINGS.get(replacement, replacement)
             if replacement in emitted:
                 continue
@@ -57,7 +57,7 @@ def migrate(text, canonical_only=False):
             emitted.add(replacement)
         for key, value in canonical.items():
             replacement = RENAMED_SETTINGS.get(key, key)
-            if replacement.startswith("KSYNC_") or replacement in emitted:
+            if replacement.startswith(("KSYNC_", "DAOCHI_")) or replacement in emitted:
                 continue
             output.append(replacement + "=" + value + "\n")
             emitted.add(replacement)
@@ -85,7 +85,7 @@ def main():
     if not args.apply:
         print("Legacy environment settings need migration; use --apply")
         return
-    backup = args.path.with_name(args.path.name + ".before-daochi-" + str(time.time_ns()))
+    backup = args.path.with_name(args.path.name + ".before-mesh-" + str(time.time_ns()))
     shutil.copy2(args.path, backup)
     os.chmod(backup, 0o600)
     descriptor, temporary = tempfile.mkstemp(dir=args.path.parent)

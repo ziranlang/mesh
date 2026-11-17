@@ -37,7 +37,7 @@ func (s *Server) baselineRunLANDiscovery(ctx context.Context, register func(stri
 		slog.Warn("LAN discovery unavailable", "error", err)
 		return
 	}
-	slog.Info("advertising Daochi node on LAN", "node_id", s.Node.ID, "port", port)
+	slog.Info("advertising Mesh node on LAN", "node_id", s.Node.ID, "port", port)
 	defer shutdown(server)
 	<-ctx.Done()
 }
@@ -53,7 +53,7 @@ func baselineListenerPort(address string) (int, error) {
 func baselineDiscoveryInstanceName(displayName, nodeID string) string {
 	displayName = strings.TrimSpace(displayName)
 	if displayName == "" {
-		displayName = "Daochi Node"
+		displayName = "Mesh Node"
 	}
 	if len(nodeID) > 12 {
 		nodeID = nodeID[:12]

@@ -94,7 +94,7 @@ func TestZiranMeshTokenCredentialAuthentication(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			request := httptest.NewRequest("POST", "/api/v1/node/mesh/export", nil)
 			if testCase.name == "alias" {
-				request.Header.Set("X-Daochi-Node-Token", testCase.header)
+				request.Header.Set("X-Mesh-Node-Token", testCase.header)
 			} else {
 				request.Header.Set("Authorization", testCase.header)
 			}
@@ -170,10 +170,10 @@ func TestZiranMeshHTTPAgainstBaseline(t *testing.T) {
 					NodeAuth_Sign(identity.ID, identity.PrivateKey, request, encoded)
 				}
 				if mode == "bad signature" {
-					request.Header.Set("X-Daochi-Node-Signature", "bad")
+					request.Header.Set("X-Mesh-Node-Signature", "bad")
 				}
 				if mode == "expired" {
-					request.Header.Set("X-Daochi-Node-Time", "1")
+					request.Header.Set("X-Mesh-Node-Time", "1")
 				}
 				panicValue := errors.New("mesh response panic")
 				var results []*httptest.ResponseRecorder
@@ -319,9 +319,9 @@ func TestZiranMeshPostJSONAgainstBaseline(t *testing.T) {
 							t.Fatalf("mesh timeout or request replay changed: %v, %v", deadline, exists)
 						}
 						if signed {
-							signature, err := base64.RawURLEncoding.DecodeString(request.Header.Get("X-Daochi-Node-Signature"))
-							message := baselineNodeMessage("daochi-node-request-v1", server.Node.ID, request.Header.Get("X-Daochi-Node-Time"), request.Header.Get("X-Daochi-Node-Nonce"), request.Method, request.URL.EscapedPath(), data)
-							if err != nil || !ed25519.Verify(server.Node.PublicKey, []byte(message), signature) || request.Header.Get("X-Daochi-Node-ID") != server.Node.ID || request.Header.Get("Authorization") != "" {
+							signature, err := base64.RawURLEncoding.DecodeString(request.Header.Get("X-Mesh-Node-Signature"))
+							message := baselineNodeMessage("daochi-node-request-v1", server.Node.ID, request.Header.Get("X-Mesh-Node-Time"), request.Header.Get("X-Mesh-Node-Nonce"), request.Method, request.URL.EscapedPath(), data)
+							if err != nil || !ed25519.Verify(server.Node.PublicKey, []byte(message), signature) || request.Header.Get("X-Mesh-Node-ID") != server.Node.ID || request.Header.Get("Authorization") != "" {
 								t.Fatal("mesh request lost node authentication")
 							}
 						} else if request.Header.Get("Authorization") != "Bearer "+server.Cfg.NodeSyncToken {

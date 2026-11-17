@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for immutable Daochi build inputs."""
+"""Tests for immutable Mesh build inputs."""
 
 from pathlib import Path
 import tempfile

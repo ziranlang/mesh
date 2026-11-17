@@ -468,22 +468,22 @@ func TestZiranAccountAccessHTTPAgainstBaseline(t *testing.T) {
 					}
 					request := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(body))
 					request.RemoteAddr = "192.0.2.1:1234"
-					request.Header.Set("X-Daochi-User", user)
-					request.Header.Set("X-Daochi-Signature", signature)
+					request.Header.Set("X-Mesh-User", user)
+					request.Header.Set("X-Mesh-Signature", signature)
 					if mode == "missing header" {
-						request.Header.Del("X-Daochi-User")
+						request.Header.Del("X-Mesh-User")
 					}
 					if mode == "header mismatch" {
-						request.Header.Set("X-Daochi-User", other)
+						request.Header.Set("X-Mesh-User", other)
 					}
 					if mode == "legacy header" {
-						request.Header.Del("X-Daochi-User")
-						request.Header.Del("X-Daochi-Signature")
+						request.Header.Del("X-Mesh-User")
+						request.Header.Del("X-Mesh-Signature")
 						request.Header.Set("X-Inbe-User", user)
 						request.Header.Set("X-Inbe-Signature", signature)
 					}
 					if mode == "bad signature" {
-						request.Header.Set("X-Daochi-Signature", "!")
+						request.Header.Set("X-Mesh-Signature", "!")
 					}
 					if mode == "cancelled" {
 						ctx, cancel := context.WithCancel(t.Context())

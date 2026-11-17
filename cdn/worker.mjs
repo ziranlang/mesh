@@ -54,14 +54,14 @@ function responseHeaders(authorization, hash, size, delivery) {
   headers.set("Content-Type", "application/octet-stream");
   headers.set("Content-Length", String(size));
   headers.set("ETag", `"${hash}"`);
-  headers.set("X-Daochi-Delivery", delivery);
+  headers.set("X-Mesh-Delivery", delivery);
   return headers;
 }
 
 async function originResponse(request, fetchOrigin) {
   const response = await fetchOrigin(request);
   const headers = new Headers(response.headers);
-  headers.set("X-Daochi-Delivery", "origin");
+  headers.set("X-Mesh-Delivery", "origin");
   return new Response(response.body, { status: response.status, headers });
 }
 

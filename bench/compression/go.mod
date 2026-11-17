@@ -1,4 +1,4 @@
-module daochi-compression-bench
+module mesh-compression-bench
 
 go 1.25
 

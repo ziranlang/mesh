@@ -19,7 +19,7 @@ func TestMetricsAdminGate(t *testing.T) {
 
 	wrongToken := httptest.NewRecorder()
 	wrongReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	wrongReq.Header.Set("X-Daochi-Admin", "wrong")
+	wrongReq.Header.Set("X-Mesh-Admin", "wrong")
 	handler.ServeHTTP(wrongToken, wrongReq)
 	if wrongToken.Code != http.StatusUnauthorized {
 		t.Fatalf("metrics with wrong admin token: status=%d, want 401", wrongToken.Code)
@@ -27,7 +27,7 @@ func TestMetricsAdminGate(t *testing.T) {
 
 	authorized := httptest.NewRecorder()
 	authReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
-	authReq.Header.Set("X-Daochi-Admin", "admin-secret")
+	authReq.Header.Set("X-Mesh-Admin", "admin-secret")
 	handler.ServeHTTP(authorized, authReq)
 	if authorized.Code != http.StatusOK || authorized.Body.Len() == 0 {
 		t.Fatalf("metrics with admin token: status=%d body=%d bytes, want 200 with payload", authorized.Code, authorized.Body.Len())

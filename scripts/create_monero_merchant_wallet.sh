@@ -34,7 +34,7 @@ if [ -e "$cold_backup" ] || [ -e "$node_backup" ]; then
   exit 1
 fi
 
-work_dir="$(mktemp -d /tmp/daochi-monero-wallet.XXXXXXXX)"
+work_dir="$(mktemp -d /tmp/mesh-monero-wallet.XXXXXXXX)"
 cleanup() {
   if [ -n "${work_dir:-}" ] && [ -d "$work_dir" ]; then
     find "$work_dir" -type f -exec shred -u {} + 2>/dev/null || true
@@ -78,7 +78,7 @@ view_wallet="$node_dir/waozi-merchant-view"
 openssl rand -base64 48 > "$cold_dir/wallet-password"
 openssl rand -base64 48 > "$node_dir/wallet-password"
 openssl rand -base64 48 > "$node_dir/rpc-password"
-printf '%s\n' 'daochi' > "$node_dir/rpc-user"
+printf '%s\n' 'mesh' > "$node_dir/rpc-user"
 
 echo
 echo "Creating the $network Waozi merchant spend wallet OFFLINE."

@@ -52,7 +52,7 @@ func postSlowly(t *testing.T, client *http.Client, url string, identity testIden
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+identity.Token)
-	request.Header.Set("X-Daochi-User", identity.UserID)
+	request.Header.Set("X-Mesh-User", identity.UserID)
 	response, err := client.Do(request)
 	if err != nil {
 		return 0, "", err
@@ -114,7 +114,7 @@ func serveWithDeadlines(handler http.Handler, method, path string, identity test
 	request.Header.Set("Content-Type", "application/json")
 	if identity.Token != "" {
 		request.Header.Set("Authorization", "Bearer "+identity.Token)
-		request.Header.Set("X-Daochi-User", identity.UserID)
+		request.Header.Set("X-Mesh-User", identity.UserID)
 	}
 	writer := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
 	handler.ServeHTTP(writer, request)

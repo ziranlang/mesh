@@ -181,9 +181,9 @@ func TestZiranInspectOpenReadOnlyAndErrorsAgainstBaseline(t *testing.T) {
 	if _, err := os.Stat(missing); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("inspection created a missing database", err)
 	}
-	t.Setenv("DAOCHI_DB", path)
+	t.Setenv("MESH_DB", path)
 	compareInspectRun(t, context.Background(), "", nil, false)
-	t.Setenv("DAOCHI_DB", " \u2003"+path+"\t")
+	t.Setenv("MESH_DB", " \u2003"+path+"\t")
 	compareInspectRun(t, context.Background(), "", nil, false)
 	compareInspectRun(t, context.Background(), missing, []string{"unknown"}, false)
 }
@@ -226,7 +226,7 @@ func TestZiranInspectNativeWriterAndOptionsAgainstBaseline(t *testing.T) {
 		}
 		outputs[implementation] = string(data)
 	}
-	if outputs[0] != outputs[1] || !strings.HasPrefix(outputs[0], "Daochi data summary\n") {
+	if outputs[0] != outputs[1] || !strings.HasPrefix(outputs[0], "Mesh data summary\n") {
 		t.Fatal("default standard output changed", outputs)
 	}
 	var panics [2]any

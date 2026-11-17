@@ -109,7 +109,7 @@ BuildPage :: () -> string {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Daochi</title>
+<title>Mesh</title>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Mono:ital,wght@0,300;0,400;0,600;1,400&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
 body{font-family:"Noto Sans Mono",ui-monospace,Menlo,monospace;margin:0;line-height:1.85;color:#4a4038;background:linear-gradient(180deg,#f7ede2 0%%,#f2e2d0 60%%,#f7ede2 100%%);font-size:13.5px}
@@ -146,13 +146,13 @@ a{color:#0b625d}
 <main>
 <section class="hero">
 <p class="eyebrow">Offline-first keys for mesh-native sync</p>
-<h1>Daochi</h1>
+<h1>Mesh</h1>
 <p class="lead">Device-created account keys, post-quantum proof of account authority, encrypted records, and remote events for native and web apps. Server-assisted today, built toward a mesh-native network.</p>
 <div class="actions"><a class="button" href="/openapi.json">OpenAPI JSON</a><a class="button secondary" href="/healthz">Health check</a><a class="button secondary" href="/readyz">Readiness</a></div>
 </section>
 PAGE_SECTION_0;
     parts[1] = #string PAGE_SECTION_1
-<section class="grid" aria-label="Daochi capabilities">
+<section class="grid" aria-label="Mesh capabilities">
 <article class="card"><h2>Offline-first keys</h2><p>Clients create the durable ML-DSA-44 account key locally. The relay sees the public key, account hash, and signatures, not the private key.</p></article>
 <article class="card"><h2>Post-quantum account authority</h2><p>The durable account key is ML-DSA-44. Clients prove control with short-lived challenges before receiving operational bearer tokens.</p></article>
 <article class="card"><h2>App-owned records</h2><p>Applications keep ownership of their data while the relay stores versions, opaque encrypted payloads, and shared projections.</p></article>
@@ -161,11 +161,11 @@ PAGE_SECTION_0;
 </section>
 <section class="security" aria-label="Security posture">
 <p><strong>Key creation starts offline.</strong> A device can create its account key before the first network request; first login registers the public key, and later logins prove control with fresh signatures.</p>
-<p><strong>Private records stay client encrypted.</strong> Daochi validates metadata and versions ciphertext, but plaintext and record encryption choices remain with clients and apps.</p>
-<p><strong>The post-quantum proof is account authority.</strong> Daochi uses ML-DSA-44 signatures for identity and account authorization; app manifest keys and token issuer keys are separate Ed25519 authorities.</p>
+<p><strong>Private records stay client encrypted.</strong> Mesh validates metadata and versions ciphertext, but plaintext and record encryption choices remain with clients and apps.</p>
+<p><strong>The post-quantum proof is account authority.</strong> Mesh uses ML-DSA-44 signatures for identity and account authorization; app manifest keys and token issuer keys are separate Ed25519 authorities.</p>
 </section>
 <h2 class="section-title">Implementation guides</h2>
-<section class="grid" aria-label="Daochi implementation guides">
+<section class="grid" aria-label="Mesh implementation guides">
 <article class="card"><h2>Encrypted record profile</h2><p>Recommended private-record envelope, nonce rules, AAD, key rotation, and test-vector shape.</p></article>
 <article class="card"><h2>Developer quickstart</h2><p>Shortest path from account key to login, signed app manifest, encrypted sync, and diagnostics.</p></article>
 <article class="card"><h2>Small node operations</h2><p>Low-resource deployment targets, trust inspection checklist, and rollout checks for home or modest nodes.</p></article>
@@ -173,12 +173,12 @@ PAGE_SECTION_0;
 <h2 class="section-title">API surface</h2>
 <p>Protocol v5 makes encrypted records the primary private-data surface while legacy typed rows remain available for compatibility. Protocol v1 through v5 remain valid through 2027-09-01.</p>
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/apps</code><p>Lists registered apps, collection prefixes, visibility classes, and capabilities.</p></section>
-<section class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>Registers or updates an app when the admin token is set and <code>X-Daochi-Admin</code> matches it. <code>X-Ksync-Admin</code> remains accepted for compatibility.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>Registers or updates an app when the admin token is set and <code>X-Mesh-Admin</code> matches it. <code>X-Ksync-Admin</code> remains accepted for compatibility.</p></section>
 PAGE_SECTION_1;
     parts[2] = #string PAGE_SECTION_2
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/challenge?user_id=&lt;sha256-public-key-hex&gt;</code><p>Issues a single-use 32-byte challenge nonce encoded as lowercase hex.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/sync/login</code><p>Verifies the challenge signature and returns a cacheable bearer token plus server clock time.</p></section>
-<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/ws</code><p>Upgrades to a WebSocket event stream authenticated with <code>Authorization: Bearer &lt;token&gt;</code>, or browser subprotocols <code>daochi-sync-v1, bearer.&lt;token&gt;</code>.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/ws</code><p>Upgrades to a WebSocket event stream authenticated with <code>Authorization: Bearer &lt;token&gt;</code>, or browser subprotocols <code>mesh-sync-v1, bearer.&lt;token&gt;</code>.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/sync</code><p>Applies typed local changes or stores an encrypted envelope, then returns remote changes newer than the requested server version.</p></section>
 <section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/diagnostics</code><p>Returns bearer-authenticated sync state, table counts, compaction position, legacy client hints, and recent sync audit metadata.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/node/pairing/invites</code><p>Creates a short-lived signed pairing payload with explicit replication scope.</p></section>
@@ -220,23 +220,23 @@ PAGE_SECTION_2;
 &lt;sha256 hex of exact raw request body bytes&gt;
 &lt;challenge nonce hex&gt;</pre>
 PAGE_SECTION_3;
-    parts[4] = "<p>Signed requests use <code>X-Daochi-User</code>, <code>X-Daochi-Signature</code>, and <code>Content-Type: application/json</code>. The older Ksync and Inbe signature headers remain accepted for shipped clients.</p>\n%s\n<footer class=\"footer\">&copy; 2026 <a href=\"https://kryonlabs.com\">Kryon Labs</a></footer>\n</main>\n</body>\n</html>"
+    parts[4] = "<p>Signed requests use <code>X-Mesh-User</code>, <code>X-Mesh-Signature</code>, and <code>Content-Type: application/json</code>. The older Ksync and Inbe signature headers remain accepted for shipped clients.</p>\n%s\n<footer class=\"footer\">&copy; 2026 <a href=\"https://ziran-lang.org\">Ziran</a></footer>\n</main>\n</body>\n</html>"
     return Join(parts[:], "")
 }
 
 Info :: () -> Map(string, Any) {
     result: Map(string, Any)
     MapInit(result)
-    MapSet(result, "title", "Daochi API")
+    MapSet(result, "title", "Mesh API")
     MapSet(result, "version", "1.0.0")
     MapSet(result, "description", "Mesh-native sync API for app-owned data. Protocol v1 through v5 remain valid through 2027-09-01; after any future deprecation, the immediately previous version stays valid for at least one additional year.")
-    resultXDaochiProtocolPolicy: Map(string, Any)
-    MapInit(resultXDaochiProtocolPolicy)
-    MapSet(resultXDaochiProtocolPolicy, "min_supported_protocol", cast(isize)MinSupportedProtocol)
-    MapSet(resultXDaochiProtocolPolicy, "latest_protocol", cast(isize)LatestProtocol)
-    MapSet(resultXDaochiProtocolPolicy, "v1_v5_valid_through", CompatibilityDeadline)
-    MapSet(resultXDaochiProtocolPolicy, "previous_version_grace_days_min", cast(isize)PreviousVersionGraceDays)
-    MapSet(result, "x-daochi-protocol-policy", resultXDaochiProtocolPolicy)
+    resultXMeshProtocolPolicy: Map(string, Any)
+    MapInit(resultXMeshProtocolPolicy)
+    MapSet(resultXMeshProtocolPolicy, "min_supported_protocol", cast(isize)MinSupportedProtocol)
+    MapSet(resultXMeshProtocolPolicy, "latest_protocol", cast(isize)LatestProtocol)
+    MapSet(resultXMeshProtocolPolicy, "v1_v5_valid_through", CompatibilityDeadline)
+    MapSet(resultXMeshProtocolPolicy, "previous_version_grace_days_min", cast(isize)PreviousVersionGraceDays)
+    MapSet(result, "x-mesh-protocol-policy", resultXMeshProtocolPolicy)
     resultXKsyncProtocolPolicy: Map(string, Any)
     MapInit(resultXKsyncProtocolPolicy)
     MapSet(resultXKsyncProtocolPolicy, "min_supported_protocol", cast(isize)MinSupportedProtocol)
@@ -733,7 +733,7 @@ PathApiV1TokensSpend :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Spend tokens")
-    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires the matching app asset permission. X-Daochi-Tx is validated when present.")
+    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires the matching app asset permission. X-Mesh-Tx is validated when present.")
     resultPostSecurity := AllocateObjects(cast(isize)1)
     resultPostSecurityItem0: Map(string, Any)
     MapInit(resultPostSecurityItem0)
@@ -766,7 +766,7 @@ PathApiV1TokensPurchasesGoogleVerify :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Verify app-store purchase and credit tokens")
-    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires a purchase permission. X-Daochi-Tx is validated when present.")
+    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires a purchase permission. X-Mesh-Tx is validated when present.")
     resultPostSecurity := AllocateObjects(cast(isize)1)
     resultPostSecurityItem0: Map(string, Any)
     MapInit(resultPostSecurityItem0)
@@ -791,7 +791,7 @@ PathApiV1TokensPurchasesMoneroInvoices :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Create direct token invoice")
-    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires a purchase permission. X-Daochi-Tx is validated when present.")
+    MapSet(resultPost, "description", "If the app has token policies, this endpoint requires a purchase permission. X-Mesh-Tx is validated when present.")
     resultPostSecurity := AllocateObjects(cast(isize)1)
     resultPostSecurityItem0: Map(string, Any)
     MapInit(resultPostSecurityItem0)
@@ -1062,7 +1062,7 @@ PathApiV1Apps :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Register or update an app")
-    MapSet(resultPost, "description", "Requires the server admin token and matching X-Daochi-Admin header. X-Ksync-Admin remains accepted for compatibility.")
+    MapSet(resultPost, "description", "Requires the server admin token and matching X-Mesh-Admin header. X-Ksync-Admin remains accepted for compatibility.")
     resultPostResponses: Map(string, Any)
     MapInit(resultPostResponses)
     resultPostResponses200: Map(string, Any)
@@ -1171,7 +1171,7 @@ PathApiV1AppsAppId :: () -> Map(string, Any) {
     resultPut: Map(string, Any)
     MapInit(resultPut)
     MapSet(resultPut, "summary", "Register or update an app")
-    MapSet(resultPut, "description", "Requires the server admin token and matching X-Daochi-Admin header. X-Ksync-Admin remains accepted for compatibility.")
+    MapSet(resultPut, "description", "Requires the server admin token and matching X-Mesh-Admin header. X-Ksync-Admin remains accepted for compatibility.")
     resultPutParameters := AllocateObjects(cast(isize)1)
     resultPutParametersItem0: Map(string, Any)
     MapInit(resultPutParametersItem0)
@@ -1290,7 +1290,7 @@ PathApiV1AccountAppGrantsSigned :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Create cross-app grant with a signed transaction")
-    MapSet(resultPost, "description", "The grant payload is bound to an X-Daochi-Tx-equivalent transaction signed by the account key and target app key.")
+    MapSet(resultPost, "description", "The grant payload is bound to an X-Mesh-Tx-equivalent transaction signed by the account key and target app key.")
     resultPostSecurity := AllocateObjects(cast(isize)1)
     resultPostSecurityItem0: Map(string, Any)
     MapInit(resultPostSecurityItem0)
@@ -1455,7 +1455,7 @@ PathApiV1SyncLogin :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Create bearer token")
-    MapSet(resultPost, "description", "Body is signed through X-Daochi-Signature over the exact raw request body bytes. Legacy X-Ksync-Signature and X-Inbe-Signature headers remain accepted. The response includes server_time for client token-expiry clock skew compensation.")
+    MapSet(resultPost, "description", "Body is signed through X-Mesh-Signature over the exact raw request body bytes. Legacy X-Ksync-Signature and X-Inbe-Signature headers remain accepted. The response includes server_time for client token-expiry clock skew compensation.")
     MapSet(resultPost, "parameters", SignedHeaderParameters())
     resultPostRequestBody: Map(string, Any)
     MapInit(resultPostRequestBody)
@@ -1529,7 +1529,7 @@ PathApiV1Sync :: () -> Map(string, Any) {
     resultPost: Map(string, Any)
     MapInit(resultPost)
     MapSet(resultPost, "summary", "Apply sync changes")
-    MapSet(resultPost, "description", "Applies typed sync changes for existing clients. Protocol v6 requires app_id plus X-Daochi-Tx. If the JSON body has v, nonce, and ciphertext fields, Daochi stores and relays it as an opaque encrypted envelope authenticated by bearer token.")
+    MapSet(resultPost, "description", "Applies typed sync changes for existing clients. Protocol v6 requires app_id plus X-Mesh-Tx. If the JSON body has v, nonce, and ciphertext fields, Mesh stores and relays it as an opaque encrypted envelope authenticated by bearer token.")
     MapSet(resultPost, "parameters", SyncHeaderParameters())
     resultPostRequestBody: Map(string, Any)
     MapInit(resultPostRequestBody)
@@ -1589,7 +1589,7 @@ PathApiV1SyncWs :: () -> Map(string, Any) {
     resultGet: Map(string, Any)
     MapInit(resultGet)
     MapSet(resultGet, "summary", "Subscribe to sync change events")
-    MapSet(resultGet, "description", "WebSocket endpoint. Send Authorization: Bearer <auth_token>. Browser clients may use Sec-WebSocket-Protocol: daochi-sync-v1, bearer.<auth_token>. Legacy ksync-sync-v1 and inbe-sync-v1 remain accepted. The server emits sync_ready after connect and sync_changed whenever another client applies changes.")
+    MapSet(resultGet, "description", "WebSocket endpoint. Send Authorization: Bearer <auth_token>. Browser clients may use Sec-WebSocket-Protocol: mesh-sync-v1, bearer.<auth_token>. Legacy daochi-sync-v1, ksync-sync-v1 and inbe-sync-v1 remain accepted. The server emits sync_ready after connect and sync_changed whenever another client applies changes.")
     resultGetParameters := AllocateObjects(cast(isize)1)
     resultGetParametersItem0: Map(string, Any)
     MapInit(resultGetParametersItem0)
@@ -1710,7 +1710,7 @@ PathApiV1AccountExport :: () -> Map(string, Any) {
     resultGet: Map(string, Any)
     MapInit(resultGet)
     MapSet(resultGet, "summary", "Export authenticated account data")
-    MapSet(resultGet, "description", "Bearer-authenticated read-only dump of all Daochi rows owned by or directly attached to the authenticated account.")
+    MapSet(resultGet, "description", "Bearer-authenticated read-only dump of all Mesh rows owned by or directly attached to the authenticated account.")
     MapSet(resultGet, "parameters", BearerHeaderParameters())
     resultGetResponses: Map(string, Any)
     MapInit(resultGetResponses)
@@ -1966,7 +1966,7 @@ PathApiV1Friends :: () -> Map(string, Any) {
     resultGet: Map(string, Any)
     MapInit(resultGet)
     MapSet(resultGet, "summary", "List accepted friends")
-    MapSet(resultGet, "description", "Bearer-authenticated. Returns account-level Daochi friends.")
+    MapSet(resultGet, "description", "Bearer-authenticated. Returns account-level Mesh friends.")
     MapSet(resultGet, "parameters", BearerHeaderParameters())
     resultGetResponses: Map(string, Any)
     MapInit(resultGetResponses)
@@ -2097,7 +2097,7 @@ PathApiV1ProfileStats :: () -> Map(string, Any) {
     resultPut: Map(string, Any)
     MapInit(resultPut)
     MapSet(resultPut, "summary", "Publish app-neutral profile stats")
-    MapSet(resultPut, "description", "Bearer-authenticated aggregate stats. Daochi stores only app/practice/metric/value rows.")
+    MapSet(resultPut, "description", "Bearer-authenticated aggregate stats. Mesh stores only app/practice/metric/value rows.")
     MapSet(resultPut, "parameters", BearerHeaderParameters())
     resultPutRequestBody: Map(string, Any)
     MapInit(resultPutRequestBody)
@@ -3109,7 +3109,7 @@ SchemaEncryptedSyncEnvelope :: () -> Map(string, Any) {
     result: Map(string, Any)
     MapInit(result)
     MapSet(result, "type", "object")
-    MapSet(result, "description", "Opaque whole-payload encrypted sync envelope. Daochi authenticates the account and relays the JSON body unchanged as encrypted_payloads.")
+    MapSet(result, "description", "Opaque whole-payload encrypted sync envelope. Mesh authenticates the account and relays the JSON body unchanged as encrypted_payloads.")
     resultRequired := AllocateStrings(cast(isize)3)
     resultRequired[0] = "v"
     resultRequired[1] = "nonce"
@@ -4141,7 +4141,7 @@ SignedHeaderParameters :: () -> []Map(string, Any) {
     result := AllocateObjects(cast(isize)2)
     resultItem0: Map(string, Any)
     MapInit(resultItem0)
-    MapSet(resultItem0, "name", "X-Daochi-User")
+    MapSet(resultItem0, "name", "X-Mesh-User")
     MapSet(resultItem0, "in", "header")
     MapSet(resultItem0, "required", true)
     MapSet(resultItem0, "description", "SHA-256 hash of the ML-DSA-44 public key. Legacy X-Ksync-User and X-Inbe-User are also accepted.")
@@ -4153,7 +4153,7 @@ SignedHeaderParameters :: () -> []Map(string, Any) {
     result[0] = resultItem0
     resultItem1: Map(string, Any)
     MapInit(resultItem1)
-    MapSet(resultItem1, "name", "X-Daochi-Signature")
+    MapSet(resultItem1, "name", "X-Mesh-Signature")
     MapSet(resultItem1, "in", "header")
     MapSet(resultItem1, "required", true)
     MapSet(resultItem1, "description", "ML-DSA-44 signature as hex or base64. Legacy X-Ksync-Signature and X-Inbe-Signature are also accepted.")
@@ -4180,7 +4180,7 @@ SyncHeaderParameters :: () -> []Map(string, Any) {
     result[0] = resultItem0
     resultItem1: Map(string, Any)
     MapInit(resultItem1)
-    MapSet(resultItem1, "name", "X-Daochi-User")
+    MapSet(resultItem1, "name", "X-Mesh-User")
     MapSet(resultItem1, "in", "header")
     MapSet(resultItem1, "required", true)
     MapSet(resultItem1, "description", "SHA-256 hash of the ML-DSA-44 public key. Legacy X-Ksync-User and X-Inbe-User are also accepted.")
@@ -4192,7 +4192,7 @@ SyncHeaderParameters :: () -> []Map(string, Any) {
     result[1] = resultItem1
     resultItem2: Map(string, Any)
     MapInit(resultItem2)
-    MapSet(resultItem2, "name", "X-Daochi-Client")
+    MapSet(resultItem2, "name", "X-Mesh-Client")
     MapSet(resultItem2, "in", "header")
     MapSet(resultItem2, "required", false)
     MapSet(resultItem2, "description", "Optional client ID for encrypted envelope metadata. X-Ksync-Client remains accepted.")
@@ -4203,7 +4203,7 @@ SyncHeaderParameters :: () -> []Map(string, Any) {
     result[2] = resultItem2
     resultItem3: Map(string, Any)
     MapInit(resultItem3)
-    MapSet(resultItem3, "name", "X-Daochi-Since-Version")
+    MapSet(resultItem3, "name", "X-Mesh-Since-Version")
     MapSet(resultItem3, "in", "header")
     MapSet(resultItem3, "required", false)
     MapSet(resultItem3, "description", "Optional last-seen server version for encrypted envelope delta reads. X-Ksync-Since-Version remains accepted.")
@@ -4214,10 +4214,10 @@ SyncHeaderParameters :: () -> []Map(string, Any) {
     result[3] = resultItem3
     resultItem4: Map(string, Any)
     MapInit(resultItem4)
-    MapSet(resultItem4, "name", "X-Daochi-Limit")
+    MapSet(resultItem4, "name", "X-Mesh-Limit")
     MapSet(resultItem4, "in", "header")
     MapSet(resultItem4, "required", false)
-    MapSet(resultItem4, "description", "Optional encrypted envelope page size. X-Ksync-Limit remains accepted. The server may clamp this with DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN.")
+    MapSet(resultItem4, "description", "Optional encrypted envelope page size. X-Ksync-Limit remains accepted. The server may clamp this with MESH_ENCRYPTED_PAYLOAD_MAX_RETURN.")
     resultItem4Schema: Map(string, Any)
     MapInit(resultItem4Schema)
     MapSet(resultItem4Schema, "type", "integer")

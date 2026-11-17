@@ -165,7 +165,7 @@ func TestZiranMiddlewareBaseline(t *testing.T) {
 					method = http.MethodOptions
 				}
 				request := httptest.NewRequest(method, "/api/v1/friends", nil)
-				request.Header.Set("Origin", "https://daochi.net")
+				request.Header.Set("Origin", "https://mesh.ziran-lang.org")
 				func() {
 					defer func() { observations[index].panic = recover() }()
 					handler.ServeHTTP(output, request)
@@ -196,13 +196,13 @@ func TestZiranMiddlewareBaseline(t *testing.T) {
 
 func TestZiranMiddlewareOriginBaseline(t *testing.T) {
 	origins := []string{
-		"", "https://daochi.net", "https://www.daochi.net", "https://daochi.pages.dev",
-		"https://daochi.kryonlabs.com", "https://inbe.waozi.xyz", "https://uku.waozi.xyz",
+		"", "https://mesh.ziran-lang.org", "https://mesh.pages.dev", "https://mesh-bew.pages.dev",
+		"https://mesh.ziran-lang.org", "https://inbe.waozi.xyz", "https://uku.waozi.xyz",
 	}
 	for _, scheme := range []string{"http", "https", "HTTP", "chrome-extension", "ftp", ""} {
 		for _, host := range []string{
 			"localhost", "LOCALHOST", "127.0.0.1", "0.0.0.0", "[::1]", "[::ffff:127.0.0.1]",
-			"daochi.net", "daochi.net.evil", strings.Repeat("a", 32), strings.Repeat("p", 32),
+			"mesh.ziran-lang.org", "mesh.ziran-lang.org.evil", strings.Repeat("a", 32), strings.Repeat("p", 32),
 			strings.Repeat("q", 32), strings.Repeat("é", 16), "evil", "",
 		} {
 			for _, suffix := range []string{"", ":8080", ":bad", "/", "/path", "?", "?x=1", "#", "#x", "\n", "\x00", "%ff"} {

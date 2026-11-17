@@ -57,7 +57,7 @@ AliasDocument :: #string JSON
           "description": "Bearer token from /api/v1/sync/login."
         },
         {
-          "name": "X-Daochi-User",
+          "name": "X-Mesh-User",
           "in": "header",
           "required": true,
           "schema": {

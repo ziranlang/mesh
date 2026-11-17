@@ -1,3 +1,4 @@
+environment :: #import "config_environment";
 // Content coding is outside signed JSON. Wire and decoded bytes have independent
 // bounds; transaction signatures continue to cover the exact decoded JSON.
 #import "std/go_types"
@@ -52,7 +53,9 @@ Split :: (value: string, separator: string) -> []string #foreign strings;
 Trim :: (value: string) -> string #foreign strings "TrimSpace";
 EqualFold :: (left: string, right: string) -> bool #foreign strings;
 Lower :: (value: string) -> string #foreign strings "ToLower";
-Getenv :: (key: string) -> string #foreign go_os;
+Getenv :: (key: string) -> string {
+    return environment.Get(key)
+}
 OpenGzipDecoder :: (reader: io.Reader) -> GzipDecoderResult #go_results #foreign gzip "NewReader";
 CloseGzipDecoderAtReturn :: (decoder: *GzipDecoder) #go_defer #foreign gzip "(*Reader).Close";
 NewGzipEncoder :: (writer: io.Writer, level: isize) -> GzipEncoderResult #go_results #foreign gzip "NewWriterLevel";
@@ -147,11 +150,11 @@ ReturnPermit :: (slot: isize) {
 
 #scope_export
 ZstdResponsesEnabled :: () -> bool {
-    return values.Bool(Getenv("DAOCHI_HTTP_ZSTD_RESPONSES"), true)
+    return values.Bool(Getenv("MESH_HTTP_ZSTD_RESPONSES"), true)
 }
 
 ZstdRequestsEnabled :: () -> bool {
-    return values.Bool(Getenv("DAOCHI_HTTP_ZSTD_REQUESTS"), true)
+    return values.Bool(Getenv("MESH_HTTP_ZSTD_REQUESTS"), true)
 }
 
 // Empty means no acceptable representation. Identity is the fallback unless

@@ -90,7 +90,7 @@ def main():
     axes[1,1].set_xlabel("Retained Go heap for four writers (MiB)")
     axes[1,1].set_ylabel("Reusable encoder profile")
     axes[1,1].set_title("Encoder pool memory after GC · 1 MiB Zstd window")
-    fig.suptitle("Daochi compression · synthetic workloads · 26 October 2026",fontsize=15)
+    fig.suptitle("Mesh compression · synthetic workloads · 26 October 2026",fontsize=15)
     fig.text(.5,-.025,"Local measurements · AMD Ryzen 9 9950X · Go 1.26.10 · one codec worker · not a production or phone benchmark",ha="center",fontsize=9)
     fig.savefig(destination/(stem+".png"),dpi=160,bbox_inches="tight");plt.close(fig)
     medium=selected("page-medium","gzip-go-fresh",1)
@@ -105,9 +105,9 @@ def main():
         "packed_records_wire_saving_percent":100*(1-packed["compressed_bytes"]/identity["compressed_bytes"])}
     (run/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
     template = '''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Daochi compression benchmark — 26 October 2026</title>
+<title>Mesh compression benchmark — 26 October 2026</title>
 <style>body{font:16px/1.55 system-ui,sans-serif;margin:0;background:#fafaf8;color:#202723}main{box-sizing:border-box;max-width:1240px;margin:auto;padding:32px}h1{font-size:30px;line-height:1.2}h2{margin-top:36px}a{color:#17655e}small,.note{color:#5d665f}section{border-top:1px solid #d7ddd7;padding-top:16px;margin-top:26px}.lead{font-size:20px;max-width:900px}.metrics{display:flex;gap:36px;flex-wrap:wrap;margin:28px 0}.metrics strong{font-size:28px;display:block;color:#17655e}label{display:inline-flex;flex-direction:column;vertical-align:top;width:min(260px,100%);margin:0 18px 14px 0}select{padding:7px;font:inherit;max-width:100%}table{border-collapse:collapse;width:100%;font-size:14px}td,th{text-align:right;padding:8px;border-bottom:1px solid #ddd}td:first-child,th:first-child{text-align:left}th{background:#edf1eb;position:sticky;top:0}.scroll{overflow:auto}img{max-width:100%;height:auto}code{background:#edf1eb;padding:1px 4px}details{margin:16px 0}summary{cursor:pointer;font-weight:600}button{padding:7px 14px;font:inherit;border:1px solid #9aa79e;background:white;cursor:pointer}@media(max-width:650px){main{padding:18px}.metrics{gap:18px}h1{font-size:26px}}</style>
-<main><small>Daochi · compression upgrade study · 26 October 2026</small><h1>Use Zstandard for negotiated sync responses.<br>Keep gzip for compatibility.</h1>
+<main><small>Mesh · compression upgrade study · 26 October 2026</small><h1>Use Zstandard for negotiated sync responses.<br>Keep gzip for compatibility.</h1>
 <p class="lead">The fastest practical HTTP candidate is reusable Go Zstandard in its fastest mode, with literal entropy compression explicitly enabled. Pre-encryption record packing delivers the larger bandwidth gain. These are local synthetic measurements; production rollout remains a separate gate.</p>
 <div class="metrics"><div><strong id="case-count"></strong>codec cases; all roundtrips match</div><div><strong id="http-gain"></strong>faster large-page loopback completion</div><div><strong id="packing"></strong>fewer wire bytes with existing record packing</div></div>
 <p><a href="../compression.md">Read the compression guide</a> · <a href="2026-10-26-compression.json">Raw JSON</a> · <a href="2026-10-26-compression.csv">CSV</a></p>

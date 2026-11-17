@@ -21,9 +21,9 @@ import (
 const baselineNodeAuthenticationWindow = 5 * time.Minute
 
 func baselineVerifyNodeRequest(database *sql.DB, ctx context.Context, req *http.Request, body []byte) error {
-	nodeID := strings.TrimSpace(req.Header.Get("X-Daochi-Node-ID"))
-	timestampText := strings.TrimSpace(req.Header.Get("X-Daochi-Node-Time"))
-	nonce := strings.TrimSpace(req.Header.Get("X-Daochi-Node-Nonce"))
+	nodeID := strings.TrimSpace(req.Header.Get("X-Mesh-Node-ID"))
+	timestampText := strings.TrimSpace(req.Header.Get("X-Mesh-Node-Time"))
+	nonce := strings.TrimSpace(req.Header.Get("X-Mesh-Node-Nonce"))
 	if !baselineValidNodeID(nodeID) || nonce == "" || len(nonce) > 128 {
 		return errors.New("invalid node authentication")
 	}
@@ -44,7 +44,7 @@ func baselineVerifyNodeRequest(database *sql.DB, ctx context.Context, req *http.
 		return errors.New("node is not paired")
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(
-		req.Header.Get("X-Daochi-Node-Signature"))
+		req.Header.Get("X-Mesh-Node-Signature"))
 	if err != nil || len(signature) != ed25519.SignatureSize {
 		return errors.New("invalid node signature")
 	}
@@ -114,10 +114,10 @@ func signedNodeFixture(nodeID string, key ed25519.PrivateKey, method, path, time
 	}
 	message := baselineNodeMessage("daochi-node-request-v1", nodeID, timestamp, nonce,
 		request.Method, request.URL.EscapedPath(), body)
-	request.Header.Set("X-Daochi-Node-ID", nodeID)
-	request.Header.Set("X-Daochi-Node-Time", timestamp)
-	request.Header.Set("X-Daochi-Node-Nonce", nonce)
-	request.Header.Set("X-Daochi-Node-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, []byte(message))))
+	request.Header.Set("X-Mesh-Node-ID", nodeID)
+	request.Header.Set("X-Mesh-Node-Time", timestamp)
+	request.Header.Set("X-Mesh-Node-Nonce", nonce)
+	request.Header.Set("X-Mesh-Node-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, []byte(message))))
 	return request
 }
 
@@ -144,12 +144,12 @@ func TestZiranNodeSigningPreservesExactMessages(t *testing.T) {
 		before := time.Now().Unix()
 		NodeAuth_Sign(nodeID, key, request, item.body)
 		after := time.Now().Unix()
-		timestamp := request.Header.Get("X-Daochi-Node-Time")
+		timestamp := request.Header.Get("X-Mesh-Node-Time")
 		parsed, err := strconv.ParseInt(timestamp, 10, 64)
 		if err != nil || parsed < before || parsed > after {
 			t.Fatalf("signing timestamp = %q", timestamp)
 		}
-		nonce := request.Header.Get("X-Daochi-Node-Nonce")
+		nonce := request.Header.Get("X-Mesh-Node-Nonce")
 		decoded, err := hex.DecodeString(nonce)
 		if err != nil || len(decoded) != 16 || nonce != strings.ToLower(nonce) {
 			t.Fatalf("signing nonce = %q", nonce)
@@ -157,11 +157,16 @@ func TestZiranNodeSigningPreservesExactMessages(t *testing.T) {
 		message := baselineNodeMessage("daochi-node-request-v1", nodeID, timestamp, nonce,
 			request.Method, request.URL.EscapedPath(), item.body)
 		want := base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, []byte(message)))
-		if got := request.Header.Get("X-Daochi-Node-Signature"); got != want {
+		if got := request.Header.Get("X-Mesh-Node-Signature"); got != want {
 			t.Fatalf("signature for %s %s = %q, want %q", item.method, item.path, got, want)
 		}
-		if request.Header.Get("X-Daochi-Node-ID") != nodeID || request.Header.Get("Unrelated") != "preserved" || len(request.Header) != 5 {
+		if request.Header.Get("X-Mesh-Node-ID") != nodeID || request.Header.Get("Unrelated") != "preserved" || len(request.Header) != 9 {
 			t.Fatalf("signing headers = %#v", request.Header)
+		}
+		for _, field := range []string{"ID", "Time", "Nonce", "Signature"} {
+			if request.Header.Get("X-Daochi-Node-"+field) != request.Header.Get("X-Mesh-Node-"+field) {
+				t.Fatalf("legacy node header %s differs from Mesh", field)
+			}
 		}
 	}
 }
@@ -180,34 +185,34 @@ func TestZiranNodeAuthenticationAgainstBaseline(t *testing.T) {
 	}{
 		{"valid", func(*http.Request, *sql.DB) {}, ""},
 		{"upper node", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-ID", strings.ToUpper(nodeID))
+			r.Header.Set("X-Mesh-Node-ID", strings.ToUpper(nodeID))
 		}, "invalid node authentication"},
 		{"missing nonce", func(r *http.Request, _ *sql.DB) {
-			r.Header.Del("X-Daochi-Node-Nonce")
+			r.Header.Del("X-Mesh-Node-Nonce")
 		}, "invalid node authentication"},
 		{"long nonce", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Nonce", strings.Repeat("é", 65))
+			r.Header.Set("X-Mesh-Node-Nonce", strings.Repeat("é", 65))
 		}, "invalid node authentication"},
 		{"malformed time", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Time", "9223372036854775808")
+			r.Header.Set("X-Mesh-Node-Time", "9223372036854775808")
 		}, "invalid node authentication time"},
 		{"old time", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Time", "0")
+			r.Header.Set("X-Mesh-Node-Time", "0")
 		}, "expired node authentication"},
 		{"future time", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Time", "9223372036854775807")
+			r.Header.Set("X-Mesh-Node-Time", "9223372036854775807")
 		}, "expired node authentication"},
 		{"body mismatch", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Signature", strings.Repeat("A", 86))
+			r.Header.Set("X-Mesh-Node-Signature", strings.Repeat("A", 86))
 		}, "invalid node signature"},
 		{"bad base64", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Signature", "!")
+			r.Header.Set("X-Mesh-Node-Signature", "!")
 		}, "invalid node signature"},
 		{"padded signature", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Signature", r.Header.Get("X-Daochi-Node-Signature")+"==")
+			r.Header.Set("X-Mesh-Node-Signature", r.Header.Get("X-Mesh-Node-Signature")+"==")
 		}, "invalid node signature"},
 		{"short signature", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Signature", "AQ")
+			r.Header.Set("X-Mesh-Node-Signature", "AQ")
 		}, "invalid node signature"},
 		{"method mismatch", func(r *http.Request, _ *sql.DB) {
 			r.Method = http.MethodGet
@@ -216,12 +221,12 @@ func TestZiranNodeAuthenticationAgainstBaseline(t *testing.T) {
 			r.URL.Path = "/different"
 		}, "invalid node signature"},
 		{"whitespace", func(r *http.Request, _ *sql.DB) {
-			for _, name := range []string{"X-Daochi-Node-ID", "X-Daochi-Node-Time", "X-Daochi-Node-Nonce"} {
+			for _, name := range []string{"X-Mesh-Node-ID", "X-Mesh-Node-Time", "X-Mesh-Node-Nonce"} {
 				r.Header.Set(name, "\u2003"+r.Header.Get(name)+"\t")
 			}
 		}, ""},
 		{"base64 line breaks", func(r *http.Request, _ *sql.DB) {
-			r.Header.Set("X-Daochi-Node-Signature", "\r\n"+r.Header.Get("X-Daochi-Node-Signature")+"\n")
+			r.Header.Set("X-Mesh-Node-Signature", "\r\n"+r.Header.Get("X-Mesh-Node-Signature")+"\n")
 		}, ""},
 		{"revoked", func(_ *http.Request, db *sql.DB) {
 			if _, err := db.Exec("UPDATE trusted_node_peers SET revoked_at='revoked'"); err != nil {
@@ -271,7 +276,7 @@ func TestZiranNodeAuthenticationPreservesDatabaseErrorsAndOrder(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		request := signedNodeFixture(nodeID, key, http.MethodPost, "/sync", timestamp, "nonce", nil)
-		request.Header.Set("X-Daochi-Node-Signature", "!")
+		request.Header.Set("X-Mesh-Node-Signature", "!")
 		got := NodeAuth_Verify(database, ctx, request, nil)
 		want := baselineVerifyNodeRequest(database, ctx, request, nil)
 		if !errors.Is(got, context.Canceled) || got != want {
@@ -280,7 +285,7 @@ func TestZiranNodeAuthenticationPreservesDatabaseErrorsAndOrder(t *testing.T) {
 		if got := PeerTrust_PublicKey(database, ctx, nodeID); !errors.Is(got.Error, context.Canceled) || got.Found || got.Value != nil {
 			t.Fatalf("canceled public key lookup = %#v", got)
 		}
-		request.Header.Del("X-Daochi-Node-ID")
+		request.Header.Del("X-Mesh-Node-ID")
 		if got := NodeAuth_Verify(database, ctx, request, nil); got == nil || got.Error() != "invalid node authentication" {
 			t.Fatalf("header validation must precede canceled lookup: %v", got)
 		}
@@ -292,7 +297,7 @@ func TestZiranNodeAuthenticationPreservesDatabaseErrorsAndOrder(t *testing.T) {
 			t.Fatal(err)
 		}
 		request := signedNodeFixture(nodeID, key, http.MethodPost, "/sync", timestamp, "nonce", nil)
-		request.Header.Set("X-Daochi-Node-Signature", "!")
+		request.Header.Set("X-Mesh-Node-Signature", "!")
 		got := NodeAuth_Verify(database, context.Background(), request, nil)
 		want := baselineVerifyNodeRequest(database, context.Background(), request, nil)
 		if got == nil || want == nil || got.Error() != want.Error() || got.Error() == "invalid node signature" {

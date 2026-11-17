@@ -29,7 +29,7 @@ img { max-width: 100%; }
 .skip-link:focus { top: 12px; }
 .topbar { display: flex; align-items: center; justify-content: space-between; gap: 30px; width: min(1100px, calc(100% - 64px)); margin: auto; min-height: 90px; border-bottom: 1px solid var(--line); }
 .brand { display: inline-flex; align-items: center; gap: 12px; color: var(--ink); font: 400 30px/1 var(--serif); text-decoration: none; }
-.brand::before { content: ''; width: 32px; height: 32px; background: url('/assets/daochi-logo-pixel-128.png') center / contain no-repeat; image-rendering: pixelated; }
+.brand::before { content: ''; width: 32px; height: 32px; background: url('/assets/mesh-logo-pixel-128.png') center / contain no-repeat; image-rendering: pixelated; }
 .nav { display: flex; align-items: center; flex-wrap: wrap; gap: 24px; }
 .nav a { font-size: 11px; color: var(--muted); text-decoration: none; padding-block: 8px; }
 .nav a:hover, .nav a[aria-current='page'] { color: var(--teal); }

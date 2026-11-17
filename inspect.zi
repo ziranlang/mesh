@@ -110,7 +110,7 @@ Run :: (context: ctx.Context, arguments: []string, options: InspectOptions) -> E
         return error
     }
     if options.DBPath == "" {
-        options.DBPath = config.EnvString("DAOCHI_DB", "daochi.db")
+        options.DBPath = config.EnvString("MESH_DB", "daochi.db")
     }
     remaining := RemainingArguments(flags)
     if remaining.count == 0 {
@@ -132,13 +132,13 @@ Run :: (context: ctx.Context, arguments: []string, options: InspectOptions) -> E
     }
     if command == "doctor" {
         if remaining.count != 2 {
-            return errors.New("usage: daochi inspect doctor <user_id_hash>")
+            return errors.New("usage: mesh inspect doctor <user_id_hash>")
         }
         return Doctor(context, database, options.Out, remaining[1], options.Full)
     }
     if command == "user" {
         if remaining.count != 2 {
-            return errors.New("usage: daochi inspect user <user_id_hash>")
+            return errors.New("usage: mesh inspect user <user_id_hash>")
         }
         return User(context, database, options.Out, remaining[1], options.Full)
     }
@@ -163,7 +163,7 @@ Open :: (path: string) -> DatabaseResult {
 }
 
 Summary :: (context: ctx.Context, database: *sql.Database, out: io.Writer) -> Error {
-    WriteLine(out, "Daochi data summary")
+    WriteLine(out, "Mesh data summary")
     for table: SummaryTables {
         count := Count(context, database, table, "", "")
         if count.error != null {
@@ -247,7 +247,7 @@ Doctor :: (context: ctx.Context, database: *sql.Database, out: io.Writer, userID
     ScanVersion(QueryUserRow(database, context, VersionQuery, userID), *version)
     compactedThrough: s64
     ScanVersion(QueryUserRow(database, context, CompactionQuery, userID), *compactedThrough)
-    Write1(out, "Daochi doctor %s\n", RedactID(userID, full))
+    Write1(out, "Mesh doctor %s\n", RedactID(userID, full))
     Write2(out, "status=ok server_version=%d compacted_through=%d\n", version, compactedThrough)
     Write2(out, "created=%s last_seen=%s\n", createdAt, lastSeenAt)
     for table: DoctorTables {

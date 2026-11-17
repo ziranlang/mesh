@@ -11,7 +11,7 @@ regexp :: #system_library "go:regexp";
 numbers :: #system_library "go:strconv";
 
 // Preserve the released Go contract using native libraries independently of
-// Daochi's Ziran HMAC, base64 codec, identifier grammar and integer parser.
+// Mesh's Ziran HMAC, base64 codec, identifier grammar and integer parser.
 #scope_file
 TokenOracleHash :: #type #foreign hash "Hash";
 TokenOracleFactory :: #type () -> TokenOracleHash;

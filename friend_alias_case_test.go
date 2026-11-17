@@ -33,7 +33,7 @@ func TestFriendRequestAcceptsAliasCaseVariants(t *testing.T) {
 	}
 	for _, spelling := range []string{"Shiori", "@SHIORI", "  shiori  "} {
 		req := httptest.NewRequest(http.MethodPost, "/api/v1/friends/requests", strings.NewReader(fmt.Sprintf(`{"target":%q}`, spelling)))
-		req.Header.Set("X-Daochi-User", users[0])
+		req.Header.Set("X-Mesh-User", users[0])
 		req.Header.Set("Authorization", "Bearer "+issueTestBearer(t, server, users[0], time.Now().Add(time.Hour)))
 		res := httptest.NewRecorder()
 		SocialHttp_CreateRequest(server.social(), res, req)

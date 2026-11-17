@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: daochi-deploy
+  group: mesh-deploy
   cancel-in-progress: false
 
 permissions:
@@ -65,17 +65,17 @@ jobs:
 
       - name: Configure SSH
         env:
-          DAOCHI_SSH_KEY: ${{ secrets.DAOCHI_SSH_KEY }}
-          DAOCHI_SSH_HOST: ${{ secrets.DAOCHI_HOST }}
-          DAOCHI_SSH_HOST_KEY: ${{ secrets.DAOCHI_SSH_HOST_KEY }}
-          DAOCHI_SSH_USER: ${{ secrets.DAOCHI_USER }}
+          MESH_SSH_KEY: ${{ secrets.MESH_SSH_KEY || secrets.DAOCHI_SSH_KEY }}
+          MESH_SSH_HOST: ${{ secrets.MESH_HOST || secrets.DAOCHI_HOST }}
+          MESH_SSH_HOST_KEY: ${{ secrets.MESH_SSH_HOST_KEY || secrets.DAOCHI_SSH_HOST_KEY }}
+          MESH_SSH_USER: ${{ secrets.MESH_USER || secrets.DAOCHI_USER }}
         run: |
           install -m 600 -D /dev/null ~/.ssh/id_ed25519
-          test -n "$DAOCHI_SSH_KEY"
-          printf '%s\n' "$DAOCHI_SSH_KEY" > ~/.ssh/id_ed25519
+          test -n "$MESH_SSH_KEY"
+          printf '%s\n' "$MESH_SSH_KEY" > ~/.ssh/id_ed25519
           python3 -B scripts/verify_deployment_inputs.py configure-ssh \
-            --host "$DAOCHI_SSH_HOST" --user "$DAOCHI_SSH_USER" \
-            --trusted-key "$DAOCHI_SSH_HOST_KEY"
+            --host "$MESH_SSH_HOST" --user "$MESH_SSH_USER" \
+            --trusted-key "$MESH_SSH_HOST_KEY"
 
       - name: Sync source and build on origin
         run: |
@@ -85,25 +85,25 @@ jobs:
           expected_entries="${{ steps.liboqs.outputs.liboqs_entries }}"
           tar --exclude='.git' --exclude='.ziran' --exclude='build' --exclude='*.db' \
               -czf - . | \
-            ssh daochi-origin '
+            ssh mesh-origin '
               set -e
-              rm -rf /opt/daochi-src.new
-              mkdir -p /opt/daochi-src.new
-              tar -C /opt/daochi-src.new -xzf -
-              python3 -B /opt/daochi-src.new/scripts/verify_deployment_inputs.py verify-source \
-                --source-dir /opt/daochi-src.new/vendor/liboqs \
+              rm -rf /opt/mesh-src.new
+              mkdir -p /opt/mesh-src.new
+              tar -C /opt/mesh-src.new -xzf -
+              python3 -B /opt/mesh-src.new/scripts/verify_deployment_inputs.py verify-source \
+                --source-dir /opt/mesh-src.new/vendor/liboqs \
                 --expected-commit "'"$expected_commit"'" \
                 --expected-digest "'"$expected_digest"'" \
                 --expected-entries "'"$expected_entries"'"
-              rm -rf /opt/daochi-src.old
-              [ -d /opt/daochi-src ] && mv /opt/daochi-src /opt/daochi-src.old
-              mv /opt/daochi-src.new /opt/daochi-src
-              rm -rf /opt/daochi-src.old
-              cd /opt/daochi-src
+              rm -rf /opt/mesh-src.old
+              [ -d /opt/mesh-src ] && mv /opt/mesh-src /opt/mesh-src.old
+              mv /opt/mesh-src.new /opt/mesh-src
+              rm -rf /opt/mesh-src.old
+              cd /opt/mesh-src
               make build VERSION=${{ github.sha }} SOURCE_COMMIT=${{ github.sha }} \
                 LIBOQS_COMMIT='"$expected_commit"'
               python3 -B scripts/verify_deployment_inputs.py verify-artifact-manifest \
-                --output daochi --manifest build/daochi.manifest.json \
+                --output mesh --manifest build/mesh.manifest.json \
                 --expected-source-commit "'"$expected_source_commit"'" \
                 --expected-liboqs-commit '"$expected_commit"'
             '
@@ -113,25 +113,28 @@ jobs:
       # keeps the verifier it has.
       - name: Install the Google Play service account
         env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.MESH_GOOGLE_SERVICE_ACCOUNT_JSON || secrets.DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
           if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ]; then
-            echo "No DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON secret; the node keeps its Google Play verifier settings"
+            echo "No MESH_GOOGLE_SERVICE_ACCOUNT_JSON secret; the node keeps its Google Play verifier settings"
             exit 0
           fi
           printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | python3 -I -c '
           import json, sys
           account = json.load(sys.stdin)
           if account.get("type") != "service_account" or not account.get("client_email") or not account.get("private_key"):
-              sys.exit("DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON is not a Google service account key")
+              sys.exit("MESH_GOOGLE_SERVICE_ACCOUNT_JSON is not a Google service account key")
           print("Google Play service account:", account["client_email"])
           '
-          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | ssh daochi-origin '
+          printf '%s' "$GOOGLE_SERVICE_ACCOUNT_JSON" | ssh mesh-origin '
             set -e
-            account=/etc/daochi/google-play-service-account.json
+            config=/etc/mesh
+            service=mesh.service
+            if [ ! -f /etc/mesh/mesh.env ]; then config=/etc/daochi; service=daochi.service; fi
+            account=$config/google-play-service-account.json
             umask 077
             cat > "$account.new"
-            user=$(systemctl show daochi.service -p User --value)
+            user=$(systemctl show "$service" -p User --value)
             if [ -n "$user" ]; then
               chown "$user" "$account.new"
             fi
@@ -141,28 +144,28 @@ jobs:
       - name: Swap binary and restart
         id: swap
         env:
-          DAOCHI_NODE_SYNC_TOKEN: ${{ secrets.DAOCHI_NODE_SYNC_TOKEN }}
+          MESH_NODE_SYNC_TOKEN: ${{ secrets.MESH_NODE_SYNC_TOKEN || secrets.DAOCHI_NODE_SYNC_TOKEN }}
           EXPECTED_NATIVE_COMMIT: ${{ steps.liboqs.outputs.liboqs_commit }}
         run: |
           DEPLOY_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
           export DEPLOY_STAMP
           echo "stamp=$DEPLOY_STAMP" >> "$GITHUB_OUTPUT"
-          python3 -c 'import json,os,sys; json.dump({"stamp":os.environ["DEPLOY_STAMP"],"source_commit":os.environ["GITHUB_SHA"],"native_commit":os.environ["EXPECTED_NATIVE_COMMIT"],"mesh_token":os.environ["DAOCHI_NODE_SYNC_TOKEN"]},sys.stdout)' |
-            ssh daochi-origin python3 /opt/daochi-src/deploy/install.py
+          python3 -c 'import json,os,sys; json.dump({"stamp":os.environ["DEPLOY_STAMP"],"source_commit":os.environ["GITHUB_SHA"],"native_commit":os.environ["EXPECTED_NATIVE_COMMIT"],"mesh_token":os.environ["MESH_NODE_SYNC_TOKEN"]},sys.stdout)' |
+            ssh mesh-origin python3 /opt/mesh-src/deploy/install.py
 
       - name: Health check (rollback on failure)
         run: |
           STAMP=${{ steps.swap.outputs.stamp }}
           code=000
           for _attempt in $(seq 1 30); do
-            code=$(ssh daochi-origin 'curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080/readyz"' || true)
+            code=$(ssh mesh-origin 'curl -sS -o /dev/null -w "%{http_code}" "http://127.0.0.1:8080/readyz"' || true)
             [ "$code" = "200" ] && break
             sleep 2
           done
           echo "health check: $code"
           if [ "$code" != "200" ]; then
             echo "::error::health check failed ($code) - rolling back"
-            printf '%s' "$STAMP" | ssh daochi-origin sh /opt/daochi-src/deploy/rollback.sh
+            printf '%s' "$STAMP" | ssh mesh-origin sh /opt/mesh-src/deploy/rollback.sh
             exit 1
           fi
           pub=000
@@ -174,6 +177,6 @@ jobs:
           echo "public endpoint through Cloudflare: $pub"
           if [ "$pub" != "200" ]; then
             echo "::error::public health check failed ($pub) - rolling back"
-            printf '%s' "$STAMP" | ssh daochi-origin sh /opt/daochi-src/deploy/rollback.sh
+            printf '%s' "$STAMP" | ssh mesh-origin sh /opt/mesh-src/deploy/rollback.sh
             exit 1
           fi

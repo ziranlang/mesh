@@ -86,7 +86,7 @@ func TestZiranTokenAssetSeedReturnsNativeErrors(t *testing.T) {
 }
 
 func TestZiranBuildVersionReachesMetrics(t *testing.T) {
-	expected := os.Getenv("DAOCHI_TEST_BUILD_VERSION")
+	expected := os.Getenv("MESH_TEST_BUILD_VERSION")
 	if expected == "" {
 		expected = "dev"
 	}
@@ -96,7 +96,7 @@ func TestZiranBuildVersionReachesMetrics(t *testing.T) {
 	server, _, _ := testServer(t)
 	response := httptest.NewRecorder()
 	server.Routes().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
-	want := fmt.Sprintf("daochi_build_info{version=%q} 1\n", expected)
+	want := fmt.Sprintf("mesh_build_info{version=%q} 1\n", expected)
 	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), want) {
 		t.Fatalf("metrics did not expose build stamp %q: status=%d body=%s",
 			expected, response.Code, response.Body.String())

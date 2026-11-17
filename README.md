@@ -1,10 +1,12 @@
-# Daochi
+# Mesh
 
-Daochi is a mesh-native sync network for app-owned data. It stores public keys and mirrored app data, but never stores client private keys. New clients should use the `X-Daochi-*` wire headers. The server still accepts shipped `X-Ksync-*` and `X-Inbe-*` compatibility headers.
+[Upgrading an existing Daochi node](docs/mesh-migration.md) preserves credentials, signed bytes and stored data.
+
+Mesh is a mesh-native sync network for app-owned data. It stores public keys and mirrored app data, but never stores client private keys. New clients should use the `X-Mesh-*` wire headers. The server still accepts shipped `X-Daochi-*`, `X-Ksync-*` and `X-Inbe-*` compatibility headers.
 
 ## Philosophy
 
-Daochi is built for imperfect networks, older devices, and changing servers.
+Mesh is built for imperfect networks, older devices, and changing servers.
 Its design rules are:
 
 - local first: account authority begins on the user's device;
@@ -23,15 +25,15 @@ Its design rules are:
 
 ## Privacy Model
 
-Daochi uses the client account key for identity and authentication. A client proves control of the account by signing a short-lived challenge with ML-DSA-44, and the server then issues a bearer token for normal sync and social API calls.
+Mesh uses the client account key for identity and authentication. A client proves control of the account by signing a short-lived challenge with ML-DSA-44, and the server then issues a bearer token for normal sync and social API calls.
 
 The legacy typed sync surface is not end-to-end encrypted against the server. Mirrored app data is stored in SQLite as normal typed rows and JSON payloads so the service can sync, compact, export, derive friend leaderboard stats, and delete account data. This is intentional for compatibility. Operational access to the server database or a valid bearer token can read the typed data those credentials allow.
 
-Protocol clients may also sync `encrypted_records`: opaque per-account private records identified by `collection` and `id`. Daochi stores and versions those blobs for relay, export, deletion, and diagnostics, but does not need to read their contents. Protocol v4 advertises this as the dual-write transition path: upgraded clients can keep sending legacy typed rows for compatibility while also seeding encrypted private records for future mesh-capable clients. Protocol v5 makes encrypted records the primary private-data surface for upgraded clients while legacy typed rows remain available through `include_legacy_data` for compatibility. Released legacy encrypted collections remain valid in v5 so clients do not need an immediate second backfill migration. Public/social projections such as aliases, friend requests, profile icons, and leaderboard stats remain readable server-side by design.
+Protocol clients may also sync `encrypted_records`: opaque per-account private records identified by `collection` and `id`. Mesh stores and versions those blobs for relay, export, deletion, and diagnostics, but does not need to read their contents. Protocol v4 advertises this as the dual-write transition path: upgraded clients can keep sending legacy typed rows for compatibility while also seeding encrypted private records for future mesh-capable clients. Protocol v5 makes encrypted records the primary private-data surface for upgraded clients while legacy typed rows remain available through `include_legacy_data` for compatibility. Released legacy encrypted collections remain valid in v5 so clients do not need an immediate second backfill migration. Public/social projections such as aliases, friend requests, profile icons, and leaderboard stats remain readable server-side by design.
 
-Clients that encrypt the whole sync payload may post an encrypted envelope to `POST /api/v1/sync` with JSON fields `v`, `nonce`, and `ciphertext`. Daochi authenticates the bearer token, stores the envelope bytes opaquely, assigns a normal `server_version`, and returns encrypted envelopes newer than `X-Daochi-Since-Version`. Existing typed clients keep using the same endpoint and JSON shape as before; the server only takes the envelope path when the request body has the explicit encrypted-envelope shape.
+Clients that encrypt the whole sync payload may post an encrypted envelope to `POST /api/v1/sync` with JSON fields `v`, `nonce`, and `ciphertext`. Mesh authenticates the bearer token, stores the envelope bytes opaquely, assigns a normal `server_version`, and returns encrypted envelopes newer than `X-Mesh-Since-Version`. Existing typed clients keep using the same endpoint and JSON shape as before; the server only takes the envelope path when the request body has the explicit encrypted-envelope shape.
 
-Daochi keeps an app registry so data ownership is app-neutral and no product behavior is hard-coded into the service. Inbe is a built-in registration because its released sync formats are a compatibility contract. The other built-in registration is `entity`, the account's own data (see [Entity data](docs/entity-data.md)). Every other app installs and maintains its own signed manifest, keys, collection scopes, and token policy. Registered apps can send `app_id` in v5 compatibility mode only when their manifest explicitly allows that protocol. Older shipped Inbe clients without `app_id` continue to sync during the compatibility window. A sync request may write only its own app's collections, and a request without `app_id` counts as Inbe, so a bearer token alone cannot reach another app's records. Protocol v6 requests must include a registered `app_id`, a signed transaction envelope, and encrypted record collections declared by that app.
+Mesh keeps an app registry so data ownership is app-neutral and no product behavior is hard-coded into the service. Inbe is a built-in registration because its released sync formats are a compatibility contract. The other built-in registration is `entity`, the account's own data (see [Entity data](docs/entity-data.md)). Every other app installs and maintains its own signed manifest, keys, collection scopes, and token policy. Registered apps can send `app_id` in v5 compatibility mode only when their manifest explicitly allows that protocol. Older shipped Inbe clients without `app_id` continue to sync during the compatibility window. A sync request may write only its own app's collections, and a request without `app_id` counts as Inbe, so a bearer token alone cannot reach another app's records. Protocol v6 requests must include a registered `app_id`, a signed transaction envelope, and encrypted record collections declared by that app.
 
 Protocol compatibility policy: protocol v1 through v5 are valid through **2027-09-01** for legacy clients covered by app policy. When a future protocol version is deprecated, the immediately previous version must remain valid for at least one additional year, and the current protocol version must always stay valid. App manifests declare their own compatibility windows through `compatibility_until` and `legacy_protocols`.
 
@@ -50,7 +52,7 @@ API access is scoped by account, with explicit shared surfaces:
 - `POST /api/v1/sync`
 - `POST /api/v1/account/delete`
 - `GET /api/v1/apps`
-- `POST /api/v1/apps` with `X-Daochi-Admin` when `DAOCHI_ADMIN_TOKEN` is set
+- `POST /api/v1/apps` with `X-Mesh-Admin` when `MESH_ADMIN_TOKEN` is set
 - `POST /api/v1/apps/register-signed`
 - `GET /api/v1/apps/{app_id}`
 - `GET /api/v1/apps/{app_id}/collections`
@@ -117,28 +119,28 @@ API access is scoped by account, with explicit shared surfaces:
 registered users, users active in the last 30 days, registered clients, clients
 active in the last 30 days, distinct connected WebSocket users, and current
 WebSocket client connections. `/metrics` publishes the same aggregate user and
-client gauges with `daochi_*` names; legacy `ksync_*` metric aliases remain for
+client gauges with `mesh_*` names; legacy `ksync_*` metric aliases remain for
 existing dashboards.
 
-The public API hostname should terminate TLS at a reverse proxy and forward to `DAOCHI_ADDR`, for example `127.0.0.1:8080`.
-Set `DAOCHI_TOKEN_SECRET_HEX` to at least 32 random bytes encoded as hex in production.
-`DAOCHI_ALLOW_EPHEMERAL_TOKEN_SECRET=1` is only for local development because it invalidates tokens on restart and is not a stable server secret.
+The public API hostname should terminate TLS at a reverse proxy and forward to `MESH_ADDR`, for example `127.0.0.1:8080`.
+Set `MESH_TOKEN_SECRET_HEX` to at least 32 random bytes encoded as hex in production.
+`MESH_ALLOW_EPHEMERAL_TOKEN_SECRET=1` is only for local development because it invalidates tokens on restart and is not a stable server secret.
 
-`POST /api/v1/sync` accepts up to 300 requests a minute per account across its devices; more return `429`. Blobs count toward `DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES` like records, and deleting an account removes its blob files.
+`POST /api/v1/sync` accepts up to 300 requests a minute per account across its devices; more return `429`. Blobs count toward `MESH_ACCOUNT_STORAGE_LIMIT_BYTES` like records, and deleting an account removes its blob files.
 
 Bearer tokens are intentionally cacheable client-side credentials, not the user's durable login state. Clients should silently run the challenge/sign/login flow again when a token expires or receives a `401`, as long as the local account key still exists. Login responses include `server_time` as Unix seconds so clients can compensate for local clock skew when caching token expiry. Older clients may ignore it. Only an explicit user logout, account deletion, or local account reset should remove the account key.
 
-The WebSocket endpoint accepts bearer auth through `Authorization: Bearer <token>`. Browser clients that cannot set custom WebSocket headers may send `Sec-WebSocket-Protocol: daochi-sync-v1, bearer.<token>`. Legacy `ksync-sync-v1` and `inbe-sync-v1` subprotocols remain accepted. Daochi rejects `?token=` WebSocket URLs so bearer tokens do not leak through request URLs, browser history, or proxy URL logs.
+The WebSocket endpoint accepts bearer auth through `Authorization: Bearer <token>`. Browser clients that cannot set custom WebSocket headers may send `Sec-WebSocket-Protocol: mesh-sync-v1, bearer.<token>`. Legacy `daochi-sync-v1`, `ksync-sync-v1` and `inbe-sync-v1` subprotocols remain accepted. Mesh rejects `?token=` WebSocket URLs so bearer tokens do not leak through request URLs, browser history, or proxy URL logs.
 
 Encrypted envelope clients should send:
 
 - `Authorization: Bearer <token>`
-- `X-Daochi-User: <sha256-public-key-hex>`
-- `X-Daochi-Client: <client-id>` when available
-- `X-Daochi-Since-Version: <last-seen-server-version>` when requesting only newer envelopes
-- `X-Daochi-Limit: <count>` when deliberately paging envelope deltas
+- `X-Mesh-User: <sha256-public-key-hex>`
+- `X-Mesh-Client: <client-id>` when available
+- `X-Mesh-Since-Version: <last-seen-server-version>` when requesting only newer envelopes
+- `X-Mesh-Limit: <count>` when deliberately paging envelope deltas
 
-`X-Ksync-*` header names remain accepted as compatibility aliases. Envelope bodies are relayed as JSON `encrypted_payloads` in the sync response. Daochi does not parse the envelope contents beyond checking that `v` is `1` or `2` and `nonce` and `ciphertext` are non-empty. If a response is paged, `encrypted_payloads_truncated` is `true` and `encrypted_payloads_next_since_version` is the next value to send as `X-Daochi-Since-Version`.
+`X-Ksync-*` header names remain accepted as compatibility aliases. Envelope bodies are relayed as JSON `encrypted_payloads` in the sync response. Mesh does not parse the envelope contents beyond checking that `v` is `1` or `2` and `nonce` and `ciphertext` are non-empty. If a response is paged, `encrypted_payloads_truncated` is `true` and `encrypted_payloads_next_since_version` is the next value to send as `X-Mesh-Since-Version`.
 
 ## Signature Message
 
@@ -156,9 +158,9 @@ Legacy `ksync-sync-v1` and `inbe-sync-v1` signed-message contexts remain accepte
 
 The challenge response returns `nonce` as lowercase hex. The challenge is single-use and expires after 60 seconds by default.
 
-Bearer-authenticated `POST /api/v1/sync` requests must include `Authorization: Bearer <token>`, `X-Daochi-User: <sha256-public-key-hex>`, and `Content-Type: application/json`. Legacy account headers remain accepted.
+Bearer-authenticated `POST /api/v1/sync` requests must include `Authorization: Bearer <token>`, `X-Mesh-User: <sha256-public-key-hex>`, and `Content-Type: application/json`. Legacy account headers remain accepted.
 
-Protocol v6 `POST /api/v1/sync` requests must also include `X-Daochi-Tx`. The header is either raw JSON or base64url JSON with:
+Protocol v6 `POST /api/v1/sync` requests must also include `X-Mesh-Tx`. The header is either raw JSON or base64url JSON with:
 
 - `protocol_version: 6`
 - `tx_id` and `nonce`, both replay-protected per account
@@ -188,15 +190,15 @@ daochi-tx-v1
 
 Signed `POST /api/v1/account/delete` and legacy `DELETE /api/v1/account` requests must include:
 
-- `X-Daochi-User: <sha256-public-key-hex>`
-- `X-Daochi-Signature: <ML-DSA-44 signature>`
+- `X-Mesh-User: <sha256-public-key-hex>`
+- `X-Mesh-Signature: <ML-DSA-44 signature>`
 - `Content-Type: application/json`
 
 Signed JSON bodies still include `user_id_hash` for compatibility. The server accepts `public_key` and signatures as either base64 or lowercase/uppercase hex. This matches the current C client account storage, which keeps ML-DSA-44 keys as hex strings.
 
 The preferred account deletion endpoint is `POST /api/v1/account/delete`, using the same challenge/signature scheme as login and sync so the private key never leaves the device. `DELETE /api/v1/account` remains supported for older clients that already shipped with that wire shape.
 
-The website deletion endpoint `POST /api/v1/account/delete-with-key` accepts `user_id_hash` plus the full exported account key text. Current exports start with `ksync-account-key-v1`, and legacy account key exports are still accepted. Current key exports include `public_id`, and Daochi rejects a request if that public ID does not match `user_id_hash`. Daochi signs a fixed deletion proof with that private key, verifies it against the registered public key, deletes the account, and does not store the uploaded key.
+The website deletion endpoint `POST /api/v1/account/delete-with-key` accepts `user_id_hash` plus the full exported account key text. Current exports start with `ksync-account-key-v1`, and legacy account key exports are still accepted. Current key exports include `public_id`, and Mesh rejects a request if that public ID does not match `user_id_hash`. Mesh signs a fixed deletion proof with that private key, verifies it against the registered public key, deletes the account, and does not store the uploaded key.
 
 ## Build
 
@@ -219,7 +221,7 @@ of ciphertext. Clients must verify `encrypted_records_only` in the response;
 older nodes do not implement this mode. Full replacements, legacy writes,
 operations and state-hash reconciliation must use the existing sync mode.
 
-Daochi's server implementation is authored in Ziran. Go is generated from the
+Mesh's server implementation is authored in Ziran. Go is generated from the
 canonical `.zi` modules and is not committed. Use Go 1.26. Run `make generate`
 after changing Ziran source and
 `make test-ziran` to check generated files and run the server suite against both
@@ -231,8 +233,8 @@ See the [development guide](docs/development.md) for source ownership and the bu
 Inspect a production database offline with:
 
 ```sh
-./daochi inspect --db /var/lib/daochi/daochi.db summary
-./daochi inspect --db /var/lib/daochi/daochi.db doctor <user_id_hash>
+./mesh inspect --db /var/lib/mesh/mesh.db summary
+./mesh inspect --db /var/lib/mesh/mesh.db doctor <user_id_hash>
 ```
 
 `inspect doctor` prints redacted account status, sync versions, table counts, recent client protocol hints, and recent sync audit metadata. Use `--full` only when you intentionally need unredacted IDs.
@@ -240,54 +242,54 @@ Inspect a production database offline with:
 Without Nix, install liboqs headers and library on the host, then:
 
 ```sh
-CGO_ENABLED=1 go build -o daochi .
+CGO_ENABLED=1 go build -o mesh .
 ```
 
 Runtime configuration:
 
 ```sh
-DAOCHI_ADDR=127.0.0.1:8080
-DAOCHI_BASE_URL=https://api.example.com
-DAOCHI_DB=/var/lib/daochi/daochi.db
-DAOCHI_ADMIN_TOKEN=<optional admin token; also gates GET /metrics and app registry writes when set>
-DAOCHI_TOKEN_SECRET_HEX=<stable 64+ hex chars shared by every server instance>
-DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX=<ed25519 public key hex for signed app approvals>
-DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE=/run/secrets/node_registry_public.hex
-DAOCHI_NODE_NAME=Home
-DAOCHI_NODE_IDENTITY_KEY_FILE=/var/lib/daochi/node.key
-DAOCHI_LAN_DISCOVERY=1
-DAOCHI_KNOWN_NODES=Public=https://api.example.com;sync=pull;apps=inbe;collections=private.inbe.v1.*;data=app_registry+encrypted_records
-DAOCHI_NODE_SYNC_TOKEN=<shared secret for trusted node-to-node mesh sync>
-DAOCHI_NODE_SYNC_INTERVAL_SECONDS=60
-DAOCHI_NODE_SYNC_BATCH_LIMIT=500
-DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX=<ed25519 public key hex>
-DAOCHI_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE=/run/secrets/token_issuer_public.hex
-DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX=<ed25519 private key hex, issuer nodes only>
-DAOCHI_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE=/run/secrets/token_issuer_private.hex
-DAOCHI_TOKEN_PRODUCTS=tokens_small:5000000:1000000000000
-DAOCHI_GOOGLE_PACKAGE_NAMES=com.example.app
-DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON=<google service account json>
-DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON_FILE=/run/secrets/google_play_service_account.json
-DAOCHI_GOOGLE_OAUTH_CLIENT_JSON_FILE=/run/secrets/google_play_oauth_client.json
-DAOCHI_GOOGLE_OAUTH_REFRESH_TOKEN_FILE=/run/secrets/google_play_refresh_token.txt
-DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED=1
+MESH_ADDR=127.0.0.1:8080
+MESH_BASE_URL=https://api.example.com
+MESH_DB=/var/lib/mesh/mesh.db
+MESH_ADMIN_TOKEN=<optional admin token; also gates GET /metrics and app registry writes when set>
+MESH_TOKEN_SECRET_HEX=<stable 64+ hex chars shared by every server instance>
+MESH_NODE_REGISTRY_PUBLIC_KEY_HEX=<ed25519 public key hex for signed app approvals>
+MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE=/run/secrets/node_registry_public.hex
+MESH_NODE_NAME=Home
+MESH_NODE_IDENTITY_KEY_FILE=/var/lib/mesh/node.key
+MESH_LAN_DISCOVERY=1
+MESH_KNOWN_NODES=Public=https://api.example.com;sync=pull;apps=inbe;collections=private.inbe.v1.*;data=app_registry+encrypted_records
+MESH_NODE_SYNC_TOKEN=<shared secret for trusted node-to-node mesh sync>
+MESH_NODE_SYNC_INTERVAL_SECONDS=60
+MESH_NODE_SYNC_BATCH_LIMIT=500
+MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX=<ed25519 public key hex>
+MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE=/run/secrets/token_issuer_public.hex
+MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX=<ed25519 private key hex, issuer nodes only>
+MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE=/run/secrets/token_issuer_private.hex
+MESH_TOKEN_PRODUCTS=tokens_small:5000000:1000000000000
+MESH_GOOGLE_PACKAGE_NAMES=com.example.app
+MESH_GOOGLE_SERVICE_ACCOUNT_JSON=<google service account json>
+MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE=/run/secrets/google_play_service_account.json
+MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE=/run/secrets/google_play_oauth_client.json
+MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE=/run/secrets/google_play_refresh_token.txt
+MESH_TOKEN_DIRECT_PURCHASES_ENABLED=1
 MONERO_WALLET_RPC_URL=http://127.0.0.1:18083
 MONERO_WALLET_RPC_USER=<wallet rpc user>
-MONERO_WALLET_RPC_PASSWORD_FILE=/run/credentials/daochi.service/monero_rpc_password
+MONERO_WALLET_RPC_PASSWORD_FILE=/run/credentials/mesh.service/monero_rpc_password
 MONERO_NETWORK=stagenet
 MONERO_RATE_ATOMIC_AMOUNT=1000000000000
 MONERO_RATE_TOKEN_UNITS=5000000
 MONERO_MINIMUM_ATOMIC_AMOUNT=1000
 MONERO_CONFIRMATIONS_REQUIRED=10
-DAOCHI_CHALLENGE_TTL_SECONDS=60
-DAOCHI_TOKEN_TTL_SECONDS=3600
-DAOCHI_MAX_BODY_BYTES=1048576
-DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN=0
-DAOCHI_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES=0
-DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS=0
+MESH_CHALLENGE_TTL_SECONDS=60
+MESH_TOKEN_TTL_SECONDS=3600
+MESH_MAX_BODY_BYTES=1048576
+MESH_ENCRYPTED_PAYLOAD_MAX_RETURN=0
+MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES=0
+MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS=0
 ```
 
-Wallet RPC Digest authentication requires a SHA-256 challenge. Daochi rejects
+Wallet RPC Digest authentication requires a SHA-256 challenge. Mesh rejects
 MD5-only challenges; use a wallet RPC version supporting SHA-256. RPC credentials
 are sent only to the configured HTTPS or literal loopback destination, and
 redirects are refused.
@@ -298,7 +300,7 @@ matches only the reviewed source fingerprint, digest function and authentication
 call site; other high-severity findings and source changes still block release.
 
 When `MONERO_RATE_ATOMIC_AMOUNT` and `MONERO_RATE_TOKEN_UNITS` are set, every
-Daochi account receives one permanent Monero subaddress on first use. Sending
+Mesh account receives one permanent Monero subaddress on first use. Sending
 XMR to that address credits the account at the configured integer ratio after
 the transfer reaches `MONERO_CONFIRMATIONS_REQUIRED`, is unlocked, has zero
 `unlock_time`, and has not been marked as a double spend. Looking up an alias or
@@ -321,9 +323,9 @@ Choose how much Dew one XMR buys and express that ratio in integer units
 the node's Dew prices before purchase. Confirmed deposits retain their
 snapshotted fixed ratio, and existing Dew balances remain intact.
 
-Set `DAOCHI_STORAGE_PLANS_ENABLED=true` on a node offering prepaid storage.
+Set `MESH_STORAGE_PLANS_ENABLED=true` on a node offering prepaid storage.
 A valid fixed Monero ratio is required before upgrades can be purchased.
-The free allowance is the node's `DAOCHI_ACCOUNT_STORAGE_LIMIT_BYTES`. Two sizes are sold: 1 GiB costs 20 Dew a month
+The free allowance is the node's `MESH_ACCOUNT_STORAGE_LIMIT_BYTES`. Two sizes are sold: 1 GiB costs 20 Dew a month
 or 200 Dew a year, and 5 GiB costs 60 Dew a month or 600 Dew a year.
 Buying the current size extends an existing paid period or starts
 immediately, with calendar month/year expiry. Buying the other size starts
@@ -350,7 +352,7 @@ Unlocks are priced by the node, never by the client. `GET /api/v1/unlocks`
 lists the account's unlocks and each product's current and regular price;
 `POST` with `{"product":"inbe.practice.taichi"}` debits the price once (100 Dew)
 and records the unlock in the same transaction. Setting
-`DAOCHI_UNLOCK_TRIAL_UNTIL` to a Unix time sells every unlock at 90% off until
+`MESH_UNLOCK_TRIAL_UNTIL` to a Unix time sells every unlock at 90% off until
 then. `POST /api/v1/unlocks/grant` returns a one-hour download grant, signed by
 the Dew issuer, for a product the account has unlocked. A package artifact
 with a `<sha256>.zx.product` file beside it naming a product is gated: it is
@@ -359,10 +361,10 @@ unexpired grant for that product. Legacy `.zib` artifacts are gated the same way
 
 Shovey Island (`shovey.island`, app `entity`) uses the same atomic unlock
 transaction at **85 Dew** regular and **51 Dew** at launch (40% off). Set
-`DAOCHI_SHOVEY_ISLAND_LAUNCH_AT` once to the actual launch's Unix seconds;
+`MESH_SHOVEY_ISLAND_LAUNCH_AT` once to the actual launch's Unix seconds;
 the server applies the offer from that instant until six calendar months
 later in UTC, exclusively. Zero disables the offer. Island ignores the
-unrelated `DAOCHI_UNLOCK_TRIAL_UNTIL` setting. The public products endpoint
+unrelated `MESH_UNLOCK_TRIAL_UNTIL` setting. The public products endpoint
 returns its current `price_units` and `regular_price_units`; Island's
 `trial_until` remains zero, so clients market only the percentage, without a
 duration or countdown. Clients must POST
@@ -418,7 +420,7 @@ empty. The USD rate is display only: it never sets a price, a charge or a
 Dew credit, which all follow the fixed funding ratio.
 
 When the node's Dew per XMR ratio changes, stop the service and run
-`daochi rescale-dew NAME FACTOR` once with the node's environment. NAME is
+`mesh rescale-dew NAME FACTOR` once with the node's environment. NAME is
 `rescale-` and lowercase letters, digits or hyphens, new for each ratio change
 (`rescale-v1` was 5 to 100 Dew per XMR, `rescale-v2` 1000 to 10,000). Every
 positive balance gains `(FACTOR-1)×balance` as a signed credit, so no ledger
@@ -429,22 +431,22 @@ nothing.
 The production node's ratio lives in `deploy/dew-ratio.env`. When a deploy
 finds it raised by a whole factor, `deploy/apply-dew-ratio.sh` stops the
 service, runs `rescale-dew` under the file's `DEW_RESCALE` name and writes the
-new ratio and the scaled `DAOCHI_TOKEN_PRODUCTS` into the node environment
+new ratio and the scaled `MESH_TOKEN_PRODUCTS` into the node environment
 before starting again. The file's `DEW_PRODUCTS` (`id:Dew` items) are added to
-`DAOCHI_TOKEN_PRODUCTS` at the ratio when the node lacks them; products the
+`MESH_TOKEN_PRODUCTS` at the ratio when the node lacks them; products the
 node sells keep their amounts until a raise scales them. A failed deploy
 restores the previous binary, database and environment together.
 
 `POST /api/v1/tokens/purchases/google/verify` credits a Google Play purchase of
-a `DAOCHI_TOKEN_PRODUCTS` product once per order and then consumes it, so Play
-and Monero buy the same Dew. `DAOCHI_GOOGLE_PACKAGE_NAMES` limits the Android
+a `MESH_TOKEN_PRODUCTS` product once per order and then consumes it, so Play
+and Monero buy the same Dew. `MESH_GOOGLE_PACKAGE_NAMES` limits the Android
 apps it accepts. `GET /api/v1/node` lists the `google-play-purchases`
 capability while a Google Play verifier is configured. Production's package
 names live in `deploy/node.env`, and a deploy installs the service account
-from the optional `DAOCHI_GOOGLE_SERVICE_ACCOUNT_JSON` secret.
+from the optional `MESH_GOOGLE_SERVICE_ACCOUNT_JSON` secret.
 
 To reward one person with Dew, for example as thanks for a past donation, stop
-the service and run `daochi reward-dew REWARD ACCOUNT DEW` with the node's
+the service and run `mesh reward-dew REWARD ACCOUNT DEW` with the node's
 environment. ACCOUNT is the person's alias (`@name`) or account ID. The Dew is
 a signed credit with `REWARD:account` as its payment ID, and a new checkpoint
 is signed. The same REWARD never credits that account twice, and reusing it
@@ -452,7 +454,7 @@ with a different amount is refused. There is no command that credits every
 account.
 
 The background reconciler runs whenever `MONERO_WALLET_RPC_URL` is configured,
-even with `DAOCHI_TOKEN_DIRECT_PURCHASES_ENABLED` unset, so confirmed deposits
+even with `MESH_TOKEN_DIRECT_PURCHASES_ENABLED` unset, so confirmed deposits
 keep settling while purchase creation is disabled. The deposit scan keeps a
 persisted height bookmark and only fetches transfers from that height onward,
 plus the mempool pool. Fixed-price invoices accept partial payments that
@@ -460,14 +462,14 @@ accumulate across transfers until they cover the price. A payment that lands
 after an invoice expired is still credited by the expired-invoice sweep;
 partial funds on an expired invoice cannot be credited or refunded
 automatically from a view-only wallet, so they are reported once through the
-`daochi_monero_stuck_invoices_total` metric and a warning log for manual
+`mesh_monero_stuck_invoices_total` metric and a warning log for manual
 disposition.
 
 The wallet RPC should open a view-only wallet, bind only to loopback, and
-require RPC authentication. Daochi needs the wallet-state-changing
+require RPC authentication. Mesh needs the wallet-state-changing
 `create_address` method, so do not enable `--restricted-rpc`; the view-only
 wallet itself prevents spending. The full wallet, mnemonic seed, private spend
-key, and their backups must never be copied to the Daochi node.
+key, and their backups must never be copied to the Mesh node.
 
 Create the cold wallet and encrypted view-only deployment bundle on the trusted
 computer with:
@@ -484,26 +486,26 @@ spend-capable wallet. The node archive contains only the view-only wallet and
 its runtime credentials. For mainnet, restore the mnemonic offline and verify
 the primary address before deploying the view-only archive.
 
-Each node has a persistent Ed25519 identity. By default it is stored beside the database as a mode-`0600` key; production deployments should set `DAOCHI_NODE_IDENTITY_KEY_FILE` explicitly or supply `DAOCHI_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE`. `DAOCHI_LAN_DISCOVERY=1` advertises `_daochi._tcp.local` with mDNS. Discovery only finds candidates: it never grants trust or starts replication.
+Each node has a persistent Ed25519 identity. By default it is stored beside the database as a mode-`0600` key; production deployments should set `MESH_NODE_IDENTITY_KEY_FILE` explicitly or supply `MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE`. `MESH_LAN_DISCOVERY=1` advertises `_daochi._tcp.local` with mDNS. Discovery only finds candidates: it never grants trust or starts replication.
 
 The manual `Verify origin SSH identity` workflow can recover a missing deployment
 host pin using that identity. It verifies a fresh, domain-separated signature
 binding the SSH host key to the node public key obtained from the authenticated
 HTTPS API. A key scan alone is never trusted. The origin command only reads and
 signs; it does not change the service or export private keys. The resulting host
-pin is encrypted to the RSA public key in `DAOCHI_SSH_BOOTSTRAP_RECIPIENT`, with
+pin is encrypted to the RSA public key in `MESH_SSH_BOOTSTRAP_RECIPIENT`, with
 only public proof fields saved alongside it. Verify the proof and workflow
 revision before installing the decrypted pin as the production environment's
-`DAOCHI_SSH_HOST_KEY` secret. Normal deployments still require strict host-key
+`MESH_SSH_HOST_KEY` secret. Normal deployments still require strict host-key
 verification and all CI/security gates.
 
-Pairing is operator-controlled. Create a short-lived, signed invite with `POST /api/v1/node/pairing/invites`, transfer its JSON as text or a QR payload, and accept it on the other node with `POST /api/v1/node/pairing/accept`. Acceptance automatically posts a signed completion to the inviter, so one invite establishes reciprocal trust while storing directional policy from each node's perspective. The invite is single-use and fixes the peer identity, addresses, direction, apps, collections, trust spaces, and data classes. Paired requests are signed, time-bounded, and replay-protected. If `DAOCHI_ADMIN_TOKEN` is configured, pairing and namespace writes require `X-Daochi-Admin`; without it they are limited to direct loopback callers. A request that carries a forwarding header (`X-Forwarded-For`, `Forwarded`, `CF-Connecting-IP` and similar), names a non-local `Host`, or comes from a cross-site browser `Origin` is refused, so a node behind a reverse proxy must set `DAOCHI_ADMIN_TOKEN` to pair. Both nodes need reachable `DAOCHI_BASE_URL` values during pairing.
+Pairing is operator-controlled. Create a short-lived, signed invite with `POST /api/v1/node/pairing/invites`, transfer its JSON as text or a QR payload, and accept it on the other node with `POST /api/v1/node/pairing/accept`. Acceptance automatically posts a signed completion to the inviter, so one invite establishes reciprocal trust while storing directional policy from each node's perspective. The invite is single-use and fixes the peer identity, addresses, direction, apps, collections, trust spaces, and data classes. Paired requests are signed, time-bounded, and replay-protected. If `MESH_ADMIN_TOKEN` is configured, pairing and namespace writes require `X-Mesh-Admin`; without it they are limited to direct loopback callers. A request that carries a forwarding header (`X-Forwarded-For`, `Forwarded`, `CF-Connecting-IP` and similar), names a non-local `Host`, or comes from a cross-site browser `Origin` is refused, so a node behind a reverse proxy must set `MESH_ADMIN_TOKEN` to pair. Both nodes need reachable `MESH_BASE_URL` values during pairing.
 
-`DAOCHI_KNOWN_NODES` remains the convenient public-node/bootstrap path. It is a comma-separated peer list whose entries can be `https://node.example`, `Name=https://node.example`, or `Name|https://node.example`. A peer can add `sync=<pull|push|bidirectional|none>`, `apps=inbe`, `collections=private.inbe.v1.*`, `spaces=<space-id>`, and `data=app_registry+encrypted_records+names`. The node worker tries configured and paired peers with pull permission. `DAOCHI_NODE_SYNC_INTERVAL_SECONDS` controls polling and `DAOCHI_NODE_SYNC_BATCH_LIMIT` caps record pages.
+`MESH_KNOWN_NODES` remains the convenient public-node/bootstrap path. It is a comma-separated peer list whose entries can be `https://node.example`, `Name=https://node.example`, or `Name|https://node.example`. A peer can add `sync=<pull|push|bidirectional|none>`, `apps=inbe`, `collections=private.inbe.v1.*`, `spaces=<space-id>`, and `data=app_registry+encrypted_records+names`. The node worker tries configured and paired peers with pull permission. `MESH_NODE_SYNC_INTERVAL_SECONDS` controls polling and `MESH_NODE_SYNC_BATCH_LIMIT` caps record pages.
 
-The mesh replicates signed app manifests, opaque encrypted app records, deletion tombstones, and signed trust-space names. App manifests are verified against the receiving node's configured registry authority and are installed before records, so a new home or neighbor node can validate collection ownership offline. Social/account projections, payments, and opaque whole-request envelopes remain API or online-authority owned. The old shared `DAOCHI_NODE_SYNC_TOKEN` is still accepted for configured-node migration, but signed pairing is the preferred trust path.
+The mesh replicates signed app manifests, opaque encrypted app records, deletion tombstones, and signed trust-space names. App manifests are verified against the receiving node's configured registry authority and are installed before records, so a new home or neighbor node can validate collection ownership offline. Social/account projections, payments, and opaque whole-request envelopes remain API or online-authority owned. The old shared `MESH_NODE_SYNC_TOKEN` is still accepted for configured-node migration, but signed pairing is the preferred trust path.
 
-Trust-space naming is an application-level ICANN alternative, not public DNS. An operator creates a local authority with `POST /api/v1/namespaces`, signs names such as `daochi://<space-id>/home` through `POST /api/v1/namespaces/claims`, and resolves them with `GET /api/v1/namespaces/resolve`. Claims replicate to approved peers, but the authority private key does not. Different neighborhoods may intentionally resolve the same label differently; there is no global blockchain or automatic claim that browsers and the public DNS root will recognize these names.
+Trust-space naming is an application-level ICANN alternative, not public DNS. An operator creates a local authority with `POST /api/v1/namespaces`, signs names such as `mesh://<space-id>/home` through `POST /api/v1/namespaces/claims`, and resolves them with `GET /api/v1/namespaces/resolve`. Claims replicate to approved peers, but the authority private key does not. Different neighborhoods may intentionally resolve the same label differently; there is no global blockchain or automatic claim that browsers and the public DNS root will recognize these names.
 
 Deletions replicate too: exports carry record tombstones in a separate
 `deletions` field, and imports apply them when the tombstone timestamp is at
@@ -528,17 +530,17 @@ Generate a token secret once and keep it stable across restarts and every deploy
 openssl rand -hex 32
 ```
 
-If `DAOCHI_TOKEN_SECRET_HEX` is missing, Daochi generates a random in-memory secret at startup. That is only suitable for single-process local development: existing bearer tokens become invalid after restart, and multi-instance deployments will reject tokens issued by another instance.
+If `MESH_TOKEN_SECRET_HEX` is missing, Mesh generates a random in-memory secret at startup. That is only suitable for single-process local development: existing bearer tokens become invalid after restart, and multi-instance deployments will reject tokens issued by another instance.
 
-Malformed environment values abort startup with the offending key name instead of silently falling back. `GET /metrics` is public only while no admin token is configured; once `DAOCHI_ADMIN_TOKEN` is set, scrape it with `X-Daochi-Admin: <token>`. The exposition includes a `daochi_build_info{version=...}` gauge identifying the running build when the binary was stamped via `make build VERSION=<...>` or the Docker/CI build args.
+Malformed environment values abort startup with the offending key name instead of silently falling back. `GET /metrics` is public only while no admin token is configured; once `MESH_ADMIN_TOKEN` is set, scrape it with `X-Mesh-Admin: <token>`. The exposition includes a `mesh_build_info{version=...}` gauge identifying the running build when the binary was stamped via `make build VERSION=<...>` or the Docker/CI build args.
 
-Encrypted envelope limits are disabled by default to avoid surprising existing clients. Set `DAOCHI_ENCRYPTED_PAYLOAD_MAX_RETURN` to cap each envelope response, `DAOCHI_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES` to reject writes that would exceed an account quota, and `DAOCHI_ENCRYPTED_PAYLOAD_RETENTION_DAYS` only after clients can tolerate older envelope pruning.
+Encrypted envelope limits are disabled by default to avoid surprising existing clients. Set `MESH_ENCRYPTED_PAYLOAD_MAX_RETURN` to cap each envelope response, `MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES` to reject writes that would exceed an account quota, and `MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS` only after clients can tolerate older envelope pruning.
 
 ## Tokens
 
-Daochi can issue signed token receipts for registered assets. The server verifies a payment provider or admin credit, writes an append-only ledger event, and signs the receipt with the configured Ed25519 issuer key. Clients must verify the issuer key and accept only issuer and asset IDs they trust.
+Mesh can issue signed token receipts for registered assets. The server verifies a payment provider or admin credit, writes an append-only ledger event, and signs the receipt with the configured Ed25519 issuer key. Clients must verify the issuer key and accept only issuer and asset IDs they trust.
 
-Self-hosted Daochi servers may use the same ledger shape for local assets later, but they cannot create receipts for an issuer without that issuer's private key. If only the issuer public key is configured, the server can expose and verify receipts but cannot credit or spend tokens.
+Self-hosted Mesh servers may use the same ledger shape for local assets later, but they cannot create receipts for an issuer without that issuer's private key. If only the issuer public key is configured, the server can expose and verify receipts but cannot credit or spend tokens.
 
 Token ledger and payment-intent rows are financial audit records. They are scoped by account for balance and receipt lookup, but they are not included in normal account data export and are not deleted by account-data cascade.
 
@@ -555,7 +557,7 @@ Token purchases, spends, invoices, receipts, and spend nonces carry `app_id`, an
 
 Signed app manifests can publish token policies with `asset_id`, `permission`, `status`, and optional `legacy_unsigned_until`. If an app has no token policies, token endpoints keep the legacy registered-app behavior. If policies exist, spends and purchases require the matching policy, and unsigned legacy requests are accepted only until that policy's `legacy_unsigned_until` timestamp. The registration validator caps that unsigned grace window at 365 days.
 
-Daochi records app-scoped token events, but it does not yet move value between separate account and app allocation pools. Treat app-filtered balances as audit views over the ledger. Explicit account-to-app allocation events are still required before calling per-app token distribution fully complete.
+Mesh records app-scoped token events, but it does not yet move value between separate account and app allocation pools. Treat app-filtered balances as audit views over the ledger. Explicit account-to-app allocation events are still required before calling per-app token distribution fully complete.
 
 ## Signed App Registration
 
@@ -567,7 +569,7 @@ Nodes can accept self-contained, app-owned manifests through `POST /api/v1/apps/
 
 An approved manifest stays signed after a newer one replaces it, and anyone may submit it. Give each approval a higher `manifest_sequence` (it sits right after `manifest_version` in the canonical JSON): a node then refuses, with `409`, any manifest whose sequence is lower than the installed one, so an old approval cannot undo a later suspension or key revocation. Mesh peers skip such stale copies. Manifests without the field keep their previous behaviour and hash. A revoked device key ID also stays revoked; registering it again returns `409`.
 
-Each node decides which registry approval key it trusts through `DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX` or `DAOCHI_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE`. That keeps registration cross-platform: CLI, TUI, web, mobile, and desktop apps all submit the same signed JSON manifest, and no platform-specific package name is the root of authority.
+Each node decides which registry approval key it trusts through `MESH_NODE_REGISTRY_PUBLIC_KEY_HEX` or `MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE`. That keeps registration cross-platform: CLI, TUI, web, mobile, and desktop apps all submit the same signed JSON manifest, and no platform-specific package name is the root of authority.
 
 ## Encrypted Hierarchy
 
@@ -606,7 +608,7 @@ server {
 
 Use your normal ACME flow for TLS certificates.
 
-Per-address rate limits trust forwarding headers only from a loopback peer. Behind Cloudflare, `CF-Connecting-IP` names the client; otherwise Daochi uses the last `X-Forwarded-For` entry, the one your proxy appended. The first entry is whatever the client sent and is never used. A proxy that does not append `$remote_addr` (or set `CF-Connecting-IP`) puts every client in one bucket.
+Per-address rate limits trust forwarding headers only from a loopback peer. Behind Cloudflare, `CF-Connecting-IP` names the client; otherwise Mesh uses the last `X-Forwarded-For` entry, the one your proxy appended. The first entry is whatever the client sent and is never used. A proxy that does not append `$remote_addr` (or set `CF-Connecting-IP`) puts every client in one bucket.
 
 ## Data Model
 

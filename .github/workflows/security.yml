@@ -14,7 +14,7 @@ permissions:
   security-events: write
 
 concurrency:
-  group: daochi-security-${{ github.workflow }}-${{ github.ref }}
+  group: mesh-security-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -127,12 +127,12 @@ jobs:
         uses: ./.github/actions/generate
 
       - name: Build image
-        run: docker build --pull -t daochi:security .
+        run: docker build --pull -t mesh:security .
 
       - name: Scan image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: daochi:security
+          image-ref: mesh:security
           format: sarif
           output: trivy-results.sarif
           severity: CRITICAL,HIGH

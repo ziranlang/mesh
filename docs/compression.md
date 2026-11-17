@@ -1,6 +1,6 @@
 # HTTP compression
 
-Daochi can negotiate Zstandard, gzip or identity for sync JSON and public node
+Mesh can negotiate Zstandard, gzip or identity for sync JSON and public node
 information. Clients that already advertise `zstd` receive it automatically;
 clients advertising gzip retain the existing representation. No encrypted-record
 format, account key, signature message or sync cursor changes are required.
@@ -46,9 +46,9 @@ private dictionary is introduced by this HTTP upgrade.
 Set either environment variable to `0` and restart the service through its
 normal deployment path to disable that direction independently:
 
-- `DAOCHI_HTTP_ZSTD_RESPONSES`: prefer Zstandard responses when accepted;
+- `MESH_HTTP_ZSTD_RESPONSES`: prefer Zstandard responses when accepted;
   defaults to enabled. Disabling it retains gzip/identity negotiation.
-- `DAOCHI_HTTP_ZSTD_REQUESTS`: accept bounded Zstandard request bodies and
+- `MESH_HTTP_ZSTD_REQUESTS`: accept bounded Zstandard request bodies and
   advertise `http-zstd-v1`; defaults to enabled. Disabling it rejects such
   uploads and removes that capability.
 

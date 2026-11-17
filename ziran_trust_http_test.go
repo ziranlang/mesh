@@ -390,9 +390,9 @@ func TestZiranTrustHTTPAgainstBaseline(t *testing.T) {
 						body.panicValue = panicValue
 					}
 					request := httptest.NewRequest("POST", path, body)
-					request.Header.Set("X-Daochi-Admin", "operator-secret")
+					request.Header.Set("X-Mesh-Admin", "operator-secret")
 					if mode == "unauthorized" {
-						request.Header.Del("X-Daochi-Admin")
+						request.Header.Del("X-Mesh-Admin")
 					}
 					if mode == "body limit" {
 						server.Cfg.MaxBodyBytes = 1
