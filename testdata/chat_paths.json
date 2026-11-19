@@ -341,5 +341,138 @@
         }
       }
     }
+  },
+  "/api/v1/lumi/developer": {
+    "post": {
+      "summary": "Submit or read a turn in the owner's developer chat",
+      "description": "Requires a signed Mesh account session for the configured Lumi owner. Supply text to submit a turn. Omit text to read its result. Repeating the same ID and text retrieves the existing turn for seven days.",
+      "security": [
+        {
+          "bearerAuth": []
+        }
+      ],
+      "requestBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "id"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "text": {
+                  "type": "string",
+                  "description": "Prompt, up to 8192 UTF-8 bytes"
+                }
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "The turn ID and its reply once available"
+        },
+        "400": {
+          "description": "Invalid turn"
+        },
+        "401": {
+          "description": "Account authentication required"
+        },
+        "403": {
+          "description": "Owner account required"
+        },
+        "404": {
+          "description": "Unknown turn"
+        },
+        "409": {
+          "description": "Turn ID is already used for different text"
+        },
+        "429": {
+          "description": "Developer queue is full"
+        },
+        "503": {
+          "description": "Developer chat unavailable"
+        }
+      }
+    }
+  },
+  "/api/v1/admin/lumi/developer": {
+    "get": {
+      "summary": "Read the next developer turn for Harmony",
+      "description": "Requires a direct loopback request with the dedicated developer token in X-Mesh-Admin.",
+      "responses": {
+        "200": {
+          "description": "The owner account and the next pending turn, if present"
+        },
+        "401": {
+          "description": "Developer relay authentication required"
+        },
+        "403": {
+          "description": "Direct loopback required"
+        },
+        "503": {
+          "description": "Developer chat unavailable"
+        }
+      }
+    },
+    "post": {
+      "summary": "Save Harmony's result for a developer turn",
+      "description": "Requires a direct loopback request with the dedicated developer token in X-Mesh-Admin. Submit the account_id and id from the inbox with the reply. Repeating the same reply leaves the terminal turn unchanged.",
+      "requestBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "account_id",
+                "id",
+                "reply"
+              ],
+              "properties": {
+                "account_id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "id": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{32}$"
+                },
+                "reply": {
+                  "type": "string",
+                  "description": "Result, up to 8192 UTF-8 bytes"
+                }
+              }
+            }
+          }
+        }
+      },
+      "responses": {
+        "200": {
+          "description": "Reply stored"
+        },
+        "400": {
+          "description": "Invalid reply"
+        },
+        "401": {
+          "description": "Developer relay authentication required"
+        },
+        "403": {
+          "description": "Direct loopback required"
+        },
+        "409": {
+          "description": "Turn is unavailable or already has a different reply"
+        },
+        "503": {
+          "description": "Developer chat unavailable"
+        }
+      }
+    }
   }
 }

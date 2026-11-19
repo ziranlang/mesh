@@ -17,18 +17,23 @@ for line in Path("/etc/mesh/mesh.env").read_text().splitlines():
     name, separator, value = line.partition("=")
     if separator:
         values[name.strip()] = value.strip().strip("\"'")
-token = values.get("MESH_FEEDBACK_TOKEN", "")
-if not token and values.get("MESH_FEEDBACK_TOKEN_FILE"):
-    token = Path(values["MESH_FEEDBACK_TOKEN_FILE"]).read_text().strip()
-if not token:
+developer = operation["action"] in ("developer-inbox", "developer-finish")
+name = "MESH_LUMI_DEVELOPER_TOKEN" if developer else "MESH_FEEDBACK_TOKEN"
+token = values.get(name, "")
+if not token and values.get(name + "_FILE"):
+    token = Path(values[name + "_FILE"]).read_text().strip()
+if not token and not developer:
     token = values.get("MESH_ADMIN_TOKEN", "")
 if not token:
-    print("Developer inbox is disabled: configure MESH_ADMIN_TOKEN.", file=sys.stderr)
+    print("Developer inbox credential is unavailable.", file=sys.stderr)
     sys.exit(1)
-base = "http://127.0.0.1:8080/api/v1/admin/feedback"
+base = "http://127.0.0.1:8080/api/v1/admin/"
+base += "lumi/developer" if developer else "feedback"
 payload = None
 if operation["action"] == "reply":
     base += "/reply"
+    payload = json.dumps(operation["reply"]).encode()
+elif operation["action"] == "developer-finish":
     payload = json.dumps(operation["reply"]).encode()
 request = urllib.request.Request(base, data=payload, headers={"X-Mesh-Admin": token, "Content-Type": "application/json"})
 try:
@@ -49,6 +54,9 @@ def main():
     parser.add_argument("--host", required=True)
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("inbox")
+    commands.add_parser("developer-inbox")
+    developer = commands.add_parser("developer-finish")
+    developer.add_argument("--file", required=True, type=Path)
     reply = commands.add_parser("reply")
     reply.add_argument("--account-id", required=True)
     reply.add_argument("--report-id", required=True)
@@ -57,6 +65,12 @@ def main():
     reply.add_argument("--reply-id")
     args = parser.parse_args()
     operation = {"action": args.action}
+    if args.action == "developer-finish":
+        with args.file.open("rb") as stream:
+            document = stream.read(65537)
+        if len(document) > 65536:
+            parser.error("developer reply document too large")
+        operation["reply"] = json.loads(document)
     if args.action == "reply":
         message = args.reply_file.read_text()
         if not message.strip() or len(message.encode()) > 4096:

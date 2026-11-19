@@ -65,6 +65,7 @@ LoopbackOrigin :: (origin: string) -> bool {
     return false
 }
 
+#scope_export
 // A loopback connection is the operator only when it came straight to this
 // process: no proxy hop, a local Host (which defeats DNS rebinding), and no
 // cross-site browser Origin.
@@ -96,7 +97,6 @@ DirectLocalRequest :: (request: *http.Request) -> bool {
     return origin == "" || LoopbackOrigin(origin)
 }
 
-#scope_export
 HeaderAlias :: (request: *http.Request, names: []string) -> string {
     headers := http.Headers(request)
     for name: names {

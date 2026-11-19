@@ -1,0 +1,190 @@
+// The private Lumi chat uses the Mesh session's verified account. The worker
+// receives only that account's turns and holds a separate operator credential.
+#import "std/go_types"
+auth :: #import "http_auth";
+body :: #import "http_body";
+chat :: #import "chat";
+identity :: #import "identity";
+response :: #import "response";
+http :: #import "std/http_go";
+json :: #import "std/json_go";
+sql :: #import "std/sql_go";
+errors :: #import "std/errors_go";
+strings :: #system_library "go:strings";
+
+Turn :: struct {
+    id: string #go_tag "json:\"id\""
+    text: string #go_tag "json:\"text,omitempty\""
+    reply: string #go_tag "json:\"reply,omitempty\""
+    account_id: string #go_tag "json:\"account_id,omitempty\""
+}
+
+#scope_file
+TrimSpace :: (value: string) -> string #foreign strings;
+
+Schema :: #string SQL
+CREATE TABLE IF NOT EXISTS server_lumi_developer_turns (
+    account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    reply TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(account_id,id)
+);
+SQL;
+
+Ready :: (service: chat.Chat, writer: http.ResponseWriter) -> bool {
+    if !identity.ValidUserID(service.configuration.LumiOwnerID) ||
+    service.configuration.LumiDeveloperToken.count < 32 {
+        response.Error(writer, cast(isize)503, "developer chat unavailable")
+        return false
+    }
+    return true
+}
+
+Open :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Request) -> bool {
+    empty: [0]Any
+    created := sql.Exec(service.database, http.Context(request), Schema, empty[:])
+    if created.error != null {
+        response.Error(writer, cast(isize)503, "developer chat unavailable")
+        return false
+    }
+    return true
+}
+
+ValidID :: (id: string) -> bool {
+    if id.count != 32 {
+        return false
+    }
+    for byte: id {
+        if !(byte >= cast(u8)48 && byte <= cast(u8)57) && !(byte >= cast(u8)97 && byte <= cast(u8)102) {
+            return false
+        }
+    }
+    return true
+}
+
+ReadTurn :: (writer: http.ResponseWriter, request: *http.Request, turn: *Turn) -> bool {
+    received := body.ReadJSON(writer, request, 65536)
+    if received.error != null || json.Unmarshal(received.value, turn) != null || !ValidID(turn.id) {
+        response.Error(writer, cast(isize)400, "invalid developer turn")
+        return false
+    }
+    return true
+}
+
+#scope_export
+Account :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Request) {
+    user := auth.BearerUser(service.database, request, service.configuration.TokenSecret)
+    if user.authentication.error != null || user.authentication.status != 0 {
+        auth.Respond(writer, service.counters, user.authentication)
+        return
+    }
+    if !Ready(service, writer) {
+        return
+    }
+    if user.value != service.configuration.LumiOwnerID {
+        response.Error(writer, cast(isize)403, "owner account required")
+        return
+    }
+    input: Turn
+    if !ReadTurn(writer, request, *input) {
+        return
+    }
+    if input.account_id != "" || input.reply != "" || input.text.count > 8192 ||
+    (input.text != "" && TrimSpace(input.text) == "") {
+        response.Error(writer, cast(isize)400, "invalid developer message")
+        return
+    }
+    if !Open(service, writer, request) {
+        return
+    }
+    context := http.Context(request)
+    arguments: [3]Any = .[user.value, input.id, input.text]
+    if input.text != "" {
+        // Retain the deduplication window across node and app restarts.
+        removed := sql.Exec(service.database, context,
+            "DELETE FROM server_lumi_developer_turns WHERE account_id=?1 AND created_at<datetime('now','-7 days')", arguments[0:1])
+        added := sql.Exec(service.database, context,
+            "INSERT INTO server_lumi_developer_turns(account_id,id,text) SELECT ?1,?2,?3 WHERE (SELECT COUNT(*) FROM server_lumi_developer_turns WHERE account_id=?1 AND reply='')<8 ON CONFLICT(account_id,id) DO NOTHING", arguments[:])
+        if removed.error != null || added.error != null {
+            response.Error(writer, cast(isize)503, "developer chat unavailable")
+            return
+        }
+    }
+    saved_text: string
+    result: Turn
+    result.id = input.id
+    values: [2]Any = .[*saved_text, *result.reply]
+    row := sql.QueryRow(service.database, context,
+        "SELECT text,reply FROM server_lumi_developer_turns WHERE account_id=?1 AND id=?2", arguments[0:2])
+    scanned := sql.ScanRow(row, values[:])
+    if errors.Is(scanned, sql.NoRows()) {
+        if input.text != "" {
+            response.Error(writer, cast(isize)429, "developer chat queue full")
+        } else {
+            response.Error(writer, cast(isize)404, "unknown developer turn")
+        }
+        return
+    }
+    if scanned != null {
+        response.Error(writer, cast(isize)503, "developer chat unavailable")
+        return
+    }
+    if input.text != "" && input.text != saved_text {
+        response.Error(writer, cast(isize)409, "developer turn already exists")
+        return
+    }
+    response.JSON(writer, cast(isize)200, result)
+}
+
+Work :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Request, finishing: bool) {
+    if !auth.DirectLocalRequest(request) {
+        response.Error(writer, cast(isize)403, "developer relay requires loopback")
+        return
+    }
+    if !Ready(service, writer) || !auth.RequireAdmin(writer, request, service.configuration.LumiDeveloperToken) ||
+    !Open(service, writer, request) {
+        return
+    }
+    context := http.Context(request)
+    account := service.configuration.LumiOwnerID
+    if !finishing {
+        result: Turn
+        arguments: [1]Any = .[account]
+        values: [2]Any = .[*result.id, *result.text]
+        row := sql.QueryRow(service.database, context,
+            "SELECT id,text FROM server_lumi_developer_turns WHERE account_id=?1 AND reply='' AND created_at>=datetime('now','-7 days') ORDER BY rowid LIMIT 1", arguments[:])
+        scanned := sql.ScanRow(row, values[:])
+        if scanned != null && !errors.Is(scanned, sql.NoRows()) {
+            response.Error(writer, cast(isize)503, "developer chat unavailable")
+            return
+        }
+        result.account_id = account
+        response.JSON(writer, cast(isize)200, result)
+        return
+    }
+    input: Turn
+    if !ReadTurn(writer, request, *input) {
+        return
+    }
+    if input.account_id != account || input.text != "" || input.reply.count > 8192 || TrimSpace(input.reply) == "" {
+        response.Error(writer, cast(isize)400, "invalid developer reply")
+        return
+    }
+    arguments: [3]Any = .[account, input.id, input.reply]
+    written := sql.Exec(service.database, context,
+        "UPDATE server_lumi_developer_turns SET reply=?3 WHERE account_id=?1 AND id=?2 AND (reply='' OR reply=?3)", arguments[:])
+    if written.error != null {
+        response.Error(writer, cast(isize)503, "developer chat unavailable")
+        return
+    }
+    changed := sql.RowsAffected(written.value)
+    if changed.error != null || changed.value != 1 {
+        response.Error(writer, cast(isize)409, "developer turn unavailable")
+        return
+    }
+    result: Turn
+    result.id = input.id
+    response.JSON(writer, cast(isize)200, result)
+}

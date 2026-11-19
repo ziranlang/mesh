@@ -80,6 +80,7 @@ Config :: struct {
     LumiBotToken: string
     LumiWebhookSecret: string
     LumiOwnerID: string
+    LumiDeveloperToken: string
     LumiGroupID: s64
     TelegramAccountsEnabled: bool
     LumiCanvasURL: string
@@ -349,6 +350,7 @@ Load :: () -> Config {
     result.LumiBotToken = EnvStringOrFile("MESH_LUMI_BOT_TOKEN", "MESH_LUMI_BOT_TOKEN_FILE", "")
     result.LumiWebhookSecret = EnvStringOrFile("MESH_LUMI_WEBHOOK_SECRET", "MESH_LUMI_WEBHOOK_SECRET_FILE", "")
     result.LumiOwnerID = EnvString("MESH_LUMI_OWNER_ID", "")
+    result.LumiDeveloperToken = EnvStringOrFile("MESH_LUMI_DEVELOPER_TOKEN", "MESH_LUMI_DEVELOPER_TOKEN_FILE", "")
     group := Getenv("MESH_LUMI_GROUP_ID")
     if group != "" {
         parsed := ParseInt(group, 10, 64)

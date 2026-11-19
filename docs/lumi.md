@@ -48,6 +48,15 @@ bounded at 524,288 bytes to accommodate JSON escaping, while ordinary provider
 responses remain capped at 65,536 bytes. These transport bounds do not change
 the final saved report limit or bypass client validation of source items.
 
+The private developer chat uses `POST /api/v1/lumi/developer`.
+Use the existing `MESH_LUMI_OWNER_ID` and configure
+`MESH_LUMI_DEVELOPER_TOKEN_FILE` with a separate relay credential. Mesh matches
+the authenticated session to the configured account before accepting any
+turn. Send `{id,text}` to submit and `{id}` to read the eventual reply.
+Repeating the same ID and text returns the original turn. The Harmony worker
+uses the existing SSH helper to read and finish turns through the loopback
+relay. Ordinary Lumi uses the conversation endpoint above.
+
 `POST /api/v1/feedback` saves an account's report idempotently. The app's
 durable outbox retries delivery, including when online conversation is disabled.
 The decoded message accepts up to 32,768 UTF-8 bytes (32 KiB), matching the

@@ -67,6 +67,7 @@ type BaselineConfig struct {
 	LumiBotToken                    string
 	LumiWebhookSecret               string
 	LumiOwnerID                     string
+	LumiDeveloperToken              string
 	TelegramAccountsEnabled         bool
 	LumiCanvasURL                   string
 	FeedbackToken                   string
@@ -158,6 +159,7 @@ func baselineLoadConfig() BaselineConfig {
 		LumiBotToken:                    baselineEnvStringOrFile("MESH_LUMI_BOT_TOKEN", "MESH_LUMI_BOT_TOKEN_FILE", ""),
 		LumiWebhookSecret:               baselineEnvStringOrFile("MESH_LUMI_WEBHOOK_SECRET", "MESH_LUMI_WEBHOOK_SECRET_FILE", ""),
 		LumiOwnerID:                     baselineEnvString("MESH_LUMI_OWNER_ID", ""),
+		LumiDeveloperToken:              baselineEnvStringOrFile("MESH_LUMI_DEVELOPER_TOKEN", "MESH_LUMI_DEVELOPER_TOKEN_FILE", ""),
 		TelegramAccountsEnabled:         ConfigValues_Bool(os.Getenv("MESH_TELEGRAM_ACCOUNTS_ENABLED"), false),
 		LumiCanvasURL:                   baselineEnvString("MESH_LUMI_CANVAS_URL", "https://inbe.waozi.xyz/build/telegram/index.html"),
 		ChatModel:                       baselineEnvString("MESH_CHAT_MODEL", "glm-4.7-flash"),
@@ -276,6 +278,8 @@ var configEnvironmentKeys = []string{
 	"MESH_LUMI_WEBHOOK_SECRET",
 	"MESH_LUMI_WEBHOOK_SECRET_FILE",
 	"MESH_LUMI_OWNER_ID",
+	"MESH_LUMI_DEVELOPER_TOKEN",
+	"MESH_LUMI_DEVELOPER_TOKEN_FILE",
 	"MESH_LUMI_GROUP_ID",
 	"MESH_LUMI_CANVAS_URL",
 	"MESH_TELEGRAM_ACCOUNTS_ENABLED",
@@ -452,6 +456,7 @@ func TestZiranConfigEnvironmentAndFiles(t *testing.T) {
 	t.Setenv("MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE", file)
 	t.Setenv("MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE", file)
 	t.Setenv("MONERO_WALLET_RPC_PASSWORD_FILE", file)
+	t.Setenv("MESH_LUMI_DEVELOPER_TOKEN_FILE", file)
 	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "malformed")
 	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE", file)
 	t.Setenv("MESH_DB", "database\nname")

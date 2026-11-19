@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Relay private Lumi developer turns for the configured Mesh owner account.
+
 - Rename Daochi to Mesh at mesh.ziran-lang.org, preserving existing account keys, encrypted records and installed-client access.
 
 - Offer each host only package releases it can run: the ZX revision it names (`zx=R`, read from each stored `.zx` header), revisions before 28 for released hosts that name none, and nothing older than its `oldest_host_api`. Serve a release's signed WebAssembly variant to web hosts that ask with `format=wasm`. Package staging keeps every archived release and blob, and the history keeps the newest release of every format, revision and interface.
