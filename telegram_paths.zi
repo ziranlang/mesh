@@ -88,6 +88,7 @@ Document1 :: #string JSON_1
   "/api/v1/lumi/telegram/ack": {
     "post": {
       "summary": "Acknowledge an action claimed by this app client",
+      "description": "An optional reply sends the final answer to the originating private Telegram message once. It requires the original account and claiming client. A 202 acknowledgement records that delivery could not be confirmed and prevents automatic replay.",
       "security": [
         {
           "bearerAuth": []
@@ -95,7 +96,13 @@ Document1 :: #string JSON_1
       ],
       "responses": {
         "200": {
-          "description": "Acknowledged"
+          "description": "Acknowledged. Any requested reply has a delivery receipt"
+        },
+        "202": {
+          "description": "Acknowledged. Telegram delivery is unconfirmed"
+        },
+        "409": {
+          "description": "No matching private Telegram message claim"
         },
         "400": {
           "description": "Invalid receipt"
@@ -109,7 +116,7 @@ Document1 :: #string JSON_1
   "/api/v1/lumi/telegram/messages": {
     "post": {
       "summary": "Acknowledge a legacy Lumi conversation upload without sending to Telegram",
-      "description": "Telegram is input-only. Authenticated uploads from older apps drain silently, including stale history and previous uncertain deliveries. Conversation history remains in encrypted account sync. No Telegram text, actions or notifications are sent.",
+      "description": "Authenticated history uploads from older apps drain silently, including stale history and previous uncertain deliveries. Conversation history remains in encrypted account sync. No Telegram text, actions or notifications are sent.",
       "security": [
         {
           "bearerAuth": []

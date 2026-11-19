@@ -70,10 +70,12 @@ ReplyAnswer :: struct {
     description: string #go_tag "json:\"description\""
 }
 
-DeliverReply :: (token: string, destination: s64, original: s64, thread: s64, content: string) -> MessageReceipt {
+DeliverReply :: (token: string, destination: s64, original: s64, thread: s64, content: string,
+    allowSendingWithoutReply: bool) -> MessageReceipt {
     failed: MessageReceipt
     encoded := json.Marshal(TelegramReplySend.{chat_id = destination, text = content,
-        message_thread_id = thread, reply_parameters = ReplyParameters.{message_id = original, allow_sending_without_reply = true}})
+        message_thread_id = thread, reply_parameters = ReplyParameters.{message_id = original,
+            allow_sending_without_reply = allowSendingWithoutReply}})
     if encoded.error != null {
         return failed
     }

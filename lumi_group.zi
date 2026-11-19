@@ -106,7 +106,7 @@ Handle :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Reque
         unused transport.Typing(configuration.LumiBotToken, destination)
         content = chat.GroupReply(service, writer, request, input)
     }
-    delivered := transport.DeliverReply(configuration.LumiBotToken, destination, message, thread, content)
+    delivered := transport.DeliverReply(configuration.LumiBotToken, destination, message, thread, content, true)
     state := ifx delivered.message_id > 0 then "delivered" else "uncertain"
     if delivered.message_id == 0 {
         if delivered.error_code >= 400 && delivered.error_code < 500 {

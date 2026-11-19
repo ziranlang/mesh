@@ -1,5 +1,5 @@
-// Telegram is an authorized input transport for the app conversation.
-// It queues app-owned actions; it never receives an account signing key.
+// Telegram queues app-owned actions and receives replies to its own messages.
+// Account signing keys stay in the app.
 #import "std/go_types"
 chat :: #import "chat";
 entries :: #import "telegram_account_entry";
@@ -21,6 +21,7 @@ group :: #import "lumi_group";
 strings :: #system_library "go:strings";
 native_sql :: #system_library "go:database/sql";
 Join :: (parts: []string, separator: string) -> string #foreign strings;
+TrimSpace :: (value: string) -> string #foreign strings;
 RollbackAtReturn :: (transaction: *sql.Transaction) #go_defer #foreign native_sql "(*Tx).Rollback";
 
 LinkResponse :: struct {
@@ -65,6 +66,7 @@ LumiUpdate :: struct {
     kind: string #go_tag "json:\"kind\""
     text: string #go_tag "json:\"text\""
     choice: isize #go_tag "json:\"choice\""
+    can_reply: bool #go_tag "json:\"can_reply,omitempty\""
 }
 LumiPoll :: struct {
     linked: bool #go_tag "json:\"linked\""
@@ -74,6 +76,7 @@ LumiPoll :: struct {
 LumiReceipt :: struct {
     id: s64 #go_tag "json:\"id\""
     client: string #go_tag "json:\"client\""
+    reply: string #go_tag "json:\"reply\""
 }
 LumiMessage :: struct {
     id: string #go_tag "json:\"id\""
@@ -105,6 +108,14 @@ EnsureSchema :: (database: *sql.Database, context: ctx.Context) -> bool {
     }
     if schema.AddColumn(database, context, "server_lumi_updates", "done_at",
         "ALTER TABLE server_lumi_updates ADD COLUMN done_at INTEGER NOT NULL DEFAULT 0") != null {
+        return false
+    }
+    if schema.AddColumn(database, context, "server_lumi_updates", "telegram_chat_id",
+        "ALTER TABLE server_lumi_updates ADD COLUMN telegram_chat_id INTEGER NOT NULL DEFAULT 0") != null ||
+    schema.AddColumn(database, context, "server_lumi_updates", "telegram_message_id",
+        "ALTER TABLE server_lumi_updates ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0") != null ||
+    schema.AddColumn(database, context, "server_lumi_updates", "telegram_reply_id",
+        "ALTER TABLE server_lumi_updates ADD COLUMN telegram_reply_id INTEGER NOT NULL DEFAULT 0") != null {
         return false
     }
     // A delivered report is never copied to the owner again, even after its
@@ -228,6 +239,51 @@ ConsumeLink :: (database: *sql.Database, requestContext: ctx.Context, code: stri
     return result
 }
 
+ReplyToUpdate :: (service: chat.Chat, writer: http.ResponseWriter, context: ctx.Context,
+    account: string, input: LumiReceipt, now: s64) {
+    arguments: [5]Any = .[account, input.id, input.client, now, 0]
+    destination: s64
+    original: s64
+    destinations: [2]Any = .[*destination, *original]
+    // Consume the exact app claim before contacting Telegram. A lost outbound
+    // response leaves an uncertain receipt and is never sent a second time.
+    row := sql.QueryRow(service.database, context, ClaimTelegramReply, arguments[0:4])
+    scanned := sql.ScanRow(row, destinations[:])
+    if scanned == sql.NoRows() {
+        delivered: s64
+        delivery: [1]Any = .[*delivered]
+        row = sql.QueryRow(service.database, context, ReadTelegramReply, arguments[0:3])
+        scanned = sql.ScanRow(row, delivery[:])
+        if scanned == sql.NoRows() {
+            response.Error(writer, 409, "no matching Telegram message claim")
+            return
+        }
+        if scanned == null {
+            status: isize = ifx delivered > 0 then 200 else 202
+            response.JSON(writer, status, true)
+            return
+        }
+    }
+    if scanned != null {
+        response.Error(writer, 503, "Telegram reply claim unavailable")
+        return
+    }
+    receipt := transport.DeliverReply(service.configuration.LumiBotToken, destination, original, 0, input.reply, false)
+    if receipt.message_id > 0 {
+        arguments[4] = receipt.message_id
+        saved := sql.Exec(service.database, ctx.Background(),
+            "UPDATE server_lumi_updates SET telegram_reply_id=?5 WHERE account_id=?1 AND id=?2 AND executor=?3 AND done_at=?4", arguments[:])
+        if saved.error == null {
+            response.JSON(writer, 200, true)
+            return
+        }
+        print("Lumi private reply receipt could not be saved\n")
+    } else {
+        print("Lumi private reply delivery failed: http=% api=% reason=%\n", receipt.http_status, receipt.error_code, receipt.reason)
+    }
+    response.JSON(writer, 202, true)
+}
+
 Account :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Request, action: string) {
     user := auth.BearerUser(service.database, request, service.configuration.TokenSecret)
     if user.authentication.error != null || user.authentication.status != 0 {
@@ -311,10 +367,16 @@ Account :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Requ
         return
     }
     if action == "ack" {
-        received := body.ReadJSON(writer, request, 256)
+        received := body.ReadJSON(writer, request, 32768)
         input: LumiReceipt
-        if received.error != null || json.Unmarshal(received.value, *input) != null || input.id == 0 || input.client.count != 64 {
+        if received.error != null || json.Unmarshal(received.value, *input) != null ||
+        input.id == 0 || input.client.count != 64 || input.reply.count > 4096 ||
+        (input.reply != "" && (input.id < 0 || TrimSpace(input.reply) == "")) {
             response.Error(writer, cast(isize)400, "invalid receipt")
+            return
+        }
+        if input.reply != "" {
+            ReplyToUpdate(service, writer, context, user.value, input, now)
             return
         }
         arguments[1] = input.id
@@ -356,11 +418,12 @@ Account :: (service: chat.Chat, writer: http.ResponseWriter, request: *http.Requ
         result: LumiPoll
         result.linked = linked
         result.linked_at = linkedAt
-        updateDestinations: [4]Any = .[*result.update.id, *result.update.kind, *result.update.text, *result.update.choice]
+        updateDestinations: [5]Any = .[*result.update.id, *result.update.kind, *result.update.text, *result.update.choice, *result.update.can_reply]
         // Only the claiming app executes this update. Another signed-in device
         // gets its resulting conversation through encrypted sync.
         arguments[1] = client
-        row = sql.QueryRow(service.database, context, "UPDATE server_lumi_updates SET executor=?2 WHERE account_id=?1 AND done=0 AND id=(SELECT id FROM server_lumi_updates WHERE account_id=?1 AND done=0 ORDER BY id LIMIT 1) AND (executor='' OR executor=?2) RETURNING id,kind,text,choice", arguments[0:2])
+        arguments[2] = destination
+        row = sql.QueryRow(service.database, context, "UPDATE server_lumi_updates SET executor=?2 WHERE account_id=?1 AND done=0 AND id=(SELECT id FROM server_lumi_updates WHERE account_id=?1 AND done=0 ORDER BY id LIMIT 1) AND (executor='' OR executor=?2) RETURNING id,kind,text,choice,(kind='message' AND telegram_chat_id=?3 AND telegram_chat_id>0 AND telegram_message_id>0)", arguments[0:3])
         unused sql.ScanRow(row, updateDestinations[:])
         response.JSON(writer, cast(isize)200, result)
         return
@@ -409,8 +472,12 @@ Webhook :: (service: chat.Chat, entryService: entries.AccountEntries, writer: ht
     }
     received := body.ReadJSON(writer, request, 32768)
     update: TelegramUpdate
-    if received.error != null || json.Unmarshal(received.value, *update) != null || update.update_id <= 0 || !Schema(service, request) {
+    if received.error != null || json.Unmarshal(received.value, *update) != null || update.update_id <= 0 {
         response.Error(writer, cast(isize)400, "invalid update")
+        return
+    }
+    if !Schema(service, request) {
+        response.Error(writer, 503, "Telegram queue temporarily unavailable")
         return
     }
     message := update.message
@@ -442,6 +509,12 @@ Webhook :: (service: chat.Chat, entryService: entries.AccountEntries, writer: ht
         return
     }
     text := parsed.message
+    // Telegram also delivers non-text private updates, and retries any
+    // webhook response outside 2xx. Ignore unsupported messages once.
+    if callback.id == "" && (text.count == 0 || text.count >= 1024) {
+        response.JSON(writer, 200, true)
+        return
+    }
     if callback.id == "" && text.count == 44 && text[:12] == "/start auth_" {
         if !SendAccountMenu(service, entryService, request, sender.id, text[12:]) {
             unused transport.Deliver(service.configuration.LumiBotToken, sender.id,
@@ -531,17 +604,10 @@ Webhook :: (service: chat.Chat, entryService: entries.AccountEntries, writer: ht
         choice = ifx callback.data[0] == cast(u8)89 then 1 else 2
         unused transport.AnswerCallback(service.configuration.LumiBotToken, callback.id)
     }
-    if text.count == 0 || text.count >= 1024 {
-        response.Error(writer, cast(isize)400, "message too long")
-        return
-    }
-    arguments[0] = update.update_id
-    arguments[1] = account
-    arguments[2] = kind
-    arguments[3] = text
-    arguments[4] = choice
+    original := ifx kind == "message" then message.message_id else 0
+    queued: [7]Any = .[update.update_id, account, kind, text, choice, sender.id, original]
     written := sql.Exec(service.database, context,
-        "INSERT OR IGNORE INTO server_lumi_updates(id,account_id,kind,text,choice) VALUES(?1,?2,?3,?4,?5)", arguments[:])
+        "INSERT OR IGNORE INTO server_lumi_updates(id,account_id,kind,text,choice,telegram_chat_id,telegram_message_id) VALUES(?1,?2,?3,?4,?5,?6,?7)", queued[:])
     if written.error != null { response.Error(writer, cast(isize)503, "app queue unavailable"); return }
     if kind == "message" {
         // Show at once that Lumi received the message; the app replies next.
@@ -551,6 +617,21 @@ Webhook :: (service: chat.Chat, entryService: entries.AccountEntries, writer: ht
 }
 
 #scope_file
+ClaimTelegramReply :: #string SQL
+UPDATE server_lumi_updates SET done=1,done_at=?4,text=''
+WHERE account_id=?1 AND id=?2 AND executor=?3 AND done=0
+  AND kind='message' AND telegram_message_id>0 AND EXISTS(
+      SELECT 1 FROM server_lumi_telegram
+      WHERE account_id=?1 AND telegram_id=server_lumi_updates.telegram_chat_id)
+RETURNING telegram_chat_id,telegram_message_id
+SQL;
+ReadTelegramReply :: #string SQL
+SELECT telegram_reply_id FROM server_lumi_updates
+WHERE account_id=?1 AND id=?2 AND executor=?3 AND done=1
+  AND kind='message' AND telegram_message_id>0 AND EXISTS(
+      SELECT 1 FROM server_lumi_telegram
+      WHERE account_id=?1 AND telegram_id=server_lumi_updates.telegram_chat_id)
+SQL;
 // An owner copy of a report holds the reporting account and report ID as JSON;
 // the CASE keeps other updates' plain text away from json_extract.
 ForgetReport :: "CREATE TRIGGER IF NOT EXISTS server_lumi_forget_report AFTER DELETE ON server_app_feedback BEGIN DELETE FROM server_lumi_updates WHERE kind='feedback' AND (CASE WHEN json_valid(text) THEN json_extract(text,'$.account_id') END)=OLD.account_id AND (CASE WHEN json_valid(text) THEN json_extract(text,'$.report_id') END)=OLD.id; END";

@@ -101,11 +101,15 @@ Lumi in Inner Breeze using a one-use link. Account signing keys stay in the app.
 for tasks, habits, diary entries, progress and feedback. `/app` and `/history`
 open Inner Breeze. App actions require the linked app to remain open and the
 corresponding sub-app to be installed. Feedback still asks for approval.
-Telegram is input-only for the Lumi conversation. Incoming messages and their
-Lumi responses remain in the app's full history and encrypted account sync.
-App messages, responses and activity never mirror to the bot. The legacy
-`POST /api/v1/lumi/telegram/messages` endpoint validates and acknowledges older
-client uploads without any external delivery, including stale queued history.
+Messages sent to the bot and their responses remain in the app's full history
+and encrypted account sync. When the linked app handles a Telegram message,
+it can attach its final answer to the authenticated `/api/v1/lumi/telegram/ack`
+request as `reply` alongside the update ID and the claiming app client. Mesh
+sends that answer once, as a direct reply to the original Telegram message.
+App-originated conversations and activity stay in the app. The legacy
+`POST /api/v1/lumi/telegram/messages` endpoint acknowledges history uploads
+without external delivery. An unconfirmed delivery consumes the update to
+prevent duplicate replies.
 Direct bot linking, help and explicit authorization acknowledgements remain.
 
 An hourly job inside the node deletes what Lumi no longer needs. When the app

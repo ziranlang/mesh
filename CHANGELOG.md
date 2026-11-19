@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Return linked Lumi replies to the exact originating private Telegram message, with a replay-safe delivery receipt.
+
 - Relay private Lumi developer turns for the configured Mesh owner account.
 
 - Rename Daochi to Mesh at mesh.ziran-lang.org, preserving existing account keys, encrypted records and installed-client access.

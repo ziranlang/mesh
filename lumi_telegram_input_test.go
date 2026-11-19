@@ -121,3 +121,95 @@ func TestLumiTelegramInputAPIDocumentation(t *testing.T) {
 		t.Fatalf("Telegram paths differ: actual=%s expected=%s", a, b)
 	}
 }
+
+func TestLumiTelegramRepliesOnlyToClaimedPrivateMessages(t *testing.T) {
+	server, store, _ := testServer(t)
+	server.Cfg.LumiBotToken = "direct-reply-fixture"
+	server.Cfg.LumiWebhookSecret = "direct-reply-webhook"
+	replies := make(chan TelegramReplySend, 8)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var reply TelegramReplySend
+		if strings.HasSuffix(r.URL.Path, "/sendMessage") && json.NewDecoder(r.Body).Decode(&reply) == nil && reply.ReplyParameters.MessageId > 0 {
+			replies <- reply
+			if reply.ReplyParameters.MessageId == 204 {
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+		}
+		_, _ = fmt.Fprint(w, `{"ok":true,"result":{"message_id":987}}`)
+	}))
+	defer upstream.Close()
+	previous := TelegramAPIBase
+	TelegramAPIBase = upstream.URL
+	t.Cleanup(func() { TelegramAPIBase = previous })
+	handler := server.Routes()
+	account := newTestIdentity(t, handler, 0xc6)
+	other := newTestIdentity(t, handler, 0xc7)
+	client := strings.Repeat("a", 64)
+	otherClient := strings.Repeat("b", 64)
+	webhook := func(id int, text string) {
+		t.Helper()
+		if out := lumiWebhook(handler, server.Cfg.LumiWebhookSecret, id, "private", text); out.Code != 200 {
+			t.Fatalf("webhook %d: %d %s", id, out.Code, out.Body.String())
+		}
+	}
+	ack := func(identity testIdentity, executor string, id, status int) {
+		t.Helper()
+		body := fmt.Sprintf(`{"id":%d,"client":%q,"reply":"A quiet morning 水"}`, id, executor)
+		out := lumiRequest(handler, identity, "POST", "/api/v1/lumi/telegram/ack", body)
+		if out.Code != status {
+			t.Fatalf("ack %d: status %d, want %d: %s", id, out.Code, status, out.Body.String())
+		}
+	}
+	poll := func(id int64) {
+		t.Helper()
+		out := lumiRequest(handler, account, "GET", "/api/v1/lumi/telegram/updates?client="+client, "")
+		var result LumiPoll
+		if out.Code != 200 || json.Unmarshal(out.Body.Bytes(), &result) != nil || result.Update.ID != id {
+			t.Fatalf("poll %d: %d %s", id, out.Code, out.Body.String())
+		}
+	}
+	webhook(201, "/start "+lumiLink(t, handler, account))
+	webhook(205, "")
+	webhook(206, strings.Repeat("a", 1024))
+	poll(0)
+	webhook(202, "What is mindful breathing?")
+	ack(account, client, 202, http.StatusConflict)
+	poll(202)
+	ack(other, client, 202, http.StatusConflict)
+	ack(account, otherClient, 202, http.StatusConflict)
+	ack(account, client, -1, http.StatusBadRequest)
+	ack(account, client, 202, http.StatusOK)
+	ack(account, client, 202, http.StatusOK)
+	webhook(202, "What is mindful breathing?")
+	poll(0)
+	select {
+	case reply := <-replies:
+		if reply.ChatId != 1234 || reply.Text != "A quiet morning 水" || reply.ReplyParameters.MessageId != 202 || reply.ReplyParameters.AllowSendingWithoutReply {
+			t.Fatalf("unexpected Telegram response: %+v", reply)
+		}
+	default:
+		t.Fatal("Telegram reply was not sent")
+	}
+	var receipt int64
+	if err := store.Database.QueryRow("SELECT telegram_reply_id FROM server_lumi_updates WHERE id=202").Scan(&receipt); err != nil || receipt != 987 {
+		t.Fatalf("delivery receipt: %d %v", receipt, err)
+	}
+	webhook(204, "One more question")
+	poll(204)
+	ack(account, client, 204, http.StatusAccepted)
+	ack(account, client, 204, http.StatusAccepted)
+	select {
+	case reply := <-replies:
+		if reply.ReplyParameters.MessageId != 204 {
+			t.Fatalf("unexpected retry or misrouted delivery: %+v", reply)
+		}
+	default:
+		t.Fatal("uncertain delivery was never attempted")
+	}
+	select {
+	case reply := <-replies:
+		t.Fatalf("duplicate Telegram reply: %+v", reply)
+	default:
+	}
+}
