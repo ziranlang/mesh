@@ -105,12 +105,6 @@ ReadAt :: (file: *rooted.File, bytes: []u8, offset: s64) -> PayloadRead #go_resu
 CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign go_os "(*Root).Close";
 CloseFileAtReturn :: (file: *rooted.File) #go_defer #foreign go_os "(*File).Close";
 
-OpenPackage :: (dbPath: string, appID: string) -> rooted.RootResult {
-    packages := rooted.OpenRoot(Join(dbPath, ".packages"))
-    if packages.error != null { return packages }
-    CloseRootAtReturn(packages.value)
-    return rooted.Child(packages.value, appID, false)
-}
 
 // The release hash of a `<sha>.zx`, legacy `<sha>.zib` or WebAssembly
 // `<sha>.wasm` artifact name.
@@ -415,7 +409,7 @@ LatestSequence :: (dbPath: string, appID: string) -> s64 {
     if !identity.ValidNamespace(appID) {
         return 0
     }
-    opened := OpenPackage(dbPath, appID)
+    opened := rooted.OpenChildDirectory(Join(dbPath, ".packages"), appID)
     if opened.error != null { return 0 }
     root := opened.value
     CloseRootAtReturn(root)
@@ -463,7 +457,7 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
         response.Error(writer, 404, "package not found")
         return
     }
-    opened := OpenPackage(context.configuration.DBPath, appID)
+    opened := rooted.OpenChildDirectory(Join(context.configuration.DBPath, ".packages"), appID)
     if opened.error != null {
         response.Error(writer, 404, "package not found")
         return

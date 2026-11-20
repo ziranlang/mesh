@@ -113,11 +113,6 @@ Valid :: (publicKey: ed.PublicKey, grant: string, product: string, now: s64) -> 
     return now < expiry.value
 }
 
-Gate :: (artifactPath: string) -> PackGate {
-    parts: [2]string = .[artifactPath, ".product"]
-    return FileGate(files.ReadFile(Join(parts[:], "")))
-}
-
 FileGate :: (named: files.FileReadResult) -> PackGate {
     result: PackGate
     if errors.Is(named.error, files.NotExist()) {

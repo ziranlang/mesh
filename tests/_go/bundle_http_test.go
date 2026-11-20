@@ -81,12 +81,34 @@ func TestPortableReleaseRoutes(t *testing.T) {
 	if loaded.Header().Get("ETag") != "\""+release.SHA256+"\"" {
 		t.Fatal("missing hash ETag")
 	}
+	bundleRoute := "portable/" + release.SHA256 + ".zib"
+	product := bundle + ".product"
+	if err = os.Symlink("missing-product", product); err != nil {
+		t.Fatal(err)
+	}
+	get(bundleRoute, 403)
+	if err = os.Remove(product); err != nil {
+		t.Fatal(err)
+	}
+	get(bundleRoute, 200)
 	newer := release
 	newer.Sequence = 2
 	newer.Version = "1.0.1"
 	newer.SHA256 = hex.EncodeToString(bytes.Repeat([]byte{0x77}, 32))
 	save("latest.json", sign(newer))
-	get("portable/"+release.SHA256+".zib", 200)
+	get(bundleRoute, 200)
+	archive := bundle + ".json"
+	archivedDescriptor := filepath.Join(root, "descriptor-fixture.json")
+	if err = os.Rename(archive, archivedDescriptor); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(filepath.Base(archivedDescriptor), archive); err != nil {
+		t.Fatal(err)
+	}
+	get(bundleRoute, 404)
+	if err = os.Rename(archivedDescriptor, archive); err != nil {
+		t.Fatal(err)
+	}
 	save("latest.json", release)
 	get("unknown/latest", 404)
 	get("portable/not-a-hash.zib", 404)
@@ -99,6 +121,21 @@ func TestPortableReleaseRoutes(t *testing.T) {
 	save("latest.json", sign(altered))
 	get("portable/latest", 503)
 	save("latest.json", release)
+	sibling := filepath.Join(filepath.Dir(root), "sibling-fixture")
+	if err = os.Rename(root, sibling); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Symlink(filepath.Base(sibling), root); err != nil {
+		t.Fatal(err)
+	}
+	get("portable/latest", 404)
+	get(bundleRoute, 404)
+	if err = os.Remove(root); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Rename(sibling, root); err != nil {
+		t.Fatal(err)
+	}
 	if err = os.WriteFile(bundle, []byte("altered"), 0600); err != nil {
 		t.Fatal(err)
 	}

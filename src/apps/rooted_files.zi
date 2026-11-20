@@ -14,6 +14,7 @@ FileResult :: struct { value: *File; error: Error; }
 OpenRootRaw :: (path: string) -> RootResult #go_results #foreign os "OpenRoot";
 RemoveRaw :: (root: *Root, name: string) -> Error #foreign os "(*Root).Remove";
 RenameRaw :: (root: *Root, oldName: string, newName: string) -> Error #foreign os "(*Root).Rename";
+CloseRootAtReturn :: (root: *Root) #go_defer #foreign os "(*Root).Close";
 CloseFileAtReturn :: (file: *File) #go_defer #foreign os "(*File).Close";
 Info :: #type #foreign os "FileInfo";
 InfoResult :: struct { value: Info; error: Error; }
@@ -60,6 +61,14 @@ Child :: (root: *Root, name: string, create: bool) -> RootResult {
         return .{error = errors.New("storage directory changed while opening")}
     }
     return opened
+}
+
+// Open a named child of a configured store, leaving only the child handle open.
+OpenChildDirectory :: (path: string, name: string) -> RootResult {
+    parent := OpenRoot(path)
+    if parent.error != null { return parent }
+    CloseRootAtReturn(parent.value)
+    return Child(parent.value, name, false)
 }
 
 Regular :: (root: *Root, name: string) -> bool {

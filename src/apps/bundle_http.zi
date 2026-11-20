@@ -3,7 +3,7 @@
 #import "std/go_types"
 http :: #import "std/http_go";
 url :: #import "std/url_go";
-files :: #import "std/file_go";
+rooted :: #import "rooted_files";
 json :: #import "std/json_go";
 text :: #import "std/text_go";
 keys :: #import "std/ed25519_go";
@@ -18,6 +18,7 @@ strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 fmt :: #system_library "go:fmt";
 go_http :: #system_library "go:net/http";
+go_os :: #system_library "go:os";
 paths :: #import "path_component";
 
 Release :: struct {
@@ -40,6 +41,7 @@ Concat :: (a: string, b: string) -> string #foreign fmt "Sprint";
 Message :: (format: string, app: string, sequence: s64, version: string, runtime: string, hash: string, size: s64, key: string) -> string #foreign fmt "Sprintf";
 Write :: (writer: http.ResponseWriter, data: []u8) -> WriteResult #go_results #foreign go_http "ResponseWriter.Write";
 WriteResult :: struct { count: isize; error: Error; }
+CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign go_os "(*Root).Close";
 
 SigningMessage :: (release: Release) -> string {
     return Message("daochi-zib-release-v1\n%s\n%d\n%s\n%s\n%s\n%d\n%s\n",
@@ -83,8 +85,14 @@ Route :: (registry: app_registry.Registry, writer: http.ResponseWriter, request:
         response.Error(writer, 404, "package not found")
         return
     }
-    root := Concat(Concat(registry.configuration.DBPath, ".packages/"), Concat(appID, "/"))
-    metadata := files.ReadFile(Concat(root, "latest.json"))
+    opened := rooted.OpenChildDirectory(Concat(registry.configuration.DBPath, ".packages"), appID)
+    if opened.error != null {
+        response.Error(writer, 404, "no portable release")
+        return
+    }
+    root := opened.value
+    CloseRootAtReturn(root)
+    metadata := rooted.ReadFile(root, "latest.json")
     release: Release
     if metadata.error != null {
         response.Error(writer, 404, "no portable release")
@@ -99,7 +107,7 @@ Route :: (registry: app_registry.Registry, writer: http.ResponseWriter, request:
             response.Error(writer, 404, "package not found")
             return
         }
-        archived := files.ReadFile(Concat(root, Concat(asset, ".json")))
+        archived := rooted.ReadFile(root, Concat(asset, ".json"))
         if archived.error != null || json.Unmarshal(archived.value, *release) != null ||
             !Valid(release, appID) || asset != Concat(release.SHA256, ".zib") {
             response.Error(writer, 404, "package not found")
@@ -123,12 +131,13 @@ Route :: (registry: app_registry.Registry, writer: http.ResponseWriter, request:
         return
     }
     // A gated pack is served only by the v2 route, which checks its grant.
-    gate := grants.Gate(Concat(root, Concat(release.SHA256, ".zib")))
+    bundleName := Concat(release.SHA256, ".zib")
+    gate := grants.FileGate(rooted.ReadFile(root, Concat(bundleName, ".product")))
     if gate.gated {
         response.Error(writer, 403, "package grant required")
         return
     }
-    bundle := files.ReadFile(Concat(root, Concat(release.SHA256, ".zib")))
+    bundle := rooted.ReadFile(root, bundleName)
     if bundle.error != null || bundle.value.count != release.Size ||
         signing.SHA256Hex(bundle.value) != release.SHA256 {
         response.Error(writer, 503, "portable release bytes do not match")
