@@ -1,0 +1,156 @@
+#import "std/go_types"
+support :: #import "bench_support";
+io :: #import "std/io_go";
+zstd :: #import "std/zstd_go";
+go_zstd :: #system_library "go:github.com/klauspost/compress/zstd";
+gzip :: #system_library "go:compress/gzip";
+brotli :: #system_library "go:github.com/andybalholm/brotli";
+go_io :: #system_library "go:io";
+
+Profile :: struct {
+    encoding: string
+    level: isize
+    reuse: bool
+    entropy: bool
+}
+
+GzipWriter :: #type #foreign gzip "Writer";
+GzipReader :: #type #foreign gzip "Reader";
+BrotliWriter :: #type #foreign brotli "Writer";
+BrotliReader :: #type #foreign brotli "Reader";
+Encoder :: struct {
+    gzip: *GzipWriter
+    zstd: *zstd.Encoder
+    brotli: *BrotliWriter
+}
+
+#scope_file
+OpenedGzipWriter :: struct {
+    writer: *GzipWriter
+    error: Error
+}
+OpenedGzipReader :: struct {
+    reader: *GzipReader
+    error: Error
+}
+Written :: struct {
+    count: isize
+    error: Error
+}
+OpenGzipWriter :: (writer: io.Writer, level: isize) -> OpenedGzipWriter #go_results #foreign gzip "NewWriterLevel";
+OpenGzipReader :: (reader: io.Reader) -> OpenedGzipReader #go_results #foreign gzip "NewReader";
+ResetGzip :: (writer: *GzipWriter, output: io.Writer) #foreign gzip "(*Writer).Reset";
+CloseGzip :: (writer: *GzipWriter) -> Error #foreign gzip "(*Writer).Close";
+CloseGzipReader :: (reader: *GzipReader) -> Error #foreign gzip "(*Reader).Close";
+OpenBrotliWriter :: (writer: io.Writer, level: isize) -> *BrotliWriter #foreign brotli "NewWriterLevel";
+OpenBrotliReader :: (reader: io.Reader) -> *BrotliReader #foreign brotli "NewReader";
+ResetBrotli :: (writer: *BrotliWriter, output: io.Writer) #foreign brotli "(*Writer).Reset";
+CloseBrotli :: (writer: *BrotliWriter) -> Error #foreign brotli "(*Writer).Close";
+ZstdLevel :: (level: isize) -> zstd.EncoderLevel #foreign go_zstd "EncoderLevelFromZstd";
+EncoderLevel :: (level: zstd.EncoderLevel) -> zstd.EncoderOption #foreign go_zstd "WithEncoderLevel";
+EncoderWorkers :: (count: isize) -> zstd.EncoderOption #foreign go_zstd "WithEncoderConcurrency";
+EncoderWindow :: (size: isize) -> zstd.EncoderOption #foreign go_zstd "WithWindowSize";
+OpenDefaultZstd :: (writer: io.Writer, level: zstd.EncoderOption, workers: zstd.EncoderOption, window: zstd.EncoderOption) -> zstd.EncoderResult #go_results #foreign go_zstd "NewWriter";
+DecoderWorkers :: (count: isize) -> zstd.DecoderOption #foreign go_zstd "WithDecoderConcurrency";
+MaximumMemory :: (size: u64) -> zstd.DecoderOption #foreign go_zstd "WithDecoderMaxMemory";
+OpenZstdReader :: (reader: io.Reader, workers: zstd.DecoderOption, memory: zstd.DecoderOption) -> zstd.DecoderResult #go_results #foreign go_zstd "NewReader";
+CloseZstdReaderAtReturn :: (reader: *zstd.Decoder) #go_defer #foreign go_zstd "(*Decoder).Close";
+WriteRaw :: (writer: io.Writer, data: []u8) -> Written #go_results #foreign go_io "Writer.Write";
+
+Writer :: (encoder: *Encoder) -> io.Writer {
+    if encoder.gzip != null { return cast(io.Writer)encoder.gzip }
+    if encoder.zstd != null { return cast(io.Writer)encoder.zstd }
+    return cast(io.Writer)encoder.brotli
+}
+
+Close :: (encoder: *Encoder) {
+    if encoder.gzip != null {
+        support.Check(CloseGzip(encoder.gzip))
+    } else if encoder.zstd != null {
+        support.Check(zstd.CloseEncoder(encoder.zstd))
+    } else {
+        support.Check(CloseBrotli(encoder.brotli))
+    }
+}
+
+#scope_export
+New :: (profile: Profile, output: io.Writer) -> Encoder {
+    encoder: Encoder
+    if profile.encoding == "gzip" {
+        opened := OpenGzipWriter(output, profile.level)
+        support.Check(opened.error)
+        encoder.gzip = opened.writer
+    } else if profile.encoding == "zstd" {
+        // The default depends on the preset. Explicit false changes the default.
+        opened: zstd.EncoderResult
+        if profile.entropy {
+            opened = zstd.NewEncoder(output, profile.level, cast(isize)1048576, true)
+        } else {
+            opened = OpenDefaultZstd(output, EncoderLevel(ZstdLevel(profile.level)),
+                EncoderWorkers(cast(isize)1), EncoderWindow(cast(isize)1048576))
+        }
+        support.Check(opened.error)
+        encoder.zstd = opened.value
+    } else if profile.encoding == "br" {
+        encoder.brotli = OpenBrotliWriter(output, profile.level)
+    } else {
+        support.Fail("unknown encoder")
+    }
+    return encoder
+}
+
+Ready :: (encoder: *Encoder) -> bool {
+    return encoder.gzip != null || encoder.zstd != null || encoder.brotli != null
+}
+
+Reset :: (encoder: *Encoder, output: io.Writer) {
+    if encoder.gzip != null {
+        ResetGzip(encoder.gzip, output)
+    } else if encoder.zstd != null {
+        zstd.Reset(encoder.zstd, output)
+    } else {
+        ResetBrotli(encoder.brotli, output)
+    }
+}
+
+Write :: (output: io.Writer, data: []u8) {
+    support.Check(WriteRaw(output, data).error)
+}
+
+Encode :: (encoder: *Encoder, input: []u8, chunked: bool) {
+    output := Writer(encoder)
+    if chunked {
+        offset: s64 = 0
+        while offset < input.count {
+            next := offset + 32768
+            if next > input.count { next = input.count }
+            Write(output, input[offset:next])
+            offset = next
+        }
+    } else {
+        Write(output, input)
+    }
+    Close(encoder)
+}
+
+Decode :: (encoding: string, input: []u8) -> []u8 {
+    if encoding == "identity" { return input }
+    reader := io.FromBytes(input)
+    result: io.ReadAllResult
+    if encoding == "gzip" {
+        opened := OpenGzipReader(reader)
+        support.Check(opened.error)
+        result = io.ReadAll(cast(io.Reader)opened.reader)
+        support.Check(result.error)
+        support.Check(CloseGzipReader(opened.reader))
+    } else if encoding == "zstd" {
+        opened := OpenZstdReader(reader, DecoderWorkers(cast(isize)1), MaximumMemory(8388608))
+        support.Check(opened.error)
+        CloseZstdReaderAtReturn(opened.value)
+        result = io.ReadAll(cast(io.Reader)opened.value)
+    } else {
+        result = io.ReadAll(cast(io.Reader)OpenBrotliReader(reader))
+    }
+    support.Check(result.error)
+    return result.value
+}

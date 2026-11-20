@@ -208,7 +208,7 @@ func TestZiranServerVerifierCaptureTiming(t *testing.T) {
 
 func baselineRoutePatterns(t *testing.T) []string {
 	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), "ziran_server_baseline_test.go", nil, 0)
+	file, err := parser.ParseFile(token.NewFileSet(), "tests/_go/ziran_server_baseline_test.go", nil, 0)
 	if err != nil {
 		t.Fatal(err)
 	}

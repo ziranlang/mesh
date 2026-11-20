@@ -1,0 +1,222 @@
+// Private loopback transport, using the same chunking and codec profiles as Mesh.
+#import "std/go_types"
+support :: #import "bench_support";
+codecs :: #import "bench_codecs";
+clock :: #import "std/time_go";
+http :: #import "std/http_go";
+io :: #import "std/io_go";
+ctx :: #import "std/context_go";
+channel :: #import "std/channel_go";
+go_http :: #system_library "go:net/http";
+go_testing :: #system_library "go:net/http/httptest";
+go_sync :: #system_library "go:sync";
+go_reflect :: #system_library "go:reflect";
+trace :: #system_library "go:mesh-compression-bench/httptrace";
+builtin :: #system_library "go:builtin";
+
+#scope_file
+Transport :: #type #foreign go_http "Transport";
+RoundTripper :: #type #foreign go_http "RoundTripper";
+Server :: #type #foreign go_testing "Server";
+Handler :: #type #foreign go_http "Handler";
+Pool :: #type #foreign go_sync "Pool";
+WaitGroup :: #type #foreign go_sync "WaitGroup";
+Responder :: struct {
+    data: []u8
+    profile: codecs.Profile
+    pool: Pool
+}
+Sample :: struct {
+    ms: float64
+    first: float64
+    wire: s64
+}
+Work :: struct {
+    jobs: channel.Channel
+    samples: []Sample
+    completed: *WaitGroup
+    client: *http.Client
+    url: string
+    encoding: string
+    data: []u8
+}
+CachedEncoder :: struct {
+    value: *codecs.Encoder
+    ok: bool
+}
+Received :: struct {
+    value: channel.Channel
+    ok: bool
+}
+Row :: struct {
+    Corpus: string #go_tag "json:\"corpus\""
+    Profile: string #go_tag "json:\"profile\""
+    Concurrency: isize #go_tag "json:\"concurrency\""
+    Requests: isize #go_tag "json:\"requests\""
+    Input: s64 #go_tag "json:\"input_bytes\""
+    Compressed: s64 #go_tag "json:\"compressed_bytes\""
+    Median: float64 #go_tag "json:\"median_ms\""
+    P95: float64 #go_tag "json:\"p95_ms\""
+    FirstByte: float64 #go_tag "json:\"first_response_byte_median_ms\""
+    Throughput: float64 #go_tag "json:\"uncompressed_mib_per_second\""
+    Allocated: float64 #go_tag "json:\"allocated_bytes_per_request\""
+    Roundtrip: bool #go_tag "json:\"roundtrip\""
+}
+Report :: struct {
+    Go: string #go_tag "json:\"go\""
+    Method: string #go_tag "json:\"method\""
+    Results: []Row #go_tag "json:\"results\""
+}
+AppendRow :: (rows: []Row, row: Row) -> []Row #foreign builtin "append";
+NewServer :: (handler: Handler) -> *Server #foreign go_testing;
+CloseServer :: (server: *Server) #go_defer #foreign go_testing "(*Server).Close";
+ServerURL :: (server: *Server) -> string #go_field #foreign go_testing "(*Server).URL";
+SetAutomaticCompression :: (transport: *Transport, disabled: bool) #go_field #foreign go_http "(*Transport).DisableCompression";
+SetIdleLimit :: (transport: *Transport, count: isize) #go_field #foreign go_http "(*Transport).MaxIdleConns";
+SetIdleHostLimit :: (transport: *Transport, count: isize) #go_field #foreign go_http "(*Transport).MaxIdleConnsPerHost";
+SetHostLimit :: (transport: *Transport, count: isize) #go_field #foreign go_http "(*Transport).MaxConnsPerHost";
+SetTransport :: (client: *http.Client, transport: RoundTripper) #go_field #foreign go_http "(*Client).Transport";
+CloseIdle :: (transport: *Transport) #go_defer #foreign go_http "(*Transport).CloseIdleConnections";
+FirstByte :: (request: *http.Request, started: clock.Time, elapsed: *float64) -> *http.Request #foreign trace;
+PoolGet :: (pool: *Pool) -> Any #foreign go_sync "(*Pool).Get";
+AsEncoder :: (value: Any) -> CachedEncoder #go_results #foreign builtin "assert";
+PoolPut :: (pool: *Pool, value: Any) #foreign go_sync "(*Pool).Put";
+AllocateEncoder :: () -> *codecs.Encoder #foreign builtin "new";
+Add :: (completed: *WaitGroup, count: isize) #foreign go_sync "(*WaitGroup).Add";
+Done :: (completed: *WaitGroup) #go_defer #foreign go_sync "(*WaitGroup).Done";
+Wait :: (completed: *WaitGroup) #foreign go_sync "(*WaitGroup).Wait";
+Reflect :: (value: Any) -> channel.Channel #foreign go_reflect "ValueOf";
+Send :: (queue: channel.Channel, value: channel.Channel) #foreign go_reflect "Value.Send";
+Receive :: (queue: channel.Channel) -> Received #go_results #foreign go_reflect "Value.Recv";
+Index :: (value: channel.Channel) -> s64 #foreign go_reflect "Value.Int";
+WorkFunction :: #type (work: Work) -> void;
+Spawn :: (callback: WorkFunction, work: Work) #foreign builtin "spawn";
+
+Serve :: (handler: *Responder, writer: http.ResponseWriter, request: *http.Request) #go_method "ServeHTTP" {
+    if handler.profile.encoding == "identity" {
+        codecs.Write(cast(io.Writer)writer, handler.data)
+        return
+    }
+    http.SetHeader(http.ResponseHeaders(writer), "Content-Encoding", handler.profile.encoding)
+    output := cast(io.Writer)writer
+    encoder: *codecs.Encoder
+    if handler.profile.reuse {
+        cached := AsEncoder(PoolGet(*handler.pool))
+        if cached.ok {
+            encoder = cached.value
+            codecs.Reset(encoder, output)
+        }
+    }
+    if encoder == null {
+        encoder = AllocateEncoder()
+        <<encoder = codecs.New(handler.profile, output)
+    }
+    codecs.Encode(encoder, handler.data, true)
+    if handler.profile.reuse { PoolPut(*handler.pool, cast(Any)encoder) }
+}
+
+One :: (work: Work) -> Sample {
+    start := clock.Now()
+    first: float64 = 0.0
+    empty: io.Reader
+    request := http.NewRequest(ctx.Background(), "GET", work.url, empty)
+    support.Check(request.error)
+    http.SetHeader(http.Headers(request.value), "Accept-Encoding", work.encoding)
+    response := http.Do(work.client, FirstByte(request.value, start, *first))
+    support.Check(response.error)
+    body := http.ResponseBody(response.value)
+    data := io.ReadAll(cast(io.Reader)body)
+    close_error := io.Close(body)
+    support.Check(data.error)
+    support.Check(close_error)
+    if !support.Equal(codecs.Decode(work.encoding, data.value), work.data) {
+        support.Fail("HTTP roundtrip mismatch")
+    }
+    return .{ms = support.ElapsedMS(start), first = first, wire = data.value.count}
+}
+
+Worker :: (work: Work) {
+    Done(work.completed)
+    received := Receive(work.jobs)
+    while received.ok {
+        work.samples[Index(received.value)] = One(work)
+        received = Receive(work.jobs)
+    }
+}
+
+RunCase :: (data: []u8, name: string, profile: codecs.Profile, concurrency: isize, corpus: string) -> Row {
+    responder: Responder = .{data = data, profile = profile}
+    server := NewServer(cast(Handler)*responder)
+    CloseServer(server)
+    transport: Transport
+    SetAutomaticCompression(*transport, true)
+    SetIdleLimit(*transport, concurrency)
+    SetIdleHostLimit(*transport, concurrency)
+    SetHostLimit(*transport, concurrency)
+    CloseIdle(*transport)
+    client := http.NewClient(cast(clock.Duration)30000000000)
+    SetTransport(client, cast(RoundTripper)*transport)
+    samples: [24]Sample
+    workers: WaitGroup
+    first_job: s64 = 0
+    jobs := channel.New(cast(Any)first_job, cast(isize)0)
+    work: Work = .{jobs = jobs, samples = samples[:], completed = *workers, client = client,
+        url = ServerURL(server), encoding = profile.encoding, data = data}
+    for index: 0..3 { unused One(work) }
+    Add(*workers, concurrency)
+    for index: cast(isize)0..concurrency - 1 { Spawn(Worker, work) }
+    before: support.MemStats
+    after: support.MemStats
+    support.GC()
+    support.ReadMemStats(*before)
+    start := clock.Now()
+    for index: cast(s64)0..23 { Send(jobs, Reflect(cast(Any)index)) }
+    channel.Close(jobs)
+    Wait(*workers)
+    elapsed := support.ElapsedMS(start)
+    support.ReadMemStats(*after)
+    latency: [24]float64
+    first: [24]float64
+    for index: 0..23 {
+        latency[index] = samples[index].ms
+        first[index] = samples[index].first
+    }
+    support.SortTimes(latency[:])
+    support.SortTimes(first[:])
+    return .{Corpus = corpus, Profile = name, Concurrency = concurrency, Requests = 24,
+        Input = data.count, Compressed = samples[23].wire, Median = latency[12], P95 = latency[22],
+        FirstByte = first[12], Throughput = cast(float64)(data.count * 24) * 1000.0 / elapsed / 1048576.0,
+        Allocated = cast(float64)(support.Allocated(*after) - support.Allocated(*before)) / 24.0, Roundtrip = true}
+}
+
+#scope_export
+Run :: (out: string) {
+    names: [8]string = .["identity", "gzip-1-fresh", "gzip-1-reuse", "zstd-1-reuse", "zstd-3-reuse",
+        "zstd-1-entropy-reuse", "zstd-3-entropy-reuse", "brotli-4-reuse"]
+    profiles: [8]codecs.Profile = .[
+        .{encoding = "identity"},
+        .{encoding = "gzip", level = 1},
+        .{encoding = "gzip", level = 1, reuse = true},
+        .{encoding = "zstd", level = 1, reuse = true},
+        .{encoding = "zstd", level = 3, reuse = true},
+        .{encoding = "zstd", level = 1, reuse = true, entropy = true},
+        .{encoding = "zstd", level = 3, reuse = true, entropy = true},
+        .{encoding = "br", level = 4, reuse = true},
+    ]
+    corpora: [3]string = .["control", "page-medium", "page-large"]
+    files: [3]string = .["control.bin", "page-medium.bin", "page-large.bin"]
+    counts: [2]isize = .[1, 4]
+    rows: []Row
+    for corpus: 0..2 {
+        data := support.Read(support.Join(support.Join(out, "corpus"), files[corpus]))
+        for index: 0..7 {
+            for count: counts {
+                rows = AppendRow(rows, RunCase(data, names[index], profiles[index], count, corpora[corpus]))
+            }
+        }
+        support.PrintProgress("HTTP benchmark completed", corpora[corpus])
+    }
+    report: Report = .{Go = support.Version(), Results = rows,
+        Method = "Private loopback HTTP, warm keepalive, 24 requests per case, GOMAXPROCS=1; completion includes decompression and byte comparison. First response byte measures HTTP headers."}
+    support.WriteJSON(out, "http-results.json", cast(Any)report)
+}

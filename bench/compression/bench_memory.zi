@@ -1,0 +1,62 @@
+#import "std/go_types"
+support :: #import "bench_support";
+codecs :: #import "bench_codecs";
+builtin :: #system_library "go:builtin";
+
+#scope_file
+Row :: struct {
+    Profile: string #go_tag "json:\"profile\""
+    Writers: isize #go_tag "json:\"retained_writers\""
+    Heap: s64 #go_tag "json:\"retained_heap_bytes\""
+    Allocated: u64 #go_tag "json:\"allocated_bytes\""
+}
+Report :: struct {
+    Go: string #go_tag "json:\"go\""
+    Method: string #go_tag "json:\"method\""
+    Results: []Row #go_tag "json:\"results\""
+}
+AppendRow :: (rows: []Row, row: Row) -> []Row #foreign builtin "append";
+NewEncoders :: (count: isize, capacity: isize) -> []codecs.Encoder #foreign builtin "make";
+AppendEncoder :: (encoders: []codecs.Encoder, value: codecs.Encoder) -> []codecs.Encoder #foreign builtin "append";
+
+Measure :: (data: []u8, name: string, profile: codecs.Profile, count: isize) -> Row {
+    support.GC()
+    before: support.MemStats
+    after: support.MemStats
+    support.ReadMemStats(*before)
+    writers := NewEncoders(cast(isize)0, count)
+    for index: cast(isize)0..count - 1 {
+        writer := codecs.New(profile, support.Discard())
+        codecs.Encode(*writer, data, true)
+        writers = AppendEncoder(writers, writer)
+    }
+    support.GC()
+    support.ReadMemStats(*after)
+    support.KeepAlive(cast(Any)writers)
+    support.KeepAlive(cast(Any)data)
+    return .{Profile = name, Writers = count,
+        Heap = cast(s64)support.Heap(*after) - cast(s64)support.Heap(*before),
+        Allocated = support.Allocated(*after) - support.Allocated(*before)}
+}
+
+#scope_export
+Run :: (output: string) {
+    data := support.Read(support.Join(support.Join(output, "corpus"), "page-large.bin"))
+    names: [4]string = .["gzip-1", "zstd-1-entropy", "zstd-3-entropy", "brotli-4"]
+    profiles: [4]codecs.Profile = .[
+        .{encoding = "gzip", level = 1},
+        .{encoding = "zstd", level = 1, entropy = true},
+        .{encoding = "zstd", level = 3, entropy = true},
+        .{encoding = "br", level = 4},
+    ]
+    counts: [2]isize = .[1, 4]
+    rows: []Row
+    for index: 0..3 {
+        for count: counts {
+            rows = AppendRow(rows, Measure(data, names[index], profiles[index], count))
+        }
+    }
+    report: Report = .{Go = support.Version(), Results = rows,
+        Method = "Retained Go heap increase after GC for closed reusable writers, private 1 MiB zstd window, output io.Discard; payload already resident; excludes decoder, HTTP buffers, database and full process RSS."}
+    support.WriteJSON(output, "memory-results.json", cast(Any)report)
+}

@@ -1,0 +1,166 @@
+#import "std/go_types"
+io :: #import "std/io_go";
+clock :: #import "std/time_go";
+json :: #import "std/json_go";
+bytes :: #system_library "go:bytes";
+os :: #system_library "go:os";
+path :: #system_library "go:path/filepath";
+runtime :: #system_library "go:runtime";
+go_time :: #system_library "go:time";
+sort :: #system_library "go:sort";
+fmt :: #system_library "go:fmt";
+builtin :: #system_library "go:builtin";
+go_io :: #system_library "go:io";
+go_json :: #system_library "go:encoding/json";
+
+Buffer :: #type #foreign bytes "Buffer";
+MemStats :: #type #foreign runtime "MemStats";
+FileMode :: #type #foreign os "FileMode";
+#scope_file
+ArgsRaw :: () -> []string #go_field #foreign os "Args";
+ReadBytes :: (path: string) -> io.ReadAllResult #go_results #foreign os "ReadFile";
+WriteBytesRaw :: (path: string, data: []u8, mode: FileMode) -> Error #foreign os "WriteFile";
+MkdirAllRaw :: (path: string, mode: FileMode) -> Error #foreign os "MkdirAll";
+JoinRaw :: (first: string, second: string) -> string #foreign path "Join";
+DiscardRaw :: () -> io.Writer #go_field #foreign go_io "Discard";
+ResetBufferRaw :: (buffer: *Buffer) #foreign bytes "(*Buffer).Reset";
+BufferBytesRaw :: (buffer: *Buffer) -> []u8 #foreign bytes "(*Buffer).Bytes";
+CloneRaw :: (data: []u8) -> []u8 #foreign bytes "Clone";
+EqualRaw :: (data: []u8, expected: []u8) -> bool #foreign bytes "Equal";
+Panic :: (value: Any) #foreign builtin "panic";
+FailRaw :: (message: string) #foreign builtin "panic";
+LimitWorkersRaw :: (count: isize) -> isize #foreign runtime "GOMAXPROCS";
+VersionRaw :: () -> string #foreign runtime "Version";
+GCRaw :: () #foreign runtime "GC";
+ReadMemStatsRaw :: (stats: *MemStats) #foreign runtime "ReadMemStats";
+HeapRaw :: (stats: *MemStats) -> u64 #go_field #foreign runtime "(*MemStats).HeapAlloc";
+AllocatedRaw :: (stats: *MemStats) -> u64 #go_field #foreign runtime "(*MemStats).TotalAlloc";
+AllocationsRaw :: (stats: *MemStats) -> u64 #go_field #foreign runtime "(*MemStats).Mallocs";
+KeepAliveRaw :: (value: Any) #foreign runtime "KeepAlive";
+ElapsedRaw :: (start: clock.Time) -> clock.Duration #foreign go_time "Since";
+NanosRaw :: (duration: clock.Duration) -> s64 #foreign go_time "Duration.Nanoseconds";
+SortTimesRaw :: (times: []float64) #foreign sort "Float64s";
+NewTimesRaw :: (count: isize, capacity: isize) -> []float64 #foreign builtin "make";
+AppendTimeRaw :: (times: []float64, value: float64) -> []float64 #foreign builtin "append";
+PrintProgressRaw :: (message: string, corpus: string) #foreign fmt "Println";
+MarshalIndent :: (value: Any, prefix: string, indent: string) -> json.JSONResult #go_results #foreign go_json;
+AppendByte :: (data: []u8, value: u8) -> []u8 #foreign builtin "append";
+
+#scope_export
+Args :: () -> []string {
+    return ArgsRaw()
+}
+
+WriteBytes :: (path: string, data: []u8, mode: FileMode) -> Error {
+    return WriteBytesRaw(path, data, mode)
+}
+
+MkdirAll :: (path: string, mode: FileMode) -> Error {
+    return MkdirAllRaw(path, mode)
+}
+
+Join :: (first: string, second: string) -> string {
+    return JoinRaw(first, second)
+}
+
+Discard :: () -> io.Writer {
+    return DiscardRaw()
+}
+
+ResetBuffer :: (buffer: *Buffer) {
+    ResetBufferRaw(buffer)
+}
+
+BufferBytes :: (buffer: *Buffer) -> []u8 {
+    return BufferBytesRaw(buffer)
+}
+
+Clone :: (data: []u8) -> []u8 {
+    return CloneRaw(data)
+}
+
+Equal :: (data: []u8, expected: []u8) -> bool {
+    return EqualRaw(data, expected)
+}
+
+Fail :: (message: string) {
+    FailRaw(message)
+}
+
+LimitWorkers :: (count: isize) -> isize {
+    return LimitWorkersRaw(count)
+}
+
+Version :: () -> string {
+    return VersionRaw()
+}
+
+GC :: () {
+    GCRaw()
+}
+
+ReadMemStats :: (stats: *MemStats) {
+    ReadMemStatsRaw(stats)
+}
+
+Heap :: (stats: *MemStats) -> u64 {
+    return HeapRaw(stats)
+}
+
+Allocated :: (stats: *MemStats) -> u64 {
+    return AllocatedRaw(stats)
+}
+
+Allocations :: (stats: *MemStats) -> u64 {
+    return AllocationsRaw(stats)
+}
+
+KeepAlive :: (value: Any) {
+    KeepAliveRaw(value)
+}
+
+Elapsed :: (start: clock.Time) -> clock.Duration {
+    return ElapsedRaw(start)
+}
+
+Nanos :: (duration: clock.Duration) -> s64 {
+    return NanosRaw(duration)
+}
+
+SortTimes :: (times: []float64) {
+    SortTimesRaw(times)
+}
+
+NewTimes :: (count: isize, capacity: isize) -> []float64 {
+    return NewTimesRaw(count, capacity)
+}
+
+AppendTime :: (times: []float64, value: float64) -> []float64 {
+    return AppendTimeRaw(times, value)
+}
+
+PrintProgress :: (message: string, corpus: string) {
+    PrintProgressRaw(message, corpus)
+}
+
+Check :: (error: Error) {
+    if error != null {
+        Panic(cast(Any)error)
+    }
+}
+
+Read :: (path: string) -> []u8 {
+    result := ReadBytes(path)
+    Check(result.error)
+    return result.value
+}
+
+WriteJSON :: (output: string, name: string, value: Any) {
+    result := MarshalIndent(value, "", "  ")
+    Check(result.error)
+    Check(WriteBytesRaw(JoinRaw(output, name), AppendByte(result.value, 10), cast(FileMode)420))
+}
+
+ElapsedMS :: (start: clock.Time) -> float64 {
+    return cast(float64)NanosRaw(ElapsedRaw(start)) / 1000000.0
+}

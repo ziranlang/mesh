@@ -13,6 +13,12 @@ import subprocess
 import tempfile
 
 
+def sources_in(repo):
+    """Return the application and Ziran test entry paths relative to Mesh."""
+    return sorted(str(path.relative_to(repo)) for directory in ("src", "tests/ziran")
+                  for path in (repo / directory).rglob("*.zi"))
+
+
 def project_flags(repo):
     if (repo / "ziran.local.toml").is_file():
         return ["--project"]
@@ -30,6 +36,10 @@ def generate_go(ziran, repo, sources, output, env, source_root=None):
         subprocess.run([*arguments, "--exe", "--entry", "main:Main", "-o", entry, *sources],
                        cwd=repo, env=env, check=True)
         shutil.copyfile(Path(entry) / "ziran_entry.go", Path(output) / "ziran_entry.go")
+    # These modules accompany the opt-in C ABI host and use Unix file locks.
+    for name in ("embedded_profile.go", "embedded_runtime.go"):
+        path = Path(output) / name
+        path.write_text("//go:build mesh_embedded\n\n" + path.read_text())
 
 
 def repo_name(name):
@@ -44,7 +54,7 @@ def main():
     parser.add_argument("--ziran", default=os.environ.get("ZIRAN", "ziran"))
     args = parser.parse_args()
     repo = Path(__file__).resolve().parent.parent
-    sources = sorted(path.name for path in repo.glob("*.zi"))
+    sources = sources_in(repo)
     if not sources:
         parser.error("no Ziran server sources found")
     env = os.environ.copy()
@@ -73,4 +83,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except subprocess.CalledProcessError as error:
+        raise SystemExit(error.returncode) from None

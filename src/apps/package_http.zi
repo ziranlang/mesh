@@ -33,7 +33,7 @@ strconv :: #system_library "go:strconv";
 hex :: #system_library "go:encoding/hex";
 fmt :: #system_library "go:fmt";
 go_http :: #system_library "go:net/http";
-native_paths :: #system_library "go:mesh/native";
+paths :: #import "path_component";
 go_os :: #system_library "go:os";
 
 #scope_file
@@ -103,11 +103,6 @@ Decode :: (value: string) -> Decoded #go_results #foreign hex "DecodeString";
 Join :: (a: string, b: string) -> string #foreign fmt "Sprint";
 Write :: (writer: http.ResponseWriter, bytes: []u8) -> WriteResult #go_results #foreign go_http "ResponseWriter.Write";
 Stat :: (path: string) -> PayloadStatus #go_results #foreign go_os "Stat";
-PathResult :: struct {
-    value: string
-    error: Error
-}
-PathComponent :: (value: string) -> PathResult #go_results #foreign native_paths "PathComponent";
 PayloadFile :: #type #foreign go_os "File";
 PayloadOpened :: struct {
     value: *PayloadFile
@@ -441,8 +436,8 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
         response.Error(writer, 404, "package not found")
         return
     }
-    appPath := PathComponent(parts[0])
-    assetPath := PathComponent(parts[1])
+    appPath := paths.Validate(parts[0])
+    assetPath := paths.Validate(parts[1])
     if appPath.error != null || assetPath.error != null {
         response.Error(writer, 404, "package not found")
         return

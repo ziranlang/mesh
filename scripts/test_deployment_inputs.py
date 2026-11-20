@@ -105,6 +105,9 @@ class DeploymentInputTest(unittest.TestCase):
             options = "-DOQS_MINIMAL_BUILD=SIG_ml_dsa_44"
             deployment_inputs.validate_native_paths(source, build)
             deployment_inputs.record_native_build(source, build, artifact, "cmake", options)
+            self.assertTrue(
+                deployment_inputs.check_native_build(source, build, artifact, "cmake", options)
+            )
             self.assertFalse(
                 deployment_inputs.check_native_build(
                     source, build, artifact, "cmake", "-DOQS_MINIMAL_BUILD=wrong"

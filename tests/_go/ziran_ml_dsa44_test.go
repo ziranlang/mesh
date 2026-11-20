@@ -266,7 +266,11 @@ func TestZiranMLDSA44OfficialVectors(t *testing.T) {
 func buildCryptoProcess(t *testing.T, extraEnvironment ...string) string {
 	t.Helper()
 	binary := filepath.Join(t.TempDir(), "ziran-provider-tests")
-	command := exec.Command("go", "test", "-c", "-o", binary, ".")
+	arguments := []string{"test", "-c", "-o", binary}
+	if overlay := os.Getenv("MESH_GO_TEST_OVERLAY"); overlay != "" {
+		arguments = append(arguments, "-overlay", overlay)
+	}
+	command := exec.Command("go", append(arguments, ".")...)
 	command.Env = append(cryptoEnvironment(t), "GOFLAGS=-mod=mod")
 	command.Env = append(command.Env, extraEnvironment...)
 	if output, err := command.CombinedOutput(); err != nil {

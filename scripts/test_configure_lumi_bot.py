@@ -43,7 +43,7 @@ class API:
 
 class ConfigurationTest(unittest.TestCase):
     def setUp(self):
-        self.commands = bot.catalogue((Path(__file__).resolve().parent.parent / "lumi_commands.zi").read_text())
+        self.commands = bot.catalogue((Path(__file__).resolve().parent.parent / "src" / "chat" / "lumi_commands.zi").read_text())
 
     def test_wrong_bot_is_never_modified(self):
         api = API("another_bot")

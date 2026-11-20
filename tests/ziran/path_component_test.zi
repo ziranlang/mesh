@@ -1,0 +1,23 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+paths :: #import "path_component";
+
+#program_export "TestPathComponentRejectsNavigationAndAliases"
+RejectsNavigationAndAliases :: (test: *testing.Test) {
+    invalid: [8]string = .["", ".", "..", "../other", "a/../b", "/absolute", "a\\b", "app\0"]
+    for name: invalid {
+        result := paths.Validate(name)
+        if result.error == null {
+            arguments: [1]Any = .[name]
+            testing.Fatalf(test, "unsafe path component accepted: %q", arguments[:])
+        }
+    }
+    valid: [4]string = .["shovey.classic", "app_name", "0123456789abcdef", "release-v2.json"]
+    for name: valid {
+        result := paths.Validate(name)
+        if result.error != null || result.value != name {
+            arguments: [3]Any = .[name, result.value, result.error]
+            testing.Fatalf(test, "valid component changed: %q became %q (%v)", arguments[:])
+        }
+    }
+}

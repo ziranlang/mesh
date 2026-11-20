@@ -222,7 +222,7 @@ older nodes do not implement this mode. Full replacements, legacy writes,
 operations and state-hash reconciliation must use the existing sync mode.
 
 Mesh's server implementation is authored in Ziran. Go is generated from the
-canonical `.zi` modules and is not committed. Use Go 1.26. Run `make generate`
+canonical `.zi` modules under `src/` and `tests/ziran/` and is not committed. Use Go 1.26. Run `make generate`
 after changing Ziran source and
 `make test-ziran` to check generated files and run the server suite against both
 source and saved Ziran IR. The default launcher is `ziran`, which resolves
@@ -242,7 +242,8 @@ Inspect a production database offline with:
 Without Nix, install liboqs headers and library on the host, then:
 
 ```sh
-CGO_ENABLED=1 go build -o mesh .
+make generate
+CGO_ENABLED=1 go build -mod=mod -o mesh .
 ```
 
 Runtime configuration:

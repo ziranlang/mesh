@@ -18,7 +18,7 @@ strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 fmt :: #system_library "go:fmt";
 go_http :: #system_library "go:net/http";
-native_paths :: #system_library "go:mesh/native";
+paths :: #import "path_component";
 
 Release :: struct {
     AppID: string #go_tag "json:\"app_id\""
@@ -31,11 +31,6 @@ Release :: struct {
     Signature: string #go_tag "json:\"signature\""
 }
 Decoded :: struct { value: []u8; error: Error; }
-PathResult :: struct {
-    value: string
-    error: Error
-}
-PathComponent :: (value: string) -> PathResult #go_results #foreign native_paths "PathComponent";
 TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
 Split :: (value: string, separator: string) -> []string #foreign strings;
 ContainsAny :: (value: string, characters: string) -> bool #foreign strings;
@@ -70,8 +65,8 @@ Route :: (registry: app_registry.Registry, writer: http.ResponseWriter, request:
         response.Error(writer, 404, "package not found")
         return
     }
-    appPath := PathComponent(parts[0])
-    assetPath := PathComponent(parts[1])
+    appPath := paths.Validate(parts[0])
+    assetPath := paths.Validate(parts[1])
     if appPath.error != null || assetPath.error != null {
         response.Error(writer, 404, "package not found")
         return

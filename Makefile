@@ -21,7 +21,7 @@ CGO_ENV := CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(abspath $(LIBOQS_PREFIX))/include" \
 	CGO_LDFLAGS="-L$(abspath $(LIBOQS_PREFIX))/lib -loqs"
 
-.PHONY: all build test run clean liboqs generate test-ziran test-ziran-ir
+.PHONY: all build test run clean liboqs generate test-ziran test-ziran-ir compression-bench
 
 all: build
 
@@ -33,13 +33,31 @@ GENERATED := ziran_entry.zi.go
 generate:
 	ZIRAN="$(ZIRAN)" python3 scripts/generate_go.py
 
-$(GENERATED): $(wildcard *.zi) ziran.lock
+ZI_SOURCES := $(shell find src tests/ziran -type f -name '*.zi')
+
+$(GENERATED): $(ZI_SOURCES) ziran.toml ziran.lock scripts/generate_go.py
 	ZIRAN="$(ZIRAN)" python3 scripts/generate_go.py
 
 test-ziran: test test-ziran-ir
 
 test-ziran-ir: liboqs $(GENERATED)
 	$(CGO_ENV) ZIRAN="$(ZIRAN)" GOCACHE=$(abspath $(BUILD_DIR)/gocache) python3 scripts/test_saved_ir.py
+
+BENCH_DIR := $(BUILD_DIR)/compression-bench
+BENCH_SOURCES := $(wildcard bench/compression/*.zi)
+BENCH_GENERATE := $(ZIRAN) build --target=go --pkg main --root bench/compression
+
+compression-bench:
+	set -e; \
+	mkdir -p "$(BENCH_DIR)"; \
+	generated=$$(mktemp -d "$(abspath $(BENCH_DIR))/go.XXXXXX"); \
+	trap 'rm -rf "$$generated"' EXIT; \
+	$(BENCH_GENERATE) --no-main -o "$$generated" $(BENCH_SOURCES); \
+	$(BENCH_GENERATE) --exe --entry bench_main:Main -o "$$generated/entry" $(BENCH_SOURCES); \
+	cp "$$generated/entry/ziran_entry.go" "$$generated/ziran_entry.go"; \
+	cd bench/compression; \
+	GOCACHE="$(abspath $(BUILD_DIR)/gocache)" $(GO) build \
+		-o "$(abspath $(BENCH_DIR))/compression-bench" "$$generated"/*.go
 
 liboqs:
 	set -e; \
@@ -70,7 +88,7 @@ build: liboqs $(GENERATED)
 		--native-metadata "$(LIBOQS_BUILD_DIR)/.mesh-native-build.json"
 
 test: liboqs $(GENERATED)
-	$(CGO_ENV) GO="$(GO)" GOCACHE=$(abspath $(BUILD_DIR)/gocache) python3 scripts/test_go.py
+	$(CGO_ENV) GO="$(GO)" GOCACHE=$(abspath $(BUILD_DIR)/gocache) python3 scripts/test_go.py $(TEST_FLAGS)
 
 run: liboqs $(GENERATED)
 	$(CGO_ENV) $(GO) run .

@@ -15,8 +15,9 @@ slot observe cancellation. Erroring or panicking streams discard the context
 and return their slot. Completed streams detach the response writer before
 becoming available for reuse.
 
-Negotiation combines repeated `Accept-Encoding` fields, respects explicit
-q-values and exclusions, and selects Zstandard when supported codecs have the
+Negotiation combines repeated `Accept-Encoding` fields and parses the combined
+preferences in one pass. It respects explicit q-values and exclusions and
+selects Zstandard when supported codecs have the
 same preference. An absent header retains identity. If the client excludes all
 supported representations, the response is 406. Negotiated responses include
 `Vary: Accept-Encoding`, retaining an existing origin or wildcard selector.
@@ -58,12 +59,13 @@ Changing compression must not raise a node's managed CPU or memory budgets.
 ## Build and verification
 
 The Go build baseline is 1.26. Canonical implementation remains Ziran:
-`content_coding.zi`, `response.zi`, `http_body.zi`, `node_info.zi` and the node
-handler in `operational_http.zi`. Generic Zstandard bindings belong upstream
+`src/http/` owns compression negotiation, request limits and response coding.
+Node capabilities live in `src/node/node_info.zi`, and the public handler is in
+`src/server/operational_http.zi`. Generic Zstandard bindings belong upstream
 in Ziran's `std/zstd_go.zi`; the consuming Go module pins the external provider.
 Generated `.zi.go` files are build outputs and are not hand-edited or committed.
 
-`content_coding_zstd_test.go` covers negotiation, malformed/oversized bodies,
+`tests/_go/content_coding_zstd_test.go` covers negotiation, malformed/oversized bodies,
 literal entropy, reuse, bounded capacity, cancellation, write errors, native
 panic cleanup, concurrent ownership, signed sync and native curl decoding.
 Upstream tests verify source/saved IR and independent libzstd interoperability.

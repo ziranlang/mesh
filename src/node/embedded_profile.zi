@@ -1,0 +1,251 @@
+#import "std/go_types"
+files :: #import "std/file_go";
+io :: #import "std/io_go";
+errors :: #import "std/errors_go";
+random :: #import "std/random_go";
+clock :: #import "std/time_go";
+config :: #import "config";
+identity :: #import "node_identity";
+os :: #system_library "go:os";
+paths :: #system_library "go:path/filepath";
+system :: #system_library "go:syscall";
+native :: #system_library "go:mesh/native";
+hex :: #system_library "go:encoding/hex";
+builtin :: #system_library "go:builtin";
+
+File :: #type #foreign os "File";
+FileResult :: struct {
+    value: *File
+    error: Error
+}
+
+ProfileResult :: struct {
+    value: string
+    error: Error
+}
+
+#scope_file
+Info :: #type #foreign os "FileInfo";
+InfoResult :: struct {
+    value: Info
+    error: Error
+}
+WriteResult :: struct {
+    count: isize
+    error: Error
+}
+
+PrivateMode :: 384
+PrivateDirectoryMode :: 448
+SecretSize :: 32
+IsAbsolute :: (path: string) -> bool #foreign paths "IsAbs";
+Clean :: (path: string) -> string #foreign paths;
+JoinRaw :: (parts: []string) -> string #go_variadic #foreign paths "Join";
+Resolve :: (path: string) -> ProfileResult #go_results #foreign paths "EvalSymlinks";
+Lstat :: (path: string) -> InfoResult #go_results #foreign os;
+StatFile :: (file: *File) -> InfoResult #go_results #foreign os "(*File).Stat";
+IsDir :: (info: Info) -> bool #foreign os "FileInfo.IsDir";
+Mode :: (info: Info) -> files.FileMode #foreign os "FileInfo.Mode";
+Size :: (info: Info) -> s64 #foreign os "FileInfo.Size";
+IsRegular :: (mode: files.FileMode) -> bool #foreign os "FileMode.IsRegular";
+Permissions :: (mode: files.FileMode) -> files.FileMode #foreign os "FileMode.Perm";
+Open :: (path: string) -> FileResult #go_results #foreign os;
+OpenFile :: (path: string, flags: isize, mode: files.FileMode) -> FileResult #go_results #foreign os;
+NoFollow :: () -> isize #go_field #foreign system "O_NOFOLLOW";
+CreateFlag :: () -> isize #go_field #foreign os "O_CREATE";
+ExclusiveFlag :: () -> isize #go_field #foreign os "O_EXCL";
+ReadWriteFlag :: () -> isize #go_field #foreign os "O_RDWR";
+WriteOnlyFlag :: () -> isize #go_field #foreign os "O_WRONLY";
+Flock :: (file: *File, how: isize) -> Error #foreign native "LockFile";
+ExclusiveLock :: () -> isize #go_field #foreign system "LOCK_EX";
+NonblockingLock :: () -> isize #go_field #foreign system "LOCK_NB";
+Sync :: (file: *File) -> Error #foreign os "(*File).Sync";
+Write :: (file: *File, data: []u8) -> WriteResult #go_results #foreign os "(*File).Write";
+CloseAtReturn :: (file: *File) #go_defer #foreign os "(*File).Close";
+AllocateBytes :: (size: isize) -> []u8 #foreign builtin "make";
+AllocateStrings :: (size: isize) -> []string #foreign builtin "make";
+EncodeHex :: (value: []u8) -> string #foreign hex "EncodeToString";
+
+Private :: (info: Info) -> bool {
+    return (cast(u32)Permissions(Mode(info)) & 63) == 0
+}
+
+ReadSecret :: (path: string) -> files.FileReadResult {
+    opened := OpenFile(path, NoFollow(), cast(files.FileMode)0)
+    if opened.error != null {
+        return .{error = opened.error}
+    }
+    CloseAtReturn(opened.value)
+    info := StatFile(opened.value)
+    if info.error != null || !IsRegular(Mode(info.value)) || !Private(info.value) || Size(info.value) != SecretSize {
+        return .{error = errors.New("invalid private node secret")}
+    }
+    bytes := io.ReadAll(io.LimitReader(cast(io.Reader)opened.value, SecretSize + 1))
+    if bytes.error != null || bytes.value.count != SecretSize {
+        return .{error = errors.New("invalid private node secret")}
+    }
+    return .{value = bytes.value}
+}
+
+CreateSecret :: (path: string) -> files.FileReadResult {
+    bytes := AllocateBytes(cast(isize)SecretSize)
+    filled := random.Fill(bytes)
+    if filled.error != null {
+        return .{error = filled.error}
+    }
+    opened := OpenFile(path, WriteOnlyFlag() | CreateFlag() | ExclusiveFlag(), cast(files.FileMode)PrivateMode)
+    if opened.error != null {
+        return .{error = opened.error}
+    }
+    written := Write(opened.value, bytes)
+    synced := Sync(opened.value)
+    closed := Close(opened.value)
+    if written.error != null || written.count != SecretSize || synced != null || closed != null {
+        unused files.Remove(path)
+        return .{error = errors.New("cannot persist node secret")}
+    }
+    directory := Open(files.Dir(path))
+    if directory.error != null {
+        return .{error = directory.error}
+    }
+    CloseAtReturn(directory.value)
+    error := Sync(directory.value)
+    if error != null {
+        return .{error = error}
+    }
+    return .{value = bytes}
+}
+
+Secret :: (path: string) -> files.FileReadResult {
+    info := Lstat(path)
+    if errors.Is(info.error, files.NotExist()) {
+        return CreateSecret(path)
+    }
+    if info.error != null {
+        return .{error = info.error}
+    }
+    if !IsRegular(Mode(info.value)) || !Private(info.value) || Size(info.value) != SecretSize {
+        return .{error = errors.New("invalid private node secret")}
+    }
+    return ReadSecret(path)
+}
+
+CloseRaw :: (file: *File) -> Error #foreign os "(*File).Close";
+
+#scope_export
+Close :: (file: *File) -> Error {
+    return CloseRaw(file)
+}
+ChmodPrivate :: (path: string) -> Error {
+    return Chmod(path, cast(files.FileMode)PrivateMode)
+}
+
+#scope_file
+Chmod :: (path: string, mode: files.FileMode) -> Error #foreign os;
+
+Join :: (root: string, name: string) -> string {
+    parts: [2]string = .[root, name]
+    return JoinRaw(parts[:])
+}
+
+StateFileError :: (path: string) -> Error {
+    info := Lstat(path)
+    if errors.Is(info.error, files.NotExist()) {
+        return null
+    }
+    if info.error != null {
+        return info.error
+    }
+    if !IsRegular(Mode(info.value)) || !Private(info.value) {
+        return errors.New("private node state required")
+    }
+    return null
+}
+
+#scope_export
+Profile :: (root: string) -> ProfileResult {
+    if !IsAbsolute(root) {
+        return .{error = errors.New("absolute private profile required")}
+    }
+    cleaned := Clean(root)
+    error := files.MkdirAll(cleaned, cast(files.FileMode)PrivateDirectoryMode)
+    if error != null {
+        return .{error = error}
+    }
+    path := Resolve(cleaned)
+    if path.error != null || path.value != cleaned {
+        return .{error = errors.New("profile symlinks are not allowed")}
+    }
+    info := Lstat(path.value)
+    if info.error != null || !IsDir(info.value) || !Private(info.value) {
+        return .{error = errors.New("profile must be private")}
+    }
+    return path
+}
+
+Lease :: (root: string) -> FileResult {
+    opened := OpenFile(Join(root, "node.lock"), CreateFlag() | ReadWriteFlag() | NoFollow(), cast(files.FileMode)PrivateMode)
+    if opened.error != null {
+        return opened
+    }
+    info := StatFile(opened.value)
+    if info.error != null || !IsRegular(Mode(info.value)) || !Private(info.value) {
+        unused Close(opened.value)
+        return .{error = errors.New("private node lock required")}
+    }
+    error := Flock(opened.value, ExclusiveLock() | NonblockingLock())
+    if error != null {
+        unused Close(opened.value)
+        return .{error = errors.New("profile node already has an owner")}
+    }
+    return opened
+}
+
+ConfigResult :: struct {
+    value: config.Config
+    error: Error
+}
+
+Configuration :: (root: string) -> ConfigResult {
+    secret := Secret(Join(root, "token-secret"))
+    if secret.error != null {
+        return .{error = secret.error}
+    }
+    admin := Secret(Join(root, "admin-secret"))
+    if admin.error != null {
+        return .{error = admin.error}
+    }
+    key_path := Join(root, "node-key")
+    db_path := Join(root, "mesh.sqlite")
+    error := StateFileError(key_path)
+    if error != null {
+        return .{error = error}
+    }
+    error = StateFileError(db_path)
+    if error != null {
+        return .{error = error}
+    }
+    key := identity.LoadOrCreateKey(key_path)
+    if key.error != null {
+        return .{error = key.error}
+    }
+    networks := AllocateStrings(cast(isize)2)
+    networks[0] = "127.0.0.0/8"
+    networks[1] = "::1/128"
+    settings: config.Config = .{
+        Addr = "127.0.0.1:0",
+        DBPath = db_path,
+        TokenSecret = secret.value,
+        AdminToken = EncodeHex(admin.value),
+        NodeIdentityPrivateKey = key.value,
+        NodeDisplayName = "Private app node",
+        ChallengeTTL = cast(clock.Duration)60000000000,
+        TokenTTL = cast(clock.Duration)3600000000000,
+        MaxBodyBytes = 1048576,
+        NodeSyncInterval = cast(clock.Duration)30000000000,
+        NodeSyncBatchLimit = cast(isize)128,
+        NodeLANOnly = true,
+        NodeLANNetworks = networks,
+    }
+    return .{value = settings}
+}

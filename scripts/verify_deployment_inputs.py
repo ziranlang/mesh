@@ -2,7 +2,7 @@
 """Verify native build and SSH inputs before a Mesh deployment."""
 
 import argparse
-from hashlib import sha256
+from hashlib import file_digest, sha256
 import json
 import os
 from pathlib import Path
@@ -182,6 +182,12 @@ def native_metadata_path(build_directory):
     return build_directory / ".mesh-native-build.json"
 
 
+def native_artifact_identity(artifact):
+    with artifact.open("rb") as stream:
+        size = os.fstat(stream.fileno()).st_size
+        return {"sha256": file_digest(stream, "sha256").hexdigest(), "size": size}
+
+
 def check_native_build(source_directory, build_directory, artifact, cmake, cmake_options):
     validate_native_paths(source_directory, build_directory)
     expected = native_build_identity(source_directory, cmake, cmake_options)
@@ -190,24 +196,21 @@ def check_native_build(source_directory, build_directory, artifact, cmake, cmake
         return False
     try:
         recorded = json.loads(metadata_path.read_text())
+        artifact_info = native_artifact_identity(artifact)
     except (OSError, UnicodeError, json.JSONDecodeError):
         return False
-    return recorded == expected and artifact.stat().st_size > 0
+    return artifact_info["size"] > 0 and recorded == {**expected, "artifact": artifact_info}
 
 
 def record_native_build(source_directory, build_directory, artifact, cmake, cmake_options):
     validate_native_paths(source_directory, build_directory)
-    if not artifact.is_file() or artifact.stat().st_size == 0:
-        raise VerificationError(f"native artifact is empty or missing: {artifact}")
-    artifact_bytes = artifact.read_bytes()
+    if not artifact.is_file():
+        raise VerificationError(f"native artifact does not exist: {artifact}")
+    artifact_info = native_artifact_identity(artifact)
+    if not artifact_info["size"]:
+        raise VerificationError(f"native artifact is empty: {artifact}")
     identity = native_build_identity(source_directory, cmake, cmake_options)
-    metadata = {
-        **identity,
-        "artifact": {
-            "sha256": sha256(artifact_bytes).hexdigest(),
-            "size": len(artifact_bytes),
-        },
-    }
+    metadata = {**identity, "artifact": artifact_info}
     encoded = (json.dumps(metadata, sort_keys=True, indent=2) + "\n").encode()
     atomic_write(native_metadata_path(build_directory), encoded, 0o600)
     return identity

@@ -141,7 +141,7 @@ def main():
     args = parser.parse_args()
     try:
         commands = (json.load(sys.stdin) if args.from_stdin else catalogue(
-            (Path(__file__).resolve().parent.parent / "lumi_commands.zi").read_text()))
+            (Path(__file__).resolve().parent.parent / "src" / "chat" / "lumi_commands.zi").read_text()))
         if args.host:
             arguments = ["python3", "-c", Path(__file__).read_text(), "--from-stdin",
                          "--env-file", str(args.env_file or "/etc/mesh/mesh.env")]

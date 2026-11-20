@@ -1,6 +1,6 @@
 [package]
 name = "Mesh"
-module_roots = ["."]
+module_roots = ["src/server", "src/accounts", "src/apps", "src/chat", "src/http", "src/node", "src/payments", "src/protocol", "src/storage", "src/sync", "src/token", "tests/ziran"]
 
 [toolchain]
 git = "https://github.com/ziranlang/ziran.git"

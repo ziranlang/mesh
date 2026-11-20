@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
-"""Test every maintained Go package without treating ignored backups as code."""
+"""Run handwritten Go and generated Ziran tests in the server package."""
 
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
 
 
-root = Path(__file__).resolve().parent.parent
-files = subprocess.check_output(
-    ["git", "ls-files", "-z", "--", "*.go"], cwd=root
-).decode().split("\0")
-packages = {"."}
-for name in files:
-    if name:
-        parent = Path(name).parent.as_posix()
-        if parent != ".":
-            # Experimental tools can own a separate Go module. They are not
-            # packages of the application module and cannot be passed to its
-            # go test invocation (the compression benchmark is one example).
-            directory = root / parent
-            nested_module = False
-            while directory != root:
-                if (directory / "go.mod").is_file():
-                    nested_module = True
-                    break
-                directory = directory.parent
-            if nested_module:
-                continue
-            packages.add("./" + parent)
-subprocess.run(
-    [os.environ.get("GO", "go"), "test", *sorted(packages)],
-    cwd=root,
-    check=True,
-)
+def run_tests(repo, arguments, env, generated=None):
+    # Keep the original package and working directory for native fixtures.
+    # Go skips the _go directory in ordinary package discovery.
+    replacement = dict(generated or {})
+    for test in sorted((repo / "tests/_go").glob("*_test.go")):
+        replacement[str(repo / test.name)] = str(test)
+    packages = ["."]
+    for directory in (repo / "native", *(repo / "testdata").iterdir()):
+        if directory.is_dir() and any(directory.glob("*.go")):
+            packages.append("./" + directory.relative_to(repo).as_posix())
+    build = repo / "build"
+    build.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="go-tests-", dir=build) as output:
+        overlay = Path(output) / "overlay.json"
+        overlay.write_text(json.dumps({"Replace": replacement}))
+        subprocess.run(
+            [env.get("GO", "go"), "test", "-overlay", str(overlay), *arguments, *sorted(packages)],
+            cwd=repo, env={**env, "MESH_GO_TEST_OVERLAY": str(overlay)}, check=True,
+        )
+
+
+if __name__ == "__main__":
+    run_tests(Path(__file__).resolve().parents[1], sys.argv[1:], os.environ)

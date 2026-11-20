@@ -1,0 +1,299 @@
+#import "std/go_types"
+#import "std/map_go"
+application :: #import "server";
+core :: #import "embedded";
+profile :: #import "embedded_profile";
+mesh :: #import "mesh";
+startup :: #import "startup";
+middleware :: #import "middleware";
+ctx :: #import "std/context_go";
+http :: #import "std/http_go";
+url :: #import "std/url_go";
+io :: #import "std/io_go";
+json :: #import "std/json_go";
+text :: #import "std/text_go";
+errors :: #import "std/errors_go";
+sync :: #import "std/sync_go";
+sql :: #import "std/sql_go";
+go_http :: #system_library "go:net/http";
+go_net :: #system_library "go:net";
+go_sync :: #system_library "go:sync";
+go_testing :: #system_library "go:net/http/httptest";
+go_json :: #system_library "go:encoding/json";
+go_io :: #system_library "go:io";
+strings :: #system_library "go:strings";
+builtin :: #system_library "go:builtin";
+
+#scope_file
+Listener :: #type #foreign go_net "Listener";
+Address :: #type #foreign go_net "Addr";
+Recorder :: #type #foreign go_testing "ResponseRecorder";
+RawMessage :: #type #foreign go_json "RawMessage";
+StringReader :: #type #foreign strings "Reader";
+
+Node :: struct {
+    core: core.EmbeddedCore
+    root: string
+    server: *startup.HTTPServer
+    cancel: ctx.CancelFunc
+    workers: startup.WorkerGroup
+    references: isize
+    lease: *profile.File
+}
+
+RouteFilter :: struct {
+    routes: middleware.Handler
+}
+
+ListenResult :: struct {
+    value: Listener
+    error: Error
+}
+StartResult :: struct {
+    value: s64
+    error: Error
+}
+Reply :: struct {
+    status: isize #go_tag "json:\"status\""
+    body: RawMessage #go_tag "json:\"body\""
+}
+ListenerTask :: struct {
+    listener: Listener
+    node: *Node
+    context: ctx.Context
+}
+
+state_lock: sync.Mutex;
+nodes: Map(s64, *Node);
+roots: Map(string, s64);
+next_handle: s64;
+
+AllocateNode :: () -> *Node #foreign builtin "new";
+AllocateFilter :: () -> *RouteFilter #foreign builtin "new";
+UnlockAtReturn :: (mutex: *sync.Mutex) #go_defer #foreign go_sync "(*Mutex).Unlock";
+AddWorkers :: (group: *startup.WorkerGroup, count: isize) #foreign go_sync "(*WaitGroup).Add";
+CompleteAtReturn :: (group: *startup.WorkerGroup) #go_defer #foreign go_sync "(*WaitGroup).Done";
+WaitWorkers :: (group: *startup.WorkerGroup) #foreign go_sync "(*WaitGroup).Wait";
+Work :: #type (task: ListenerTask) -> void;
+Spawn :: (callback: Work, task: ListenerTask) #foreign builtin "spawn";
+Listen :: (network: string, address: string) -> ListenResult #go_results #foreign go_net;
+ListenerAddress :: (listener: Listener) -> Address #foreign go_net "Listener.Addr";
+AddressString :: (address: Address) -> string #foreign go_net "Addr.String";
+Serve :: (server: *startup.HTTPServer, listener: Listener) -> Error #foreign go_http "(*Server).Serve";
+CloseServer :: (server: *startup.HTTPServer) -> Error #foreign go_http "(*Server).Close";
+ServeHTTP :: (handler: middleware.Handler, writer: http.ResponseWriter, request: *http.Request) #foreign go_http "Handler.ServeHTTP";
+NotFound :: (writer: http.ResponseWriter, request: *http.Request) #foreign go_http;
+SetRemoteAddress :: (request: *http.Request, address: string) #go_field #foreign go_http "(*Request).RemoteAddr";
+NewRecorder :: () -> *Recorder #foreign go_testing;
+Response :: (recorder: *Recorder) -> *http.Response #foreign go_testing "(*ResponseRecorder).Result";
+NewReader :: (body: string) -> *StringReader #foreign strings;
+Join :: (parts: []string, separator: string) -> string #foreign strings;
+HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
+Contains :: (value: string, needle: string) -> bool #foreign strings;
+CloseBodyAtReturn :: (body: io.ReadCloser) #go_defer #foreign go_io "ReadCloser.Close";
+
+RunServer :: (task: ListenerTask) {
+    CompleteAtReturn(*task.node.workers)
+    unused Serve(task.node.server, task.listener)
+}
+
+RunMesh :: (task: ListenerTask) {
+    CompleteAtReturn(*task.node.workers)
+    mesh.Run(application.Mesh(task.node.core.server), task.context)
+}
+
+#scope_export
+Handle :: (filter: *RouteFilter, writer: http.ResponseWriter, request: *http.Request) #go_method "ServeHTTP" {
+    if !core.AllowedPath(url.Path(http.RequestURL(request))) {
+        NotFound(writer, request)
+        return
+    }
+    ServeHTTP(filter.routes, writer, request)
+}
+
+Handler :: (node: core.EmbeddedCore) -> middleware.Handler {
+    filter := AllocateFilter()
+    filter.routes = application.Routes(node.server)
+    return cast(middleware.Handler)filter
+}
+
+ResumeNode :: (node: *Node) -> Error {
+    if node.server != null {
+        return null
+    }
+    opened := Listen("tcp", "127.0.0.1:0")
+    if opened.error != null {
+        return opened.error
+    }
+    addr := AddressString(ListenerAddress(opened.value))
+    node.core.server.cfg.Addr = addr
+    node.core.server.cfg.BaseURL = startup.LocalHTTPURL(addr)
+    node.server = startup.NewHTTPServer(addr, Handler(node.core))
+    lifetime := ctx.WithCancel(ctx.Background())
+    node.cancel = lifetime.cancel
+    task: ListenerTask = .{listener = opened.value, node = node, context = lifetime.value}
+    AddWorkers(*node.workers, cast(isize)2)
+    Spawn(RunServer, task)
+    Spawn(RunMesh, task)
+    return null
+}
+
+SuspendNode :: (node: *Node) {
+    if node.server == null {
+        return
+    }
+    ctx.Cancel(node.cancel)
+    unused CloseServer(node.server)
+    WaitWorkers(*node.workers)
+    node.server = null
+}
+
+#scope_file
+OpenNode :: (root: string, lease: *profile.File) -> StartResult {
+    settings := profile.Configuration(root)
+    if settings.error != null {
+        return .{error = settings.error}
+    }
+    opened := core.Open(settings.value)
+    if opened.error != null {
+        return .{error = opened.error}
+    }
+    arguments: []Any
+    journal := sql.Exec(opened.value.store.database, ctx.Background(),
+        "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL", arguments)
+    if journal.error != null {
+        unused core.Close(opened.value)
+        return .{error = journal.error}
+    }
+    error := profile.ChmodPrivate(settings.value.DBPath)
+    if error != null {
+        unused core.Close(opened.value)
+        return .{error = error}
+    }
+    node := AllocateNode()
+    node.root = root
+    node.core = opened.value
+    node.references = cast(isize)1
+    node.lease = lease
+    error = ResumeNode(node)
+    if error != null {
+        unused core.Close(node.core)
+        return .{error = error}
+    }
+    next_handle += 1
+    MapSet(nodes, next_handle, node)
+    MapSet(roots, root, next_handle)
+    return .{value = next_handle}
+}
+
+#scope_export
+Start :: (root: string) -> StartResult {
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    path := profile.Profile(root)
+    if path.error != null {
+        return .{error = path.error}
+    }
+    handle := MapGet(roots, path.value)
+    if handle != 0 {
+        node := MapGet(nodes, handle)
+        error := ResumeNode(node)
+        if error != null {
+            return .{error = error}
+        }
+        node.references += 1
+        return .{value = handle}
+    }
+    lock := profile.Lease(path.value)
+    if lock.error != null {
+        return .{error = lock.error}
+    }
+    result := OpenNode(path.value, lock.value)
+    if result.error != null {
+        unused profile.Close(lock.value)
+    }
+    return result
+}
+
+Stop :: (handle: s64) -> bool {
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    node := MapGet(nodes, handle)
+    if node == null {
+        return false
+    }
+    node.references -= 1
+    if node.references == 0 {
+        SuspendNode(node)
+        unused core.Close(node.core)
+        unused profile.Close(node.lease)
+        MapDelete(roots, node.root)
+        MapDelete(nodes, handle)
+    }
+    return true
+}
+
+Suspend :: (handle: s64) -> bool {
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    node := MapGet(nodes, handle)
+    if node == null {
+        return false
+    }
+    SuspendNode(node)
+    return true
+}
+
+Resume :: (handle: s64) -> bool {
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    node := MapGet(nodes, handle)
+    return node != null && ResumeNode(node) == null
+}
+
+Lookup :: (handle: s64) -> *Node {
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    return MapGet(nodes, handle)
+}
+
+Request :: (handle: s64, method: string, route: string, data: string) -> json.JSONResult {
+    if !HasPrefix(route, "/") || Contains(route, "://") || data.count > 1048576 {
+        return .{error = errors.New("invalid embedded request")}
+    }
+    sync.Lock(*state_lock)
+    UnlockAtReturn(*state_lock)
+    node := MapGet(nodes, handle)
+    if node == null {
+        return .{error = errors.New("unknown embedded node")}
+    }
+    address: [2]string = .["http://127.0.0.1", route]
+    request := http.NewRequest(ctx.Background(), method, Join(address[:], ""), cast(io.Reader)NewReader(data))
+    if request.error != null {
+        return .{error = request.error}
+    }
+    SetRemoteAddress(request.value, "127.0.0.1:1")
+    headers := http.Headers(request.value)
+    http.SetHeader(headers, "Content-Type", "application/json")
+    // This in-process operator capability never crosses a peer transport.
+    http.SetHeader(headers, "X-Mesh-Admin", node.core.server.cfg.AdminToken)
+    recorder := NewRecorder()
+    ServeHTTP(Handler(node.core), cast(http.ResponseWriter)recorder, request.value)
+    response := Response(recorder)
+    body := http.ResponseBody(response)
+    CloseBodyAtReturn(body)
+    encoded := io.ReadAll(io.LimitReader(cast(io.Reader)body, 1048576))
+    if encoded.error != null {
+        return .{error = encoded.error}
+    }
+    payload := encoded.value
+    if !json.Valid(payload) {
+        quoted := json.Marshal(text.FromBytes(payload))
+        if quoted.error != null {
+            return quoted
+        }
+        payload = quoted.value
+    }
+    reply: Reply = .{status = http.StatusCode(response), body = cast(RawMessage)payload}
+    return json.Marshal(reply)
+}

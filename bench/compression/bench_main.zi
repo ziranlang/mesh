@@ -1,0 +1,22 @@
+support :: #import "bench_support";
+corpus :: #import "bench_corpus";
+http :: #import "bench_http";
+memory :: #import "bench_memory";
+
+Main :: () {
+    args := support.Args()
+    if args.count != 3 {
+        support.Fail("usage: compression-bench codecs|http|memory OUTPUT")
+        return
+    }
+    unused support.LimitWorkers(cast(isize)1)
+    if args[1] == "codecs" {
+        corpus.Run(args[2])
+    } else if args[1] == "http" {
+        http.Run(args[2])
+    } else if args[1] == "memory" {
+        memory.Run(args[2])
+    } else {
+        support.Fail("usage: compression-bench codecs|http|memory OUTPUT")
+    }
+}

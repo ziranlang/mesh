@@ -22,13 +22,14 @@ the managed limits or run the stages concurrently.
 python3 bench/compression/benchmark.py --output build/scratch/compression-2026-10-26
 ```
 
-Then, from `bench/compression`:
+Then build and run the Ziran driver from the repository root. It uses the Go
+backend with the same gzip, Zstandard and Brotli libraries as the recorded run.
 
 ```sh
-GOTOOLCHAIN=go1.26.10 GOMAXPROCS=1 GOFLAGS=-p=1 go mod download
-GOTOOLCHAIN=go1.26.10 GOMAXPROCS=1 GOFLAGS=-p=1 go run . ../../build/scratch/compression-2026-10-26
-GOTOOLCHAIN=go1.26.10 GOMAXPROCS=1 GOFLAGS=-p=1 go run ./http ../../build/scratch/compression-2026-10-26
-GOTOOLCHAIN=go1.26.10 GOMAXPROCS=1 GOFLAGS=-p=1 go run ./memory ../../build/scratch/compression-2026-10-26
+GOTOOLCHAIN=go1.26.10 GOFLAGS=-p=1 make compression-bench
+build/compression-bench/compression-bench codecs build/scratch/compression-2026-10-26
+build/compression-bench/compression-bench http build/scratch/compression-2026-10-26
+build/compression-bench/compression-bench memory build/scratch/compression-2026-10-26
 ```
 
 Finally, from the repository root:

@@ -48,7 +48,7 @@ func TestOpenAPISpecCoversRegisteredRoutes(t *testing.T) {
 	if len(paths) == 0 {
 		t.Fatal("openapi spec has no paths")
 	}
-	source, err := os.ReadFile("server.zi")
+	source, err := os.ReadFile("src/server/server.zi")
 	if err != nil {
 		t.Fatal(err)
 	}

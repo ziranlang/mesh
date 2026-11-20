@@ -1,9 +1,22 @@
 # Development
 
-Mesh's canonical server implementation is written in Ziran. Source files at
-the repository root define HTTP handlers, protocol values, storage, node trust,
-sync and account services. The build generates their Go output; generated
-`.zi.go` and `.zi_test.go` files are ignored and must not be edited by hand.
+Mesh's server is written in Ziran. The build generates `.zi.go` and
+`.zi_test.go` files in the root Go package. These are ignored build outputs.
+
+| Path | Contents |
+| --- | --- |
+| `src/server` | Entry point, startup, configuration, routing and operations |
+| `src/http` | HTTP middleware, body limits, compression and websockets |
+| `src/node` | Peer discovery, trust, replication and the embedded node |
+| `src/sync` | Client sync, cursors, history and record transfer |
+| `src/storage` | SQLite, schema, retention and storage accounting |
+| `src/protocol` | Wire types, signing, encryption and serialization |
+| `src/accounts`, `src/apps`, `src/chat`, `src/payments`, `src/token` | Application features |
+| `tests/ziran` | Ziran tests run by the Go backend |
+| `tests/_go` | Go regression tests and independent behavior baselines |
+| `testdata` | Shared protocol fixtures and standalone reference programs |
+| `native`, `embedded_host.go` | Go callback adapter and C entry points |
+| `bench/compression` | Ziran compression benchmarks and native codec comparisons |
 
 ## Requirements and build
 
@@ -38,17 +51,20 @@ commands. Do not hand-edit lockfiles or downstream dependency source copies.
 
 `make test-ziran` runs the application suite against generated Go from source,
 then saves checked `.zir`, generates Go from that IR and runs the suite again.
+The test runner adds `tests/_go` to the server package with a Go overlay.
 Independent fixtures cover native types, signatures, SQL behavior, protocol
 bytes, cancellation, replay prevention and resource cleanup.
 
 ```sh
 make test-ziran GOFLAGS='-mod=mod -race -count=1'
+make test TEST_FLAGS='-tags=mesh_embedded -run TestEmbeddedNode'
 ```
 
 Keep test concurrency within the managed machine budget. Tests do not use the
 owner's display. Visual or window-management tests require a private display
-and isolated processes. The separate compression benchmark Go module owns its
-experimental dependencies and is excluded from application package discovery.
+and isolated processes. `make compression-bench` builds the Ziran codec, HTTP,
+and retained-memory benchmarks. Their Go backend dependencies are pinned in a
+separate module. See the [benchmark instructions](../bench/compression/README.md).
 
 ## Ownership and boundaries
 

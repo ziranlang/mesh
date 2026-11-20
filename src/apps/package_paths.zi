@@ -2,14 +2,16 @@
 #import "std/map_go"
 json :: #import "std/json_go";
 text :: #import "std/text_go";
+strings :: #system_library "go:strings";
+Join :: (values: []string, separator: string) -> string #foreign strings;
 
 Paths :: () -> Map(string, Any) {
     paths: Map(string, Any)
-    json.Unmarshal(text.ToBytes(Document), *paths)
+    json.Unmarshal(text.ToBytes(Join(Documents[:], "")), *paths)
     return paths
 }
 
-Document :: #string JSON
+Document1 :: #string JSON_1
 {
   "/api/v1/packages/{app_id}/{asset}": {
     "get": {
@@ -25,6 +27,9 @@ Document :: #string JSON
       }
     }
   },
+JSON_1;
+
+Document2 :: #string JSON_2
   "/api/v2/packages/{app_id}/{asset}": {
     "get": {
       "summary": "Read an app's portable release for current hosts",
@@ -62,4 +67,6 @@ Document :: #string JSON
     }
   }
 }
-JSON;
+JSON_2;
+
+Documents: [2]string = .[Document1, Document2];
