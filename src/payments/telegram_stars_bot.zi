@@ -127,6 +127,7 @@ ReconcileReply :: struct {
 HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
 TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
 Join :: (values: []string, separator: string) -> string #foreign strings;
+Clone :: (value: string) -> string #foreign strings;
 CancelCallback :: #type (cancel: ctx.CancelFunc) -> void;
 CancelAtReturn :: (callback: CancelCallback, cancel: ctx.CancelFunc) #go_defer #foreign builtin "call";
 
@@ -171,7 +172,8 @@ InvoiceLink :: (link: string) -> bool {
 }
 
 Merchant :: (configuration: *config.Config, node: string) -> store.Merchant {
-    return store.Merchant.{bot = telegram.BotID(configuration.LumiBotToken), node = node, audience = configuration.BaseURL}
+    bot := telegram.BotID(configuration.LumiBotToken)
+    return store.Merchant.{bot = bot, node = node, audience = Clone(configuration.BaseURL)}
 }
 
 Answer :: (context: ctx.Context, token: string, queryID: string, accepted: bool) -> bool {
