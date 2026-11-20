@@ -22,19 +22,17 @@ os :: #system_library "go:os";
 native_http :: #system_library "go:net/http";
 fmt :: #system_library "go:fmt";
 paths :: #import "path_component";
+rooted :: #import "rooted_files";
+random :: #system_library "go:crypto/rand";
 
 MaxBlobBytes :: 16777216;
-File :: #type #foreign os "File";
-Opened :: struct { value: *File; error: Error; }
 Written :: struct { count: isize; error: Error; }
 Split :: (value: string, separator: string) -> []string #foreign strings;
 TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
-Join :: (parts: []string, separator: string) -> string #foreign strings;
-Temporary :: (folder: string, pattern: string) -> Opened #go_results #foreign os "CreateTemp";
-Name :: (file: *File) -> string #foreign os "(*File).Name";
-Close :: (file: *File) -> Error #foreign os "(*File).Close";
-Sync :: (file: *File) -> Error #foreign os "(*File).Sync";
-Write :: (file: *File, value: []u8) -> Written #go_results #foreign os "(*File).Write";
+RandomText :: () -> string #foreign random "Text";
+Close :: (file: *rooted.File) -> Error #foreign os "(*File).Close";
+Sync :: (file: *rooted.File) -> Error #foreign os "(*File).Sync";
+Write :: (file: *rooted.File, value: []u8) -> Written #go_results #foreign os "(*File).Write";
 WriteResponse :: (writer: http.ResponseWriter, value: []u8) -> Written #go_results #foreign native_http "ResponseWriter.Write";
 Length :: (value: s64) -> string #foreign fmt "Sprint";
 Concat :: (a: string, b: string) -> string #foreign fmt "Sprint";
@@ -48,23 +46,37 @@ ValidHash :: (hash: string) -> bool {
     return true
 }
 
-Save :: (folder: string, path: string, data: []u8) -> Error {
-    error := files.MkdirAll(folder, cast(files.FileMode)448)
-    if error != null { return error }
-    opened := Temporary(folder, ".upload-*")
+CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign os "(*Root).Close";
+
+OpenStore :: (path: string, user: string, app: string, create: bool) -> rooted.RootResult {
+    if create {
+        error := files.MkdirAll(path, cast(files.FileMode)448)
+        if error != null { return .{error = error} }
+    }
+    store := rooted.OpenRoot(path)
+    if store.error != null { return store }
+    CloseRootAtReturn(store.value)
+    account := rooted.Child(store.value, user, create)
+    if account.error != null { return account }
+    CloseRootAtReturn(account.value)
+    return rooted.Child(account.value, app, create)
+}
+
+Save :: (root: *rooted.Root, hash: string, data: []u8) -> Error {
+    temporary := Concat(".upload-", RandomText())
+    opened := rooted.Create(root, temporary)
     if opened.error != null { return opened.error }
-    temporary := Name(opened.value)
-    defer { unused files.Remove(temporary) }
+    defer { unused rooted.Remove(root, temporary) }
     written := Write(opened.value, data)
     if written.error != null {
         unused Close(opened.value)
         return written.error
     }
-    error = Sync(opened.value)
+    error := Sync(opened.value)
     closed := Close(opened.value)
     if error != null { return error }
     if closed != null { return closed }
-    return files.Rename(temporary, path)
+    return rooted.Rename(root, temporary, hash)
 }
 
 // Takes a blob out of the trash when the account has room for it again.
@@ -199,10 +211,7 @@ Route :: (store: registry.Registry, writer: http.ResponseWriter, request: *http.
         auth.Respond(writer, store.counters, verified)
         return
     }
-    pathParts: [4]string = .[Concat(store.configuration.DBPath, ".blobs"), userPath.value, appID, hash]
-    folderParts: [3]string = .[pathParts[0], pathParts[1], pathParts[2]]
-    path := Join(pathParts[:], "/")
-    folder := Join(folderParts[:], "/")
+    rootPath := Concat(store.configuration.DBPath, ".blobs")
     http.SetHeader(http.ResponseHeaders(writer), "Cache-Control", "private, no-store")
     if method == "PUT" {
         // Blobs count toward the account's storage limit like records, so
@@ -242,7 +251,14 @@ Route :: (store: registry.Registry, writer: http.ResponseWriter, request: *http.
                 return
             }
         }
-        error := Save(folder, path, data)
+        opened := OpenStore(rootPath, userPath.value, appID, true)
+        if opened.error != null {
+            signed.Forget(store.database, context, header.value)
+            response.Error(writer, 507, "could not store blob")
+            return
+        }
+        CloseRootAtReturn(opened.value)
+        error := Save(opened.value, hash, data)
         if error != null {
             signed.Forget(store.database, context, header.value)
             response.Error(writer, 507, "could not store blob")
@@ -250,7 +266,7 @@ Route :: (store: registry.Registry, writer: http.ResponseWriter, request: *http.
         }
         error = storage.RecordBlob(store.database, context, user.value, appID, hash, cast(s64)data.count)
         if error != null {
-            unused files.Remove(path)
+            unused rooted.Remove(opened.value, hash)
             signed.Forget(store.database, context, header.value)
             response.Error(writer, 507, "could not store blob")
             return
@@ -277,9 +293,14 @@ Route :: (store: registry.Registry, writer: http.ResponseWriter, request: *http.
         Restore(store, writer, request, user.value, appID, hash)
         return
     }
+    opened := OpenStore(rootPath, userPath.value, appID, false)
     if method == "DELETE" {
         // Deleting is idempotent, so a retry after a lost reply succeeds.
-        removed := files.Remove(path)
+        removed := opened.error
+        if removed == null {
+            CloseRootAtReturn(opened.value)
+            removed = rooted.Remove(opened.value, hash)
+        }
         if removed != null && !errors.Is(removed, files.NotExist()) {
             response.Error(writer, 507, "could not delete blob")
             return
@@ -292,7 +313,12 @@ Route :: (store: registry.Registry, writer: http.ResponseWriter, request: *http.
         http.WriteHeader(writer, 204)
         return
     }
-    read := files.ReadFile(path)
+    if opened.error != null {
+        response.Error(writer, 404, "blob not found")
+        return
+    }
+    CloseRootAtReturn(opened.value)
+    read := rooted.ReadFile(opened.value, hash)
     if read.error != null {
         response.Error(writer, 404, "blob not found")
         return

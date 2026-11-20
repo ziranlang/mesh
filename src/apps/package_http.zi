@@ -16,7 +16,7 @@
 #import "std/go_types"
 http :: #import "std/http_go";
 url :: #import "std/url_go";
-files :: #import "std/file_go";
+rooted :: #import "rooted_files";
 json :: #import "std/json_go";
 text :: #import "std/text_go";
 keys :: #import "std/ed25519_go";
@@ -47,11 +47,6 @@ WriteResult :: struct {
 }
 Number :: struct {
     value: s64
-    error: Error
-}
-PayloadInfo :: #type #foreign go_os "FileInfo";
-PayloadStatus :: struct {
-    info: PayloadInfo
     error: Error
 }
 Interfaces :: struct {
@@ -102,19 +97,20 @@ Split :: (value: string, separator: string) -> []string #foreign strings;
 Decode :: (value: string) -> Decoded #go_results #foreign hex "DecodeString";
 Join :: (a: string, b: string) -> string #foreign fmt "Sprint";
 Write :: (writer: http.ResponseWriter, bytes: []u8) -> WriteResult #go_results #foreign go_http "ResponseWriter.Write";
-Stat :: (path: string) -> PayloadStatus #go_results #foreign go_os "Stat";
-PayloadFile :: #type #foreign go_os "File";
-PayloadOpened :: struct {
-    value: *PayloadFile
-    error: Error
-}
 PayloadRead :: struct {
     count: isize
     error: Error
 }
-Open :: (path: string) -> PayloadOpened #go_results #foreign go_os "Open";
-ReadAt :: (file: *PayloadFile, bytes: []u8, offset: s64) -> PayloadRead #go_results #foreign go_os "(*File).ReadAt";
-Close :: (file: *PayloadFile) -> Error #foreign go_os "(*File).Close";
+ReadAt :: (file: *rooted.File, bytes: []u8, offset: s64) -> PayloadRead #go_results #foreign go_os "(*File).ReadAt";
+CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign go_os "(*Root).Close";
+CloseFileAtReturn :: (file: *rooted.File) #go_defer #foreign go_os "(*File).Close";
+
+OpenPackage :: (dbPath: string, appID: string) -> rooted.RootResult {
+    packages := rooted.OpenRoot(Join(dbPath, ".packages"))
+    if packages.error != null { return packages }
+    CloseRootAtReturn(packages.value)
+    return rooted.Child(packages.value, appID, false)
+}
 
 // The release hash of a `<sha>.zx`, legacy `<sha>.zib` or WebAssembly
 // `<sha>.wasm` artifact name.
@@ -157,8 +153,8 @@ Bucket :: (request: *http.Request) -> s64 {
 
 // A missing, unreadable or expired rollout file releases to everyone, so a
 // staged release never stays held back without a publisher.
-HeldBack :: (root: string, sequence: s64, bucket: s64) -> bool {
-    metadata := files.ReadFile(Join(root, "rollout.json"))
+HeldBack :: (root: *rooted.Root, sequence: s64, bucket: s64) -> bool {
+    metadata := rooted.ReadFile(root, "rollout.json")
     if metadata.error != null || metadata.value.count > 4096 {
         return false
     }
@@ -206,14 +202,14 @@ ModuleHash :: (value: release.ReleaseV2) -> string {
 
 // The executable revision of a stored `.zx`: the little-endian u32 after
 // its `ZX\0\0` magic. Zero when the file is missing, short or not ZX.
-Revision :: (path: string) -> s64 {
-    opened := Open(path)
+Revision :: (root: *rooted.Root, name: string) -> s64 {
+    opened := rooted.OpenRegular(root, name)
     if opened.error != null {
         return 0
     }
+    CloseFileAtReturn(opened.value)
     header: [8]u8
     read := ReadAt(opened.value, header[:], 0)
-    unused Close(opened.value)
     if read.count != 8 || header[0] != cast(u8)90 || header[1] != cast(u8)88 ||
     header[2] != cast(u8)0 || header[3] != cast(u8)0 {
         return 0
@@ -256,11 +252,11 @@ SameRelease :: (variant: release.ReleaseV2, value: release.ReleaseV2) -> bool {
 
 // The release's signed WebAssembly variant: the module Ziran lowered from its
 // `.zx`, archived as `release-<sequence>.wasm.json` beside `<sha>.wasm`.
-WasmVariant :: (context: registry.Registry, request: *http.Request, root: string,
+WasmVariant :: (context: registry.Registry, request: *http.Request, root: *rooted.Root,
     value: release.ReleaseV2) -> Selected {
     result: Selected
     name := Join(Join("release-", Sequence(value.Sequence)), ".wasm.json")
-    metadata := files.ReadFile(Join(root, name))
+    metadata := rooted.ReadFile(root, name)
     if metadata.error != null || metadata.value.count > 65536 {
         return result
     }
@@ -269,8 +265,8 @@ WasmVariant :: (context: registry.Registry, request: *http.Request, root: string
     !release.Valid(variant, value.AppID) || !SameRelease(variant, value) {
         return result
     }
-    module := Join(root, Join(variant.Artifacts[0].SHA256, ".wasm"))
-    if Stat(module).error != null || !Trusted(context, request, variant) {
+    module := Join(variant.Artifacts[0].SHA256, ".wasm")
+    if !rooted.Regular(root, module) || !Trusted(context, request, variant) {
         return result
     }
     result.value = variant
@@ -281,7 +277,7 @@ WasmVariant :: (context: registry.Registry, request: *http.Request, root: string
 // The signed descriptor a host downloads for this release: the release
 // itself when its module is stored in the host's format and ZX revision, or
 // for a web host the release's WebAssembly variant.
-Offered :: (context: registry.Registry, request: *http.Request, root: string,
+Offered :: (context: registry.Registry, request: *http.Request, root: *rooted.Root,
     value: release.ReleaseV2, wanted: Interfaces) -> Selected {
     result: Selected
     module := ModuleHash(value)
@@ -290,11 +286,11 @@ Offered :: (context: registry.Registry, request: *http.Request, root: string,
     }
     if wanted.format == ".zib" {
         result.value = value
-        result.found = Stat(Join(root, Join(module, ".zib"))).error == null
+        result.found = rooted.Regular(root, Join(module, ".zib"))
         return result
     }
-    executable := Join(root, Join(module, ".zx"))
-    if Stat(executable).error != null || !RevisionFits(Revision(executable), wanted) {
+    executable := Join(module, ".zx")
+    if !rooted.Regular(root, executable) || !RevisionFits(Revision(root, executable), wanted) {
         return result
     }
     if wanted.format == ".wasm" {
@@ -320,10 +316,10 @@ Trusted :: (context: registry.Registry, request: *http.Request,
 
 // Retained choices may have large sequence gaps. Read the bounded history
 // first; older stores without it keep their bounded archive fallback.
-Older :: (context: registry.Registry, request: *http.Request, root: string,
+Older :: (context: registry.Registry, request: *http.Request, root: *rooted.Root,
     appID: string, latest: s64, wanted: Interfaces) -> Selected {
     result: Selected
-    retained := files.ReadFile(Join(root, "history-v2.json"))
+    retained := rooted.ReadFile(root, "history-v2.json")
     if retained.error == null {
         history: ReleaseHistory
         if retained.value.count > 262144 || json.Unmarshal(retained.value, *history) != null ||
@@ -347,7 +343,7 @@ Older :: (context: registry.Registry, request: *http.Request, root: string,
     }
     sequence := latest - 1
     while sequence > 0 && sequence > latest - 256 {
-        metadata := files.ReadFile(Join(root, Join(Join("release-", Sequence(sequence)), ".json")))
+        metadata := rooted.ReadFile(root, Join(Join("release-", Sequence(sequence)), ".json"))
         if metadata.error == null && metadata.value.count <= 65536 {
             value: release.ReleaseV2
             if json.Unmarshal(metadata.value, *value) == null && value.Sequence == sequence &&
@@ -365,18 +361,18 @@ Older :: (context: registry.Registry, request: *http.Request, root: string,
 }
 
 History :: (context: registry.Registry, writer: http.ResponseWriter,
-    request: *http.Request, root: string, appID: string) {
+    request: *http.Request, root: *rooted.Root, appID: string) {
     wanted := Wanted(request)
     bucket := Bucket(request)
     if !wanted.valid || bucket < 0 {
         response.Error(writer, 400, "invalid interface version, format or bucket")
         return
     }
-    metadata := files.ReadFile(Join(root, "history-v2.json"))
+    metadata := rooted.ReadFile(root, "history-v2.json")
     history: ReleaseHistory
     fallback: [1]release.ReleaseV2
     if metadata.error != null {
-        metadata = files.ReadFile(Join(root, "latest-v2.json"))
+        metadata = rooted.ReadFile(root, "latest-v2.json")
         if metadata.error != null || metadata.value.count > 65536 ||
         json.Unmarshal(metadata.value, *fallback[0]) != null {
             response.Error(writer, 404, "portable history unavailable")
@@ -419,7 +415,11 @@ LatestSequence :: (dbPath: string, appID: string) -> s64 {
     if !identity.ValidNamespace(appID) {
         return 0
     }
-    metadata := files.ReadFile(Join(Join(dbPath, ".packages/"), Join(appID, "/latest-v2.json")))
+    opened := OpenPackage(dbPath, appID)
+    if opened.error != null { return 0 }
+    root := opened.value
+    CloseRootAtReturn(root)
+    metadata := rooted.ReadFile(root, "latest-v2.json")
     value: release.ReleaseV2
     if metadata.error != null || metadata.value.count > 65536 ||
     json.Unmarshal(metadata.value, *value) != null || value.AppID != appID || value.Sequence < 0 {
@@ -463,7 +463,13 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
         response.Error(writer, 404, "package not found")
         return
     }
-    root := Join(Join(context.configuration.DBPath, ".packages/"), Join(appID, "/"))
+    opened := OpenPackage(context.configuration.DBPath, appID)
+    if opened.error != null {
+        response.Error(writer, 404, "package not found")
+        return
+    }
+    root := opened.value
+    CloseRootAtReturn(root)
     if asset == "history" {
         History(context, writer, request, root, appID)
         return
@@ -478,7 +484,7 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
         }
         filename = Join(asset, ".release-v2.json")
     }
-    metadata := files.ReadFile(Join(root, filename))
+    metadata := rooted.ReadFile(root, filename)
     if metadata.error != null {
         response.Error(writer, 404, "portable release unavailable")
         return
@@ -527,13 +533,13 @@ Route :: (context: registry.Registry, writer: http.ResponseWriter,
         return
     }
     // A grant on an artifact that is not gated changes nothing.
-    gate := grants.Gate(Join(root, asset))
+    gate := grants.FileGate(rooted.ReadFile(root, Join(asset, ".product")))
     if gate.gated && !grants.Valid(context.configuration.WaoziIssuerPublicKey, grant,
         gate.product, clock.Unix(clock.Now())) {
         response.Error(writer, 403, "package grant required")
         return
     }
-    bundle := files.ReadFile(Join(root, asset))
+    bundle := rooted.ReadFile(root, asset)
     if bundle.error != null || bundle.value.count != expected ||
     signing.SHA256Hex(bundle.value) != hash {
         response.Error(writer, 503, "portable release bytes do not match")

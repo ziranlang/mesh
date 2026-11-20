@@ -1,0 +1,96 @@
+// Directory handles keep storage operations beneath the configured store.
+#import "std/go_types"
+files :: #import "std/file_go";
+io :: #import "std/io_go";
+errors :: #import "std/errors_go";
+os :: #system_library "go:os";
+
+Root :: #type #foreign os "Root";
+File :: #type #foreign os "File";
+RootResult :: struct { value: *Root; error: Error; }
+FileResult :: struct { value: *File; error: Error; }
+
+#scope_file
+OpenRootRaw :: (path: string) -> RootResult #go_results #foreign os "OpenRoot";
+RemoveRaw :: (root: *Root, name: string) -> Error #foreign os "(*Root).Remove";
+RenameRaw :: (root: *Root, oldName: string, newName: string) -> Error #foreign os "(*Root).Rename";
+CloseFileAtReturn :: (file: *File) #go_defer #foreign os "(*File).Close";
+Info :: #type #foreign os "FileInfo";
+InfoResult :: struct { value: Info; error: Error; }
+Lstat :: (root: *Root, name: string) -> InfoResult #go_results #foreign os "(*Root).Lstat";
+StatRoot :: (root: *Root, name: string) -> InfoResult #go_results #foreign os "(*Root).Stat";
+StatFile :: (file: *File) -> InfoResult #go_results #foreign os "(*File).Stat";
+SameFile :: (before: Info, after: Info) -> bool #foreign os "SameFile";
+IsDir :: (info: Info) -> bool #foreign os "FileInfo.IsDir";
+Mode :: (info: Info) -> files.FileMode #foreign os "FileInfo.Mode";
+IsRegular :: (mode: files.FileMode) -> bool #foreign os "FileMode.IsRegular";
+OpenChild :: (root: *Root, name: string) -> RootResult #go_results #foreign os "(*Root).OpenRoot";
+Open :: (root: *Root, name: string) -> FileResult #go_results #foreign os "(*Root).Open";
+OpenFile :: (root: *Root, name: string, flags: isize, mode: files.FileMode) -> FileResult #go_results #foreign os "(*Root).OpenFile";
+Mkdir :: (root: *Root, name: string, mode: files.FileMode) -> Error #foreign os "(*Root).Mkdir";
+CloseDirectory :: (root: *Root) -> Error #foreign os "(*Root).Close";
+Close :: (file: *File) -> Error #foreign os "(*File).Close";
+Exists :: () -> Error #go_field #foreign os "ErrExist";
+CreateFlag :: () -> isize #go_field #foreign os "O_CREATE";
+ExclusiveFlag :: () -> isize #go_field #foreign os "O_EXCL";
+WriteOnlyFlag :: () -> isize #go_field #foreign os "O_WRONLY";
+
+#scope_export
+OpenRoot :: (path: string) -> RootResult { return OpenRootRaw(path) }
+Remove :: (root: *Root, name: string) -> Error { return RemoveRaw(root, name) }
+Rename :: (root: *Root, oldName: string, newName: string) -> Error {
+    return RenameRaw(root, oldName, newName)
+}
+
+// Open one child directory. Checking the opened directory's identity also
+// rejects a link that replaced it between inspecting and opening the name.
+Child :: (root: *Root, name: string, create: bool) -> RootResult {
+    if create {
+        error := Mkdir(root, name, cast(files.FileMode)448)
+        if error != null && !errors.Is(error, Exists()) { return .{error = error} }
+    }
+    before := Lstat(root, name)
+    if before.error != null { return .{error = before.error} }
+    if !IsDir(before.value) { return .{error = errors.New("invalid storage directory")} }
+    opened := OpenChild(root, name)
+    if opened.error != null { return opened }
+    after := StatRoot(opened.value, ".")
+    if after.error != null || !SameFile(before.value, after.value) {
+        unused CloseDirectory(opened.value)
+        return .{error = errors.New("storage directory changed while opening")}
+    }
+    return opened
+}
+
+Regular :: (root: *Root, name: string) -> bool {
+    entry := Lstat(root, name)
+    return entry.error == null && IsRegular(Mode(entry.value))
+}
+
+OpenRegular :: (root: *Root, name: string) -> FileResult {
+    before := Lstat(root, name)
+    if before.error != null { return .{error = before.error} }
+    if !IsRegular(Mode(before.value)) { return .{error = errors.New("invalid storage file")} }
+    opened := Open(root, name)
+    // The file was present at Lstat, so a failed open must not be treated as
+    // an absent grant sidecar, even if a concurrent change yields ENOENT.
+    if opened.error != null { return .{error = errors.New("could not open storage file")} }
+    after := StatFile(opened.value)
+    if after.error != null || !SameFile(before.value, after.value) {
+        unused Close(opened.value)
+        return .{error = errors.New("storage file changed while opening")}
+    }
+    return opened
+}
+
+ReadFile :: (root: *Root, name: string) -> files.FileReadResult {
+    opened := OpenRegular(root, name)
+    if opened.error != null { return .{error = opened.error} }
+    CloseFileAtReturn(opened.value)
+    read := io.ReadAll(cast(io.Reader)opened.value)
+    return .{value = read.value, error = read.error}
+}
+
+Create :: (root: *Root, name: string) -> FileResult {
+    return OpenFile(root, name, WriteOnlyFlag() | CreateFlag() | ExclusiveFlag(), cast(files.FileMode)384)
+}

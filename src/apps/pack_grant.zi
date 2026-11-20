@@ -114,9 +114,12 @@ Valid :: (publicKey: ed.PublicKey, grant: string, product: string, now: s64) -> 
 }
 
 Gate :: (artifactPath: string) -> PackGate {
-    result: PackGate
     parts: [2]string = .[artifactPath, ".product"]
-    named := files.ReadFile(Join(parts[:], ""))
+    return FileGate(files.ReadFile(Join(parts[:], "")))
+}
+
+FileGate :: (named: files.FileReadResult) -> PackGate {
+    result: PackGate
     if errors.Is(named.error, files.NotExist()) {
         return result
     }

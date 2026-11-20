@@ -1,6 +1,6 @@
 module mesh
 
-go 1.26.10
+go 1.26.11
 
 require (
 	github.com/grandcat/zeroconf v1.0.0
