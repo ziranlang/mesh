@@ -1,0 +1,330 @@
+#import "std/go_types"
+authorization :: #import "authorization";
+config :: #import "config";
+telegram :: #import "telegram_init";
+transport :: #import "telegram_transport";
+store :: #import "telegram_stars_store";
+strict :: #import "strict_json";
+response :: #import "response";
+ctx :: #import "std/context_go";
+http :: #import "std/http_go";
+sql :: #import "std/sql_go";
+json :: #import "std/json_go";
+text :: #import "std/text_go";
+clock :: #import "std/time_go";
+ed :: #import "std/ed25519_go";
+policy :: #import "token_policy";
+strings :: #system_library "go:strings";
+builtin :: #system_library "go:builtin";
+
+#scope_file
+Price :: struct {
+    label: string #go_tag "json:\"label\""
+    amount: s64 #go_tag "json:\"amount\""
+}
+
+CreateInvoice :: struct {
+    title: string #go_tag "json:\"title\""
+    description: string #go_tag "json:\"description\""
+    payload: string #go_tag "json:\"payload\""
+    providerToken: string #go_tag "json:\"provider_token\""
+    currency: string #go_tag "json:\"currency\""
+    prices: [1]Price #go_tag "json:\"prices\""
+}
+
+LinkReply :: struct {
+    ok: bool #go_tag "json:\"ok\""
+    link: string #go_tag "json:\"result\""
+}
+
+User :: struct {
+    id: s64 #go_tag "json:\"id\""
+    bot: bool #go_tag "json:\"is_bot\""
+}
+
+Chat :: struct {
+    id: s64 #go_tag "json:\"id\""
+    kind: string #go_tag "json:\"type\""
+}
+
+PreCheckout :: struct {
+    id: string #go_tag "json:\"id\""
+    user: User #go_tag "json:\"from\""
+    currency: string #go_tag "json:\"currency\""
+    amount: s64 #go_tag "json:\"total_amount\""
+    payload: string #go_tag "json:\"invoice_payload\""
+}
+
+PaymentDetails :: struct {
+    currency: string #go_tag "json:\"currency\""
+    amount: s64 #go_tag "json:\"total_amount\""
+    payload: string #go_tag "json:\"invoice_payload\""
+    charge: string #go_tag "json:\"telegram_payment_charge_id\""
+}
+
+Message :: struct {
+    chat: Chat #go_tag "json:\"chat\""
+    sender: User #go_tag "json:\"from\""
+    success: *PaymentDetails #go_tag "json:\"successful_payment\""
+    refund: *PaymentDetails #go_tag "json:\"refunded_payment\""
+}
+
+Update :: struct {
+    message: Message #go_tag "json:\"message\""
+    checkout: *PreCheckout #go_tag "json:\"pre_checkout_query\""
+}
+
+CheckoutAnswer :: struct {
+    id: string #go_tag "json:\"pre_checkout_query_id\""
+    ok: bool #go_tag "json:\"ok\""
+    message: string #go_tag "json:\"error_message,omitempty\""
+}
+
+HistoryRequest :: struct {
+    offset: isize #go_tag "json:\"offset\""
+    limit: isize #go_tag "json:\"limit\""
+}
+
+Partner :: struct {
+    kind: string #go_tag "json:\"type\""
+    transaction: string #go_tag "json:\"transaction_type\""
+    user: User #go_tag "json:\"user\""
+    payload: string #go_tag "json:\"invoice_payload\""
+}
+
+Transaction :: struct {
+    id: string #go_tag "json:\"id\""
+    amount: s64 #go_tag "json:\"amount\""
+    fractions: s64 #go_tag "json:\"nanostar_amount\""
+    source: *Partner #go_tag "json:\"source\""
+    receiver: *Partner #go_tag "json:\"receiver\""
+}
+
+Transactions :: struct {
+    values: []Transaction #go_tag "json:\"transactions\""
+}
+
+History :: struct {
+    ok: bool #go_tag "json:\"ok\""
+    transactions: Transactions #go_tag "json:\"result\""
+}
+
+ReconcileReply :: struct {
+    seen: isize #go_tag "json:\"seen\""
+    matched: isize #go_tag "json:\"matched\""
+    next: isize #go_tag "json:\"next_offset\""
+}
+
+HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
+TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
+Join :: (values: []string, separator: string) -> string #foreign strings;
+CancelCallback :: #type (cancel: ctx.CancelFunc) -> void;
+CancelAtReturn :: (callback: CancelCallback, cancel: ctx.CancelFunc) #go_defer #foreign builtin "call";
+
+OpaqueID :: (value: string) -> bool {
+    if value.count < 1 || value.count > 256 {
+        return false
+    }
+    for byte: value {
+        if byte < 33 || byte > 126 {
+            return false
+        }
+    }
+    return true
+}
+
+PayloadID :: (payload: string) -> string {
+    if !HasPrefix(payload, store.PayloadPrefix) {
+        return ""
+    }
+    id := TrimPrefix(payload, store.PayloadPrefix)
+    if !authorization.HexID(id, 32) {
+        return ""
+    }
+    return id
+}
+
+InvoiceLink :: (link: string) -> bool {
+    slug := TrimPrefix(link, "https://t.me/$")
+    if slug == link {
+        slug = TrimPrefix(link, "https://t.me/invoice/")
+    }
+    if slug == link || slug.count < 1 || slug.count > 128 {
+        return false
+    }
+    for byte: slug {
+        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 95) {
+            return false
+        }
+    }
+    return true
+}
+
+Merchant :: (configuration: *config.Config, node: string) -> store.Merchant {
+    return store.Merchant.{bot = telegram.BotID(configuration.LumiBotToken), node = node, audience = configuration.BaseURL}
+}
+
+Answer :: (context: ctx.Context, token: string, queryID: string, accepted: bool) -> bool {
+    answer := CheckoutAnswer.{id = queryID, ok = accepted}
+    if !accepted {
+        answer.message = "This offer is unavailable. Return to the app and try again."
+    }
+    received := transport.CallJSON(context, token, "answerPreCheckoutQuery", answer)
+    decoded: transport.TelegramAnswer
+    return received.ok && json.Unmarshal(received.bytes, *decoded) == null && decoded.ok
+}
+
+#scope_export
+CreateLink :: (context: ctx.Context, token: string, invoice: store.Invoice) -> string {
+    payload: [2]string = .[store.PayloadPrefix, invoice.reply.id]
+    prices: [1]Price = .[Price.{label = invoice.title, amount = invoice.reply.amount}]
+    request := CreateInvoice.{title = invoice.title, description = invoice.title, payload = Join(payload[:], ""),
+        currency = store.Currency, prices = prices}
+    received := transport.CallJSON(context, token, "createInvoiceLink", request)
+    decoded: LinkReply
+    if !received.ok || json.Unmarshal(received.bytes, *decoded) != null || !decoded.ok || !InvoiceLink(decoded.link) {
+        return ""
+    }
+    return decoded.link
+}
+
+// The Lumi webhook authenticates the configured bot before dispatching here.
+// A false return leaves ordinary updates in the original chat handler.
+Handle :: (database: *sql.Database, configuration: *config.Config, node: string, writer: http.ResponseWriter,
+    request: *http.Request, raw: []u8) -> bool {
+    update: Update
+    if json.Unmarshal(raw, *update) != null {
+        response.Error(writer, 400, "invalid Telegram update")
+        return true
+    }
+    message := update.message
+    if update.checkout == null && message.success == null && message.refund == null {
+        return false
+    }
+    if !strict.Valid(text.FromBytes(raw)) || (message.success != null && message.refund != null) ||
+        (update.checkout != null && (message.success != null || message.refund != null)) {
+        response.Error(writer, 400, "invalid Telegram payment update")
+        return true
+    }
+    context := http.Context(request)
+    merchant := Merchant(configuration, node)
+    signer := cast(ed.PrivateKey)configuration.WaoziIssuerPrivateKey
+    if update.checkout != null {
+        deadline := ctx.WithTimeout(context, cast(clock.Duration)8000000000)
+        CancelAtReturn(ctx.Cancel, deadline.cancel)
+        query := <<update.checkout
+        if !OpaqueID(query.id) {
+            response.Error(writer, 400, "invalid Telegram checkout query")
+            return true
+        }
+        id := PayloadID(query.payload)
+        decision: store.Settlement
+        if id != "" && query.currency == store.Currency && query.user.id > 0 && !query.user.bot &&
+            merchant.bot > 0 && merchant.audience != "" && policy.IssuerStatus(configuration.*) == "ok" {
+            payment := store.Payment.{invoiceID = id, buyer = query.user.id, amount = query.amount, currency = query.currency}
+            decision = store.Approve(database, deadline.value, merchant, payment, query.id, clock.Unix(clock.Now()))
+        }
+        if !Answer(deadline.value, configuration.LumiBotToken, query.id, decision.accepted && decision.error == null) {
+            response.Error(writer, 503, "Telegram checkout reply temporarily unavailable")
+        } else {
+            response.JSON(writer, 200, true)
+        }
+        return true
+    }
+    refund := message.refund != null
+    details := ifx refund then message.refund else message.success
+    if !HasPrefix(details.payload, store.PayloadPrefix) {
+        // The bot may receive unrelated service messages or historical invoices.
+        return false
+    }
+    id := PayloadID(details.payload)
+    buyer := message.sender.id
+    if refund {
+        // Refund notifications are service messages. The bot's private chat
+        // identifies the recipient even when the sender is the bot.
+        buyer = message.chat.id
+    }
+    if id == "" || buyer <= 0 ||
+        (refund && message.chat.kind != "private") ||
+        (!refund && (message.sender.bot || (message.chat.kind == "private" && message.chat.id != buyer))) ||
+        details.currency != store.Currency || details.amount <= 0 || !OpaqueID(details.charge) {
+        response.Error(writer, 400, "invalid Telegram payment")
+        return true
+    }
+    payment := store.Payment.{invoiceID = id, buyer = buyer, amount = details.amount,
+        currency = details.currency, charge = details.charge}
+    settled := store.Settle(database, context, merchant, payment, signer, refund)
+    if settled.error != null {
+        response.Error(writer, 503, "Telegram payment temporarily unavailable")
+    } else if !settled.accepted {
+        response.Error(writer, 409, "Telegram payment does not match an approved invoice")
+    } else {
+        response.JSON(writer, 200, true)
+    }
+    return true
+}
+
+Reconcile :: (database: *sql.Database, configuration: *config.Config, node: string,
+    writer: http.ResponseWriter, request: *http.Request, offset: isize) {
+    context := http.Context(request)
+    merchant := Merchant(configuration, node)
+    signer := cast(ed.PrivateKey)configuration.WaoziIssuerPrivateKey
+    if merchant.bot <= 0 || merchant.audience == "" || policy.IssuerStatus(configuration.*) != "ok" {
+        response.Error(writer, 503, "Telegram reconciliation unavailable")
+        return
+    }
+    received := transport.CallJSON(context, configuration.LumiBotToken, "getStarTransactions",
+        HistoryRequest.{offset = offset, limit = 32})
+    history: History
+    if !received.ok || json.Unmarshal(received.bytes, *history) != null || !history.ok ||
+        history.transactions.values.count > 32 {
+        response.Error(writer, 503, "Telegram history temporarily unavailable")
+        return
+    }
+    result := ReconcileReply.{seen = cast(isize)history.transactions.values.count, next = offset + cast(isize)history.transactions.values.count}
+    for transaction: history.transactions.values {
+        refund := transaction.receiver != null
+        if (transaction.source == null && !refund) || (transaction.source != null && refund) ||
+            transaction.fractions != 0 || !OpaqueID(transaction.id) {
+            continue
+        }
+        partner := ifx refund then transaction.receiver else transaction.source
+        if partner.kind != "user" || partner.user.bot || partner.user.id <= 0 ||
+            (partner.transaction != "invoice_payment" && !(refund && partner.transaction == "" && partner.payload == "")) {
+            continue
+        }
+        id := PayloadID(partner.payload)
+        if id == "" && refund && partner.payload == "" {
+            record := store.ForCharge(database, context, merchant, transaction.id)
+            if record.error != null {
+                response.Error(writer, 503, "Telegram payment temporarily unavailable")
+                return
+            }
+            if record.found {
+                id = record.invoice.reply.id
+            }
+        }
+        if id == "" || transaction.amount == -9223372036854775808 {
+            continue
+        }
+        amount := transaction.amount
+        if refund && amount < 0 {
+            amount = -amount
+        }
+        if amount <= 0 {
+            continue
+        }
+        payment := store.Payment.{invoiceID = id, buyer = partner.user.id, amount = amount,
+            currency = store.Currency, charge = transaction.id}
+        settled := store.Settle(database, context, merchant, payment, signer, refund)
+        if settled.error != null {
+            response.Error(writer, 503, "Telegram payment temporarily unavailable")
+            return
+        }
+        if settled.accepted {
+            result.matched += 1
+        }
+    }
+    response.JSON(writer, 200, result)
+}

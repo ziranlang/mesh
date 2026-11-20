@@ -283,6 +283,8 @@ var configEnvironmentKeys = []string{
 	"MESH_LUMI_GROUP_ID",
 	"MESH_LUMI_CANVAS_URL",
 	"MESH_TELEGRAM_ACCOUNTS_ENABLED",
+	"MESH_TELEGRAM_STARS_APPS",
+	"MESH_TELEGRAM_STARS_PRICES",
 	"MESH_ADDR",
 	"MESH_ADMIN_TOKEN",
 	"MESH_ALLOW_EPHEMERAL_TOKEN_SECRET",
@@ -357,7 +359,7 @@ func assertConfigurationMatchesBaseline(t *testing.T) Config {
 	expected := baselineLoadConfig()
 	actualType := reflect.TypeOf(actual)
 	expectedType := reflect.TypeOf(expected)
-	if actualType.NumField() != expectedType.NumField()+9 {
+	if actualType.NumField() != expectedType.NumField()+11 {
 		t.Fatal("configuration fields changed")
 	}
 	for i := 0; i < expectedType.NumField(); i++ {

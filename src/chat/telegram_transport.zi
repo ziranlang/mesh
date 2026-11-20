@@ -12,6 +12,7 @@ strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 native_io :: #system_library "go:io";
 native_json :: #system_library "go:encoding/json";
+native_http :: #system_library "go:net/http";
 
 StringReader :: #type #foreign strings "Reader";
 Reader :: (value: string) -> *StringReader #foreign strings "NewReader";
@@ -19,6 +20,7 @@ EncodeHex :: (bytes: []u8) -> string #foreign hex "EncodeToString";
 Join :: (parts: []string, separator: string) -> string #foreign strings;
 Contains :: (value: string, part: string) -> bool #foreign strings;
 CloseAtReturn :: (stream: io.ReadCloser) #go_defer #foreign native_io "ReadCloser.Close";
+HeaderValues :: (headers: http.Header, name: string) -> []string #foreign native_http "Header.Values";
 
 TelegramAPIBase: string = "https://api.telegram.org";
 TelegramHTTPClient: *http.Client = http.NewClient(cast(clock.Duration)10000000000);
@@ -134,33 +136,45 @@ Nonce :: () -> string {
 }
 
 WebhookTrusted :: (request: *http.Request, secret: string) -> bool {
-    supplied := http.HeaderValue(http.Headers(request), "X-Telegram-Bot-Api-Secret-Token")
-    return secret != "" && constant.ConstantTimeTextEqual(supplied, secret)
+    supplied := HeaderValues(http.Headers(request), "X-Telegram-Bot-Api-Secret-Token")
+    return secret != "" && supplied.count == 1 && constant.ConstantTimeTextEqual(supplied[0], secret)
 }
 
 Call :: (token: string, method: string, value: Any) -> bool {
+    result := CallJSON(context.Background(), token, method, value)
+    answer: TelegramAnswer
+    return result.ok && json.Unmarshal(result.bytes, *answer) == null && answer.ok
+}
+
+BotReply :: struct {
+    bytes: []u8
+    ok: bool
+}
+
+CallJSON :: (ctx: context.Context, token: string, method: string, value: Any) -> BotReply {
     encoded := json.Marshal(value)
     if encoded.error != null {
-        return false
+        return .{}
     }
     parts: [5]string = .[TelegramAPIBase, "/bot", token, "/", method]
-    request := http.NewRequest(context.Background(), "POST", Join(parts[:], ""),
+    request := http.NewRequest(ctx, "POST", Join(parts[:], ""),
         cast(io.Reader)Reader(text.FromBytes(encoded.value)))
     if request.error != null {
-        return false
+        return .{}
     }
     http.SetHeader(http.Headers(request.value), "Content-Type", "application/json")
     received := http.Do(TelegramHTTPClient, request.value)
     if received.error != null {
         // HTTP errors can contain the credential-bearing URL. Never log them.
-        return false
+        return .{}
     }
     stream := http.ResponseBody(received.value)
     CloseAtReturn(stream)
     bytes := io.ReadAll(io.LimitReader(cast(io.Reader)stream, 65537))
-    answer: TelegramAnswer
-    return http.StatusCode(received.value) == 200 && bytes.error == null &&
-        bytes.value.count <= 65536 && json.Unmarshal(bytes.value, *answer) == null && answer.ok
+    if http.StatusCode(received.value) != 200 || bytes.error != null || bytes.value.count > 65536 {
+        return .{}
+    }
+    return BotReply.{bytes = bytes.value, ok = true}
 }
 
 Deliver :: (token: string, destination: s64, content: string, draft: string, canvas: string) -> bool {

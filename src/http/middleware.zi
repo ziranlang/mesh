@@ -139,6 +139,7 @@ AllowedOrigin :: (origin: string) -> string {
     if origin == "https://mesh-bew.pages.dev" ||
         origin == "https://mesh.ziran-lang.org" ||
         origin == "https://inbe.waozi.xyz" ||
+        origin == "https://innerbreeze.org" ||
         origin == "https://uku.waozi.xyz" ||
         origin == "https://shovey.waozi.xyz" ||
         origin == "https://wurm.waozi.xyz" ||

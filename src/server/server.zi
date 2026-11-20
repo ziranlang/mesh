@@ -51,6 +51,7 @@ lumi_telegram :: #import "lumi_telegram";
 lumi_developer :: #import "lumi_developer";
 authorization_http :: #import "authorization_http";
 telegram_entries :: #import "telegram_account_entry";
+telegram_stars :: #import "telegram_stars";
 response :: #import "response";
 delegated_sync :: #import "delegated_sync";
 delegated_ws :: #import "delegated_ws";
@@ -419,6 +420,13 @@ Routes :: (server: *Server) -> middleware.Handler #go_method "Routes" {
     Route(mux, "POST /api/v1/tokens/spend", server, HandleTokenHttpSpend)
     Route(mux, "POST /api/v1/tokens/gifts", server, HandleTokenGift)
     Route(mux, "POST /api/v1/tokens/purchases/google/verify", server, HandleGooglePlayHttpVerify)
+    Route(mux, "POST /api/v1/telegram/launch", server, HandleTelegramLaunch)
+    Route(mux, "GET /api/v1/tokens/purchases/telegram/catalog", server, HandleTelegramStarsCatalog)
+    Route(mux, "GET /api/v1/tokens/purchases/telegram/balance", server, HandleTelegramStarsBalance)
+    Route(mux, "POST /api/v1/tokens/purchases/telegram/invoices", server, HandleTelegramStarsCreate)
+    Route(mux, "GET /api/v1/tokens/purchases/telegram/invoices/{invoice_id}", server, HandleTelegramStarsInvoice)
+    Route(mux, "POST /api/v1/tokens/purchases/telegram/invoices/{invoice_id}/cancel", server, HandleTelegramStarsCancel)
+    Route(mux, "POST /api/v1/admin/tokens/purchases/telegram/reconcile", server, HandleTelegramStarsReconcile)
     Route(mux, "POST /api/v1/tokens/purchases/monero/invoices", server, HandleMoneroInvoicesCreate)
     Route(mux, "GET /api/v1/tokens/purchases/monero/invoices/", server, HandleMoneroInvoicesRead)
     Route(mux, "GET /api/v1/tokens/purchases/monero/address", server, HandleMoneroDepositsAddress)
@@ -816,6 +824,39 @@ HandleLumiPublish :: (server: *Server, writer: http.ResponseWriter, request: *ht
 
 HandleLumiWebhook :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
     lumi_telegram.Webhook(ChatService(server), TelegramEntries(server), writer, request)
+}
+
+TelegramStars :: (server: *Server) -> telegram_stars.Service {
+    return telegram_stars.Service.{database = server.store.database, configuration = *server.cfg,
+        counters = server.metrics, limiter = server.limiter, node = RetainPath(server.node.ID)}
+}
+
+HandleTelegramLaunch :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Launch(TelegramStars(server), writer, request)
+}
+
+HandleTelegramStarsCatalog :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Catalog(TelegramStars(server), writer, request)
+}
+
+HandleTelegramStarsBalance :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Balance(TelegramStars(server), writer, request)
+}
+
+HandleTelegramStarsCreate :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Create(TelegramStars(server), writer, request)
+}
+
+HandleTelegramStarsInvoice :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Invoice(TelegramStars(server), writer, request, false)
+}
+
+HandleTelegramStarsCancel :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Invoice(TelegramStars(server), writer, request, true)
+}
+
+HandleTelegramStarsReconcile :: (server: *Server, writer: http.ResponseWriter, request: *http.Request) {
+    telegram_stars.Reconcile(TelegramStars(server), writer, request)
 }
 
 TelegramEntries :: (server: *Server) -> telegram_entries.AccountEntries {

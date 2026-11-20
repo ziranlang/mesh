@@ -1,0 +1,314 @@
+#import "std/go_types"
+ctx :: #import "std/context_go";
+sql :: #import "std/sql_go";
+errors :: #import "std/errors_go";
+ed :: #import "std/ed25519_go";
+ledger :: #import "token_ledger";
+receipts :: #import "token_receipt";
+native_sql :: #system_library "go:database/sql";
+strings :: #system_library "go:strings";
+numbers :: #system_library "go:strconv";
+
+Currency :: "XTR"
+Provider :: "telegram_stars"
+PayloadPrefix :: "entity_stars."
+InvoiceLifetime :: 900
+
+InvoiceReply :: struct {
+    id: string #go_tag "json:\"invoice_id\""
+    link: string #go_tag "json:\"invoice_url,omitempty\""
+    product: string #go_tag "json:\"product_id\""
+    currency: string #go_tag "json:\"currency\""
+    amount: s64 #go_tag "json:\"amount\""
+    units: s64 #go_tag "json:\"units\""
+    status: string #go_tag "json:\"status\""
+}
+
+Invoice :: struct {
+    reply: InvoiceReply
+    account: string
+    app: string
+    bot: s64
+    buyer: s64
+    node: string
+    audience: string
+    requestID: string
+    title: string
+    expires: s64
+    linkAttempt: s64
+    checkout: string
+    charge: string
+}
+
+ReadResult :: struct {
+    invoice: Invoice
+    found: bool
+    error: Error
+}
+
+Merchant :: struct {
+    bot: s64
+    node: string
+    audience: string
+}
+
+Payment :: struct {
+    invoiceID: string
+    buyer: s64
+    amount: s64
+    currency: string
+    charge: string
+}
+
+Settlement :: struct {
+    accepted: bool
+    error: Error
+}
+
+#scope_file
+RollbackAtReturn :: (transaction: *sql.Transaction) #go_defer #foreign native_sql "(*Tx).Rollback";
+Join :: (values: []string, separator: string) -> string #foreign strings;
+FormatInt :: (value: s64, base: isize) -> string #foreign numbers;
+
+Schema :: #string SQL
+CREATE TABLE IF NOT EXISTS telegram_stars_invoices (
+    invoice_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    bot_id INTEGER NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    units INTEGER NOT NULL CHECK(units > 0),
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cancelled','credited','refunded')),
+    invoice_url TEXT NOT NULL DEFAULT '',
+    link_attempt INTEGER NOT NULL DEFAULT 0,
+    checkout_id TEXT NOT NULL DEFAULT '',
+    charge_id TEXT NOT NULL DEFAULT '',
+    UNIQUE(account_id,app_id,bot_id,node_id,audience,request_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_stars_charge ON telegram_stars_invoices(bot_id,charge_id) WHERE charge_id<>'';
+CREATE TABLE IF NOT EXISTS telegram_stars_launches (
+    digest TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    bot_id INTEGER NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telegram_stars_launch_expiry ON telegram_stars_launches(expires_at);
+SQL
+
+Columns :: "SELECT invoice_id,account_id,app_id,bot_id,buyer_id,node_id,audience,request_id,product_id,title,amount,units,expires_at,state,invoice_url,link_attempt,checkout_id,charge_id FROM telegram_stars_invoices "
+
+Scan :: (row: *sql.Row) -> ReadResult {
+    result: ReadResult
+    invoice := *result.invoice
+    reply := *invoice.reply
+    destinations: [18]Any = .[*reply.id, *invoice.account, *invoice.app, *invoice.bot, *invoice.buyer,
+        *invoice.node, *invoice.audience, *invoice.requestID, *reply.product, *invoice.title,
+        *reply.amount, *reply.units, *invoice.expires, *reply.status, *reply.link,
+        *invoice.linkAttempt, *invoice.checkout, *invoice.charge]
+    result.error = sql.ScanRow(row, destinations[:])
+    if errors.Is(result.error, sql.NoRows()) {
+        result.error = null
+    } else if result.error == null {
+        reply.currency = Currency
+        result.found = true
+    }
+    return result
+}
+
+#scope_export
+SchemaSQL :: () -> string {
+    return Schema
+}
+
+BindLaunch :: (transaction: *sql.Transaction, context: ctx.Context, merchant: Merchant, digest: string,
+    account: string, app: string, buyer: s64, expires: s64, now: s64) -> Settlement {
+    cutoff: [1]Any = .[now]
+    pruned := sql.ExecTx(transaction, context,
+        "DELETE FROM telegram_stars_launches WHERE expires_at<=?1", cutoff[:])
+    if pruned.error != null {
+        return Settlement.{error = pruned.error}
+    }
+    values: [8]Any = .[digest, account, app, merchant.bot, buyer, merchant.node, merchant.audience, expires]
+    bound := sql.ExecTx(transaction, context,
+        "INSERT INTO telegram_stars_launches(digest,account_id,app_id,bot_id,buyer_id,node_id,audience,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(digest) DO UPDATE SET expires_at=excluded.expires_at WHERE account_id=excluded.account_id AND app_id=excluded.app_id AND bot_id=excluded.bot_id AND buyer_id=excluded.buyer_id AND node_id=excluded.node_id AND audience=excluded.audience",
+        values[:])
+    if bound.error != null {
+        return Settlement.{error = bound.error}
+    }
+    count := sql.RowsAffected(bound.value)
+    return Settlement.{accepted = count.value == 1, error = count.error}
+}
+
+PublicReply :: (invoice: Invoice, now: s64) -> InvoiceReply {
+    reply := invoice.reply
+    if reply.status == "pending" && invoice.expires <= now {
+        reply.status = "expired"
+    }
+    if reply.status != "pending" {
+        reply.link = ""
+    }
+    return reply
+}
+
+ForRequest :: (transaction: *sql.Transaction, context: ctx.Context, desired: Invoice) -> ReadResult {
+    values: [6]Any = .[desired.account, desired.app, desired.bot, desired.node, desired.audience, desired.requestID]
+    parts: [2]string = .[Columns, "WHERE account_id=?1 AND app_id=?2 AND bot_id=?3 AND node_id=?4 AND audience=?5 AND request_id=?6"]
+    return Scan(sql.QueryRowTx(transaction, context, Join(parts[:], ""), values[:]))
+}
+
+Reserve :: (transaction: *sql.Transaction, context: ctx.Context, desired: Invoice) -> ReadResult {
+    values: [13]Any = .[desired.reply.id, desired.account, desired.app, desired.bot, desired.buyer,
+        desired.node, desired.audience, desired.requestID, desired.reply.product, desired.title,
+        desired.reply.amount, desired.reply.units, desired.expires]
+    result: ReadResult
+    result.error = sql.ExecTx(transaction, context,
+        "INSERT INTO telegram_stars_invoices(invoice_id,account_id,app_id,bot_id,buyer_id,node_id,audience,request_id,product_id,title,amount,units,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(account_id,app_id,bot_id,node_id,audience,request_id) DO NOTHING",
+        values[:]).error
+    if result.error != null {
+        return result
+    }
+    return ForRequest(transaction, context, desired)
+}
+
+Read :: (transaction: *sql.Transaction, context: ctx.Context, id: string) -> ReadResult {
+    values: [1]Any = .[id]
+    parts: [2]string = .[Columns, "WHERE invoice_id=?1"]
+    return Scan(sql.QueryRowTx(transaction, context, Join(parts[:], ""), values[:]))
+}
+
+ForCharge :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, charge: string) -> ReadResult {
+    values: [4]Any = .[merchant.bot, merchant.node, merchant.audience, charge]
+    parts: [2]string = .[Columns, "WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4"]
+    return Scan(sql.QueryRow(database, context, Join(parts[:], ""), values[:]))
+}
+
+ClaimLink :: (transaction: *sql.Transaction, context: ctx.Context, id: string, now: s64) -> Settlement {
+    values: [3]Any = .[id, now, now - 20]
+    written := sql.ExecTx(transaction, context,
+        "UPDATE telegram_stars_invoices SET link_attempt=?2 WHERE invoice_id=?1 AND state='pending' AND invoice_url='' AND link_attempt<=?3 AND expires_at>?2", values[:])
+    if written.error != null {
+        return Settlement.{error = written.error}
+    }
+    count := sql.RowsAffected(written.value)
+    return Settlement.{accepted = count.value == 1, error = count.error}
+}
+
+StoreLink :: (database: *sql.Database, context: ctx.Context, id: string, attempt: s64, link: string) -> Settlement {
+    values: [4]Any = .[id, attempt, link, ifx link == "" then cast(s64)0 else attempt]
+    written := sql.Exec(database, context,
+        "UPDATE telegram_stars_invoices SET invoice_url=?3,link_attempt=?4 WHERE invoice_id=?1 AND link_attempt=?2 AND invoice_url='' AND state='pending'", values[:])
+    if written.error != null {
+        return Settlement.{error = written.error}
+    }
+    count := sql.RowsAffected(written.value)
+    return Settlement.{accepted = count.value == 1, error = count.error}
+}
+
+Cancel :: (transaction: *sql.Transaction, context: ctx.Context, id: string, now: s64) -> Settlement {
+    values: [2]Any = .[id, now]
+    written := sql.ExecTx(transaction, context,
+        "UPDATE telegram_stars_invoices SET state='cancelled' WHERE invoice_id=?1 AND state='pending' AND checkout_id='' AND expires_at>?2", values[:])
+    if written.error != null {
+        return Settlement.{error = written.error}
+    }
+    count := sql.RowsAffected(written.value)
+    return Settlement.{accepted = count.value == 1, error = count.error}
+}
+
+Approve :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, payment: Payment,
+    checkout: string, now: s64) -> Settlement {
+    values: [8]Any = .[payment.invoiceID, merchant.bot, merchant.node, merchant.audience,
+        payment.buyer, payment.amount, checkout, now]
+    written := sql.Exec(database, context,
+        "UPDATE telegram_stars_invoices SET checkout_id=?7 WHERE invoice_id=?1 AND bot_id=?2 AND node_id=?3 AND audience=?4 AND buyer_id=?5 AND amount=?6 AND state='pending' AND invoice_url<>'' AND (checkout_id='' OR checkout_id=?7) AND expires_at>?8 AND EXISTS(SELECT 1 FROM server_lumi_telegram b WHERE b.account_id=telegram_stars_invoices.account_id AND b.telegram_id=buyer_id) AND EXISTS(SELECT 1 FROM server_users u WHERE u.user_id_hash=telegram_stars_invoices.account_id) AND EXISTS(SELECT 1 FROM server_apps a WHERE a.app_id=telegram_stars_invoices.app_id AND a.status='active' AND NOT EXISTS(SELECT 1 FROM server_app_manifests m WHERE m.app_id=a.app_id AND (m.status<>'active' OR (m.expires_at>0 AND m.expires_at<=?8))))", values[:])
+    if written.error != null {
+        return Settlement.{error = written.error}
+    }
+    count := sql.RowsAffected(written.value)
+    return Settlement.{accepted = count.value == 1, error = count.error}
+}
+
+Settle :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, payment: Payment,
+    signer: ed.PrivateKey, refund: bool) -> Settlement {
+    opened := sql.Begin(database, context, null)
+    if opened.error != null {
+        return Settlement.{error = opened.error}
+    }
+    transaction := opened.value
+    RollbackAtReturn(transaction)
+    values: [1]Any = .[payment.invoiceID]
+    locked := sql.ExecTx(transaction, context,
+        "UPDATE telegram_stars_invoices SET invoice_id=invoice_id WHERE invoice_id=?1", values[:])
+    if locked.error != null {
+        return Settlement.{error = locked.error}
+    }
+    record := Read(transaction, context, payment.invoiceID)
+    invoice := record.invoice
+    if record.error != null {
+        return Settlement.{error = record.error}
+    }
+    if !record.found || invoice.buyer != payment.buyer || invoice.reply.amount != payment.amount ||
+        payment.currency != Currency || invoice.checkout == "" || invoice.reply.status == "cancelled" ||
+        invoice.bot != merchant.bot || invoice.node != merchant.node || invoice.audience != merchant.audience ||
+        (invoice.charge != "" && invoice.charge != payment.charge) {
+        return .{}
+    }
+    if invoice.reply.status == "refunded" || (invoice.reply.status == "credited" && !refund) {
+        return Settlement.{accepted = true, error = sql.Commit(transaction)}
+    }
+    unavailable := errors.New("Telegram wallet issuer unavailable")
+    source: [2]string = .[FormatInt(merchant.bot, 10), payment.charge]
+    event := receipts.TokenEventInput.{AccountID = invoice.account, AppID = invoice.app, EventType = "credit",
+        AmountDelta = invoice.reply.units, SourceType = Provider, SourceRef = Join(source[:], ":")}
+    if invoice.reply.status == "pending" {
+        // Own the unique charge before inserting anything in the ledger.
+        chargeArgs: [2]Any = .[payment.invoiceID, payment.charge]
+        written := sql.ExecTx(transaction, context,
+            "UPDATE telegram_stars_invoices SET charge_id=?2 WHERE invoice_id=?1 AND NOT EXISTS(SELECT 1 FROM telegram_stars_invoices other WHERE other.bot_id=telegram_stars_invoices.bot_id AND other.charge_id=?2)", chargeArgs[:])
+        if written.error != null {
+            return Settlement.{error = written.error}
+        }
+        count := sql.RowsAffected(written.value)
+        if count.error != null || count.value != 1 {
+            return Settlement.{error = count.error}
+        }
+        owner: s64
+        ownerArgs: [1]Any = .[invoice.account]
+        ownerDest: [1]Any = .[*owner]
+        failure := sql.ScanRow(sql.QueryRowTx(transaction, context,
+            "SELECT COUNT(*) FROM server_users WHERE user_id_hash=?1", ownerArgs[:]), ownerDest[:])
+        if failure != null || owner != 1 {
+            return Settlement.{error = failure}
+        }
+        credit := ledger.CreditPaymentTx(transaction, context, signer, Provider, event.SourceRef, event, unavailable)
+        if credit.error != null || !credit.created {
+            return Settlement.{error = credit.error}
+        }
+    }
+    if refund {
+        event.EventType = "debit"
+        event.AmountDelta = -invoice.reply.units
+        reversal := ledger.Insert(transaction, context, signer, event, unavailable)
+        if reversal.error != null {
+            return Settlement.{error = reversal.error}
+        }
+    }
+    state: [2]Any = .[payment.invoiceID, ifx refund then "refunded" else "credited"]
+    written := sql.ExecTx(transaction, context,
+        "UPDATE telegram_stars_invoices SET state=?2 WHERE invoice_id=?1", state[:])
+    if written.error != null {
+        return Settlement.{error = written.error}
+    }
+    return Settlement.{accepted = true, error = sql.Commit(transaction)}
+}

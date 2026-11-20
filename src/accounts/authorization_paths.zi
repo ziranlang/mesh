@@ -40,7 +40,7 @@ Document1 :: #string JSON_1
     "summary": "Owner signs one finite delegate grant",
 JSON_1;
 Document2 :: #string JSON_2
-    "description": "Owner ML-DSA signature binds account, grant, claimed delegate Ed25519 and ML-KEM-768 keys, registered app/client, node/audience, exact collection, approved visibility, read/write operations, key generation, opaque encrypted collection-key envelope, timestamps, nonce and optional verified Telegram identity. Maximum lifetime is thirty days. Known Inbe private v1 collections sharing the global key are refused. No chaining, broad bearer, account export/delete, payment or unlisted operations.",
+    "description": "Owner ML-DSA signature binds account, grant, claimed delegate Ed25519 and ML-KEM-768 keys, registered app/client, node/audience, exact collection, approved visibility, read/write operations, key generation, opaque encrypted collection-key envelope, timestamps, nonce and optional verified Telegram identity. An explicit telegram_stars flag authorizes only the Telegram Stars purchase routes and Dew balance read for that linked buyer. Maximum lifetime is thirty days. Known Inbe private v1 collections sharing the global key are refused. No chaining, broad bearer, account export/delete or unlisted operations.",
     "security": [{"bearerAuth": []}],
     "responses": {"200": {"description": "Signed grant accepted"}, "401": {"description": "Owner grant signature rejected"}, "403": {"description": "Scope or current app policy mismatch"}, "409": {"description": "Does not match claimed request or already issued"}}
   }},

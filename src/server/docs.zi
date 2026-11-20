@@ -2191,10 +2191,13 @@ Paths :: () -> Map(string, Any) {
     MapSet(result, "/api/v1/lumi/developer", MapGet(additions, "/api/v1/lumi/developer"))
     MapSet(result, "/api/v1/admin/lumi/developer", MapGet(additions, "/api/v1/admin/lumi/developer"))
     telegram := telegram_paths.Paths()
-    telegramNames: [12]string = .["/api/v1/lumi/telegram/link", "/api/v1/lumi/telegram/updates",
+    telegramNames: [19]string = .["/api/v1/lumi/telegram/link", "/api/v1/lumi/telegram/updates",
     "/api/v1/lumi/telegram/ack", "/api/v1/lumi/telegram/messages", "/api/v1/lumi/telegram/webhook",
     "/api/v1/telegram/environment", "/api/v1/telegram/entry", "/api/v1/telegram/entry/verify",
-    "/api/v1/telegram/entry/status", "/api/v1/telegram/entry/rendezvous", "/api/v1/telegram/entry/cancel", "/api/v1/telegram/account/bind"]
+    "/api/v1/telegram/entry/status", "/api/v1/telegram/entry/rendezvous", "/api/v1/telegram/entry/cancel", "/api/v1/telegram/account/bind",
+    "/api/v1/telegram/launch", "/api/v1/tokens/purchases/telegram/catalog", "/api/v1/tokens/purchases/telegram/balance",
+    "/api/v1/tokens/purchases/telegram/invoices", "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}",
+    "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}/cancel", "/api/v1/admin/tokens/purchases/telegram/reconcile"]
     for name: telegramNames {
         MapSet(result, name, MapGet(telegram, name))
     }

@@ -1,5 +1,6 @@
 #import "std/go_types"
 entries :: #import "telegram_account_entry";
+stars :: #import "telegram_stars_store";
 history :: #import "state_history";
 lists :: #import "shared_lists";
 publications :: #import "publications";
@@ -136,10 +137,11 @@ Ensure :: (database: *sql.Database, context: ctx.Context) -> Error {
     if pragmas.error != null {
         return pragmas.error
     }
-    definitions: [18]string = .[Join(Tables[:], ""), entries.SchemaSQL(), history.SchemaSQL(), lists.SchemaSQL(),
+    definitions: [19]string = .[Join(Tables[:], ""), entries.SchemaSQL(), history.SchemaSQL(), lists.SchemaSQL(),
         publications.SchemaSQL(), plans.SchemaSQL(), unlocks.SchemaSQL(), rescales.SchemaSQL(),
         exchange_rates.SchemaSQL(), FeedbackReplies, evidence.SchemaSQL(), checkins.SchemaSQL(), holds.SchemaSQL(),
-        backups.SchemaSQL(), passkeys.SchemaSQL(), google_links.SchemaSQL(), TombstoneContent, allocations.SchemaSQL()]
+        backups.SchemaSQL(), passkeys.SchemaSQL(), google_links.SchemaSQL(), TombstoneContent, allocations.SchemaSQL(),
+        stars.SchemaSQL()]
     created := sql.Exec(database, context, Join(definitions[:], ""), empty[:])
     if created.error != null {
         return created.error

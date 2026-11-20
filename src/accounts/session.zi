@@ -102,7 +102,13 @@ ValidQuery :: (request: *http.Request, query: string) -> bool {
     if query != RawQuery(http.RequestURL(request)) {
         return false
     }
-    if url.Path(http.RequestURL(request)) != "/api/v1/delegated/ws" {
+    path := url.Path(http.RequestURL(request))
+    if path == "/api/v1/tokens/purchases/telegram/catalog" || path == "/api/v1/tokens/purchases/telegram/balance" {
+        app := url.Value(url.Query(http.RequestURL(request)), "app_id")
+        fields: [2]string = .["app_id=", app]
+        return identity.ValidNamespace(app) && query == Join(fields[:], "")
+    }
+    if path != "/api/v1/delegated/ws" {
         return query == ""
     }
     // The only admitted query has an ASCII collection value, so its unique

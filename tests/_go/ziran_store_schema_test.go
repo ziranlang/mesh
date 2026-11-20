@@ -67,6 +67,14 @@ func schemaCatalog(t *testing.T, store *Store) []map[string]any {
 			continue
 		}
 		name := entry["tbl_name"].(string)
+		// Stars invoice and launch tables extend the released schema. Their
+		// uniqueness and rollback behavior is checked by the Stars tests.
+		switch entry["name"] {
+		case "telegram_stars_invoices", "telegram_stars_launches", "telegram_stars_charge", "telegram_stars_launch_expiry",
+			"sqlite_autoindex_telegram_stars_invoices_1", "sqlite_autoindex_telegram_stars_invoices_2",
+			"sqlite_autoindex_telegram_stars_launches_1":
+			continue
+		}
 		if strings.HasPrefix(name, "server_authorization_") || strings.HasPrefix(name, "server_telegram_") ||
 			name == "server_alias_case_collisions" || entry["name"] == "server_users_alias_case_unique" ||
 			name == "server_storage_plans" || name == "server_storage_purchases" ||

@@ -268,6 +268,10 @@ TokenProduct :: struct {
     MoneroAtomicAmount: s64 #go_tag "json:\"monero_atomic_amount,omitempty\""
 }
 
+TelegramStarsPrice :: struct {
+    Amount: s64
+}
+
 TokenAsset :: struct {
     IssuerID: string #go_tag "json:\"issuer_id\""
     AssetID: string #go_tag "json:\"asset_id\""

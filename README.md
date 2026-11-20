@@ -19,6 +19,7 @@ Its design rules are:
 
 - [Encrypted record profile v1](docs/encrypted-record-profile-v1.md) defines the recommended client-side envelope for private records.
 - [Developer quickstart](docs/developer-quickstart.md) shows the shortest path from account key to encrypted sync.
+- [Telegram Mini Apps and Stars](docs/telegram-stars.md) documents signed launch, Dew purchases and payment recovery.
 - [Small node operations](docs/operations-small-node.md) records low-resource targets and trust inspection checks.
 - [HTTP compression](docs/compression.md) covers Zstandard/gzip negotiation, bounded codec reuse and measurements.
 - [Development](docs/development.md) describes canonical source, builds, tests and deployment verification.

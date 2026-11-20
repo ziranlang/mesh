@@ -261,10 +261,10 @@ RefundTx :: (transaction: *sql.Transaction, context: ctx.Context, receipt: Token
     originalID: string
     originalApp: string
     issued: s64
-    arguments: [3]Any = .[receipt.AccountID, receipt.AssetID, receipt.SourceRef]
+    arguments: [4]Any = .[receipt.AccountID, receipt.AssetID, receipt.SourceRef, receipt.SourceType]
     destinations: [3]Any = .[*originalID, *originalApp, *issued]
     error := sql.ScanRow(sql.QueryRowTx(transaction, context,
-        "SELECT l.receipt_id,l.app_id,l.amount_delta FROM token_ledger l JOIN token_processed_payments p ON p.receipt_id=l.receipt_id AND p.provider='google_play' AND p.provider_payment_id=l.source_ref AND p.account_id=l.account_id AND p.amount=l.amount_delta AND p.asset_id=l.asset_id WHERE l.account_id=?1 AND l.asset_id=?2 AND l.source_type='google_play' AND l.source_ref=?3 AND l.event_type='credit'", arguments[:]), destinations[:])
+        "SELECT l.receipt_id,l.app_id,l.amount_delta FROM token_ledger l JOIN token_processed_payments p ON p.receipt_id=l.receipt_id AND p.provider=l.source_type AND p.provider_payment_id=l.source_ref AND p.account_id=l.account_id AND p.amount=l.amount_delta AND p.asset_id=l.asset_id WHERE l.account_id=?1 AND l.asset_id=?2 AND l.source_type=?4 AND l.source_ref=?3 AND l.event_type='credit'", arguments[:]), destinations[:])
     if error != null || originalApp != receipt.AppID {
         return errors.New("refund purchase source mismatch")
     }
@@ -272,7 +272,7 @@ RefundTx :: (transaction: *sql.Transaction, context: ctx.Context, receipt: Token
     refunded: s64
     refundDestination: [1]Any = .[*refunded]
     error = sql.ScanRow(sql.QueryRowTx(transaction, context,
-        "SELECT COALESCE(-SUM(d.amount_delta),0) FROM token_ledger d JOIN token_ledger p ON p.receipt_id=?1 WHERE d.account_id=p.account_id AND d.asset_id=p.asset_id AND d.source_type='google_play' AND d.source_ref=p.source_ref AND d.event_type='debit' AND d.receipt_id<>?2", totals[:]), refundDestination[:])
+        "SELECT COALESCE(-SUM(d.amount_delta),0) FROM token_ledger d JOIN token_ledger p ON p.receipt_id=?1 WHERE d.account_id=p.account_id AND d.asset_id=p.asset_id AND d.source_type=p.source_type AND d.source_ref=p.source_ref AND d.event_type='debit' AND d.receipt_id<>?2", totals[:]), refundDestination[:])
     if error != null {
         return error
     }
@@ -281,7 +281,7 @@ RefundTx :: (transaction: *sql.Transaction, context: ctx.Context, receipt: Token
     }
     values: [3]Any = .[originalID, amount, receipt.ReceiptID]
     written := sql.ExecTx(transaction, context,
-        "UPDATE token_allocations SET remaining=remaining-?2 WHERE receipt_id=?1 AND source_type='google_play'", values[:2])
+        "UPDATE token_allocations SET remaining=remaining-?2 WHERE receipt_id=?1", values[:2])
     if written.error != null {
         return written.error
     }
@@ -335,7 +335,7 @@ Record :: (transaction: *sql.Transaction, context: ctx.Context, receipt: TokenRe
         return errors.New("insufficient balance")
     }
     amount := -receipt.AmountDelta
-    if receipt.SourceType == "google_play" {
+    if receipt.SourceType == "google_play" || receipt.SourceType == "telegram_stars" {
         return RefundTx(transaction, context, receipt, amount)
     }
     if receipt.SourceType == "referral_reversal" {

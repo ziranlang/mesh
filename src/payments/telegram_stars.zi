@@ -1,0 +1,460 @@
+#import "std/go_types"
+#import "std/map_go"
+#import "protocol"
+authorization :: #import "authorization";
+session :: #import "session";
+auth :: #import "http_auth";
+config :: #import "config";
+identity :: #import "identity";
+telegram :: #import "telegram_init";
+transport :: #import "telegram_transport";
+provider :: #import "telegram_stars_bot";
+store :: #import "telegram_stars_store";
+body :: #import "http_body";
+strict :: #import "strict_json";
+response :: #import "response";
+ledger :: #import "token_ledger";
+receipts :: #import "token_receipt";
+metrics :: #import "metrics";
+rate :: #import "rate_limit";
+request_rate :: #import "request_rate";
+policy :: #import "token_policy";
+sql :: #import "std/sql_go";
+ctx :: #import "std/context_go";
+http :: #import "std/http_go";
+url :: #import "std/url_go";
+clock :: #import "std/time_go";
+native_sql :: #system_library "go:database/sql";
+net_http :: #system_library "go:net/http";
+strings :: #system_library "go:strings";
+numbers :: #system_library "go:strconv";
+builtin :: #system_library "go:builtin";
+
+Service :: struct {
+    database: *sql.Database
+    configuration: *config.Config
+    counters: *metrics.ServerMetrics
+    limiter: *rate.RateLimiter
+    node: string
+}
+
+#scope_file
+LaunchRequest :: struct {
+    app: string #go_tag "json:\"app_id\""
+    initData: string #go_tag "json:\"init_data\""
+}
+
+LaunchReply :: struct {
+    app: string #go_tag "json:\"app_id\""
+    startParam: string #go_tag "json:\"start_param,omitempty\""
+    chatType: string #go_tag "json:\"chat_type,omitempty\""
+    available: bool #go_tag "json:\"stars_available\""
+}
+
+Offer :: struct {
+    product: string #go_tag "json:\"product_id\""
+    title: string #go_tag "json:\"title\""
+    amount: s64 #go_tag "json:\"amount\""
+    units: s64 #go_tag "json:\"units\""
+}
+
+CatalogReply :: struct {
+    currency: string #go_tag "json:\"currency\""
+    products: []Offer #go_tag "json:\"products\""
+}
+
+CreateRequest :: struct {
+    app: string #go_tag "json:\"app_id\""
+    product: string #go_tag "json:\"product_id\""
+    requestID: string #go_tag "json:\"request_id\""
+    initData: string #go_tag "json:\"init_data\""
+}
+
+BalanceReply :: struct {
+    account: string #go_tag "json:\"account_id\""
+    app: string #go_tag "json:\"app_id\""
+    asset: string #go_tag "json:\"asset_id\""
+    balance: s64 #go_tag "json:\"balance\""
+}
+
+Principal :: struct {
+    transaction: *sql.Transaction
+    account: string
+    grant: authorization.Grant
+    delegated: bool
+}
+
+RollbackAtReturn :: (transaction: *sql.Transaction) #go_defer #foreign native_sql "(*Tx).Rollback";
+HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
+TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
+Join :: (values: []string, separator: string) -> string #foreign strings;
+FormatInt :: (value: s64, base: isize) -> string #foreign numbers;
+PathValue :: (request: *http.Request, name: string) -> string #foreign net_http "(*Request).PathValue";
+OfferList :: (length: isize, capacity: isize) -> []Offer #foreign builtin "make";
+AppendOffer :: (values: []Offer, value: Offer) -> []Offer #foreign builtin "append";
+
+Merchant :: (service: Service) -> store.Merchant {
+    return store.Merchant.{bot = telegram.BotID(service.configuration.LumiBotToken),
+        node = service.node, audience = service.configuration.BaseURL}
+}
+
+Enabled :: (service: Service, app: string) -> bool {
+    return service.configuration.TelegramAccountsEnabled &&
+        service.configuration.LumiWebhookSecret != "" && telegram.BotID(service.configuration.LumiBotToken) > 0 &&
+        policy.IssuerStatus(service.configuration.*) == "ok" &&
+        MapGet(service.configuration.TelegramStarsApps, app)
+}
+
+ValidID :: (value: string, minimum: s64, maximum: s64) -> bool {
+    if value.count < minimum || value.count > maximum || value == "." || value == ".." {
+        return false
+    }
+    for byte: value {
+        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 46 || byte == 95) {
+            return false
+        }
+    }
+    return true
+}
+
+Product :: (service: Service, id: string) -> Offer {
+    product := MapGet(service.configuration.TokenProducts, id)
+    price := MapGet(service.configuration.TelegramStarsPrices, id).Amount
+    if price <= 0 || !ValidID(id, 1, 128) || product.ProductID != id ||
+        product.TokenUnits <= 0 || product.TokenUnits > 9007199254740991 ||
+        product.TokenUnits % 1000000 != 0 {
+        return .{}
+    }
+    title: [2]string = .[FormatInt(product.TokenUnits / 1000000, 10), "Dew"]
+    return Offer.{product = id, title = Join(title[:], " "), amount = price, units = product.TokenUnits}
+}
+
+CatalogProducts :: (service: Service, app: string) -> []Offer {
+    result := OfferList(0, 32)
+    if !Enabled(service, app) {
+        return result
+    }
+    for id: MapKeys(service.configuration.TelegramStarsPrices) {
+        product := Product(service, id)
+        if product.product != "" {
+            result = AppendOffer(result, product)
+        }
+        if result.count > 32 {
+            // The client contract is bounded. An oversized configuration cannot quote a partial catalog.
+            return OfferList(0, 0)
+        }
+    }
+    return result
+}
+
+Open :: (service: Service, writer: http.ResponseWriter, request: *http.Request, raw: []u8) -> Principal {
+    principal: Principal
+    header := http.HeaderValue(http.Headers(request), "Authorization")
+    principal.delegated = HasPrefix(header, "Delegate ")
+    if !principal.delegated {
+        owner := auth.BearerUser(service.database, request, service.configuration.TokenSecret)
+        if owner.authentication.error != null || owner.authentication.status != 0 {
+            auth.Respond(writer, service.counters, owner.authentication)
+            return .{}
+        }
+        principal.account = owner.value
+    }
+    context := http.Context(request)
+    opened := sql.Begin(service.database, context, null)
+    if opened.error != null {
+        response.Error(writer, 503, "Telegram purchases temporarily unavailable")
+        return .{}
+    }
+    principal.transaction = opened.value
+    if principal.delegated {
+        delegated := session.AuthenticateTx(opened.value, context, request, raw, service.node, service.configuration.BaseURL)
+        if delegated.authentication.error != null || delegated.authentication.status != 0 {
+            unused sql.Rollback(opened.value)
+            auth.Respond(writer, service.counters, delegated.authentication)
+            return .{}
+        }
+        principal.grant = delegated.grant
+        principal.account = delegated.grant.accountID
+    }
+    return principal
+}
+
+Buyer :: (service: Service, principal: Principal, writer: http.ResponseWriter,
+    context: ctx.Context, app: string, purchasing: bool) -> s64 {
+    merchant := Merchant(service)
+    if !identity.ValidNamespace(app) || merchant.bot <= 0 || !authorization.HexID(merchant.node, 64) || merchant.audience == "" {
+        response.Error(writer, 403, "Telegram application unavailable")
+        return 0
+    }
+    if principal.delegated && (principal.grant.appID != app ||
+        principal.grant.botID != merchant.bot || principal.grant.telegramID <= 0 ||
+        (purchasing && !principal.grant.telegramStars)) {
+        response.Error(writer, 403, "Telegram purchase permission required")
+        return 0
+    }
+    buyer: s64
+    values: [3]Any = .[principal.account, app, clock.Unix(clock.Now())]
+    destination: [1]Any = .[*buyer]
+    row := sql.QueryRowTx(principal.transaction, context,
+        "SELECT b.telegram_id FROM server_lumi_telegram b JOIN server_apps a ON a.app_id=?2 AND a.status='active' WHERE b.account_id=?1 AND NOT EXISTS(SELECT 1 FROM server_app_manifests m WHERE m.app_id=a.app_id AND (m.status<>'active' OR (m.expires_at>0 AND m.expires_at<=?3)))", values[:])
+    if sql.ScanRow(row, destination[:]) != null || buyer <= 0 ||
+        (principal.delegated && buyer != principal.grant.telegramID) {
+        response.Error(writer, 403, "Telegram buyer is not linked to this account")
+        return 0
+    }
+    return buyer
+}
+
+SignedLaunch :: (service: Service, principal: Principal, writer: http.ResponseWriter, context: ctx.Context,
+    app: string, raw: string, buyer: s64, now: s64) -> telegram.TelegramInitIdentity {
+    verified := telegram.Validate(raw, service.configuration.LumiBotToken, now)
+    if !verified.valid || verified.userID != buyer {
+        response.Error(writer, 401, "invalid Telegram launch")
+        return .{}
+    }
+    bound := store.BindLaunch(principal.transaction, context, Merchant(service), verified.digest,
+        principal.account, app, buyer, verified.authDate + 300, now)
+    if bound.error != null {
+        response.Error(writer, 503, "Telegram launch temporarily unavailable")
+        return .{}
+    }
+    if !bound.accepted {
+        response.Error(writer, 409, "Telegram launch is bound to another session")
+        return .{}
+    }
+    return verified
+}
+
+Commit :: (principal: Principal, writer: http.ResponseWriter) -> bool {
+    if sql.Commit(principal.transaction) != null {
+        response.Error(writer, 503, "Telegram purchases temporarily unavailable")
+        return false
+    }
+    return true
+}
+
+AppQuery :: (request: *http.Request) -> string {
+    return url.Value(url.Query(http.RequestURL(request)), "app_id")
+}
+
+#scope_export
+Launch :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    raw := body.ReadJSON(writer, request, 32768)
+    input: LaunchRequest
+    if raw.error != null || strict.Decode(raw.value, *input) != null {
+        response.Error(writer, 400, "invalid Telegram launch request")
+        return
+    }
+    principal := Open(service, writer, request, raw.value)
+    if principal.transaction == null {
+        return
+    }
+    RollbackAtReturn(principal.transaction)
+    context := http.Context(request)
+    buyer := Buyer(service, principal, writer, context, input.app, false)
+    if buyer == 0 {
+        return
+    }
+    verified := SignedLaunch(service, principal, writer, context, input.app, input.initData, buyer, clock.Unix(clock.Now()))
+    if !verified.valid || !Commit(principal, writer) {
+        return
+    }
+    available := (!principal.delegated || principal.grant.telegramStars) && CatalogProducts(service, input.app).count > 0
+    result := LaunchReply.{app = input.app, startParam = verified.startParam, chatType = verified.chatType, available = available}
+    response.JSON(writer, 200, result)
+}
+
+Catalog :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    empty: []u8
+    principal := Open(service, writer, request, empty)
+    if principal.transaction == null {
+        return
+    }
+    RollbackAtReturn(principal.transaction)
+    app := AppQuery(request)
+    if Buyer(service, principal, writer, http.Context(request), app, true) == 0 || !Commit(principal, writer) {
+        return
+    }
+    result := CatalogReply.{currency = store.Currency, products = CatalogProducts(service, app)}
+    response.JSON(writer, 200, result)
+}
+
+Create :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    raw := body.ReadJSON(writer, request, 32768)
+    input: CreateRequest
+    if raw.error != null || strict.Decode(raw.value, *input) != null ||
+        !ValidID(input.product, 1, 128) || !ValidID(input.requestID, 8, 128) {
+        response.Error(writer, 400, "invalid Telegram invoice request")
+        return
+    }
+    principal := Open(service, writer, request, raw.value)
+    if principal.transaction == null {
+        return
+    }
+    RollbackAtReturn(principal.transaction)
+    context := http.Context(request)
+    buyer := Buyer(service, principal, writer, context, input.app, true)
+    if buyer == 0 {
+        return
+    }
+    rateKey: [2]string = .["telegram-stars:", principal.account]
+    if !request_rate.Allow(service.limiter, service.counters, Join(rateKey[:], ""), 30, cast(clock.Duration)60000000000) {
+        response.Error(writer, 429, "Telegram purchase rate limit exceeded")
+        return
+    }
+    now := clock.Unix(clock.Now())
+    verified := SignedLaunch(service, principal, writer, context, input.app, input.initData, buyer, now)
+    if !verified.valid {
+        return
+    }
+    merchant := Merchant(service)
+    desired := store.Invoice.{account = principal.account, app = input.app, bot = merchant.bot,
+        buyer = buyer, node = merchant.node, audience = merchant.audience, requestID = input.requestID,
+        expires = now + store.InvoiceLifetime}
+    record := store.ForRequest(principal.transaction, context, desired)
+    if record.error == null && !record.found {
+        selected: Offer
+        for offer: CatalogProducts(service, input.app) {
+            if offer.product == input.product {
+                selected = offer
+                break
+            }
+        }
+        if selected.product == "" {
+            response.Error(writer, 404, "Telegram product unavailable")
+            return
+        }
+        desired.reply = store.InvoiceReply.{id = transport.Nonce(), product = selected.product,
+            amount = selected.amount, units = selected.units}
+        desired.title = selected.title
+        if !authorization.HexID(desired.reply.id, 32) {
+            response.Error(writer, 503, "Telegram invoice temporarily unavailable")
+            return
+        }
+        record = store.Reserve(principal.transaction, context, desired)
+    }
+    if record.error != null || !record.found {
+        response.Error(writer, 503, "Telegram invoice temporarily unavailable")
+        return
+    }
+    invoice := record.invoice
+    if invoice.buyer != buyer || invoice.reply.product != input.product {
+        response.Error(writer, 409, "purchase request terms changed")
+        return
+    }
+    result := store.PublicReply(invoice, now)
+    if result.status != "pending" || result.link != "" {
+        if Commit(principal, writer) {
+            response.JSON(writer, 200, result)
+        }
+        return
+    }
+    claim := store.ClaimLink(principal.transaction, context, result.id, now)
+    if !claim.accepted || claim.error != null {
+        response.Error(writer, 503, "Telegram invoice creation in progress")
+        return
+    }
+    if !Commit(principal, writer) {
+        return
+    }
+    link := provider.CreateLink(context, service.configuration.LumiBotToken, invoice)
+    saved := store.StoreLink(service.database, context, result.id, now, link)
+    if link == "" || !saved.accepted || saved.error != null {
+        response.Error(writer, 503, "Telegram invoice temporarily unavailable")
+        return
+    }
+    result.link = link
+    response.JSON(writer, 201, result)
+}
+
+Invoice :: (service: Service, writer: http.ResponseWriter, request: *http.Request, cancel: bool) {
+    id := PathValue(request, "invoice_id")
+    if !authorization.HexID(id, 32) {
+        response.Error(writer, 404, "Telegram invoice not found")
+        return
+    }
+    empty: []u8
+    principal := Open(service, writer, request, empty)
+    if principal.transaction == null {
+        return
+    }
+    RollbackAtReturn(principal.transaction)
+    context := http.Context(request)
+    now := clock.Unix(clock.Now())
+    record := store.Read(principal.transaction, context, id)
+    if record.error != null {
+        response.Error(writer, 503, "Telegram invoice temporarily unavailable")
+        return
+    }
+    invoice := record.invoice
+    merchant := Merchant(service)
+    if !record.found || invoice.account != principal.account || invoice.bot != merchant.bot ||
+        invoice.node != merchant.node || invoice.audience != merchant.audience ||
+        (principal.delegated && (principal.grant.appID != invoice.app || !principal.grant.telegramStars)) {
+        response.Error(writer, 404, "Telegram invoice not found")
+        return
+    }
+    buyer := Buyer(service, principal, writer, context, invoice.app, true)
+    if buyer == 0 {
+        return
+    }
+    if buyer != invoice.buyer {
+        response.Error(writer, 404, "Telegram invoice not found")
+        return
+    }
+    if cancel && invoice.reply.status == "pending" && invoice.expires > now {
+        cancelled := store.Cancel(principal.transaction, context, id, now)
+        if cancelled.error != null {
+            response.Error(writer, 503, "Telegram cancellation temporarily unavailable")
+            return
+        }
+        if !cancelled.accepted {
+            response.Error(writer, 409, "Telegram checkout already approved")
+            return
+        }
+        invoice.reply.status = "cancelled"
+    }
+    if Commit(principal, writer) {
+        response.JSON(writer, 200, store.PublicReply(invoice, now))
+    }
+}
+
+Balance :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    empty: []u8
+    principal := Open(service, writer, request, empty)
+    if principal.transaction == null {
+        return
+    }
+    RollbackAtReturn(principal.transaction)
+    app := AppQuery(request)
+    context := http.Context(request)
+    if Buyer(service, principal, writer, context, app, true) == 0 {
+        return
+    }
+    balance := ledger.BalanceTx(principal.transaction, context, principal.account, receipts.AssetID)
+    if balance.error != null {
+        response.Error(writer, 503, "Telegram wallet balance temporarily unavailable")
+        return
+    }
+    if Commit(principal, writer) {
+        response.JSON(writer, 200, BalanceReply.{account = principal.account, app = app, asset = receipts.AssetID, balance = balance.value})
+    }
+}
+
+HistoryPage :: struct {
+    offset: isize #go_tag "json:\"offset\""
+}
+
+Reconcile :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    if !auth.RequireLocalOperator(writer, request, service.configuration.AdminToken) {
+        return
+    }
+    raw := body.ReadJSON(writer, request, 128)
+    page: HistoryPage
+    if raw.error != null || strict.Decode(raw.value, *page) != null || page.offset < 0 || page.offset > 1000000 {
+        response.Error(writer, 400, "invalid Telegram history offset")
+        return
+    }
+    provider.Reconcile(service.database, service.configuration, service.node, writer, request, page.offset)
+}

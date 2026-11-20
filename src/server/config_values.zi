@@ -173,3 +173,23 @@ Products :: (raw: string) -> Map(string, TokenProduct) {
     }
     return result
 }
+
+StarsPrices :: (raw: string) -> Map(string, TelegramStarsPrice) {
+    result: Map(string, TelegramStarsPrice)
+    MapInit(result)
+    for item: Split(raw, ",") {
+        pair := Split(TrimSpace(item), ":")
+        if pair.count != 2 || pair[0] == "" {
+            continue
+        }
+        stars := ParseInt(pair[1], 10, 64)
+        if stars.error != null || stars.value <= 0 || stars.value > 9007199254740991 ||
+            MapGet(result, pair[0]).Amount != 0 {
+            // An ambiguous price disables this product until configuration is corrected.
+            MapSet(result, pair[0], TelegramStarsPrice.{Amount = -1})
+            continue
+        }
+        MapSet(result, pair[0], TelegramStarsPrice.{Amount = stars.value})
+    }
+    return result
+}

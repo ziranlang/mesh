@@ -22,6 +22,8 @@ TelegramInitIdentity :: struct {
     userID: s64
     authDate: s64
     digest: string
+    startParam: string
+    chatType: string
     valid: bool
 }
 
@@ -46,6 +48,19 @@ ParseInteger :: (value: string, base: isize, bits: isize) -> Integer #go_results
 FormatInteger :: (value: s64, base: isize) -> string #foreign numbers "FormatInt";
 Sort :: (values: []string) #foreign sort "Strings";
 Append :: (values: []string, value: string) -> []string #foreign builtin "append";
+
+LaunchToken :: (value: string) -> string {
+    if value.count > 512 {
+        return ""
+    }
+    for byte: value {
+        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 95) {
+            return ""
+        }
+    }
+    return value
+}
 
 #scope_export
 BotID :: (token: string) -> s64 {
@@ -139,6 +154,11 @@ ValidateWithKey :: (raw: string, token: string, now: s64,
     }
     result.authDate = parsed.value
     result.userID = user.id
+    result.startParam = LaunchToken(MapGet(fields, "start_param"))
+    chat := MapGet(fields, "chat_type")
+    if chat == "sender" || chat == "private" || chat == "group" || chat == "supergroup" || chat == "channel" {
+        result.chatType = chat
+    }
     // Hash the signed content, not the raw URL encoding, for replay detection.
     replay: [3]string = .[FormatInteger(result.botID, 10), "\n", Join(hmacFields, "\n")]
     result.digest = signing.SHA256Hex(text.ToBytes(Join(replay[:], "")))

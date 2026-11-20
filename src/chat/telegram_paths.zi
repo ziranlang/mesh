@@ -313,7 +313,46 @@ Document5 :: #string JSON_5
         }
       ]
     }
-  }
-}
+  },
 JSON_5;
-Documents: [5]string = .[Document1, Document2, Document3, Document4, Document5];
+Document6 :: #string JSON_6
+  "/api/v1/telegram/launch": {"post": {
+    "summary": "Verify raw Telegram Mini App launch data",
+    "description": "Requires an owner bearer or Telegram-linked delegate proof and a JSON body with app_id and init_data. Returns verified start_param, chat_type and purchase availability.",
+    "responses": {"200": {"description":"Verified launch"},"401":{"description":"Invalid launch or account authentication"},"403":{"description":"Telegram app or linked buyer unavailable"},"409":{"description":"Launch already bound to a different app"}}
+  }},
+  "/api/v1/tokens/purchases/telegram/catalog": {"get": {
+    "summary": "Read canonical Dew packs offered for Telegram Stars",
+    "parameters": [{"name":"app_id","in":"query","required":true,"schema":{"type":"string"}}],
+    "responses": {"200":{"description":"Enabled products with XTR and wallet-unit amounts"},"403":{"description":"Telegram purchase permission required"}}
+  }},
+  "/api/v1/tokens/purchases/telegram/balance": {"get": {
+    "summary": "Read the linked purchaser's Dew balance",
+    "parameters": [{"name":"app_id","in":"query","required":true,"schema":{"type":"string"}}],
+    "responses": {"200":{"description":"Current account, app, asset and signed integer wallet balance"},"403":{"description":"Telegram purchase permission required"}}
+  }},
+  "/api/v1/tokens/purchases/telegram/invoices": {"post": {
+    "summary": "Create a buyer-bound XTR invoice link",
+    "description": "Requires app_id, product_id, request_id and fresh init_data. Reuse request_id only for retries of the same product.",
+    "responses": {"200":{"description":"Existing invoice"},"201":{"description":"Created invoice"},"409":{"description":"Request ID terms conflict"},"503":{"description":"Creation retryable"}}
+  }},
+JSON_6;
+Document7 :: #string JSON_7
+  "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}": {"get": {
+    "summary": "Read the issuer's Stars settlement state",
+    "parameters": [{"name":"invoice_id","in":"path","required":true,"schema":{"type":"string","pattern":"^[a-f0-9]{32}$"}}],
+    "responses": {"200":{"description":"Own invoice status and quote"},"404":{"description":"Invoice unavailable"}}
+  }},
+  "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}/cancel": {"post": {
+    "summary": "Cancel an unpaid Stars invoice before approval",
+    "parameters": [{"name":"invoice_id","in":"path","required":true,"schema":{"type":"string","pattern":"^[a-f0-9]{32}$"}}],
+    "responses": {"200":{"description":"Current invoice status and quote"},"409":{"description":"Checkout already approved"}}
+  }},
+  "/api/v1/admin/tokens/purchases/telegram/reconcile": {"post": {
+    "summary": "Reconcile one authenticated Telegram Stars transaction page",
+    "description": "Requires the configured admin header or direct loopback operator access. JSON body with nonnegative offset. Up to 32 entries per call.",
+    "responses": {"200":{"description":"Seen and matched counts and next_offset"},"503":{"description":"Provider or wallet temporarily unavailable"}}
+  }}
+}
+JSON_7;
+Documents: [7]string = .[Document1, Document2, Document3, Document4, Document5, Document6, Document7];

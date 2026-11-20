@@ -40,6 +40,7 @@ Grant :: struct {
     nonce: string #go_tag "json:\"nonce\""
     botID: s64 #go_tag "json:\"bot_id\""
     telegramID: s64 #go_tag "json:\"telegram_id\""
+    telegramStars: bool #go_tag "json:\"telegram_stars,omitempty\""
     scopes: []GrantScope #go_tag "json:\"scopes\""
     signature: string #go_tag "json:\"signature\""
 }
@@ -94,6 +95,10 @@ GrantMessage :: (grant: Grant) -> string {
         parts: [2]string = .[message, Join(fields[:], "\n")]
         message = Join(parts[:], "")
     }
+    if grant.telegramStars {
+        fields: [2]string = .[message, "telegram-stars-purchases\n"]
+        message = Join(fields[:], "")
+    }
     return message
 }
 
@@ -110,7 +115,8 @@ ValidGrant :: (grant: Grant, nodeID: string, audience: string, now: s64) -> bool
         grant.expiresAt <= now || grant.expiresAt - grant.issuedAt > 2592000 ||
         grant.scopes.count < 1 || grant.scopes.count > 16 ||
         grant.botID < 0 || grant.telegramID < 0 ||
-        ((grant.botID == 0) != (grant.telegramID == 0)) {
+        ((grant.botID == 0) != (grant.telegramID == 0)) ||
+        (grant.telegramStars && grant.botID == 0) {
         return false
     }
     previous := ""
