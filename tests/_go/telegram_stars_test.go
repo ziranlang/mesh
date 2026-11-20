@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
@@ -430,6 +431,64 @@ func TestTelegramStarsCancelExpiryAndRefundFirstHistory(t *testing.T) {
 	f.wallet(t, 1, 1, 0)
 }
 
+func TestTelegramStarsWithdrawnOffer(t *testing.T) {
+	f := newStarsFixture(t)
+	approved := f.create(t, "approved-before-disable", 201)
+	f.checkout(t, approved.ID, "approved-checkout", "XTR", 1234, starsPrice, true)
+	withdrawn := f.create(t, "withdrawn-existing-link", 201)
+	f.failLink.Store(true)
+	f.create(t, "withdrawn-link-retry", 503)
+
+	f.server.Cfg.TelegramStarsPrices = nil
+	f.create(t, "withdrawn-link-retry", 404)
+	f.create(t, "withdrawn-existing-link", 404)
+	if calls := f.providerCalls.Load(); calls != 3 {
+		t.Fatalf("withdrawn offer reached provider: %d calls", calls)
+	}
+	f.checkout(t, withdrawn.ID, "withdrawn-checkout", "XTR", 1234, starsPrice, false)
+	status := starsDecode[InvoiceReply](t, starsRequest(f.handler, "GET", starsRoot+"/invoices/"+withdrawn.ID, f.owner.Token, "", nil), 200)
+	if status.Link != "" {
+		t.Fatal("withdrawn offer returned a checkout link")
+	}
+	f.server.Cfg.TelegramStarsPrices = ConfigValues_StarsPrices("dew_10:24")
+	f.checkout(t, withdrawn.ID, "changed-quote-checkout", "XTR", 1234, starsPrice, false)
+	if got := f.webhook(approved.ID, "already-paid", "successful_payment", "XTR", 1234, starsPrice, starsSecret).Code; got != 200 {
+		t.Fatalf("approved payment after offer withdrawal got status %d", got)
+	}
+	f.wallet(t, 1, 0, starsUnits)
+}
+
+func TestTelegramStarsPayloadlessRefundBeforePayment(t *testing.T) {
+	f := newStarsFixture(t)
+	invoice := f.create(t, "history-without-payload", 201)
+	f.checkout(t, invoice.ID, "approved-history", "XTR", 1234, starsPrice, true)
+	f.history.Store(fmt.Sprintf(`[
+		{"id":"refund-first","amount":%d,"receiver":{"type":"user","transaction_type":"invoice_payment","user":{"id":1234}}}
+	]`, starsPrice))
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest("POST", "/api/v1/admin/tokens/purchases/telegram/reconcile", strings.NewReader(`{"offset":0}`))
+		req.RemoteAddr = "127.0.0.1:1024"
+		req.Host = "127.0.0.1"
+		out := httptest.NewRecorder()
+		f.handler.ServeHTTP(out, req)
+		result := starsDecode[map[string]int](t, out, 200)
+		if result["seen"] != 1 || result["matched"] != 0 || result["next_offset"] != 1 {
+			t.Fatal("unresolved refund reported as settled")
+		}
+	}
+	f.wallet(t, 0, 0, 0)
+	for i := 0; i < 2; i++ {
+		if got := f.webhook(invoice.ID, "refund-first", "successful_payment", "XTR", 1234, starsPrice, starsSecret).Code; got != 200 {
+			t.Fatalf("payment after reconciled refund got status %d", got)
+		}
+	}
+	status := starsDecode[InvoiceReply](t, starsRequest(f.handler, "GET", starsRoot+"/invoices/"+invoice.ID, f.owner.Token, "", nil), 200)
+	if status.Status != "refunded" {
+		t.Fatalf("payment after reconciled refund has state %q", status.Status)
+	}
+	f.wallet(t, 1, 1, 0)
+}
+
 func (f *starsFixture) delegateStars(t *testing.T, method, target string, body []byte) *http.Request {
 	t.Helper()
 	request := httptest.NewRequest(method, target, bytes.NewReader(body))
@@ -507,6 +566,43 @@ func TestTelegramStarsDelegatedPurchaseBoundary(t *testing.T) {
 			t.Fatalf("delegated scope status=%d", out.Code)
 		}
 		if permitted {
+			t.Run("bodyless routes reject transmitted bytes", func(t *testing.T) {
+				invoice := f.create(t, "delegate-body-boundary", 201)
+				for _, route := range []struct{ method, target string }{
+					{"GET", path},
+					{"GET", starsRoot + "/catalog?app_id=inbe"},
+					{"GET", starsRoot + "/invoices/" + invoice.ID},
+					{"POST", starsRoot + "/invoices/" + invoice.ID + "/cancel"},
+				} {
+					req := f.delegateStars(t, route.method, route.target, nil)
+					req.Body = httptest.NewRequest(route.method, route.target, strings.NewReader(" ")).Body
+					req.ContentLength = -1
+					result := httptest.NewRecorder()
+					f.handler.ServeHTTP(result, req)
+					if result.Code != 400 {
+						t.Errorf("%s %s accepted an unsigned body: status=%d", route.method, route.target, result.Code)
+					}
+				}
+			})
+			t.Run("compressed launch is not the signed body", func(t *testing.T) {
+				var compressed bytes.Buffer
+				encoder := gzip.NewWriter(&compressed)
+				if _, err := encoder.Write(launchBody); err != nil {
+					t.Fatal(err)
+				}
+				if err := encoder.Close(); err != nil {
+					t.Fatal(err)
+				}
+				req := f.delegateStars(t, "POST", starsLaunch, launchBody)
+				req.Body = httptest.NewRequest("POST", starsLaunch, &compressed).Body
+				req.ContentLength = int64(compressed.Len())
+				req.Header.Set("Content-Encoding", "gzip")
+				result := httptest.NewRecorder()
+				f.handler.ServeHTTP(result, req)
+				if result.Code != 400 {
+					t.Fatalf("compressed launch accepted a digest of different bytes: status=%d", result.Code)
+				}
+			})
 			out = httptest.NewRecorder()
 			f.handler.ServeHTTP(out, input)
 			if out.Code != 409 {

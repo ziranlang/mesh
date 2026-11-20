@@ -47,8 +47,10 @@ application's routing rules. [Telegram launch verification](https://core.telegra
 
 Use the existing `Bearer` owner session or the hosted `Delegate ds1.<session_id>`
 session with a valid `X-Mesh-Delegate` proof. For the two GET query routes, the
-proof signs the exact query `app_id=APP` with an empty body digest. Sign the
-invoice path and method and hash the exact body sent over HTTP. The signed
+proof signs the exact query `app_id=APP`. Use an empty query on the other
+Stars routes. Sign the path and method, and supply the SHA-256 digest of the
+exact HTTP body, including the digest of zero bytes for bodyless routes.
+Send delegated JSON without a `Content-Encoding` header. The signed
 Telegram-linked owner grant needs `telegram_stars: true` for hosted purchasing.
 Append the literal ASCII line `telegram-stars-purchases` followed by one LF to
 the existing grant canonical message after all collection scopes, before owner
@@ -73,8 +75,9 @@ user request. A provider/link failure may leave a quote pending and retryable.
 Pre-checkout validates the stored payload, bot, buyer, XTR amount, current
 account/app binding and quote expiry before answering Telegram. After approval,
 an authenticated `successful_payment` settles even if the dialog has closed
-or the quote has expired. The charge record and signed canonical wallet credit
-commit in the same SQLite transaction. A verified `refunded_payment` reverses
+or the quote has expired. Withdrawing a pack or changing its price or Dew
+quantity blocks new approvals on its old quotes. The charge record and signed
+canonical wallet credit commit in the same SQLite transaction. A verified `refunded_payment` reverses
 the original lot through the wallet ledger. Repeated or reordered events
 converge on the same credit and reversal. A refund of consumed Dew can leave
 wallet debt. Telegram's browser callback has no settlement authority.
@@ -87,8 +90,9 @@ operator can `POST /api/v1/admin/tokens/purchases/telegram/reconcile` with
 loopback connection. This reads one provider history page of up to 32 entries
 and returns `{seen, matched, next_offset}`. Scan further pages as needed. It
 matches authentic history against the same approved stored invoice and charge
-rules. Preserve the issuer database containing these records during backups
-and deployments. [Stars transaction history](https://core.telegram.org/bots/api#getstartransactions)
+rules. A refund without an invoice payload is retained against its Telegram
+charge until the matching payment can be resolved. Preserve the issuer database
+containing these records during backups and deployments. [Stars transaction history](https://core.telegram.org/bots/api#getstartransactions)
 
 ## Local verification
 

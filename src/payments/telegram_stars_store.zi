@@ -93,6 +93,15 @@ CREATE TABLE IF NOT EXISTS telegram_stars_invoices (
     UNIQUE(account_id,app_id,bot_id,node_id,audience,request_id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS telegram_stars_charge ON telegram_stars_invoices(bot_id,charge_id) WHERE charge_id<>'';
+CREATE TABLE IF NOT EXISTS telegram_stars_history_refunds (
+    bot_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    charge_id TEXT NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    PRIMARY KEY(bot_id,node_id,audience,charge_id,buyer_id,amount)
+);
 CREATE TABLE IF NOT EXISTS telegram_stars_launches (
     digest TEXT PRIMARY KEY,
     account_id TEXT NOT NULL,
@@ -187,9 +196,9 @@ Read :: (transaction: *sql.Transaction, context: ctx.Context, id: string) -> Rea
     return Scan(sql.QueryRowTx(transaction, context, Join(parts[:], ""), values[:]))
 }
 
-ForCharge :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, charge: string) -> ReadResult {
-    values: [4]Any = .[merchant.bot, merchant.node, merchant.audience, charge]
-    parts: [2]string = .[Columns, "WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4"]
+ReadQuote :: (database: *sql.Database, context: ctx.Context, id: string) -> ReadResult {
+    values: [1]Any = .[id]
+    parts: [2]string = .[Columns, "WHERE invoice_id=?1"]
     return Scan(sql.QueryRow(database, context, Join(parts[:], ""), values[:]))
 }
 
@@ -253,7 +262,24 @@ Settle :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, pa
     if locked.error != null {
         return Settlement.{error = locked.error}
     }
-    record := Read(transaction, context, payment.invoiceID)
+    refundKey: [6]Any = .[merchant.bot, merchant.node, merchant.audience, payment.charge, payment.buyer, payment.amount]
+    record: ReadResult
+    if refund && payment.invoiceID == "" {
+        // History can omit the invoice payload. Resolve or retain the refund
+        // while holding the same write lock used by payment settlement.
+        parts: [2]string = .[Columns, "WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4"]
+        record = Scan(sql.QueryRowTx(transaction, context, Join(parts[:], ""), refundKey[:4]))
+        if record.error == null && !record.found {
+            saved := sql.ExecTx(transaction, context,
+                "INSERT INTO telegram_stars_history_refunds(bot_id,node_id,audience,charge_id,buyer_id,amount) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM telegram_stars_invoices WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND buyer_id=?5 AND amount=?6 AND checkout_id<>'' AND charge_id='' AND state='pending') ON CONFLICT DO NOTHING", refundKey[:])
+            if saved.error != null {
+                return Settlement.{error = saved.error}
+            }
+            return Settlement.{error = sql.Commit(transaction)}
+        }
+    } else {
+        record = Read(transaction, context, payment.invoiceID)
+    }
     invoice := record.invoice
     if record.error != null {
         return Settlement.{error = record.error}
@@ -264,6 +290,17 @@ Settle :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, pa
         (invoice.charge != "" && invoice.charge != payment.charge) {
         return .{}
     }
+    if !refund && invoice.reply.status == "pending" {
+        held: s64
+        destination: [1]Any = .[*held]
+        row := sql.QueryRowTx(transaction, context,
+            "SELECT EXISTS(SELECT 1 FROM telegram_stars_history_refunds WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4 AND buyer_id=?5 AND amount=?6)", refundKey[:])
+        failure := sql.ScanRow(row, destination[:])
+        if failure != null {
+            return Settlement.{error = failure}
+        }
+        refund = held != 0
+    }
     if invoice.reply.status == "refunded" || (invoice.reply.status == "credited" && !refund) {
         return Settlement.{accepted = true, error = sql.Commit(transaction)}
     }
@@ -273,7 +310,7 @@ Settle :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, pa
         AmountDelta = invoice.reply.units, SourceType = Provider, SourceRef = Join(source[:], ":")}
     if invoice.reply.status == "pending" {
         // Own the unique charge before inserting anything in the ledger.
-        chargeArgs: [2]Any = .[payment.invoiceID, payment.charge]
+        chargeArgs: [2]Any = .[invoice.reply.id, payment.charge]
         written := sql.ExecTx(transaction, context,
             "UPDATE telegram_stars_invoices SET charge_id=?2 WHERE invoice_id=?1 AND NOT EXISTS(SELECT 1 FROM telegram_stars_invoices other WHERE other.bot_id=telegram_stars_invoices.bot_id AND other.charge_id=?2)", chargeArgs[:])
         if written.error != null {
@@ -303,8 +340,13 @@ Settle :: (database: *sql.Database, context: ctx.Context, merchant: Merchant, pa
         if reversal.error != null {
             return Settlement.{error = reversal.error}
         }
+        removed := sql.ExecTx(transaction, context,
+            "DELETE FROM telegram_stars_history_refunds WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4 AND buyer_id=?5 AND amount=?6", refundKey[:])
+        if removed.error != null {
+            return Settlement.{error = removed.error}
+        }
     }
-    state: [2]Any = .[payment.invoiceID, ifx refund then "refunded" else "credited"]
+    state: [2]Any = .[invoice.reply.id, ifx refund then "refunded" else "credited"]
     written := sql.ExecTx(transaction, context,
         "UPDATE telegram_stars_invoices SET state=?2 WHERE invoice_id=?1", state[:])
     if written.error != null {

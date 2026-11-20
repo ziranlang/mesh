@@ -1,4 +1,5 @@
 #import "std/go_types"
+#import "std/map_go"
 authorization :: #import "authorization";
 config :: #import "config";
 telegram :: #import "telegram_init";
@@ -15,7 +16,15 @@ clock :: #import "std/time_go";
 ed :: #import "std/ed25519_go";
 policy :: #import "token_policy";
 strings :: #system_library "go:strings";
+numbers :: #system_library "go:strconv";
 builtin :: #system_library "go:builtin";
+
+Offer :: struct {
+    product: string #go_tag "json:\"product_id\""
+    title: string #go_tag "json:\"title\""
+    amount: s64 #go_tag "json:\"amount\""
+    units: s64 #go_tag "json:\"units\""
+}
 
 #scope_file
 Price :: struct {
@@ -175,7 +184,70 @@ Answer :: (context: ctx.Context, token: string, queryID: string, accepted: bool)
     return received.ok && json.Unmarshal(received.bytes, *decoded) == null && decoded.ok
 }
 
+FormatInt :: (value: s64, base: isize) -> string #foreign numbers;
+OfferList :: (length: isize, capacity: isize) -> []Offer #foreign builtin "make";
+AppendOffer :: (values: []Offer, value: Offer) -> []Offer #foreign builtin "append";
+
+Enabled :: (configuration: *config.Config, app: string) -> bool {
+    return configuration.TelegramAccountsEnabled &&
+        configuration.LumiWebhookSecret != "" && telegram.BotID(configuration.LumiBotToken) > 0 &&
+        policy.IssuerStatus(configuration.*) == "ok" &&
+        MapGet(configuration.TelegramStarsApps, app)
+}
+
+Product :: (configuration: *config.Config, id: string) -> Offer {
+    product := MapGet(configuration.TokenProducts, id)
+    price := MapGet(configuration.TelegramStarsPrices, id).Amount
+    if price <= 0 || !ValidID(id, 1, 128) || product.ProductID != id ||
+        product.TokenUnits <= 0 || product.TokenUnits > 9007199254740991 ||
+        product.TokenUnits % 1000000 != 0 {
+        return .{}
+    }
+    title: [2]string = .[FormatInt(product.TokenUnits / 1000000, 10), "Dew"]
+    return Offer.{product = id, title = Join(title[:], " "), amount = price, units = product.TokenUnits}
+}
+
 #scope_export
+ValidID :: (value: string, minimum: s64, maximum: s64) -> bool {
+    if value.count < minimum || value.count > maximum || value == "." || value == ".." {
+        return false
+    }
+    for byte: value {
+        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+            (byte >= 97 && byte <= 122) || byte == 45 || byte == 46 || byte == 95) {
+            return false
+        }
+    }
+    return true
+}
+
+CatalogProducts :: (configuration: *config.Config, app: string) -> []Offer {
+    result := OfferList(0, 32)
+    if !Enabled(configuration, app) {
+        return result
+    }
+    for id: MapKeys(configuration.TelegramStarsPrices) {
+        product := Product(configuration, id)
+        if product.product != "" {
+            result = AppendOffer(result, product)
+        }
+        if result.count > 32 {
+            // The client contract is bounded. An oversized configuration cannot quote a partial catalog.
+            return OfferList(0, 0)
+        }
+    }
+    return result
+}
+
+OfferActive :: (configuration: *config.Config, invoice: store.Invoice) -> bool {
+    for offer: CatalogProducts(configuration, invoice.app) {
+        if offer.product == invoice.reply.product {
+            return offer.amount == invoice.reply.amount && offer.units == invoice.reply.units
+        }
+    }
+    return false
+}
+
 CreateLink :: (context: ctx.Context, token: string, invoice: store.Invoice) -> string {
     payload: [2]string = .[store.PayloadPrefix, invoice.reply.id]
     prices: [1]Price = .[Price.{label = invoice.title, amount = invoice.reply.amount}]
@@ -223,7 +295,11 @@ Handle :: (database: *sql.Database, configuration: *config.Config, node: string,
         if id != "" && query.currency == store.Currency && query.user.id > 0 && !query.user.bot &&
             merchant.bot > 0 && merchant.audience != "" && policy.IssuerStatus(configuration.*) == "ok" {
             payment := store.Payment.{invoiceID = id, buyer = query.user.id, amount = query.amount, currency = query.currency}
-            decision = store.Approve(database, deadline.value, merchant, payment, query.id, clock.Unix(clock.Now()))
+            record := store.ReadQuote(database, deadline.value, id)
+            if record.error == null && record.found &&
+                (record.invoice.checkout == query.id || OfferActive(configuration, record.invoice)) {
+                decision = store.Approve(database, deadline.value, merchant, payment, query.id, clock.Unix(clock.Now()))
+            }
         }
         if !Answer(deadline.value, configuration.LumiBotToken, query.id, decision.accepted && decision.error == null) {
             response.Error(writer, 503, "Telegram checkout reply temporarily unavailable")
@@ -295,17 +371,7 @@ Reconcile :: (database: *sql.Database, configuration: *config.Config, node: stri
             continue
         }
         id := PayloadID(partner.payload)
-        if id == "" && refund && partner.payload == "" {
-            record := store.ForCharge(database, context, merchant, transaction.id)
-            if record.error != null {
-                response.Error(writer, 503, "Telegram payment temporarily unavailable")
-                return
-            }
-            if record.found {
-                id = record.invoice.reply.id
-            }
-        }
-        if id == "" || transaction.amount == -9223372036854775808 {
+        if (id == "" && (!refund || partner.payload != "")) || transaction.amount == -9223372036854775808 {
             continue
         }
         amount := transaction.amount

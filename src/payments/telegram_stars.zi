@@ -18,7 +18,7 @@ receipts :: #import "token_receipt";
 metrics :: #import "metrics";
 rate :: #import "rate_limit";
 request_rate :: #import "request_rate";
-policy :: #import "token_policy";
+io :: #import "std/io_go";
 sql :: #import "std/sql_go";
 ctx :: #import "std/context_go";
 http :: #import "std/http_go";
@@ -27,8 +27,7 @@ clock :: #import "std/time_go";
 native_sql :: #system_library "go:database/sql";
 net_http :: #system_library "go:net/http";
 strings :: #system_library "go:strings";
-numbers :: #system_library "go:strconv";
-builtin :: #system_library "go:builtin";
+native_io :: #system_library "go:io";
 
 Service :: struct {
     database: *sql.Database
@@ -51,16 +50,9 @@ LaunchReply :: struct {
     available: bool #go_tag "json:\"stars_available\""
 }
 
-Offer :: struct {
-    product: string #go_tag "json:\"product_id\""
-    title: string #go_tag "json:\"title\""
-    amount: s64 #go_tag "json:\"amount\""
-    units: s64 #go_tag "json:\"units\""
-}
-
 CatalogReply :: struct {
     currency: string #go_tag "json:\"currency\""
-    products: []Offer #go_tag "json:\"products\""
+    products: []provider.Offer #go_tag "json:\"products\""
 }
 
 CreateRequest :: struct {
@@ -88,70 +80,50 @@ RollbackAtReturn :: (transaction: *sql.Transaction) #go_defer #foreign native_sq
 HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
 TrimPrefix :: (value: string, prefix: string) -> string #foreign strings;
 Join :: (values: []string, separator: string) -> string #foreign strings;
-FormatInt :: (value: s64, base: isize) -> string #foreign numbers;
 PathValue :: (request: *http.Request, name: string) -> string #foreign net_http "(*Request).PathValue";
-OfferList :: (length: isize, capacity: isize) -> []Offer #foreign builtin "make";
-AppendOffer :: (values: []Offer, value: Offer) -> []Offer #foreign builtin "append";
+HeaderValues :: (headers: http.Header, name: string) -> []string #foreign net_http "Header.Values";
+CloseAtReturn :: (stream: io.ReadCloser) #go_defer #foreign native_io "ReadCloser.Close";
 
 Merchant :: (service: Service) -> store.Merchant {
     return store.Merchant.{bot = telegram.BotID(service.configuration.LumiBotToken),
         node = service.node, audience = service.configuration.BaseURL}
 }
 
-Enabled :: (service: Service, app: string) -> bool {
-    return service.configuration.TelegramAccountsEnabled &&
-        service.configuration.LumiWebhookSecret != "" && telegram.BotID(service.configuration.LumiBotToken) > 0 &&
-        policy.IssuerStatus(service.configuration.*) == "ok" &&
-        MapGet(service.configuration.TelegramStarsApps, app)
-}
-
-ValidID :: (value: string, minimum: s64, maximum: s64) -> bool {
-    if value.count < minimum || value.count > maximum || value == "." || value == ".." {
+UnencodedDelegateBody :: (writer: http.ResponseWriter, request: *http.Request) -> bool {
+    headers := http.Headers(request)
+    if HasPrefix(http.HeaderValue(headers, "Authorization"), "Delegate ") &&
+        HeaderValues(headers, "Content-Encoding").count != 0 {
+        response.Error(writer, 400, "Telegram delegate requests require unencoded JSON")
         return false
-    }
-    for byte: value {
-        if !((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
-            (byte >= 97 && byte <= 122) || byte == 45 || byte == 46 || byte == 95) {
-            return false
-        }
     }
     return true
 }
 
-Product :: (service: Service, id: string) -> Offer {
-    product := MapGet(service.configuration.TokenProducts, id)
-    price := MapGet(service.configuration.TelegramStarsPrices, id).Amount
-    if price <= 0 || !ValidID(id, 1, 128) || product.ProductID != id ||
-        product.TokenUnits <= 0 || product.TokenUnits > 9007199254740991 ||
-        product.TokenUnits % 1000000 != 0 {
-        return .{}
+EmptyBody :: (writer: http.ResponseWriter, request: *http.Request) -> bool {
+    stream := http.Body(request)
+    CloseAtReturn(stream)
+    read := io.ReadAll(io.LimitReader(cast(io.Reader)stream, 1))
+    if read.error != null || read.value.count != 0 {
+        response.Error(writer, 400, "Telegram request requires an empty body")
+        return false
     }
-    title: [2]string = .[FormatInt(product.TokenUnits / 1000000, 10), "Dew"]
-    return Offer.{product = id, title = Join(title[:], " "), amount = price, units = product.TokenUnits}
-}
-
-CatalogProducts :: (service: Service, app: string) -> []Offer {
-    result := OfferList(0, 32)
-    if !Enabled(service, app) {
-        return result
-    }
-    for id: MapKeys(service.configuration.TelegramStarsPrices) {
-        product := Product(service, id)
-        if product.product != "" {
-            result = AppendOffer(result, product)
-        }
-        if result.count > 32 {
-            // The client contract is bounded. An oversized configuration cannot quote a partial catalog.
-            return OfferList(0, 0)
-        }
-    }
-    return result
+    return true
 }
 
 Open :: (service: Service, writer: http.ResponseWriter, request: *http.Request, raw: []u8) -> Principal {
     principal: Principal
-    header := http.HeaderValue(http.Headers(request), "Authorization")
-    principal.delegated = HasPrefix(header, "Delegate ")
+    headers := http.Headers(request)
+    credentials := HeaderValues(headers, "Authorization")
+    if credentials.count > 1 {
+        response.Error(writer, 401, "ambiguous Telegram authorization")
+        return .{}
+    }
+    principal.delegated = HasPrefix(http.HeaderValue(headers, "Authorization"), "Delegate ")
+    if principal.delegated && (HeaderValues(headers, "X-Mesh-Delegate").count != 1 ||
+        http.HeaderValue(headers, "X-Mesh-Delegate") == "") {
+        response.Error(writer, 401, "one Telegram delegate proof is required")
+        return .{}
+    }
     if !principal.delegated {
         owner := auth.BearerUser(service.database, request, service.configuration.TokenSecret)
         if owner.authentication.error != null || owner.authentication.status != 0 {
@@ -240,6 +212,9 @@ AppQuery :: (request: *http.Request) -> string {
 
 #scope_export
 Launch :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    if !UnencodedDelegateBody(writer, request) {
+        return
+    }
     raw := body.ReadJSON(writer, request, 32768)
     input: LaunchRequest
     if raw.error != null || strict.Decode(raw.value, *input) != null {
@@ -260,12 +235,15 @@ Launch :: (service: Service, writer: http.ResponseWriter, request: *http.Request
     if !verified.valid || !Commit(principal, writer) {
         return
     }
-    available := (!principal.delegated || principal.grant.telegramStars) && CatalogProducts(service, input.app).count > 0
+    available := (!principal.delegated || principal.grant.telegramStars) && provider.CatalogProducts(service.configuration, input.app).count > 0
     result := LaunchReply.{app = input.app, startParam = verified.startParam, chatType = verified.chatType, available = available}
     response.JSON(writer, 200, result)
 }
 
 Catalog :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    if !EmptyBody(writer, request) {
+        return
+    }
     empty: []u8
     principal := Open(service, writer, request, empty)
     if principal.transaction == null {
@@ -276,15 +254,18 @@ Catalog :: (service: Service, writer: http.ResponseWriter, request: *http.Reques
     if Buyer(service, principal, writer, http.Context(request), app, true) == 0 || !Commit(principal, writer) {
         return
     }
-    result := CatalogReply.{currency = store.Currency, products = CatalogProducts(service, app)}
+    result := CatalogReply.{currency = store.Currency, products = provider.CatalogProducts(service.configuration, app)}
     response.JSON(writer, 200, result)
 }
 
 Create :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    if !UnencodedDelegateBody(writer, request) {
+        return
+    }
     raw := body.ReadJSON(writer, request, 32768)
     input: CreateRequest
     if raw.error != null || strict.Decode(raw.value, *input) != null ||
-        !ValidID(input.product, 1, 128) || !ValidID(input.requestID, 8, 128) {
+        !provider.ValidID(input.product, 1, 128) || !provider.ValidID(input.requestID, 8, 128) {
         response.Error(writer, 400, "invalid Telegram invoice request")
         return
     }
@@ -314,8 +295,8 @@ Create :: (service: Service, writer: http.ResponseWriter, request: *http.Request
         expires = now + store.InvoiceLifetime}
     record := store.ForRequest(principal.transaction, context, desired)
     if record.error == null && !record.found {
-        selected: Offer
-        for offer: CatalogProducts(service, input.app) {
+        selected: provider.Offer
+        for offer: provider.CatalogProducts(service.configuration, input.app) {
             if offer.product == input.product {
                 selected = offer
                 break
@@ -344,6 +325,10 @@ Create :: (service: Service, writer: http.ResponseWriter, request: *http.Request
         return
     }
     result := store.PublicReply(invoice, now)
+    if result.status == "pending" && invoice.checkout == "" && !provider.OfferActive(service.configuration, invoice) {
+        response.Error(writer, 404, "Telegram product unavailable")
+        return
+    }
     if result.status != "pending" || result.link != "" {
         if Commit(principal, writer) {
             response.JSON(writer, 200, result)
@@ -372,6 +357,9 @@ Invoice :: (service: Service, writer: http.ResponseWriter, request: *http.Reques
     id := PathValue(request, "invoice_id")
     if !authorization.HexID(id, 32) {
         response.Error(writer, 404, "Telegram invoice not found")
+        return
+    }
+    if !EmptyBody(writer, request) {
         return
     }
     empty: []u8
@@ -416,11 +404,18 @@ Invoice :: (service: Service, writer: http.ResponseWriter, request: *http.Reques
         invoice.reply.status = "cancelled"
     }
     if Commit(principal, writer) {
-        response.JSON(writer, 200, store.PublicReply(invoice, now))
+        result := store.PublicReply(invoice, now)
+        if result.link != "" && invoice.checkout == "" && !provider.OfferActive(service.configuration, invoice) {
+            result.link = ""
+        }
+        response.JSON(writer, 200, result)
     }
 }
 
 Balance :: (service: Service, writer: http.ResponseWriter, request: *http.Request) {
+    if !EmptyBody(writer, request) {
+        return
+    }
     empty: []u8
     principal := Open(service, writer, request, empty)
     if principal.transaction == null {
