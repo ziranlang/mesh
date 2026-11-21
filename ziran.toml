@@ -3,8 +3,8 @@ name = "Mesh"
 module_roots = ["src/server", "src/accounts", "src/apps", "src/chat", "src/http", "src/node", "src/payments", "src/protocol", "src/storage", "src/sync", "src/token", "tests/ziran"]
 
 [toolchain]
-git = "https://github.com/ziranlang/ziran.git"
-ref = "e4e8efa4a92f36e2fb0cea1d56b11471afa68621"
+git = "https://git.waozi.xyz/ziranlang/ziran.git"
+ref = "8e8e53bacd207ad8ed9d9a92a96483893e6788d8"
 
 [dependencies.shovey]
 git = "https://github.com/waozixyz/shovey.git"

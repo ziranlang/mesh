@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Pin a Ziran toolchain that can generate Go from the multiline OpenAPI strings.
+
 - Verify Telegram Mini App launches and settle Telegram Stars Dew purchases and refunds in the existing account wallet.
 
 - Organize server sources and tests by responsibility, move embedded node behavior, filesystem component validation and compression benchmarks into Ziran, and parse HTTP compression preferences in one pass.

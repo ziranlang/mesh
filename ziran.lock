@@ -140,8 +140,8 @@
     "name": "Mesh"
   },
   "toolchain": {
-    "commit": "e4e8efa4a92f36e2fb0cea1d56b11471afa68621",
-    "ref": "e4e8efa4a92f36e2fb0cea1d56b11471afa68621",
-    "url": "https://github.com/ziranlang/ziran.git"
+    "commit": "8e8e53bacd207ad8ed9d9a92a96483893e6788d8",
+    "ref": "8e8e53bacd207ad8ed9d9a92a96483893e6788d8",
+    "url": "https://git.waozi.xyz/ziranlang/ziran.git"
   }
 }
