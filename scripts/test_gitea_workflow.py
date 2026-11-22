@@ -77,6 +77,17 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(len(script_tests), len(set(script_tests)))
         setup_go = next(step for step in steps if "actions/setup-go@" in (step.get("uses") or ""))
         self.assertEqual(setup_go["with"]["cache"], "false")
+        names = [step.get("name") for step in steps]
+        root = names.index("Use the installed Go root")
+        self.assertEqual(root, steps.index(setup_go) + 1)
+        self.assertIn('echo "GOROOT=$root" >> "$GITHUB_ENV"', steps[root]["run"])
+
+    def test_container_probe_stays_inside_its_network_namespace(self):
+        steps = self.jobs["container"]["steps"]
+        verify = next(step for step in steps if step.get("name") == "Verify container starts as a non-root user")
+        self.assertNotIn(" -p ", verify["run"])
+        self.assertIn('--network "container:$container"', verify["run"])
+        self.assertRegex(verify["env"]["PROBE_IMAGE"], r"^[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}$")
 
     def test_generated_go_reuses_the_runner_package_cache(self):
         steps = read_yaml(ROOT / ".gitea/actions/generate/action.yml")["runs"]["steps"]

@@ -60,6 +60,14 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      # The shared runner exports the native SDK's GOROOT for other builds.
+      # Each tool must read the standard library of the Go setup-go installed.
+      - name: Use the installed Go root
+        run: |
+          root=$(dirname "$(dirname "$(readlink -f "$(command -v go)")")")
+          echo "GOROOT=$root" >> "$GITHUB_ENV"
+          GOROOT=$root go version
+
       - name: Generate the Go from the Zi sources
         uses: ./.gitea/actions/generate
 
@@ -165,39 +173,37 @@ jobs:
       - name: Build container image
         run: docker build --pull --build-arg VERSION="ci-$GITHUB_SHA" -t "mesh:ci-$GITHUB_RUN_ID" .
 
+      # The CI slice denies private ranges, including Docker's bridge, so a
+      # published port cannot reach the container. A probe in the container's
+      # own network namespace reads it over loopback instead.
       - name: Verify container starts as a non-root user
         env:
           EXPECTED_VERSION: ci-${{ github.sha }}
+          PROBE_IMAGE: busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
         run: |
           MESH_TOKEN_SECRET_HEX=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
           export MESH_TOKEN_SECRET_HEX
-          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e MESH_TOKEN_SECRET_HEX -e MESH_DB=/data/test.db -e MESH_ADDR=:8080 -p 127.0.0.1::8080 "mesh:ci-$GITHUB_RUN_ID")
+          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e MESH_TOKEN_SECRET_HEX -e MESH_DB=/data/test.db -e MESH_ADDR=:8080 "mesh:ci-$GITHUB_RUN_ID")
           trap 'docker logs "$container"; docker rm -f "$container"' EXIT
           test "$(docker inspect --format '{{.Config.User}}' "$container")" = '65532:65532'
-          port=$(docker port "$container" 8080/tcp)
-          export CONTAINER_URL="http://$port"
-          python3 - <<'PY'
-          import json
-          import os
-          import time
-          import urllib.error
-          import urllib.request
-
-          base = os.environ['CONTAINER_URL']
-          for attempt in range(60):
-              try:
-                  with urllib.request.urlopen(base + '/readyz', timeout=2) as response:
-                      if response.status == 200:
-                          break
-              except (urllib.error.URLError, TimeoutError):
-                  pass
-              time.sleep(1)
-          else:
-              raise SystemExit('container did not become ready')
-          with urllib.request.urlopen(base + '/api/v1/node', timeout=2) as response:
-              node = json.load(response)
-          assert node['build_version'] == os.environ['EXPECTED_VERSION'], node
-          PY
+          probe() {
+            docker run --rm --network "container:$container" "$PROBE_IMAGE" wget -q -O - -T 2 "http://127.0.0.1:8080$1"
+          }
+          docker pull --quiet "$PROBE_IMAGE"
+          ready=false
+          for attempt in $(seq 60); do
+            if probe /readyz > /dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != true ]; then
+            echo 'container did not become ready'
+            exit 1
+          fi
+          probe /api/v1/node | python3 -c 'import json, os, sys; node = json.load(sys.stdin); assert node["build_version"] == os.environ["EXPECTED_VERSION"], node'
+          docker image rm "$PROBE_IMAGE"
 
       - name: Scan image
         uses: https://github.com/aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
