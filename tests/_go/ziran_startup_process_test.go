@@ -123,6 +123,49 @@ func startupProcess(t *testing.T, mode string, baseline bool, root string, addre
 	return command
 }
 
+func TestZiranStartupRejectsInvalidConfiguredNodeIdentity(t *testing.T) {
+	for _, name := range []string{"invalid hex with valid credential file", "missing credential file", "empty credential file", "mismatched public key"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			credential := filepath.Join(root, "configured.key")
+			var direct string
+			var contents []byte
+			want := "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX must contain"
+			switch name {
+			case "invalid hex with valid credential file":
+				direct = "invalid-fixture-key"
+				contents = []byte(strings.Repeat("11", ed25519.SeedSize))
+			case "missing credential file":
+				want = "could not read MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE"
+			case "empty credential file":
+				contents = []byte("\n")
+			case "mismatched public key":
+				direct = strings.Repeat("00", ed25519.PrivateKeySize)
+				want = "configured Ed25519 node identity public key does not match its seed"
+			}
+			if contents != nil {
+				if err := os.WriteFile(credential, contents, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			command := startupProcess(t, "inspect missing", false, root, "127.0.0.1:0")
+			command.Env = append(command.Env, "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX="+direct,
+				"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE="+credential)
+			output, err := command.CombinedOutput()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 1 || !bytes.Contains(output, []byte(want)) {
+				t.Fatalf("expected credential configuration failure, got %v: %s", err, output)
+			}
+			if direct != "" && bytes.Contains(output, []byte(direct)) {
+				t.Fatal("startup printed the configured credential")
+			}
+			if _, err := os.Stat(filepath.Join(root, "node.key")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatal("startup touched the fallback identity", err)
+			}
+		})
+	}
+}
+
 func TestZiranStartupCLIAndFatalErrorsAgainstBaseline(t *testing.T) {
 	for _, mode := range []string{"inspect", "inspect create key", "inspect argument timing", "inspect invalid", "inspect missing", "key error", "invalid key file", "configuration error", "store error", "verifier error", "verifier unavailable", "verifier wrapped unavailable", "listen error"} {
 		t.Run(mode, func(t *testing.T) {

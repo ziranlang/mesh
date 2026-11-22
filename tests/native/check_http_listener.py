@@ -2387,6 +2387,27 @@ def check_lan_startup(binary, env):
     corrupt_key.write_text(written)
     rejects({"MESH_NODE_IDENTITY_KEY_FILE": str(corrupt_key)}, b"could not load the Mesh node identity")
     assert corrupt_key.read_text() == written
+    fallback = corrupt_key.with_suffix(".fallback-key")
+    credential = corrupt_key.with_suffix(".credential")
+    bad_identity = b"could not load the Mesh node identity"
+    configured = {"MESH_NODE_IDENTITY_KEY_FILE": str(fallback),
+                  "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE": str(credential)}
+    rejects(configured, bad_identity)
+    credential.write_text("\n")
+    rejects(configured, bad_identity)
+    credential.write_text("11" * 32 + "\n")
+    rejects(configured | {"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX": "invalid-fixture-key"}, bad_identity)
+    rejects(configured | {"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX": "00" * 64}, bad_identity)
+    assert not fallback.exists()
+    # RFC 8032 test vector 1. The seed and expanded forms identify the same node.
+    seed = "9d61b19deffd5a60ba844af492ec2cc4" "4449c5697b326919703bac031cae7f60"
+    public = "d75a980182b10ab7d54bfed3c964073a" "0ee172f3daa62325af021a68f707511a"
+    credential.write_text(seed + "\n")
+    for inline in ("", seed + public):
+        settings = configured | {"MESH_NODE_IDENTITY_PRIVATE_KEY_HEX": inline}
+        with pairing_node(binary, fallback.with_suffix(".db"), **settings) as port:
+            assert node_status("127.0.0.1", port)["node_public_key"] == public
+    assert not fallback.exists()
     rejects({"MESH_LAN_ONLY": "0"}, b"stored app manifest forbids this node network scope")
 
 

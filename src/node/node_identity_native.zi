@@ -80,6 +80,12 @@
         return sha.BytesToHex(*digest[0], digest.count, *identity.id[0], identity.id.count) == 1
     }
 
+    LoadConfigured :: (key: *binary.BinaryBytes, identity: *Identity) -> bool {
+        bytes := VecSlice(key.value, 0, key.value.count)
+        defer oqs.Cleanse(bytes)
+        return key.error == "" && LoadSeed(bytes, identity) && SetID(identity)
+    }
+
     #scope_export
     HexSetting :: (key: string, fileKey: string) -> binary.BinaryBytes {
         raw := wire.TrimSpace(environment.EnvironmentText(key))
@@ -101,20 +107,30 @@
 
     // A single canonical node-key format is shared with the released server.
     Load :: (databasePath: string, identity: *Identity) -> bool {
-        configured := HexSetting("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE")
-        defer oqs.Cleanse(VecSlice(configured.value, 0, configured.value.count))
-        if configured.error != "" { return false }
-        if configured.value.count != 0 {
-            if !LoadSeed(VecSlice(configured.value, 0, configured.value.count), identity) { return false }
-        } else {
-            path := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_KEY_FILE"))
-            defaultPath: Vec(u8)
-            if path == "" {
-                if !BuilderAppend(defaultPath, databasePath) || !BuilderAppend(defaultPath, ".node-key") { return false }
-                path = TextView(VecSlice(defaultPath, 0, defaultPath.count))
+        raw := environment.EnvironmentText("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX")
+        if raw != "" {
+            value := wire.TrimSpace(raw)
+            if (value.count != 64 && value.count != 128) || !binary.IsHex(value) {
+                return false
             }
-            return LoadFile(path, identity)
+            configured := binary.DecodeBinaryField(value)
+            return LoadConfigured(*configured, identity)
         }
-        return SetID(identity)
+        configuredPath := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE"))
+        if configuredPath != "" {
+            scratch: [4096]u8
+            defer oqs.Cleanse(scratch[:])
+            configured := ReadHex(configuredPath, scratch[:])
+            return LoadConfigured(*configured, identity)
+        }
+        path := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_KEY_FILE"))
+        defaultPath: Vec(u8)
+        if path == "" {
+            if !BuilderAppend(defaultPath, databasePath) || !BuilderAppend(defaultPath, ".node-key") {
+                return false
+            }
+            path = TextView(VecSlice(defaultPath, 0, defaultPath.count))
+        }
+        return LoadFile(path, identity)
     }
 }

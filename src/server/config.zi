@@ -16,6 +16,7 @@ go_random :: #system_library "go:crypto/rand";
 go_log :: #system_library "go:log";
 go_slog :: #system_library "go:log/slog";
 go_format :: #system_library "go:fmt";
+go_bytes :: #system_library "go:bytes";
 builtin :: #system_library "go:builtin";
 
 Config :: struct {
@@ -119,6 +120,7 @@ AppendText :: (values: []string, value: string) -> []string #foreign builtin "ap
 Atoi :: (value: string) -> NativeIntegerResult #go_results #foreign go_numbers;
 ParseInt :: (value: string, base: isize, bits: isize) -> WideIntegerResult #go_results #foreign go_numbers;
 DecodeString :: (value: string) -> FileResult #go_results #foreign go_hex;
+EqualBytes :: (left: []u8, right: []u8) -> bool #foreign go_bytes "Equal";
 ReadRandom :: (value: []u8) -> RandomResult #go_results #foreign go_random "Read";
 AllocateBytes :: (count: isize) -> []u8 #foreign builtin "make";
 PrivateLength :: (value: PrivateKey) -> isize #foreign builtin "len";
@@ -242,6 +244,36 @@ EnvBytesHexOrFile :: (key: string, fileKey: string, fallback: []u8) -> []u8 {
     return fallback
 }
 
+#scope_file
+ConfiguredNodePrivateKey :: () -> PrivateKey {
+    raw := Getenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX")
+    if raw == "" {
+        path := TrimSpace(Getenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE"))
+        if path == "" {
+            absent: PrivateKey
+            return absent
+        }
+        read := ReadFile(path)
+        if read.error != null {
+            Fatal("could not read MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE")
+        }
+        raw = text.FromBytes(read.value)
+    }
+    decoded := DecodeString(TrimSpace(raw))
+    if decoded.error != null || (decoded.value.count != 32 && decoded.value.count != 64) {
+        Fatal("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
+    }
+    derived := NewKeyFromSeed(decoded.value[:32])
+    if decoded.value.count == 64 {
+        derivedBytes := cast([]u8)derived
+        if !EqualBytes(decoded.value[32:64], derivedBytes[32:64]) {
+            Fatal("configured Ed25519 node identity public key does not match its seed")
+        }
+    }
+    return derived
+}
+
+#scope_export
 // Comma-separated values, without blanks or spaces.
 ClientIDList :: (value: string) -> []string {
     result: []string
@@ -287,15 +319,7 @@ Load :: () -> Config {
         }
     }
     baseURL := EnvString("MESH_BASE_URL", "https://api.example.com")
-    nodeKeyBytes := EnvBytesHexOrFile("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE", empty)
-    nodePrivateKey: PrivateKey
-    if nodeKeyBytes.count == 32 {
-        nodePrivateKey = NewKeyFromSeed(nodeKeyBytes)
-    } else if nodeKeyBytes.count == 64 {
-        nodePrivateKey = cast(PrivateKey)nodeKeyBytes
-    } else if nodeKeyBytes.count != 0 {
-        Fatal("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX must contain a 32-byte Ed25519 seed or 64-byte private key")
-    }
+    nodePrivateKey := ConfiguredNodePrivateKey()
     result: Config
     result.Addr = EnvString("MESH_ADDR", "127.0.0.1:8080")
     result.BaseURL = baseURL

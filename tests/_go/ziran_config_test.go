@@ -410,8 +410,9 @@ func TestZiranConfigDefaultsAndKeyIdentity(t *testing.T) {
 	}
 	t.Setenv("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "abcdef")
 	t.Setenv("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "111213")
-	for _, nodeKeySize := range []int{0, 32, 64} {
-		t.Setenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", strings.Repeat("33", nodeKeySize))
+	seed := bytes.Repeat([]byte{0x33}, ed25519.SeedSize)
+	for _, nodeKey := range [][]byte{nil, seed, ed25519.NewKeyFromSeed(seed)} {
+		t.Setenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", hex.EncodeToString(nodeKey))
 		assertConfigurationMatchesBaseline(t)
 	}
 	t.Setenv("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "")
