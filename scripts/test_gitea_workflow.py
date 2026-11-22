@@ -35,7 +35,8 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(set(deploy["needs"]), REQUIRED_JOBS)
         self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy"})
         for guard in (
-            "github.server_url == 'https://git.waozi.xyz'",
+            # Gitea evaluates job conditions with its ROOT_URL, which ends in a slash.
+            "(github.server_url == 'https://git.waozi.xyz' || github.server_url == 'https://git.waozi.xyz/')",
             "github.repository == 'ziranlang/mesh'",
             "github.ref == 'refs/heads/master'",
             "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')",

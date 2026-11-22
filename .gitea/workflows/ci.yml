@@ -254,7 +254,7 @@ jobs:
   deploy:
     needs: [checks, container]
     if: >-
-      github.server_url == 'https://git.waozi.xyz' &&
+      (github.server_url == 'https://git.waozi.xyz' || github.server_url == 'https://git.waozi.xyz/') &&
       github.repository == 'ziranlang/mesh' && github.ref == 'refs/heads/master' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       vars.MESH_DEPLOY_READY == 'true' && vars.MESH_DEPLOY_RUNNER != ''
@@ -265,7 +265,7 @@ jobs:
     steps:
       - name: Verify canonical deployment context
         run: |
-          test "$GITHUB_SERVER_URL" = https://git.waozi.xyz
+          test "${GITHUB_SERVER_URL%/}" = https://git.waozi.xyz
           test "$GITHUB_REPOSITORY" = ziranlang/mesh
           test "$GITHUB_REF" = refs/heads/master
           case "$GITHUB_EVENT_NAME" in push|workflow_dispatch) ;; *) exit 1 ;; esac
