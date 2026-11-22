@@ -7,6 +7,8 @@ secrets/
 *.db
 *.db-shm
 *.db-wal
+# Node identity private keys
+*.node-key
 *.sqlite
 *.sqlite3
 mesh
