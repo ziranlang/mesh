@@ -25,7 +25,7 @@ CGO_ENV := CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(abspath $(LIBOQS_PREFIX))/include" \
 	CGO_LDFLAGS="-L$(abspath $(LIBOQS_PREFIX))/lib -loqs"
 
-.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server test-ziran-native-embedded compression-bench
+.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server test-ziran-native-google-play test-ziran-native-embedded compression-bench
 
 all: build
 
@@ -124,6 +124,19 @@ test-ziran-native-server: test-ziran-native-http
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle --server
 	LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 -B tests/native/check_account_2fa.py "$(NATIVE_SERVER_BUILD_DIR)/server_native" \
+		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
+	$(MAKE) -f Makefile test-ziran-native-google-play
+
+# Google Play verification, OAuth and refunds against a loopback Play API.
+test-ziran-native-google-play: liboqs
+	mkdir -p $(BUILD_DIR)/native-tests/google-play
+	XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
+	LDFLAGS="$(LDFLAGS) -L$(abspath $(LIBOQS_PREFIX))/lib -L$(SQLITE_NATIVE_DIR) $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR))" \
+	LDLIBS="$(NATIVE_SERVER_LIBS)" \
+	$(ZIRAN) build $(ZIRAN_PROJECT) --target=c --exe --entry google_play:Main --root tests/native \
+		-o $(BUILD_DIR)/native-tests/google-play tests/native/google_play.zi
+	LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		python3 -B tests/native/check_google_play.py $(BUILD_DIR)/native-tests/google-play/google_play \
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
 
 # Load generated protocol types before SQL macros with matching field names.

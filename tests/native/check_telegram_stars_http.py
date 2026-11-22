@@ -93,8 +93,9 @@ def seed(database, keys):
     with closing(sqlite3.connect(database)) as db, db:
         for app in ("inbe", "second"):
             db.execute("INSERT OR IGNORE INTO server_apps(app_id,display_name) VALUES (?,?)", (app, app))
-        db.executemany("INSERT INTO server_lumi_telegram(account_id,telegram_id) VALUES (?,?)",
-                       ((keys.owner[0], PRIVATE), (keys.other[0], PRIVATE + 1)))
+        linked = int(time.time())
+        db.executemany("INSERT INTO server_lumi_telegram(account_id,telegram_id,linked_at) VALUES (?,?,?)",
+                       ((keys.owner[0], PRIVATE, linked), (keys.other[0], PRIVATE + 1, linked)))
 
 
 def launch(init=None, app="inbe"):
@@ -324,6 +325,7 @@ def main():
                 with node(args.binary, Path(path), **settings, MESH_LUMI_WEBHOOK_SECRET=SECRET,
                           MESH_LUMI_FIXTURE_TELEGRAM_PORT=str(provider_port)) as (port, database):
                     exercise(port, database, args.oracle, provider)
+    print("Native Telegram Stars HTTP passed")
 
 
 if __name__ == "__main__":

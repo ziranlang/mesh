@@ -2522,7 +2522,8 @@ def main():
                         "check_game_evidence_http.py", "check_monero_http.py", "check_monero_reconcile.py"):
             subprocess.run([sys.executable, "-B", fixture_dir / fixture, binary, oracle], check=True)
         for fixture in ("check_delegated_http.py", "check_delegated_ws.py",
-                        "check_lumi_telegram_http.py", "check_telegram_account_http.py"):
+                        "check_lumi_telegram_http.py", "check_telegram_account_http.py",
+                        "check_telegram_stars_http.py"):
             subprocess.run([sys.executable, "-B", fixture_dir / fixture, binary, oracle, "--server"], check=True)
 
 if __name__ == "__main__":
