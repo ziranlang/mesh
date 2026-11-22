@@ -69,6 +69,8 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(len(plain_tests), 1)
         self.assertIn("-coverprofile=coverage.out", plain_tests[0])
         self.assertEqual(sum("-race" in run for run in runs), 1)
+        coverage = next(step for step in steps if step.get("name") == "Test and report coverage")
+        self.assertIn("GOFLAGS=-mod=mod go tool cover", coverage["run"])
         native = next(step for step in steps if step.get("name") == "Native server suite")
         self.assertIn("make sqlite-native microhttpd-native", native["run"])
         self.assertIn("make test-ziran-native-server", native["run"])

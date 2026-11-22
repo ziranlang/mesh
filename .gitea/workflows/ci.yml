@@ -105,7 +105,7 @@ jobs:
       - name: Test and report coverage
         run: |
           make test TEST_FLAGS="-coverprofile=coverage.out"
-          go tool cover -func=coverage.out | tail -1
+          GOFLAGS=-mod=mod go tool cover -func=coverage.out | tail -1
 
       - name: Race test
         run: make test GOFLAGS="-mod=mod -race"
@@ -176,6 +176,13 @@ jobs:
 
       - name: Generate the Go from the Zi sources
         uses: ./.gitea/actions/generate
+
+      # A cancelled run skips its image cleanup. The runner refuses jobs below
+      # 2 GiB free in its slot, so earlier job images go before each build.
+      - name: Remove images of earlier runs
+        run: |
+          docker image ls --filter 'reference=mesh:ci-*' --quiet | sort -u | xargs -r docker image rm --force
+          docker image prune --force
 
       - name: Build container image
         run: docker build --pull --build-arg VERSION="ci-$GITHUB_SHA" -t "mesh:ci-$GITHUB_RUN_ID" .
