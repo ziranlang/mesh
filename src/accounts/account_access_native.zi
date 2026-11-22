@@ -542,47 +542,55 @@
         now := calendar.UnixMilliseconds()
         audit: [31]u8
         count := AuditTime(now, audit[:])
-        if now < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
+        if now < 0 || count == 0 {
             return ErrorReply(access, connection, method, 500, "authentication failed")
         }
-        defer mutex.Unlock(*access.databaseLock)
+        isRead := method == "GET" || method == "HEAD"
+        body := input
+        decoded: Vec(u8)
+        if !isRead {
+            if overflow || input.count > settings.maximumBodyBytes {
+                return ErrorReply(access, connection, method, 400, "request body too large")
+            }
+            encoding: [limits.MaxHeaderBytes]u8
+            length := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
+            if length < 0 {
+                return ErrorReply(access, connection, method, 400, "unsupported content encoding")
+            }
+            header := TextView(encoding[:length])
+            if header != "" && !wire.MatchesToken(wire.TrimSpace(header), "identity") {
+                if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+                    return ErrorReply(access, connection, method, 503, "request decoder unavailable")
+                }
+                payload := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
+                if payload.error != "" {
+                    return ErrorReply(access, connection, method, 400, payload.error)
+                }
+                body = payload.bytes
+            }
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "authentication failed")
+        }
         user := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
         if user.status != 0 {
+            unused mutex.Unlock(*access.databaseLock)
             return ErrorReply(access, connection, method, user.status, user.message)
         }
         document: json.JsonDocument
         root := json.JsonNewObject(*document)
         account := TextView(user.userID[:])
-        if method == "GET" || method == "HEAD" {
+        if isRead {
             listed := devices.List(settings.database, account, *document, root)
+            unused mutex.Unlock(*access.databaseLock)
             if listed.status != 0 {
                 return ErrorReply(access, connection, method, listed.status, listed.message)
             }
             return Reply(access, connection, method, 200, *document, root)
         }
-        if overflow || input.count > settings.maximumBodyBytes {
-            return ErrorReply(access, connection, method, 400, "request body too large")
-        }
-        encoding: [limits.MaxHeaderBytes]u8
-        length := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
-        if length < 0 {
-            return ErrorReply(access, connection, method, 400, "unsupported content encoding")
-        }
-        header := TextView(encoding[:length])
         timestamp: time.TimestampValue = .{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}
-        body := input
-        decoded: Vec(u8)
-        if header != "" && !wire.MatchesToken(wire.TrimSpace(header), "identity") {
-            if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
-                return ErrorReply(access, connection, method, 503, "request decoder unavailable")
-            }
-            payload := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
-            if payload.error != "" {
-                return ErrorReply(access, connection, method, 400, payload.error)
-            }
-            body = payload.bytes
-        }
         changed := devices.Change(settings.database, settings.verify, account, body, method == "DELETE", timestamp, *document, root)
+        unused mutex.Unlock(*access.databaseLock)
         if changed.status != 0 {
             return ErrorReply(access, connection, method, changed.status, changed.message)
         }

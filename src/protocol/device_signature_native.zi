@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    pq :: #import "ml_dsa44_native";
     #scope_file
     crypto :: #system_library "crypto";
     PublicKey :: (context: *void, keyType: *u8, properties: *u8, bytes: *u8, count: usize) -> *void #foreign crypto "EVP_PKEY_new_raw_public_key_ex";
@@ -50,5 +51,14 @@
         if VerifyInit(context, null, null, null, key) != 1 { return false }
         messagePointer := ifx message.count > 0 then *message[0] else null
         return VerifyMessage(context, *signature[0], cast(usize)signature.count, messagePointer, cast(usize)message.count) == 1
+    }
+
+    // Verifies either classical Ed25519 (32B key / 64B sig) or post-quantum
+    // ML-DSA-44 (1312B key / 2420B sig) for forward-compatible PQ migration.
+    VerifyAny :: (publicKey: []u8, message: []u8, signature: []u8) -> bool {
+        if publicKey.count == 32 && signature.count == 64 {
+            return Verify(publicKey, message, signature)
+        }
+        return pq.Verify(publicKey, message, signature)
     }
 }
