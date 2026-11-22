@@ -37,6 +37,7 @@
     token_issuer :: #import "token_issuer_native";
     token_rewards :: #import "token_rewards_http_native";
     referrals :: #import "referral_http_native";
+    referral_settlement :: #import "referral_settlement_native";
     reward_campaign :: #import "token_reward_native";
     reward_cli :: #import "reward_cli_native";
     entitlement_rules :: #import "entitlement_rules_native";
@@ -134,6 +135,7 @@
         telegramStars: stars.State
         moneroPurchases: monero.State
         moneroReconciler: monero_worker.Worker
+        referralSettlement: referral_settlement.Worker
         playPurchases: play.PlayState
         playVerifier: bool
         giftsEnabled: bool
@@ -863,6 +865,11 @@
             return Fail("could not start Mesh Monero reconciliation\n")
         }
         defer monero_worker.Close(*state.moneroReconciler)
+        if !referral_settlement.Open(*state.referralSettlement, *state.accounts, *state.tokens.signer,
+            state.pairingConfiguration.baseURL) {
+            return Fail("could not start Mesh referral settlement\n")
+        }
+        defer referral_settlement.Close(*state.referralSettlement)
         if !monero.Open(*state.moneroPurchases, walletConfiguration, monero_worker.Cancellation(*state.moneroReconciler)) {
             return Fail("could not initialize Mesh Monero purchases\n")
         }

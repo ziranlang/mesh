@@ -1,0 +1,410 @@
+// Native referral settlement with the rules of the Go referral_settlement
+// worker: a durable receipt outbox, commissions of floor(net paid / 20) on
+// verified paid purchases, capped reversals and offsets of refund debt.
+// Settlement and its ledger effects commit together.
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    issuer :: #import "token_issuer_native";
+    mutex :: #import "std/mutex_linux";
+    referrals :: #import "referral_http_native";
+    signing :: #import "token_signing_native";
+    socket :: #import "std/socket_linux";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    stdio :: #import "std/stdio_linux";
+    thread :: #import "std/thread_linux";
+    wire :: #import "wire_text";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    // What a settlement pass needs; the worker runs passes on a thread.
+    Settlement :: struct {
+        database: *void
+        lock: *mutex.Mutex
+        signer: *issuer.Issuer
+        baseURL: string
+    }
+
+    Worker :: struct {
+        settlement: Settlement
+        thread: thread.Thread
+        stopFD: s32
+        opened: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (descriptors: *socket.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+
+    IntervalMilliseconds :: 10000;
+    Page :: 100;
+    ReceiptLength :: 32;
+    Paid :: "SELECT event_type,amount_delta,source_type,source_ref,account_id,app_id,ledger_seq FROM token_ledger WHERE receipt_id=?1";
+    Debts :: "SELECT purchase_receipt_id FROM referral_commissions WHERE issued_units-reversed_units>target_units ORDER BY updated_at,purchase_receipt_id LIMIT 100";
+    Pending :: "SELECT receipt_id FROM referral_outbox WHERE done=0 ORDER BY ledger_seq LIMIT 100";
+    // Bound by 1000 ledger rows per tick; retries keep the last committed cursor.
+    BackfillOutbox :: #string SQL
+INSERT OR IGNORE INTO referral_outbox(receipt_id,ledger_seq) SELECT receipt_id,ledger_seq FROM token_ledger
+WHERE ledger_seq>(SELECT backfill_seq FROM referral_state WHERE id=1)
+ AND ledger_seq<=(SELECT backfill_seq+1000 FROM referral_state WHERE id=1)
+ AND source_type IN ('monero','monero_account','google_play','monero_reorg')
+SQL;
+    AdvanceBackfill :: "UPDATE referral_state SET backfill_seq=MIN(backfill_seq+1000,COALESCE((SELECT MAX(ledger_seq) FROM token_ledger),0)) WHERE id=1";
+    LockState :: "UPDATE referral_state SET backfill_seq=backfill_seq WHERE id=1";
+    TrustedPayment :: "SELECT COUNT(*) FROM token_processed_payments WHERE provider=?1 AND provider_payment_id=?2 AND receipt_id=?3 AND account_id=?4 AND amount=?5 AND asset_id='waozi:token'";
+    PaidGoogleProof :: "SELECT COUNT(*) FROM google_play_purchase_proofs p JOIN google_play_purchase_lifecycle g ON g.purchase_token=p.purchase_token WHERE g.receipt_id=?1 AND p.payment_kind='paid'";
+    ProviderReversals :: "SELECT COALESCE(SUM(-amount_delta),0) FROM token_ledger WHERE account_id=?1 AND source_type=?2 AND source_ref=?3 AND event_type='debit'";
+    // 1: the purchase earns nothing; 2: uncertain wallet evidence grants nothing new.
+    DepositHold :: "SELECT CASE status WHEN 'compensation_hold' THEN 1 WHEN 'compensated' THEN 1 WHEN 'conflict_hold' THEN 2 ELSE 0 END FROM monero_deposits WHERE receipt_id=?1";
+    InvoiceHold :: "SELECT CASE state WHEN 'invalid' THEN 1 WHEN 'compensated' THEN 1 WHEN 'conflict' THEN 2 ELSE 0 END FROM referral_monero_invoices WHERE receipt_id=?1";
+    OutstandingDebts :: #string SQL
+SELECT p.ledger_seq,c.purchase_receipt_id,c.app_id,c.issued_units-c.reversed_units-c.target_units
+FROM referral_commissions c JOIN token_ledger p ON p.receipt_id=c.purchase_receipt_id
+WHERE c.referrer_id=?1 AND ((?2='google_play' AND p.source_type='google_play' AND p.app_id=?3)
+ OR (?2 IN ('monero','monero_account') AND p.source_type IN ('monero','monero_account')))
+ AND c.purchase_receipt_id<>?4 AND p.ledger_seq>?5 AND c.issued_units-c.reversed_units>c.target_units
+ORDER BY p.ledger_seq LIMIT 100
+SQL;
+
+    Receipt :: struct {
+        id: [ReceiptLength]u8
+    }
+
+    Debt :: struct {
+        sequence: s64
+        purchase: [ReceiptLength]u8
+        app: [64]u8
+        appLength: s64
+        units: s64
+    }
+
+    // Copies a receipt ID, which is always ReceiptLength characters.
+    TakeID :: (id: string, target: []u8) -> bool {
+        if id.count != ReceiptLength || target.count < ReceiptLength { return false }
+        for byte, index: id { target[index] = byte }
+        return true
+    }
+
+    Count :: (database: *void, query: string, arguments: []sql.Argument) -> sql.IntegerResult {
+        return sql.ReadInteger(database, query, arguments)
+    }
+
+    // Collects the receipt IDs a query lists, so later writes cannot disturb it.
+    ReadIDs :: (database: *void, query: string, output: *Vec(Receipt)) -> bool {
+        none: [0]sql.Argument
+        rows := sql.Prepare(database, query, none[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        while true {
+            step := sqlite.SqliteStep(rows.value)
+            if step == sqlite.SQLITE_DONE { return true }
+            if step != sqlite.SQLITE_ROW { return false }
+            item: Receipt
+            if !TakeID(sql.ColumnText(rows.value, 0), item.id[:]) || !VecPush(<<output, item) { return false }
+        }
+        return false
+    }
+
+    ReadDebts :: (database: *void, arguments: []sql.Argument, output: *Vec(Debt)) -> bool {
+        rows := sql.Prepare(database, OutstandingDebts, arguments)
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        while true {
+            step := sqlite.SqliteStep(rows.value)
+            if step == sqlite.SQLITE_DONE { return true }
+            if step != sqlite.SQLITE_ROW { return false }
+            item: Debt = .{sequence = sqlite.SqliteColumnInt64(rows.value, 0), units = sqlite.SqliteColumnInt64(rows.value, 3)}
+            app := sql.ColumnText(rows.value, 2)
+            if app.count > item.app.count || !TakeID(sql.ColumnText(rows.value, 1), item.purchase[:]) { return false }
+            for byte, index: app { item.app[index] = byte }
+            item.appLength = app.count
+            if !VecPush(<<output, item) { return false }
+        }
+        return false
+    }
+
+    // Recovers the referrer's outstanding refund debt from a new commission of
+    // `budget` units before any of it becomes spendable.
+    OffsetNewEarnings :: (database: *void, signer: *issuer.Issuer, referrer: string, credit: string, budget: s64,
+        source: string, app: string, purchase: string, at: string) -> bool {
+        remaining := budget
+        cursor: s64 = 0
+        debts: Vec(Debt)
+        defer VecFree(debts)
+        failed := false
+        while remaining > 0 && !failed {
+            VecClear(debts)
+            arguments: [5]sql.Argument = .[sql.TextArg(referrer), sql.TextArg(source), sql.TextArg(app), sql.TextArg(purchase), sql.IntArg(cursor)]
+            if !ReadDebts(database, arguments[:], *debts) {
+                failed = true
+                break
+            }
+            if debts.count == 0 { break }
+            for debt: VecSlice(debts, 0, debts.count) {
+                cursor = debt.sequence
+                units := ifx debt.units < remaining then debt.units else remaining
+                if units <= 0 { break }
+                recovered := RecoverDebt(database, signer, referrer, credit, debt, units, at)
+                if recovered < 0 {
+                    failed = true
+                    break
+                }
+                remaining -= recovered
+            }
+        }
+        return !failed
+    }
+
+    // Reverses up to `units` of one older purchase's debt against a new credit;
+    // the number reversed, or -1 on failure.
+    RecoverDebt :: (database: *void, signer: *issuer.Issuer, referrer: string, credit: string, debt: Debt,
+        units: s64, at: string) -> s64 {
+        old := TextView(debt.purchase[:])
+        authorized := writes.AuthorizeReferralOffset(database, referrer, old, credit, units)
+        if authorized.status != sqlite.SQLITE_OK || !authorized.found { return -1 }
+        if authorized.value <= 0 { return 0 }
+        event: signing.Event = .{account = referrer, app = TextView(debt.app[:debt.appLength]), kind = "debit",
+            amount = -authorized.value, source = "referral_reversal", reference = old}
+        reversal: signing.Receipt
+        values: [2]sql.Argument = .[sql.TextArg(old), sql.IntArg(authorized.value)]
+        if !writes.SettlementInsert(database, signer, event, at, *reversal) ||
+            sql.Execute(database, "UPDATE referral_commissions SET reversed_units=reversed_units+?2,updated_at=CURRENT_TIMESTAMP WHERE purchase_receipt_id=?1", values[:]) != sqlite.SQLITE_OK {
+            return -1
+        }
+        return authorized.value
+    }
+
+    // Brings one purchase's commission to its target. Purchases that do not
+    // qualify settle as nothing; only failures return false.
+    SettlePurchase :: (database: *void, signer: *issuer.Issuer, purchase: string, at: string) -> bool {
+        key: [1]sql.Argument = .[sql.TextArg(purchase)]
+        paid := sql.Prepare(database, Paid, key[:])
+        if paid.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(paid.value)
+        step := sqlite.SqliteStep(paid.value)
+        if step == sqlite.SQLITE_DONE { return true }
+        if step != sqlite.SQLITE_ROW { return false }
+        amount := sqlite.SqliteColumnInt64(paid.value, 1)
+        source := sql.ColumnText(paid.value, 2)
+        reference := sql.ColumnText(paid.value, 3)
+        account := sql.ColumnText(paid.value, 4)
+        app := sql.ColumnText(paid.value, 5)
+        sequence := sqlite.SqliteColumnInt64(paid.value, 6)
+        if sql.ColumnText(paid.value, 0) != "credit" || amount <= 0 { return true }
+        if source != "monero" && source != "monero_account" && source != "google_play" { return true }
+        // Only provider-idempotent paid credits qualify. A source label by itself does not.
+        proof: [5]sql.Argument = .[sql.TextArg(source), sql.TextArg(reference), sql.TextArg(purchase), sql.TextArg(account), sql.IntArg(amount)]
+        trusted := Count(database, TrustedPayment, proof[:])
+        if !trusted.found { return false }
+        if trusted.value != 1 { return true }
+        if source == "google_play" {
+            none: [0]sql.Argument
+            tables := Count(database, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='google_play_purchase_proofs'", none[:])
+            if !tables.found { return false }
+            if tables.value == 0 { return true }
+            eligible := Count(database, PaidGoogleProof, key[:])
+            if !eligible.found { return false }
+            if eligible.value != 1 { return true }
+        }
+        owner: [1]sql.Argument = .[sql.TextArg(account)]
+        claim := sql.Prepare(database, "SELECT referrer_id,welcome_seq FROM referral_claims WHERE account_id=?1", owner[:])
+        if claim.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(claim.value)
+        step = sqlite.SqliteStep(claim.value)
+        if step == sqlite.SQLITE_DONE { return true }
+        if step != sqlite.SQLITE_ROW { return false }
+        referrer := sql.ColumnText(claim.value, 0)
+        if sequence <= sqlite.SqliteColumnInt64(claim.value, 1) { return true }
+        // Net value is computed once per original receipt, never from clients. A
+        // provider's partial signed reversal reduces the original net before flooring.
+        history: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(source), sql.TextArg(reference)]
+        reversals := Count(database, ProviderReversals, history[:])
+        if !reversals.found { return false }
+        net := ifx reversals.value >= amount then 0 else amount - reversals.value
+        if source == "monero_account" || source == "monero" {
+            hold := Count(database, ifx source == "monero" then InvoiceHold else DepositHold, key[:])
+            if hold.status != sqlite.SQLITE_OK { return false }
+            if hold.value == 2 { return true }
+            if hold.value == 1 { net = 0 }
+        }
+        target := net / 20
+        created: [4]sql.Argument = .[sql.TextArg(purchase), sql.TextArg(referrer), sql.TextArg(app), sql.IntArg(amount)]
+        if sql.Execute(database, "INSERT OR IGNORE INTO referral_commissions(purchase_receipt_id,referrer_id,app_id,paid_units) VALUES(?1,?2,?3,?4)", created[:]) != sqlite.SQLITE_OK {
+            return false
+        }
+        issued := Count(database, "SELECT issued_units FROM referral_commissions WHERE purchase_receipt_id=?1", key[:])
+        reversed := Count(database, "SELECT reversed_units FROM referral_commissions WHERE purchase_receipt_id=?1", key[:])
+        if !issued.found || !reversed.found { return false }
+        issuedUnits := issued.value
+        reversedUnits := reversed.value
+        difference := target - (issuedUnits - reversedUnits)
+        if difference > 0 {
+            event: signing.Event = .{account = referrer, app = app, kind = "credit", amount = difference,
+                source = "referral_commission", reference = purchase}
+            credit: signing.Receipt
+            if !writes.SettlementInsert(database, signer, event, at, *credit) ||
+                !OffsetNewEarnings(database, signer, referrer, TextView(credit.id[:ReceiptLength]), difference, source, app, purchase, at) {
+                return false
+            }
+            issuedUnits += difference
+        } else if difference < 0 {
+            available := writes.ReferralReversible(database, referrer, app, purchase)
+            if !available.found { return false }
+            units := ifx -difference < available.value then -difference else available.value
+            if units > 0 {
+                event: signing.Event = .{account = referrer, app = app, kind = "debit", amount = -units,
+                    source = "referral_reversal", reference = purchase}
+                reversal: signing.Receipt
+                if !writes.SettlementInsert(database, signer, event, at, *reversal) { return false }
+                reversedUnits += units
+            }
+        }
+        state: [4]sql.Argument = .[sql.TextArg(purchase), sql.IntArg(target), sql.IntArg(issuedUnits), sql.IntArg(reversedUnits)]
+        return sql.Execute(database, "UPDATE referral_commissions SET target_units=?2,issued_units=?3,reversed_units=?4,updated_at=CURRENT_TIMESTAMP WHERE purchase_receipt_id=?1", state[:]) == sqlite.SQLITE_OK
+    }
+
+    // The purchase an outbox receipt belongs to. A reorg names the deposit it moved.
+    OutboxPurchase :: (database: *void, id: string, purchase: []u8) -> s64 {
+        key: [1]sql.Argument = .[sql.TextArg(id)]
+        event := sql.Prepare(database, "SELECT source_type,source_ref FROM token_ledger WHERE receipt_id=?1", key[:])
+        if event.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(event.value)
+        if sqlite.SqliteStep(event.value) != sqlite.SQLITE_ROW { return -1 }
+        source := sql.ColumnText(event.value, 0)
+        reference := sql.ColumnText(event.value, 1)
+        if source == "monero_reorg" {
+            source = "monero_account"
+            reference = wire.TrimPrefix(reference, "monero_reorg:")
+        }
+        lookup: [2]sql.Argument = .[sql.TextArg(source), sql.TextArg(reference)]
+        payment := sql.Prepare(database, "SELECT receipt_id FROM token_processed_payments WHERE provider=?1 AND provider_payment_id=?2", lookup[:])
+        if payment.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(payment.value)
+        step := sqlite.SqliteStep(payment.value)
+        if step == sqlite.SQLITE_DONE { return 0 }
+        if step != sqlite.SQLITE_ROW || !TakeID(sql.ColumnText(payment.value, 0), purchase) { return -1 }
+        return ReceiptLength
+    }
+
+    // One transaction per receipt: settle it, mark the outbox entry, then
+    // recover outstanding refund debt before a new reward becomes spendable.
+    Process :: (database: *void, signer: *issuer.Issuer, id: string, outbox: bool, at: string) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        none: [0]sql.Argument
+        if sql.Execute(database, LockState, none[:]) != sqlite.SQLITE_OK { return false }
+        purchase: [ReceiptLength]u8
+        length: s64 = ReceiptLength
+        for byte, index: id {
+            if index >= ReceiptLength { return false }
+            purchase[index] = byte
+        }
+        if outbox {
+            length = OutboxPurchase(database, id, purchase[:])
+            if length < 0 { return false }
+        }
+        if length > 0 && !SettlePurchase(database, signer, TextView(purchase[:length]), at) { return false }
+        if outbox {
+            key: [1]sql.Argument = .[sql.TextArg(id)]
+            if sql.Execute(database, "UPDATE referral_outbox SET done=1 WHERE receipt_id=?1", key[:]) != sqlite.SQLITE_OK { return false }
+        }
+        debts: Vec(Receipt)
+        defer VecFree(debts)
+        settled := ReadIDs(database, Debts, *debts)
+        for debt: VecSlice(debts, 0, debts.count) {
+            if !settled { break }
+            settled = SettlePurchase(database, signer, TextView(debt.id[:]), at)
+        }
+        return settled && sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Backfill :: (database: *void) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        none: [0]sql.Argument
+        return sql.Execute(database, LockState, none[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, BackfillOutbox, none[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, AdvanceBackfill, none[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    // One locked step of a pass; the lock is released between receipts.
+    Locked :: (settlement: *Settlement, id: string, outbox: bool, backfill: bool) -> bool {
+        if !mutex.Lock(settlement.lock) { return false }
+        defer mutex.Unlock(settlement.lock)
+        if backfill { return Backfill(settlement.database) }
+        timestamp: [31]u8
+        at := signing.WireTime(signing.Now(), false, timestamp[:])
+        return at != "" && Process(settlement.database, settlement.signer, id, outbox, at)
+    }
+
+    ListLocked :: (settlement: *Settlement, query: string, output: *Vec(Receipt)) -> bool {
+        if !mutex.Lock(settlement.lock) { return false }
+        defer mutex.Unlock(settlement.lock)
+        return ReadIDs(settlement.database, query, output)
+    }
+
+    Wait :: (worker: *Worker, timeout: s32) -> bool {
+        if !worker.opened || worker.stopFD < 0 { return false }
+        descriptor: socket.LinuxPollFd = .{fd = worker.stopFD, events = 1}
+        return Poll(*descriptor, 1, timeout) > 0
+    }
+
+    #scope_export
+    // Settles the outbox and outstanding debts once. Only the canonical issuer settles.
+    Reconcile :: (settlement: *Settlement) -> bool {
+        if wire.TrimSpace(settlement.baseURL) != referrals.Authority || issuer.Status(settlement.signer) != "ok" { return true }
+        if !Locked(settlement, "", false, true) { return false }
+        return Drain(settlement, Pending, true) && Drain(settlement, Debts, false)
+    }
+
+    #scope_file
+    // Processes each listed receipt in its own locked transaction.
+    Drain :: (settlement: *Settlement, query: string, outbox: bool) -> bool {
+        listed: Vec(Receipt)
+        defer VecFree(listed)
+        ok := ListLocked(settlement, query, *listed)
+        for entry: VecSlice(listed, 0, listed.count) {
+            if !ok { break }
+            ok = Locked(settlement, TextView(entry.id[:]), outbox, false)
+        }
+        return ok
+    }
+
+    #scope_file
+    Run :: (context: *void) {
+        worker := cast(*Worker)context
+        while true {
+            if !Reconcile(*worker.settlement) {
+                unused stdio.PrintError("referral settlement failed\n")
+            }
+            if Wait(worker, IntervalMilliseconds) { return }
+        }
+    }
+
+    #scope_export
+    Open :: (worker: *Worker, access: *accounts.AccountAccess, signer: *issuer.Issuer, baseURL: string) -> bool {
+        worker.stopFD = EventFD(0, 0x80800) // EFD_CLOEXEC | EFD_NONBLOCK
+        if worker.stopFD < 0 { return false }
+        worker.settlement = .{database = access.configuration.database, lock = *access.databaseLock,
+            signer = signer, baseURL = baseURL}
+        worker.opened = true
+        if thread.ThreadStart(*worker.thread, Run, cast(*void)worker) { return true }
+        unused CloseFD(worker.stopFD)
+        worker.stopFD = -1
+        worker.opened = false
+        return false
+    }
+
+    Close :: (worker: *Worker) {
+        if !worker.opened { return }
+        unused Signal(worker.stopFD, 1)
+        if thread.ThreadRunning(*worker.thread) { thread.ThreadWait(*worker.thread) }
+        unused CloseFD(worker.stopFD)
+        worker.stopFD = -1
+        worker.opened = false
+    }
+}

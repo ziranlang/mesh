@@ -61,9 +61,11 @@ SQL;
         ok: bool
     }
 
-    FirstLot :: (database: *void, account: string, app: string) -> Lot {
-        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(ledger.AssetID), sql.TextArg(app)]
-        row := sql.Prepare(database, "SELECT receipt_id,remaining FROM token_allocations WHERE account_id=?1 AND asset_id=?2 AND app_id=?3 AND remaining>0 ORDER BY ledger_seq LIMIT 1", arguments[:])
+    // An empty source or source type matches every lot of the pool.
+    FirstLot :: (database: *void, account: string, app: string, source: string = "", sourceType: string = "") -> Lot {
+        arguments: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(ledger.AssetID), sql.TextArg(app),
+            sql.TextArg(source), sql.TextArg(sourceType)]
+        row := sql.Prepare(database, "SELECT receipt_id,remaining FROM token_allocations WHERE account_id=?1 AND asset_id=?2 AND app_id=?3 AND remaining>0 AND (?4='' OR source_receipt_id=?4) AND (?5='' OR source_type=?5) ORDER BY ledger_seq LIMIT 1", arguments[:])
         if row.status != sqlite.SQLITE_OK {
             return .{}
         }
@@ -82,15 +84,18 @@ SQL;
         return lot
     }
 
-    Consume :: (database: *void, account: string, app: string, debit: string, units: s64) -> bool {
+    // Historical shared credit has no lot, so a shortfall in the unnamed shared
+    // pool is recorded with an empty credit ID; a named pool must cover it.
+    Consume :: (database: *void, account: string, app: string, debit: string, units: s64,
+        source: string = "", sourceType: string = "") -> bool {
         remaining := units
         while remaining > 0 {
-            lot := FirstLot(database, account, app)
+            lot := FirstLot(database, account, app, source, sourceType)
             if !lot.ok {
                 return false
             }
             if !lot.found {
-                return app == "" && AuditDebit(database, debit, "", remaining)
+                return app == "" && source == "" && AuditDebit(database, debit, "", remaining)
             }
             taken := ifx lot.remaining < remaining then lot.remaining else remaining
             if taken <= 0 {
@@ -127,20 +132,190 @@ SQL;
             return false
         }
         if event.amount > 0 {
-            title := ifx event.source == payment_allocation.NativeGoogleLedgerProvider then event.app else ""
-            arguments: [8]sql.Argument = .[sql.TextArg(id), sql.TextArg(event.account), sql.TextArg(ledger.AssetID),
-                sql.TextArg(title), sql.TextArg(event.source), sql.TextArg(event.reference), sql.IntArg(event.amount), sql.IntArg(receipt.sequence)]
-            return sql.Execute(database, "INSERT INTO token_allocations(receipt_id,account_id,asset_id,app_id,source_receipt_id,source_type,provider_payment_id,issued,remaining,ledger_seq) VALUES(?1,?2,?3,?4,?1,?5,?6,?7,?7,?8)",
+            title: [64]u8
+            titleLength: s64 = 0
+            if event.source == payment_allocation.NativeGoogleLedgerProvider {
+                titleLength = CopyText(event.app, title[:])
+            }
+            // A commission's lot names the purchase it rewards, never itself.
+            origin := id
+            if event.source == ReferralCommission {
+                titleLength = CommissionTitle(database, event, title[:])
+                if titleLength < 0 { return false }
+                origin = event.reference
+            }
+            arguments: [9]sql.Argument = .[sql.TextArg(id), sql.TextArg(event.account), sql.TextArg(ledger.AssetID),
+                sql.TextArg(TextView(title[:titleLength])), sql.TextArg(event.source), sql.TextArg(event.reference), sql.IntArg(event.amount),
+                sql.IntArg(receipt.sequence), sql.TextArg(origin)]
+            return sql.Execute(database, "INSERT INTO token_allocations(receipt_id,account_id,asset_id,app_id,source_receipt_id,source_type,provider_payment_id,issued,remaining,ledger_seq) VALUES(?1,?2,?3,?4,?9,?5,?6,?7,?7,?8)",
                 arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
         }
         if payment_allocation.OriginatingLot(event.source) {
             return payment_allocation.Refund(database, event, originalPurchase, id, cutoff.value)
+        }
+        if event.source == ReferralReversal {
+            return ConsumeReversal(database, event, id, pools)
         }
         amount := -event.amount
         shared := ifx pools.shared > 0 then pools.shared else 0
         matching := pools.spendable - shared
         scoped := ifx matching < amount then matching else amount
         return Consume(database, event.account, event.app, id, scoped) && Consume(database, event.account, "", id, amount - scoped)
+    }
+
+    ReferralCommission :: "referral_commission";
+    ReferralReversal :: "referral_reversal";
+    PaidPurchase :: #string SQL
+SELECT l.source_type,l.source_ref,l.app_id,l.account_id FROM token_ledger l
+JOIN token_processed_payments p ON p.receipt_id=l.receipt_id AND p.provider=l.source_type
+ AND p.provider_payment_id=l.source_ref AND p.account_id=l.account_id AND p.asset_id=l.asset_id AND p.amount=l.amount_delta
+WHERE l.receipt_id=?1 AND l.event_type='credit' AND l.amount_delta>0 AND l.source_type IN ('google_play','monero','monero_account')
+SQL;
+    ReferralOffsetSQL :: #string SQL
+WITH old_rewards AS (
+    SELECT MAX(CASE WHEN source_type='referral_commission' THEN ledger_seq END) AS last_credit,
+           COALESCE(SUM(amount_delta),0) AS outstanding
+    FROM token_ledger WHERE account_id=?1 AND source_ref=?2
+        AND source_type IN ('referral_commission','referral_reversal')
+), own_lots AS (
+    SELECT COALESCE(SUM(MAX(remaining,0)),0) AS units
+    FROM token_allocations WHERE account_id=?1 AND source_receipt_id=?2
+        AND source_type='referral_commission'
+), old_reserved AS (
+    SELECT COALESCE(SUM(remaining),0) AS units FROM token_referral_offsets
+    WHERE account_id=?1 AND source_receipt_id=?2
+), new_reserved AS (
+    SELECT COALESCE(SUM(remaining),0) AS units FROM token_referral_offsets
+    WHERE credit_receipt_id=?3
+)
+SELECT MAX(0,MIN(?4,a.remaining-new_reserved.units,
+                 old_rewards.outstanding-own_lots.units-old_reserved.units))
+FROM token_allocations a
+JOIN token_ledger new_paid ON new_paid.receipt_id=a.source_receipt_id
+JOIN token_ledger old_paid ON old_paid.receipt_id=?2
+JOIN old_rewards JOIN own_lots JOIN old_reserved JOIN new_reserved
+WHERE a.receipt_id=?3 AND a.account_id=?1 AND a.source_type='referral_commission'
+    AND a.source_receipt_id<>?2 AND a.ledger_seq>old_rewards.last_credit
+    AND ((new_paid.source_type='google_play' AND old_paid.source_type='google_play' AND new_paid.app_id=old_paid.app_id)
+         OR (new_paid.source_type IN ('monero','monero_account') AND old_paid.source_type IN ('monero','monero_account')))
+SQL;
+    ReferralOffsetsSQL :: #string SQL
+SELECT MIN(?3+COALESCE(SUM(MIN(o.remaining,MAX(a.remaining,0))),0),
+ MAX(COALESCE((SELECT SUM(amount_delta) FROM token_ledger WHERE account_id=?1 AND source_ref=?2
+  AND source_type IN ('referral_commission','referral_reversal') AND receipt_id<>?4),0),0))
+FROM token_referral_offsets o JOIN token_allocations a ON a.receipt_id=o.credit_receipt_id
+WHERE o.account_id=?1 AND o.source_receipt_id=?2
+SQL;
+
+    CopyText :: (text: string, output: []u8) -> s64 {
+        if text.count > output.count { return -1 }
+        for byte, index: text { output[index] = byte }
+        return text.count
+    }
+
+    // The title a commission lot keeps: the purchase's verified Google title,
+    // or none for Monero. -1 when the purchase is not a verified paid credit.
+    CommissionTitle :: (database: *void, event: signing.Event, title: []u8) -> s64 {
+        arguments: [1]sql.Argument = .[sql.TextArg(event.reference)]
+        row := sql.Prepare(database, PaidPurchase, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW || sql.ColumnText(row.value, 2) != event.app { return -1 }
+        if sql.ColumnText(row.value, 0) != payment_allocation.NativeGoogleLedgerProvider { return 0 }
+        binding: [3]sql.Argument = .[sql.TextArg(sql.ColumnText(row.value, 1)), sql.TextArg(sql.ColumnText(row.value, 3)),
+            sql.TextArg(event.app)]
+        bound := sql.Prepare(database, "SELECT app_id FROM token_google_origins WHERE payment_id=?1 AND account_id=?2 AND app_id=?3", binding[:])
+        if bound.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(bound.value)
+        if sqlite.SqliteStep(bound.value) != sqlite.SQLITE_ROW { return -1 }
+        return CopyText(sql.ColumnText(bound.value, 0), title)
+    }
+
+    // A reversal may take the referrer's own commission lots for that purchase.
+    // Without lots, old shared commissions stay bounded by what is outstanding.
+    ReferralOwn :: (database: *void, account: string, app: string, purchase: string, excluded: string,
+        shared: ledger.Pools) -> sql.IntegerResult {
+        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(purchase), sql.TextArg(excluded)]
+        purchaseKey: [1]sql.Argument = .[arguments[1]]
+        title := sql.Prepare(database, "SELECT app_id FROM token_ledger WHERE receipt_id=?1 AND asset_id='waozi:token' AND event_type='credit' AND source_type IN ('google_play','monero','monero_account')", purchaseKey[:])
+        if title.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(title.value)
+        if sqlite.SqliteStep(title.value) != sqlite.SQLITE_ROW || sql.ColumnText(title.value, 0) != app { return .{} }
+        lots := sql.ReadInteger(database, "SELECT COUNT(*) FROM token_allocations WHERE account_id=?1 AND source_receipt_id=?2 AND source_type='referral_commission'", arguments[:2])
+        if !lots.found { return .{} }
+        if lots.value > 0 {
+            return sql.ReadInteger(database, "SELECT COALESCE(SUM(MAX(remaining,0)),0) FROM token_allocations WHERE account_id=?1 AND source_receipt_id=?2 AND source_type='referral_commission'", arguments[:2])
+        }
+        outstanding := sql.ReadInteger(database, "SELECT COALESCE(SUM(amount_delta),0) FROM token_ledger WHERE account_id=?1 AND source_ref=?2 AND source_type IN ('referral_commission','referral_reversal') AND receipt_id<>?3", arguments[:])
+        if !outstanding.found { return .{} }
+        bound := ifx shared.shared > 0 then shared.shared else 0
+        owed := ifx outstanding.value > 0 then outstanding.value else 0
+        return .{status = sqlite.SQLITE_OK, found = true, value = ifx bound < owed then bound else owed}
+    }
+
+    // Own eligibility plus authorized offsets, never more than is outstanding.
+    ReferralAvailable :: (database: *void, account: string, app: string, purchase: string, excluded: string,
+        shared: ledger.Pools) -> sql.IntegerResult {
+        own := ReferralOwn(database, account, app, purchase, excluded, shared)
+        if !own.found { return own }
+        arguments: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(purchase), sql.IntArg(own.value), sql.TextArg(excluded)]
+        return sql.ReadInteger(database, ReferralOffsetsSQL, arguments[:])
+    }
+
+    // The earliest authorized offset for a purchase with units left; 0 when none.
+    NextOffset :: (database: *void, account: string, purchase: string, credit: []u8) -> s64 {
+        arguments: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(purchase)]
+        row := sql.Prepare(database, "SELECT o.credit_receipt_id,MIN(o.remaining,a.remaining) FROM token_referral_offsets o JOIN token_allocations a ON a.receipt_id=o.credit_receipt_id WHERE o.account_id=?1 AND o.source_receipt_id=?2 AND o.remaining>0 AND a.remaining>0 ORDER BY a.ledger_seq LIMIT 1", arguments[:])
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE { return 0 }
+        if step != sqlite.SQLITE_ROW || !TakeID(sql.ColumnText(row.value, 0), credit) { return -1 }
+        return sqlite.SqliteColumnInt64(row.value, 1)
+    }
+
+    ConsumeOffsets :: (database: *void, account: string, purchase: string, debit: string, units: s64) -> bool {
+        remaining := units
+        while remaining > 0 {
+            credit: [32]u8
+            available := NextOffset(database, account, purchase, credit[:])
+            if available <= 0 { return false }
+            taken := ifx available < remaining then available else remaining
+            id := TextView(credit[:])
+            values: [4]sql.Argument = .[sql.TextArg(id), sql.IntArg(taken), sql.TextArg(purchase), sql.TextArg(account)]
+            if sql.Execute(database, "UPDATE token_allocations SET remaining=remaining-?2 WHERE receipt_id=?1 AND remaining>=?2", values[:2]) != sqlite.SQLITE_OK ||
+                sqlite.SqliteChanges(database) != 1 ||
+                sql.Execute(database, "UPDATE token_referral_offsets SET remaining=remaining-?2 WHERE credit_receipt_id=?1 AND source_receipt_id=?3 AND account_id=?4 AND remaining>=?2", values[:]) != sqlite.SQLITE_OK ||
+                sqlite.SqliteChanges(database) != 1 || !AuditDebit(database, debit, id, taken) {
+                return false
+            }
+            remaining -= taken
+        }
+        return true
+    }
+
+    // Own commission lots first, then offsets authorized against new earnings.
+    ConsumeReversal :: (database: *void, event: signing.Event, debit: string, shared: ledger.Pools) -> bool {
+        amount := -event.amount
+        eligible := ReferralAvailable(database, event.account, event.app, event.reference, debit, shared)
+        own := ReferralOwn(database, event.account, event.app, event.reference, debit, shared)
+        if !eligible.found || !own.found || amount <= 0 || amount > eligible.value { return false }
+        taken := ifx own.value < amount then own.value else amount
+        arguments: [2]sql.Argument = .[sql.TextArg(event.account), sql.TextArg(event.reference)]
+        row := sql.Prepare(database, "SELECT app_id FROM token_allocations WHERE account_id=?1 AND source_receipt_id=?2 AND source_type='referral_commission' LIMIT 1", arguments[:])
+        if row.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_ROW {
+            title: [64]u8
+            length := CopyText(sql.ColumnText(row.value, 0), title[:])
+            if length < 0 || !Consume(database, event.account, TextView(title[:length]), debit, taken, event.reference, ReferralCommission) {
+                return false
+            }
+        } else if step != sqlite.SQLITE_DONE || !Consume(database, event.account, "", debit, taken) {
+            return false
+        }
+        return ConsumeOffsets(database, event.account, event.reference, debit, amount - taken)
     }
 
     Head :: struct {
@@ -315,6 +490,38 @@ SQL;
     }
 
     #scope_export
+    // How much of a purchase's commission the referrer could still give back.
+    ReferralReversible :: (database: *void, account: string, app: string, purchase: string) -> sql.IntegerResult {
+        shared := ledger.ReadPools(database, account, "")
+        if !shared.ok { return .{} }
+        return ReferralAvailable(database, account, app, purchase, "", shared)
+    }
+
+    // Reserves part of a new commission to repay an older purchase's refund
+    // debt. Authorization names the exact new receipt; nothing else substitutes.
+    AuthorizeReferralOffset :: (database: *void, account: string, purchase: string, credit: string, units: s64) -> sql.IntegerResult {
+        if units <= 0 { return .{status = sqlite.SQLITE_OK, found = true} }
+        arguments: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(purchase), sql.TextArg(credit), sql.IntArg(units)]
+        existing := sql.ReadInteger(database, "SELECT MIN(o.remaining,MAX(a.remaining,0),?4) FROM token_referral_offsets o JOIN token_allocations a ON a.receipt_id=o.credit_receipt_id WHERE o.account_id=?1 AND o.source_receipt_id=?2 AND o.credit_receipt_id=?3", arguments[:])
+        if existing.status != sqlite.SQLITE_OK || existing.found { return existing }
+        allowed := sql.ReadInteger(database, ReferralOffsetSQL, arguments[:])
+        if allowed.status != sqlite.SQLITE_OK { return allowed }
+        if !allowed.found || allowed.value == 0 { return .{status = sqlite.SQLITE_OK, found = true} }
+        values: [4]sql.Argument = .[arguments[0], arguments[1], arguments[2], sql.IntArg(allowed.value)]
+        if sql.Execute(database, "INSERT INTO token_referral_offsets(account_id,source_receipt_id,credit_receipt_id,units,remaining) VALUES(?1,?2,?3,?4,?4)", values[:]) != sqlite.SQLITE_OK {
+            return .{}
+        }
+        return allowed
+    }
+
+    // Issues a settlement receipt inside the caller's transaction, with no
+    // provider or nonce record, as the Go ledger.Insert does.
+    SettlementInsert :: (database: *void, signer: *issuer.Issuer, event: signing.Event, at: string, receipt: *signing.Receipt) -> bool {
+        if sqlite.SqliteGetAutocommit(database) || signing.Validate(event) != "" { return false }
+        pools := ledger.ReadPools(database, event.account, "")
+        return pools.ok && Insert(database, signer, event, at, pools, receipt)
+    }
+
     Rollback :: (database: *void) {
         if !sqlite.SqliteGetAutocommit(database) {
             unused sqlite.SqliteExecText(database, "ROLLBACK")

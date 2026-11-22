@@ -14,11 +14,12 @@ suite under `tests/_go` is Go.
    test. Done: `/readyz` direct purchases, chat-usage retention, the Telegram
    Stars and Google Play suites, the shared capability list, `DAOCHI_*`
    setting aliases and the four referral routes. Remaining:
-   - Referral settlement. Port the worker in `referral_settlement.zi` (10 s
-     outbox, `floor(net/20)` commissions, capped reversals, debt offset
-     through allocation lots, Monero holds, Google paid-proof and origin
-     backfill). Native creates the tables and triggers and requeues the
-     outbox, so commissions wait in `referral_outbox` until it runs.
+   - Referral settlement. The native worker settles the outbox every 10 s
+     with Go's commissions, holds, capped reversals and debt offsets, and
+     native allocation has Go's referral lots, reversal eligibility and
+     offsets. Remaining: a native test of the debt-offset path, the
+     historical Google origin backfill (`BackfillGoogleOrigins`) and the
+     Monero monitor parity noted in `referral_monero.zi:108-110`.
    - `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
 2. The generated C in the native build folder includes only libc and compiler
    headers. `ziran_exe_main.c` is the executable entry. CI builds and tests the

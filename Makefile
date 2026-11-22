@@ -25,7 +25,7 @@ CGO_ENV := CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(abspath $(LIBOQS_PREFIX))/include" \
 	CGO_LDFLAGS="-L$(abspath $(LIBOQS_PREFIX))/lib -loqs"
 
-.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server test-ziran-native-google-play test-ziran-native-embedded compression-bench
+.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server test-ziran-native-google-play test-ziran-native-ledger sqlite-native microhttpd-native test-ziran-native-embedded compression-bench
 
 all: build
 
@@ -165,6 +165,22 @@ test-ziran-native-server: test-ziran-native-http
 		python3 -B tests/native/check_account_2fa.py "$(NATIVE_SERVER_BUILD_DIR)/server_native" \
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
 	$(MAKE) -f Makefile test-ziran-native-google-play
+	$(MAKE) -f Makefile test-ziran-native-ledger
+
+# Signed ledger allocation and referral settlement against in-memory SQLite.
+NATIVE_LEDGER_TESTS := token_payment_ledger referral_settlement
+test-ziran-native-ledger: liboqs
+	set -e; \
+	for entry in $(NATIVE_LEDGER_TESTS); do \
+		mkdir -p "$(BUILD_DIR)/native-tests/$$entry"; \
+		XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
+		LDFLAGS="$(LDFLAGS) -L$(abspath $(LIBOQS_PREFIX))/lib -L$(SQLITE_NATIVE_DIR) $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR))" \
+		LDLIBS="$(NATIVE_SERVER_LIBS)" \
+		$(ZIRAN) build $(ZIRAN_PROJECT) --target=c --exe --entry "$$entry:Main" --root tests/native \
+			-o "$(BUILD_DIR)/native-tests/$$entry" "tests/native/$$entry.zi"; \
+		LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+			"$(BUILD_DIR)/native-tests/$$entry/$$entry"; \
+	done
 
 # Google Play verification, OAuth and refunds against a loopback Play API.
 test-ziran-native-google-play: liboqs

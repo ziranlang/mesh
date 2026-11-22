@@ -1,0 +1,128 @@
+issuer :: #import "token_issuer_native";
+ledger :: #import "token_ledger_native";
+mutex :: #import "std/mutex_linux";
+referrals :: #import "referral_http_native";
+schema :: #import "sqlite_schema";
+settlement :: #import "referral_settlement_native";
+signing :: #import "token_signing_native";
+sql :: #import "sqlite_statement_native";
+sqlite :: #import "sqlite/SQLite";
+startup :: #import "store_startup_native";
+stdio :: #import "std/stdio_linux";
+writes :: #import "token_writes_native";
+
+#scope_file
+Referrer :: "1111111111111111111111111111111111111111111111111111111111111111";
+Friend :: "2222222222222222222222222222222222222222222222222222222222222222";
+Late :: "3333333333333333333333333333333333333333333333333333333333333333";
+FixtureTime :: "2026-11-22T12:00:00Z";
+
+Exec :: (database: *void, statement: string) -> bool {
+    return sqlite.SqliteExecText(database, statement) == sqlite.SQLITE_OK
+}
+
+Integer :: (database: *void, statement: string, text: string) -> s64 {
+    arguments: [1]sql.Argument = .[sql.TextArg(text)]
+    result := sql.ReadInteger(database, statement, arguments[:])
+    return ifx result.found then result.value else -1
+}
+
+// Binds `account` to the referrer with its welcome credit at ledger sequence `welcome`.
+Claim :: (database: *void, account: string, welcome: s64) -> bool {
+    arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(Referrer), sql.IntArg(welcome)]
+    return sql.Execute(database, "INSERT INTO referral_claims(account_id,referrer_id,code,request_id,source_app_id,accepted_at,welcome_receipt_id,welcome_seq) VALUES(?1,?2,'cccccccccccccccccccccccccccccccc','claim-0001','',?3||'',substr(?1,1,32),?3)", arguments[:]) == sqlite.SQLITE_OK
+}
+
+// A verified Monero account deposit for `account`; its receipt ID is written to `id`.
+Purchase :: (database: *void, signer: *issuer.Issuer, account: string, payment: string, units: s64, id: []u8) -> bool {
+    event: signing.Event = .{account = account, app = "inbe", kind = "credit", amount = units, source = "monero_account", reference = payment}
+    if !Exec(database, "BEGIN IMMEDIATE") { return false }
+    defer writes.Rollback(database)
+    credit := writes.CreditPayment(database, signer, "monero_account", payment, event, FixtureTime)
+    if credit.status != 200 || !Exec(database, "COMMIT") { return false }
+    for byte, index: TextView(credit.id[:]) { id[index] = byte }
+    return true
+}
+
+// A ledger event without a provider payment record, as settlement would see a forged label.
+Unverified :: (database: *void, signer: *issuer.Issuer, event: signing.Event) -> bool {
+    if !Exec(database, "BEGIN IMMEDIATE") { return false }
+    defer writes.Rollback(database)
+    receipt: signing.Receipt
+    return writes.SettlementInsert(database, signer, event, FixtureTime, *receipt) && Exec(database, "COMMIT")
+}
+
+Commissions :: (database: *void) -> s64 {
+    return Integer(database, "SELECT COUNT(*) FROM token_ledger WHERE source_type='referral_commission' AND source_ref<>?1", "")
+}
+
+// Settles nothing away from the canonical issuer, then a verified deposit earns floor(1000/20).
+Commission :: (database: *void, signer: *issuer.Issuer, lock: *mutex.Mutex, purchase: []u8) -> bool {
+    elsewhere: settlement.Settlement = .{database = database, lock = lock, signer = signer, baseURL = "https://elsewhere.invalid"}
+    canonical: settlement.Settlement = .{database = database, lock = lock, signer = signer, baseURL = referrals.Authority}
+    if !Claim(database, Friend, 0) || !Purchase(database, signer, Friend, "deposit-1", 1000, purchase) { return false }
+    paid := TextView(purchase)
+    if !settlement.Reconcile(*elsewhere) || Commissions(database) != 0 ||
+        Integer(database, "SELECT COUNT(*) FROM referral_outbox WHERE receipt_id=?1 AND done=0", paid) != 1 {
+        return false
+    }
+    if !settlement.Reconcile(*canonical) || !settlement.Reconcile(*canonical) { return false }
+    return Commissions(database) == 1 &&
+        Integer(database, "SELECT amount_delta FROM token_ledger WHERE source_type='referral_commission' AND source_ref=?1 AND app_id='inbe'", paid) == 50 &&
+        Integer(database, "SELECT target_units*1000000+issued_units*1000+reversed_units FROM referral_commissions WHERE purchase_receipt_id=?1", paid) == 50050000 &&
+        Integer(database, "SELECT remaining FROM token_allocations WHERE source_type='referral_commission' AND source_receipt_id=?1 AND app_id=''", paid) == 50 &&
+        Integer(database, "SELECT done FROM referral_outbox WHERE receipt_id=?1", paid) == 1 &&
+        ledger.Balance(database, Referrer).value == 50
+}
+
+// A provider's partial reversal lowers the target to floor(600/20) and takes 20 back from the lot.
+Reversal :: (database: *void, signer: *issuer.Issuer, lock: *mutex.Mutex, purchase: string) -> bool {
+    canonical: settlement.Settlement = .{database = database, lock = lock, signer = signer, baseURL = referrals.Authority}
+    refund: signing.Event = .{account = Friend, app = "inbe", kind = "debit", amount = -400, source = "monero_account", reference = "deposit-1"}
+    if !Unverified(database, signer, refund) || !settlement.Reconcile(*canonical) { return false }
+    return Integer(database, "SELECT target_units*1000000+issued_units*1000+reversed_units FROM referral_commissions WHERE purchase_receipt_id=?1", purchase) == 30050020 &&
+        Integer(database, "SELECT -amount_delta FROM token_ledger WHERE source_type='referral_reversal' AND source_ref=?1", purchase) == 20 &&
+        Integer(database, "SELECT remaining FROM token_allocations WHERE source_type='referral_commission' AND source_receipt_id=?1", purchase) == 30 &&
+        ledger.Balance(database, Referrer).value == 30
+}
+
+// Purchases before the welcome credit and credits without a provider payment earn nothing.
+Ineligible :: (database: *void, signer: *issuer.Issuer, lock: *mutex.Mutex) -> bool {
+    canonical: settlement.Settlement = .{database = database, lock = lock, signer = signer, baseURL = referrals.Authority}
+    early: [32]u8
+    forged: signing.Event = .{account = Friend, app = "inbe", kind = "credit", amount = 4000, source = "monero_account", reference = "forged-1"}
+    if !Purchase(database, signer, Late, "deposit-2", 2000, early[:]) || !Claim(database, Late, 1000000) ||
+        !Unverified(database, signer, forged) || !settlement.Reconcile(*canonical) {
+        return false
+    }
+    return Commissions(database) == 1 && ledger.Balance(database, Referrer).value == 30 &&
+        Integer(database, "SELECT COUNT(*) FROM referral_outbox WHERE done=0 AND receipt_id<>?1", "") == 0
+}
+
+Failure :: (name: string) -> s32 {
+    unused stdio.PrintError(name)
+    unused stdio.PrintError("\n")
+    return 1
+}
+
+#scope_export
+Main :: () -> s32 {
+    opened := schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return Failure("open SQLite") }
+    defer sqlite.SqliteClose(opened.database)
+    if startup.InitializeFeatures(opened.database) != sqlite.SQLITE_OK { return Failure("initialize SQLite features") }
+    signer: issuer.Issuer
+    seed: [32]u8
+    empty: []u8
+    if !issuer.Open(*signer, empty, seed[:]) { return Failure("load fixture issuer") }
+    defer issuer.Close(*signer)
+    lock: mutex.Mutex
+    if !mutex.Open(*lock) { return Failure("open settlement lock") }
+    defer mutex.Close(*lock)
+    purchase: [32]u8
+    if !Commission(opened.database, *signer, *lock, purchase[:]) { return Failure("referral commission on a verified deposit") }
+    if !Reversal(opened.database, *signer, *lock, TextView(purchase[:])) { return Failure("referral reversal after a partial refund") }
+    if !Ineligible(opened.database, *signer, *lock) { return Failure("referral eligibility") }
+    unused stdio.WriteOutput("Native referral settlement tests passed\n")
+    return 0
+}
