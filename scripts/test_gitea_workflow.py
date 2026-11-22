@@ -83,6 +83,12 @@ class GiteaWorkflowTest(unittest.TestCase):
         generate = next(step for step in steps if step.get("name") == "Generate the Go")
         self.assertNotIn("XDG_CACHE_HOME", generate.get("env", {}))
         self.assertNotIn("runner.temp", str(generate))
+        env = generate["env"]
+        rewrites = {env[f"GIT_CONFIG_VALUE_{index}"]: env[f"GIT_CONFIG_KEY_{index}"]
+                    for index in range(int(env["GIT_CONFIG_COUNT"]))}
+        for organization in ("ziranlang", "kryonlabs"):
+            self.assertEqual(rewrites[f"https://github.com/{organization}/"],
+                             f"url.https://git.waozi.xyz/{organization}/.insteadOf")
 
     def test_pinned_actions_and_job_shell_syntax(self):
         step_groups = [job["steps"] for job in self.jobs.values()]

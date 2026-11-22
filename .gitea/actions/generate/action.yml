@@ -11,8 +11,16 @@ runs:
         path: .ziran
     # Fetched packages stay in the host runner's own cache between jobs. It
     # is outside the checkout, where go ./... would compile their files.
+    # Gitea is the primary host of these organizations and keeps renamed
+    # repositories reachable; the GitHub mirror refused anonymous fetches
+    # from the Mesh runner.
     - name: Generate the Go
       shell: bash
       env:
         ZIRAN: ${{ steps.ziran.outputs.ziran }}
+        GIT_CONFIG_COUNT: '2'
+        GIT_CONFIG_KEY_0: url.https://git.waozi.xyz/ziranlang/.insteadOf
+        GIT_CONFIG_VALUE_0: https://github.com/ziranlang/
+        GIT_CONFIG_KEY_1: url.https://git.waozi.xyz/kryonlabs/.insteadOf
+        GIT_CONFIG_VALUE_1: https://github.com/kryonlabs/
       run: make generate ZIRAN="$ZIRAN"
