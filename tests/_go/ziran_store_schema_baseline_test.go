@@ -48,7 +48,11 @@ func baselineSchemaOpenStore(path string) (*Store, error) {
 func (s *Store) baselineSchemaMigrate(ctx context.Context) error {
 	if _, err := s.Database.ExecContext(ctx, `
 PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+PRAGMA temp_store=MEMORY;
+PRAGMA cache_size=-32000;
+PRAGMA mmap_size=268435456;
 `); err != nil {
 		return err
 	}
