@@ -87,6 +87,15 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(root, steps.index(setup_go) + 1)
         self.assertIn('echo "GOROOT=$root" >> "$GITHUB_ENV"', steps[root]["run"])
 
+    def test_make_shim_forwards_every_target_ci_and_the_origin_run(self):
+        shim = (ROOT / "makefile").read_text()
+        forwarded = set(re.search(r"^build test run[^\n]*:", shim, re.MULTILINE).group(0).rstrip(":").split())
+        runs = "\n".join(step.get("run", "") for job in self.jobs.values() for step in job["steps"])
+        targets = set(re.findall(r"\bmake ((?:[a-z][\w-]*(?: |$))+)", runs, re.MULTILINE))
+        wanted = {word for group in targets for word in group.split() if "=" not in word}
+        wanted |= {"build", "build-native"}
+        self.assertLessEqual(wanted, forwarded | {"all"})
+
     def test_deploy_ships_the_native_sources_it_generated(self):
         steps = self.jobs["deploy"]["steps"]
         names = [step.get("name") for step in steps]
