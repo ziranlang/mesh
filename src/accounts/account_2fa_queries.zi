@@ -1,0 +1,73 @@
+Schema :: #string SQL_END
+CREATE TABLE IF NOT EXISTS server_account_2fa (
+ user_id_hash TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ enabled INTEGER NOT NULL DEFAULT 0,
+ totp_secret_enc TEXT NOT NULL DEFAULT '',
+ pending_secret_enc TEXT NOT NULL DEFAULT '',
+ pending_expires_at INTEGER NOT NULL DEFAULT 0,
+ last_used_step INTEGER NOT NULL DEFAULT -1,
+ created_at INTEGER NOT NULL DEFAULT 0,
+ updated_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS server_account_2fa_recovery (
+ user_id_hash TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ code_hash TEXT NOT NULL,
+ used_at INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(user_id_hash, code_hash)
+);
+SQL_END;
+
+ReadState :: #string SQL_END
+SELECT enabled, totp_secret_enc, pending_secret_enc, pending_expires_at, last_used_step
+FROM server_account_2fa
+WHERE user_id_hash=?1
+SQL_END;
+
+CountRecovery :: #string SQL_END
+SELECT COUNT(*)
+FROM server_account_2fa_recovery
+WHERE user_id_hash=?1 AND used_at=0
+SQL_END;
+
+UpsertPending :: #string SQL_END
+INSERT INTO server_account_2fa(user_id_hash, enabled, totp_secret_enc, pending_secret_enc, pending_expires_at, last_used_step, created_at, updated_at)
+VALUES(?1, 0, '', ?2, ?3, -1, ?4, ?4)
+ON CONFLICT(user_id_hash) DO UPDATE SET
+ pending_secret_enc=excluded.pending_secret_enc,
+ pending_expires_at=excluded.pending_expires_at,
+ updated_at=excluded.updated_at
+WHERE server_account_2fa.enabled=0
+SQL_END;
+
+ActivateTotp :: #string SQL_END
+UPDATE server_account_2fa
+SET enabled=1, totp_secret_enc=?2, pending_secret_enc='', pending_expires_at=0, last_used_step=?3, updated_at=?4
+WHERE user_id_hash=?1 AND enabled=0 AND pending_secret_enc<>'' AND pending_expires_at>=?4
+SQL_END;
+
+AdvanceStep :: #string SQL_END
+UPDATE server_account_2fa
+SET last_used_step=?2, updated_at=?3
+WHERE user_id_hash=?1 AND enabled=1 AND last_used_step<?2
+SQL_END;
+
+DeleteRecoveryCodes :: "DELETE FROM server_account_2fa_recovery WHERE user_id_hash=?1";
+
+InsertRecoveryCode :: #string SQL_END
+INSERT INTO server_account_2fa_recovery(user_id_hash, code_hash, used_at)
+VALUES(?1, ?2, 0)
+SQL_END;
+
+ConsumeRecoveryCode :: #string SQL_END
+UPDATE server_account_2fa_recovery
+SET used_at=?3
+WHERE user_id_hash=?1 AND code_hash=?2 AND used_at=0
+SQL_END;
+
+DisableAccount :: "DELETE FROM server_account_2fa WHERE user_id_hash=?1";
+
+RevokeOtherSessions :: #string SQL_END
+UPDATE server_auth_sessions
+SET revoked_at=CURRENT_TIMESTAMP
+WHERE user_id_hash=?1 AND token_hash<>?2 AND revoked_at=''
+SQL_END;

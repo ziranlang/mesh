@@ -14,6 +14,7 @@
     exporter :: #import "account_export_native";
     profileRules :: #import "account_profile_rules";
     sessions :: #import "auth_sessions_native";
+    twofa :: #import "account_2fa_native";
     devices :: #import "device_keys_native";
     holds :: #import "account_hold_native";
     accountKeys :: #import "account_keys_native";
@@ -127,6 +128,7 @@
         user: Text
         client: Text
         key: Text
+        twoFactorCode: Text
         restore: bool
         valid: bool
     }
@@ -167,6 +169,14 @@
                         return .{}
                     }
                     result.key = json.JsonString(*document, node)
+                } else if wire.MatchesToken(key, "totp_code") || wire.MatchesToken(key, "recovery_code") ||
+                    wire.MatchesToken(key, "two_factor_code") {
+                    if valueKind != .String {
+                        return .{}
+                    }
+                    if TextView(result.twoFactorCode) == "" {
+                        result.twoFactorCode = json.JsonString(*document, node)
+                    }
                 }
             }
             node = json.JsonNext(*document, node)
@@ -267,6 +277,12 @@
             return ErrorReply(access, connection, method, 500, "login failed")
         }
         defer mutex.Unlock(*access.databaseLock)
+        now := calendar.UnixMilliseconds()
+        twofaStatus := twofa.CheckRequest(settings.database, *access.limiter, settings.secret,
+            connection, subject, TextView(values.twoFactorCode), now / 1000)
+        if twofaStatus != .Allowed {
+            return twofa.WriteRejected(connection, twofaStatus)
+        }
         if values.restore {
             restored := holds.Restore(settings.database, settings.path, subject)
             if restored.databaseError != sqlite.SQLITE_OK || restored.error != "" {
@@ -276,7 +292,6 @@
                 print("Mesh: %\n", restored.cleanupError)
             }
         }
-        now := calendar.UnixMilliseconds()
         audit: [32]u8
         count := AuditTime(now, audit[:])
         if count == 0 {
@@ -303,11 +318,15 @@
         }
         userNode: s32 = -1
         keyNode: s32 = -1
+        twofaNode: s32 = -1
         node := json.JsonFirst(*document, document.root)
         while node >= 0 {
             name: Text = json.JsonKey(*document, node)
             isUser := wire.MatchesToken(TextView(name), "user_id_hash")
-            if isUser || (withKey && wire.MatchesToken(TextView(name), "exported_key")) {
+            isTwofa := wire.MatchesToken(TextView(name), "totp_code") ||
+                wire.MatchesToken(TextView(name), "recovery_code") ||
+                wire.MatchesToken(TextView(name), "two_factor_code")
+            if isUser || (withKey && wire.MatchesToken(TextView(name), "exported_key")) || isTwofa {
                 kind := json.JsonKindOf(*document, node)
                 if kind != .Null {
                     if kind != .String {
@@ -315,6 +334,8 @@
                     }
                     if isUser {
                         userNode = node
+                    } else if isTwofa {
+                        if twofaNode < 0 { twofaNode = node }
                     } else {
                         keyNode = node
                     }
@@ -324,9 +345,11 @@
         }
         supplied: Text = json.JsonString(*document, userNode)
         user := wire.TrimSpace(TextView(supplied))
+        twofaText: Text = json.JsonString(*document, twofaNode)
+        twofaCode := TextView(twofaText)
         if withKey {
             key: Text = json.JsonString(*document, keyNode)
-            return DeleteExportedKey(access, connection, method, user, wire.TrimSpace(TextView(key)))
+            return DeleteExportedKey(access, connection, method, user, wire.TrimSpace(TextView(key)), twofaCode)
         }
         header := bearer.UserHeader(connection)
         if header.value == "" {
@@ -360,10 +383,15 @@
             return ErrorReply(access, connection, method, 500, "delete failed")
         }
         defer mutex.Unlock(*access.databaseLock)
+        twofaStatus := twofa.CheckRequest(settings.database, *access.limiter, settings.secret,
+            connection, subject, twofaCode, calendar.UnixMilliseconds() / 1000)
+        if twofaStatus != .Allowed {
+            return twofa.WriteRejected(connection, twofaStatus)
+        }
         return DeleteAccount(access, connection, method, subject)
     }
 
-    DeleteExportedKey :: (access: *AccountAccess, connection: *void, method: string, user: string, key: string) -> s32 {
+    DeleteExportedKey :: (access: *AccountAccess, connection: *void, method: string, user: string, key: string, twofaCode: string) -> s32 {
         normalized: [64]u8
         if !identity.NormalizeUserID(user, normalized[:]) {
             return ErrorReply(access, connection, method, 400, "invalid user_id_hash")
@@ -414,6 +442,11 @@
         if account.count != sizes.mlDSA44PublicKeySize || !signing.Sign(privateKey, bytes, signatureBytes[:]) ||
             !settings.verify(account.bytes[:], bytes, signatureBytes[:]) {
             return ErrorReply(access, connection, method, 401, "exported key does not match sync account")
+        }
+        twofaStatus := twofa.CheckRequest(settings.database, *access.limiter, settings.secret,
+            connection, accountID, twofaCode, calendar.UnixMilliseconds() / 1000)
+        if twofaStatus != .Allowed {
+            return twofa.WriteRejected(connection, twofaStatus)
         }
         return DeleteAccount(access, connection, method, accountID)
     }
@@ -588,6 +621,14 @@
             }
             return Reply(access, connection, method, 200, *document, root)
         }
+        if method == "POST" {
+            twofaStatus := twofa.CheckRequest(settings.database, *access.limiter, settings.secret,
+                connection, account, "", now / 1000)
+            if twofaStatus != .Allowed {
+                unused mutex.Unlock(*access.databaseLock)
+                return twofa.WriteRejected(connection, twofaStatus)
+            }
+        }
         timestamp: time.TimestampValue = .{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}
         changed := devices.Change(settings.database, settings.verify, account, body, method == "DELETE", timestamp, *document, root)
         unused mutex.Unlock(*access.databaseLock)
@@ -609,7 +650,8 @@
             return false
         }
         count := AuditTime(now + settings.tokenSeconds * 1000, audit[:])
-        if count == 0 || sessions.Initialize(settings.database, TextView(audit[:count])) != sqlite.SQLITE_OK {
+        if count == 0 || sessions.Initialize(settings.database, TextView(audit[:count])) != sqlite.SQLITE_OK ||
+            twofa.Initialize(settings.database) != sqlite.SQLITE_OK {
             return false
         }
         if !mutex.Open(*access.databaseLock) {

@@ -37,11 +37,11 @@
       "url": "https://github.com/webmproject/libwebp.git"
     },
     {
-      "commit": "944826f70779a6b6cd53f6b06a75b36f4d8a2558",
+      "commit": "cd4a75b3383e49dd5eb10a18b2181fe74b161880",
       "dependencies": {},
-      "id": "p5a3dad3b49e1d33d",
+      "id": "p2fda61ab0faf2d7f",
       "name": "crypto",
-      "ref": "944826f70779a6b6cd53f6b06a75b36f4d8a2558",
+      "ref": "cd4a75b3383e49dd5eb10a18b2181fe74b161880",
       "url": "https://git.waozi.xyz/ziranlang/crypto.git"
     },
     {
@@ -169,8 +169,8 @@
     }
   ],
   "root": {
-    "dependencies": {"compression": "pd73f64df1a9c6f70", "crypto": "p5a3dad3b49e1d33d", "oqs": "p7098ac9cd92f7e5f", "shovey": "p996a48e854c61f5a", "sqlite": "padce96609ba3b10f"},
-    "dependency_refs": {"compression": "4f75a402c58c86648011c30bcb52380993887565", "crypto": "944826f70779a6b6cd53f6b06a75b36f4d8a2558", "oqs": "22d2ddbdc236796953c905a05a2cebf5ab1b4ff3", "shovey": "master", "sqlite": "ce8e0ccdf50cf26897cf31d81538654937579f4a"},
+    "dependencies": {"compression": "pd73f64df1a9c6f70", "crypto": "p2fda61ab0faf2d7f", "oqs": "p7098ac9cd92f7e5f", "shovey": "p996a48e854c61f5a", "sqlite": "padce96609ba3b10f"},
+    "dependency_refs": {"compression": "4f75a402c58c86648011c30bcb52380993887565", "crypto": "cd4a75b3383e49dd5eb10a18b2181fe74b161880", "oqs": "22d2ddbdc236796953c905a05a2cebf5ab1b4ff3", "shovey": "master", "sqlite": "ce8e0ccdf50cf26897cf31d81538654937579f4a"},
     "name": "Mesh"
   },
   "toolchain": {

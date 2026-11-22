@@ -122,6 +122,9 @@ test-ziran-native-server: test-ziran-native-http
 	LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 -B tests/native/check_http_listener.py "$(NATIVE_SERVER_BUILD_DIR)/server_native" \
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle --server
+	LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
+		python3 -B tests/native/check_account_2fa.py "$(NATIVE_SERVER_BUILD_DIR)/server_native" \
+		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
 
 # Load generated protocol types before SQL macros with matching field names.
 build-ziran-native-embedded: liboqs

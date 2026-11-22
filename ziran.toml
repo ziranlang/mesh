@@ -12,7 +12,7 @@ ref = "master"
 
 [dependencies.crypto]
 git = "https://git.waozi.xyz/ziranlang/crypto.git"
-ref = "944826f70779a6b6cd53f6b06a75b36f4d8a2558"
+ref = "cd4a75b3383e49dd5eb10a18b2181fe74b161880"
 
 [dependencies.sqlite]
 git = "https://git.waozi.xyz/ziranlang/sqlite.git"

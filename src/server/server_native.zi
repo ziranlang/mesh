@@ -1,5 +1,6 @@
 #if TARGET == .C && OS == .LINUX {
     accounts :: #import "account_access_native";
+    twofa :: #import "account_2fa_native";
     holds :: #import "account_hold_native";
     passkeys :: #import "account_passkey_native";
     backups :: #import "account_backup_native";
@@ -284,6 +285,8 @@
                 uploads.Append(body, upload, <<size, backups.RequestBytes(route))
             } else if passkey && verb == "POST" {
                 uploads.Append(body, upload, <<size, passkeys.RequestBytes(route))
+            } else if twofa.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, twofa.MaxRequestBytes)
             } else if blob && verb == "PUT" {
                 uploads.Append(body, upload, <<size, blobs.MaxBlobBytes)
             } else if feedback.ReadsBody(route, verb) {
@@ -494,6 +497,13 @@
         if passkey {
             if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
             return passkeys.Handle(*state.accounts, connection, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if twofa.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            settings := state.accounts.configuration
+            return twofa.Handle(settings.database, *state.accounts.databaseLock, *state.accounts.limiter,
+                settings.secret, settings.zstdRequests, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
         }
         if blob {
             if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
