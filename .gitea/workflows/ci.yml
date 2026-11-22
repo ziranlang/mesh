@@ -19,7 +19,9 @@ defaults:
     shell: bash
 
 jobs:
-  build-policy:
+  # Every gate that runs on the shared Build slot lives in one job, so each
+  # push sets up Ziran, generates the Go and builds liboqs once.
+  checks:
     runs-on: build-ubuntu24.04
     steps:
       - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -50,15 +52,6 @@ jobs:
           python3 -B scripts/test_bootstrap_ssh.py
           python3 -B scripts/test_deployment_inputs.py
           python3 -B scripts/test_deploy_install.py
-          python3 -B scripts/test_migrate_env.py
-
-  lint:
-    runs-on: build-ubuntu24.04
-    steps:
-      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          submodules: recursive
 
       - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
@@ -70,6 +63,12 @@ jobs:
 
       - name: Build the vendored liboqs
         uses: ./.gitea/actions/liboqs
+
+      - name: Check formatting
+        run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+
+      - name: Check generated diff hygiene
+        run: git diff --check
 
       - name: Install golangci-lint
         env:
@@ -92,41 +91,59 @@ jobs:
           CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
           CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
 
-  test:
-    runs-on: build-ubuntu24.04
-    steps:
-      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Generate the Go from the Zi sources
-        uses: ./.gitea/actions/generate
-
-      - name: Build the vendored liboqs
-        uses: ./.gitea/actions/liboqs
-
-      - name: Check formatting
-        run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
-
-      - name: Check generated diff hygiene
-        run: git diff --check
-
-      - name: Test
-        run: make test
+      # One run reports coverage and is the plain test gate.
+      - name: Test and report coverage
+        run: |
+          make test TEST_FLAGS="-coverprofile=coverage.out"
+          go tool cover -func=coverage.out | tail -1
 
       - name: Race test
         run: make test GOFLAGS="-mod=mod -race"
 
-      - name: Report coverage
+      - name: Install pinned vulnerability, source and license scanners
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: '-mod=mod'
         run: |
-          make test TEST_FLAGS="-coverprofile=coverage.out"
-          go tool cover -func=coverage.out | tail -1
+          export GOBIN="$RUNNER_TEMP"
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install github.com/google/go-licenses/v2@v2.0.1
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan the generated application packages without cgo
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: "-mod=mod"
+        run: |
+          test -s server.zi.go
+          test -s google_play_reconciliation.zi.go
+          govulncheck -scan=package . ./native
+
+      - name: Scan the generated application packages with native cryptography
+        env:
+          CGO_ENABLED: '1'
+          GOFLAGS: "-mod=mod"
+          CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
+          CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
+        run: govulncheck -scan=package . ./native
+
+      - name: Scan generated Go and check dependency licenses
+        env:
+          CGO_ENABLED: '1'
+          GOFLAGS: '-mod=mod'
+          CGO_CFLAGS: '-I${{ github.workspace }}/build/liboqs/install/include'
+          CGO_LDFLAGS: '-L${{ github.workspace }}/build/liboqs/install/lib -loqs'
+        run: |
+          gosec -quiet -severity high -confidence high -fmt=sarif -out gosec.sarif . ./native
+          GOROOT="$(go env GOROOT)" go-licenses check --ignore mesh . ./native
+      - name: Preserve the source scan report
+        if: always()
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gosec-sarif
+          path: gosec.sarif
+          if-no-files-found: error
 
   container:
     runs-on: ${{ vars.MESH_CONTAINER_RUNNER || 'build-ubuntu24.04' }}
@@ -201,95 +218,8 @@ jobs:
         if: always()
         run: docker image rm "mesh:ci-$GITHUB_RUN_ID"
 
-  govulncheck:
-    runs-on: build-ubuntu24.04
-    strategy:
-      matrix:
-        cgo: ['0', '1']
-    steps:
-      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Generate the Go from the Zi sources
-        uses: ./.gitea/actions/generate
-
-      - name: Build native cryptography for the production scan
-        if: matrix.cgo == '1'
-        uses: ./.gitea/actions/liboqs
-
-      - name: Install the pinned vulnerability scanner
-        env:
-          CGO_ENABLED: '0'
-          GOFLAGS: '-mod=mod'
-        run: |
-          GOBIN="$RUNNER_TEMP" go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-
-      - name: Scan the generated application packages
-        env:
-          CGO_ENABLED: ${{ matrix.cgo }}
-          GOFLAGS: "-mod=mod"
-          CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
-          CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
-        run: |
-          test -s server.zi.go
-          test -s google_play_reconciliation.zi.go
-          govulncheck -scan=package . ./native
-
-  source-security:
-    runs-on: build-ubuntu24.04
-    steps:
-      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Generate the Go from the Zi sources
-        uses: ./.gitea/actions/generate
-
-      - name: Build the vendored liboqs
-        uses: ./.gitea/actions/liboqs
-
-      - name: Install pinned source and license scanners
-        env:
-          CGO_ENABLED: '0'
-          GOFLAGS: '-mod=mod'
-        run: |
-          export GOBIN="$RUNNER_TEMP"
-          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
-          go install github.com/google/go-licenses/v2@v2.0.1
-          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
-      - name: Scan generated Go and check dependency licenses
-        env:
-          CGO_ENABLED: '1'
-          GOFLAGS: '-mod=mod'
-          CGO_CFLAGS: '-I${{ github.workspace }}/build/liboqs/install/include'
-          CGO_LDFLAGS: '-L${{ github.workspace }}/build/liboqs/install/lib -loqs'
-        run: |
-          gosec -quiet -severity high -confidence high -fmt=sarif -out gosec.sarif . ./native
-          GOROOT="$(go env GOROOT)" go-licenses check --ignore mesh . ./native
-      - name: Preserve the source scan report
-        if: always()
-        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: gosec-sarif
-          path: gosec.sarif
-          if-no-files-found: error
-
   deploy:
-    needs: [build-policy, lint, test, container, govulncheck, source-security]
+    needs: [checks, container]
     if: >-
       github.server_url == 'https://git.waozi.xyz' &&
       github.repository == 'ziranlang/mesh' && github.ref == 'refs/heads/master' &&

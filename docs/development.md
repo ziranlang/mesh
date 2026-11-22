@@ -215,9 +215,12 @@ record envelopes and compression before encryption.
 
 The [canonical Mesh repository](https://git.waozi.xyz/ziranlang/mesh) contains
 `.gitea/workflows/ci.yml` for master pushes, weekly security checks and manual
-runs on Build. Production deployment requires the build-policy, lint, Go test
-and race, container, vulnerability, static analysis and dependency license
-checks. The deploy job accepts only the canonical repository's `master` and
+runs on Build. The `checks` job runs every gate that uses the shared Build
+slot: build policy, lint, Go test with coverage, race, both vulnerability
+scans, static analysis and dependency licenses. It sets up Ziran, generates
+the Go and builds liboqs once. The `container` job runs in parallel on the
+Mesh runner. Production deployment requires both jobs, and
+`deploy/gitea-origin.py` requires the same job names. The deploy job accepts only the canonical repository's `master` and
 checks the current remote revision before transferring source to the origin.
 GitHub mirrors source. Its legacy API workflow requires manual dispatch for
 recovery during the transition.

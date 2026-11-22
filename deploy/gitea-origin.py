@@ -22,9 +22,7 @@ ORIGIN = 'https://git.waozi.xyz'
 API = ORIGIN + '/api/v1/repos/ziranlang/mesh'
 PUBLIC = 'https://api.waozi.xyz'
 SOURCE = Path('/opt/mesh-src')
-REQUIRED_JOBS = {
-    'build-policy', 'lint', 'test', 'container', 'govulncheck (0)', 'govulncheck (1)', 'source-security',
-}
+REQUIRED_JOBS = {'checks', 'container'}
 MAX_ARCHIVE = 64 * 1024**2
 MAX_SOURCE = 512 * 1024**2
 COMMAND = re.compile(

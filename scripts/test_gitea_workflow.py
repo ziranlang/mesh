@@ -14,9 +14,8 @@ from verify_build_inputs import EXPECTED_GOLANGCI_LINT_SHA256, EXPECTED_GOLANGCI
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".gitea/workflows/ci.yml"
 ACTION_REF = re.compile(r"^https://(?:github\.com|git\.waozi\.xyz)/[\w./-]+@[a-f0-9]{40}$")
-REQUIRED_JOBS = {
-    "build-policy", "lint", "test", "container", "govulncheck", "source-security",
-}
+REQUIRED_JOBS = {"checks", "container"}
+SHARED_SLOT_SETUP = ("./.gitea/actions/generate", "./.gitea/actions/liboqs")
 
 
 def read_yaml(path):
@@ -50,6 +49,32 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(set(read_yaml(ROOT / ".github/workflows/deploy.yml")["on"]), {"workflow_dispatch"})
         for filename in ("ci.yml", "security.yml"):
             self.assertEqual(set(read_yaml(ROOT / ".github/workflows" / filename)["on"]), {"workflow_call"})
+
+    def test_origin_gate_matches_the_deploy_needs(self):
+        origin = (ROOT / "deploy/gitea-origin.py").read_text()
+        match = re.search(r"^REQUIRED_JOBS = (\{.*?\})$", origin, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        self.assertEqual(eval(match.group(1), {}), set(self.jobs["deploy"]["needs"]))
+        # Gitea reports matrix jobs under suffixed names the origin would not match.
+        for job_id in REQUIRED_JOBS:
+            self.assertNotIn("strategy", self.jobs[job_id])
+
+    def test_shared_slot_sets_up_and_tests_once(self):
+        steps = self.jobs["checks"]["steps"]
+        uses = [step.get("uses") for step in steps]
+        for action in SHARED_SLOT_SETUP:
+            self.assertEqual(uses.count(action), 1)
+        runs = [step.get("run", "") for step in steps]
+        plain_tests = [run for run in runs if "make test" in run and "-race" not in run]
+        self.assertEqual(len(plain_tests), 1)
+        self.assertIn("-coverprofile=coverage.out", plain_tests[0])
+        self.assertEqual(sum("-race" in run for run in runs), 1)
+        for name in ("Lint", "Race test", "Scan generated Go and check dependency licenses"):
+            self.assertIn(name, [step.get("name") for step in steps])
+        scans = [run for run in runs if "govulncheck -scan=package . ./native" in run]
+        self.assertEqual(len(scans), 2)
+        script_tests = re.findall(r"python3 -B (scripts/test_\w+\.py)", "\n".join(runs))
+        self.assertEqual(len(script_tests), len(set(script_tests)))
 
     def test_pinned_actions_and_job_shell_syntax(self):
         step_groups = [job["steps"] for job in self.jobs.values()]
@@ -86,7 +111,7 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertNotIn("/opt/mesh-src", source)
 
     def test_linter_pins_and_checksum_are_retained(self):
-        step = next(item for item in self.jobs["lint"]["steps"] if item.get("name") == "Install golangci-lint")
+        step = next(item for item in self.jobs["checks"]["steps"] if item.get("name") == "Install golangci-lint")
         self.assertEqual(step["env"], {
             "GOLANGCI_LINT_VERSION": EXPECTED_GOLANGCI_LINT_VERSION,
             "GOLANGCI_LINT_SHA256": EXPECTED_GOLANGCI_LINT_SHA256,
