@@ -122,6 +122,19 @@ def run(*args, cwd=None, data=None, timeout=60):
                    env={'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': '/root', 'LANG': 'C.UTF-8'})
 
 
+def native_build_commands(stage, revision, native_revision):
+    """The native server builds with cc from the artifact's generated C, when present."""
+    if not (stage / 'build/native-release/server').is_dir():
+        return []
+    return [
+        ('/usr/bin/make', '-j2', 'build-native', f'VERSION={revision}', f'SOURCE_COMMIT={revision}',
+         f'LIBOQS_COMMIT={native_revision}'),
+        ('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-artifact-manifest',
+         '--output', 'mesh-native', '--manifest', 'build/mesh-native.manifest.json',
+         '--expected-source-commit', revision, '--expected-liboqs-commit', native_revision),
+    ]
+
+
 def check_revision(revision, attempts=15):
     for attempt in range(attempts):
         try:
@@ -161,6 +174,8 @@ def deploy(run_id, attempt, revision, native_revision, native_digest, native_ent
         run('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-artifact-manifest',
             '--output', 'mesh', '--manifest', 'build/mesh.manifest.json', '--expected-source-commit', revision,
             '--expected-liboqs-commit', native_revision, cwd=stage)
+        for command in native_build_commands(stage, revision, native_revision):
+            run(*command, cwd=stage, timeout=900)
         require_master(revision, get)
         old = Path(temporary) / 'previous-source'
         if not SOURCE.is_dir() or SOURCE.is_symlink():

@@ -286,6 +286,10 @@ jobs:
       - name: Generate the Go from the Zi sources
         uses: ./.gitea/actions/generate
 
+      # The origin compiles this generated C with cc; Ziran stays off the origin.
+      - name: Generate the native server sources
+        run: make native-release
+
       - name: Verify the pinned native source
         id: liboqs
         run: python3 -B scripts/verify_deployment_inputs.py pinned-source
@@ -296,6 +300,8 @@ jobs:
           test "$(git ls-remote --exit-code origin refs/heads/master | cut -f1)" = "$GITHUB_SHA"
           git ls-files -z --recurse-submodules > "$RUNNER_TEMP/mesh-source-files"
           find . -maxdepth 1 -type f \( -name '*.zi.go' -o -name '*.zi_test.go' \) \
+            -print0 >> "$RUNNER_TEMP/mesh-source-files"
+          find build/native-release -type f \( -name '*.c' -o -name '*.h' \) \
             -print0 >> "$RUNNER_TEMP/mesh-source-files"
           tar --null --no-recursion --files-from="$RUNNER_TEMP/mesh-source-files" \
             --create --gzip --file="$RUNNER_TEMP/mesh-source.tar.gz"

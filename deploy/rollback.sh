@@ -22,6 +22,16 @@ if [ -f "/var/lib/mesh/backups/mesh.mesh.$STAMP" ]; then
 elif [ -f "/var/lib/mesh/backups/mesh.mesh-absent.$STAMP" ]; then
   rm -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf
 fi
+if [ -f "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP" ]; then
+  cp "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP" /opt/mesh/mesh-native
+elif [ -f "/var/lib/mesh/backups/mesh-native-absent.$STAMP" ]; then
+  rm -f /opt/mesh/mesh-native /opt/mesh/mesh-native.manifest.json
+fi
+if [ -f "/var/lib/mesh/backups/mesh.runtime.$STAMP" ]; then
+  install -m 644 "/var/lib/mesh/backups/mesh.runtime.$STAMP" /etc/systemd/system/mesh.service.d/30-runtime.conf
+elif [ -f "/var/lib/mesh/backups/mesh.runtime-absent.$STAMP" ]; then
+  rm -f /etc/systemd/system/mesh.service.d/30-runtime.conf
+fi
 systemctl daemon-reload
 if [ -f "/var/lib/mesh/backups/mesh.legacy-prune-enabled.$STAMP" ]; then
   systemctl disable --now mesh-backup-prune.timer || true

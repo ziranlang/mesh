@@ -87,6 +87,16 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(root, steps.index(setup_go) + 1)
         self.assertIn('echo "GOROOT=$root" >> "$GITHUB_ENV"', steps[root]["run"])
 
+    def test_deploy_ships_the_native_sources_it_generated(self):
+        steps = self.jobs["deploy"]["steps"]
+        names = [step.get("name") for step in steps]
+        release = names.index("Generate the native server sources")
+        package = names.index("Package the exact canonical revision")
+        self.assertEqual(steps[release]["run"], "make native-release")
+        self.assertLess(names.index("Generate the Go from the Zi sources"), release)
+        self.assertLess(release, package)
+        self.assertIn("find build/native-release -type f", steps[package]["run"])
+
     def test_container_probe_stays_inside_its_network_namespace(self):
         steps = self.jobs["container"]["steps"]
         verify = next(step for step in steps if step.get("name") == "Verify container starts as a non-root user")

@@ -225,6 +225,16 @@ checks the current remote revision before transferring source to the origin.
 GitHub mirrors source. Its legacy API workflow requires manual dispatch for
 recovery during the transition.
 
+The deploy job also ships the native server's generated C and SQLite source
+(`make native-release`). The origin builds both servers: `make build` for the
+Go binary at `/opt/mesh/mesh` and `make build-native` for
+`/opt/mesh/mesh-native`, which needs Debian's `libmicrohttpd12t64`.
+`deploy/runtime` (`go` or `native`) selects the server. `native` writes the
+`mesh.service.d/30-runtime.conf` drop-in, and a failed install restores the
+previous selection. The Go binary stays installed for its CLI commands. To go
+back to Go by hand, remove that drop-in, then run `systemctl daemon-reload`
+and `systemctl restart mesh.service`.
+
 The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker and
 an isolated `MESH_DEPLOY_RUNNER` with access to the production origin. Set the
 repository variable `MESH_DEPLOY_READY` to `true` after verifying the runner and

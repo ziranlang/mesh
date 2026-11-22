@@ -144,6 +144,61 @@ print("MONERO_RATE_TOKEN_UNITS=100")
         self.assert_old_install()
         self.assertFalse((self.root / "services.log").exists())
 
+    def native_release(self, runtime):
+        (self.root / "opt/mesh-src/mesh-native").write_text("new native")
+        (self.root / "opt/mesh-src/build/mesh-native.manifest.json").write_text("native manifest")
+        (self.root / "opt/mesh-src/deploy/runtime").write_text(runtime + "\n")
+
+    def runtime_selection(self):
+        return self.root / "etc/systemd/system/mesh.service.d/30-runtime.conf"
+
+    def test_native_runtime_installs_beside_go_and_selects_it(self):
+        self.native_release("native")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual((self.root / "opt/mesh/mesh").read_text(), "new binary")
+        self.assertEqual((self.root / "opt/mesh/mesh-native").read_text(), "new native")
+        self.assertEqual((self.root / "opt/mesh/mesh-native.manifest.json").read_text(), "native manifest")
+        self.assertEqual(self.runtime_selection().read_text(),
+                         f"[Service]\nExecStart=\nExecStart={self.root}/opt/mesh/mesh-native\n")
+        self.assertEqual(self.runtime_selection().stat().st_mode & 0o777, 0o644)
+
+    def test_go_runtime_removes_the_native_selection(self):
+        self.runtime_selection().write_text("old runtime")
+        self.native_release("go")
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertFalse(self.runtime_selection().exists())
+        self.assertEqual((self.root / "opt/mesh/mesh-native").read_text(), "new native")
+
+    def test_failed_native_health_restores_previous_runtime(self):
+        (self.root / "opt/mesh/mesh-native").write_text("old native")
+        self.runtime_selection().write_text("old runtime")
+        self.native_release("native")
+        self.environment["FAIL_SERVICE"] = "is-active --quiet mesh.service"
+        self.assertNotEqual(self.run_install().returncode, 0)
+        self.assert_old_install()
+        self.assertEqual((self.root / "opt/mesh/mesh-native").read_text(), "old native")
+        self.assertEqual(self.runtime_selection().read_text(), "old runtime")
+
+    def test_failed_first_native_install_restores_go(self):
+        self.native_release("native")
+        self.environment["FAIL_SERVICE"] = "is-active --quiet mesh.service"
+        self.assertNotEqual(self.run_install().returncode, 0)
+        self.assert_old_install()
+        self.assertFalse((self.root / "opt/mesh/mesh-native").exists())
+        self.assertFalse(self.runtime_selection().exists())
+
+    def test_native_runtime_requires_a_native_build_and_known_runtime(self):
+        for runtime, native in (("native", False), ("rust", True)):
+            with self.subTest(runtime=runtime):
+                self.native_release(runtime)
+                if not native:
+                    (self.root / "opt/mesh-src/mesh-native").unlink()
+                self.assertNotEqual(self.run_install().returncode, 0)
+                self.assert_old_install()
+                self.assertFalse((self.root / "services.log").exists())
+
     def prepare_legacy_rename(self):
         import shutil
         legacy_env = self.root / "etc/daochi/daochi.env"

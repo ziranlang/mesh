@@ -33,6 +33,21 @@ python3 /opt/mesh-src/scripts/verify_deployment_inputs.py verify-artifact-manife
   --manifest /opt/mesh-src/build/mesh.manifest.json \
   --expected-source-commit "$source_commit" \
   --expected-liboqs-commit "$expected_commit"
+# deploy/runtime selects the server mesh.service runs: go or native.
+runtime=go
+if [ -f /opt/mesh-src/deploy/runtime ]; then
+  runtime=$(cat /opt/mesh-src/deploy/runtime)
+fi
+case "$runtime" in go|native) ;; *) exit 1 ;; esac
+if [ -f /opt/mesh-src/mesh-native ]; then
+  python3 /opt/mesh-src/scripts/verify_deployment_inputs.py verify-artifact-manifest \
+    --output /opt/mesh-src/mesh-native \
+    --manifest /opt/mesh-src/build/mesh-native.manifest.json \
+    --expected-source-commit "$source_commit" \
+    --expected-liboqs-commit "$expected_commit"
+elif [ "$runtime" = native ]; then
+  exit 1
+fi
 python3 /opt/mesh-src/deploy/migrate-install.py prepare "$STAMP"
 mkdir -p /var/lib/mesh/backups
 database=$(python3 /opt/mesh-src/deploy/database-path.py /etc/mesh/mesh.env)
@@ -51,6 +66,16 @@ if [ -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf ]; then
   cp /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf "/var/lib/mesh/backups/mesh.mesh.$STAMP"
 else
   touch "/var/lib/mesh/backups/mesh.mesh-absent.$STAMP"
+fi
+if [ -f /opt/mesh/mesh-native ]; then
+  cp /opt/mesh/mesh-native "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP"
+else
+  touch "/var/lib/mesh/backups/mesh-native-absent.$STAMP"
+fi
+if [ -f /etc/systemd/system/mesh.service.d/30-runtime.conf ]; then
+  cp /etc/systemd/system/mesh.service.d/30-runtime.conf "/var/lib/mesh/backups/mesh.runtime.$STAMP"
+else
+  touch "/var/lib/mesh/backups/mesh.runtime-absent.$STAMP"
 fi
 rollback_ready=1
 # Replace the existing backup maintenance unit only when it was already enabled.
@@ -73,6 +98,22 @@ install -m 755 /opt/mesh-src/mesh /opt/mesh/mesh.new
 install -m 644 /opt/mesh-src/build/mesh.manifest.json /opt/mesh/mesh.manifest.new
 mv /opt/mesh/mesh.new /opt/mesh/mesh
 mv /opt/mesh/mesh.manifest.new /opt/mesh/mesh.manifest.json
+# The Go binary stays installed: its CLI commands and apply-dew-ratio.sh use it.
+if [ -f /opt/mesh-src/mesh-native ]; then
+  install -m 755 /opt/mesh-src/mesh-native /opt/mesh/mesh-native.new
+  install -m 644 /opt/mesh-src/build/mesh-native.manifest.json /opt/mesh/mesh-native.manifest.new
+  mv /opt/mesh/mesh-native.new /opt/mesh/mesh-native
+  mv /opt/mesh/mesh-native.manifest.new /opt/mesh/mesh-native.manifest.json
+fi
+install -d -m 755 /etc/systemd/system/mesh.service.d
+if [ "$runtime" = native ]; then
+  printf '[Service]\nExecStart=\nExecStart=/opt/mesh/mesh-native\n' > /etc/systemd/system/mesh.service.d/30-runtime.new
+  chmod 644 /etc/systemd/system/mesh.service.d/30-runtime.new
+  mv /etc/systemd/system/mesh.service.d/30-runtime.new /etc/systemd/system/mesh.service.d/30-runtime.conf
+else
+  rm -f /etc/systemd/system/mesh.service.d/30-runtime.conf
+fi
+systemctl daemon-reload
 if [ -n "$mesh_token" ]; then
   install -d -m 755 /etc/systemd/system/mesh.service.d
   printf '%s' "$mesh_token" | python3 -c '

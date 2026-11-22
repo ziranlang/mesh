@@ -66,6 +66,17 @@ class OriginPolicyTest(unittest.TestCase):
         with self.assertRaises(origin.DeployError):
             self.verify()
 
+    def test_native_server_builds_only_from_shipped_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stage = Path(directory)
+            self.assertEqual(origin.native_build_commands(stage, self.revision, '4' * 40), [])
+            (stage / 'build/native-release/server').mkdir(parents=True)
+            build, verify = origin.native_build_commands(stage, self.revision, '4' * 40)
+            self.assertEqual(build[:3], ('/usr/bin/make', '-j2', 'build-native'))
+            self.assertIn(f'SOURCE_COMMIT={self.revision}', build)
+            self.assertIn('mesh-native', verify)
+            self.assertIn(self.revision, verify)
+
     def test_forced_command_grammar(self):
         command = f'deploy 42 3 {self.revision} {"4" * 40} {"5" * 64} 6667 88'
         self.assertIsNotNone(origin.COMMAND.fullmatch(command))
