@@ -170,10 +170,6 @@
         file := tree.OpenChildRegularFile(directory, hash)
         if !file.valid { return Missing() }
         size := files.FileSize(file)
-        if size < 0 || size > MaxBlobBytes || !digest.Matches(file, size, hash) {
-            unused files.CloseFile(file)
-            return .{status = 503, message = "blob integrity failure"}
-        }
         if !Committed(database) {
             unused files.CloseFile(file)
             return StorageFailure()
@@ -189,7 +185,8 @@
         bytes: []u8, overflow: bool) -> Result {
         milliseconds := calendar.UnixMilliseconds()
         if milliseconds < 0 || !mutex.Lock(*access.databaseLock) { return StorageFailure() }
-        defer mutex.Unlock(*access.databaseLock)
+        locked := true
+        defer { if locked { unused mutex.Unlock(*access.databaseLock) } }
         now := milliseconds / 1000
         instant: time.TimestampValue = .{seconds = now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
         audit: [31]u8
@@ -208,7 +205,13 @@
         if operation == .Invalid { return .{status = 405, message = "unsupported blob method"} }
         if operation == .Put {
             if overflow || bytes.count == 0 || bytes.count > MaxBlobBytes { return .{status = 413, message = "blob exceeds limit or is empty"} }
-            if !MatchesHash(bytes, address.hash) { return .{status = 400, message = "blob hash mismatch"} }
+            // Release databaseLock while hashing up to 16 MiB of blob bytes.
+            locked = false
+            unused mutex.Unlock(*access.databaseLock)
+            hashOK := MatchesHash(bytes, address.hash)
+            if !mutex.Lock(*access.databaseLock) { return StorageFailure() }
+            locked = true
+            if !hashOK { return .{status = 400, message = "blob hash mismatch"} }
         }
         header := wire.TrimSpace(http.Header(connection, "X-Mesh-Tx"))
         signer := address.app
@@ -249,7 +252,15 @@
         result := Apply(access, connection, method, route, bytes, overflow)
         headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = PrivateCache}]
         if result.file.valid {
-            return http.WriteFile(connection, 200, "application/octet-stream", result.file, result.size, headers[:])
+            // Verify on-disk blob integrity outside databaseLock before streaming.
+            address := BlobAddress(route)
+            if result.size < 0 || result.size > MaxBlobBytes || !address.valid ||
+                !digest.Matches(result.file, result.size, address.hash) {
+                unused files.CloseFile(result.file)
+                result = .{status = 503, message = "blob integrity failure"}
+            } else {
+                return http.WriteFile(connection, 200, "application/octet-stream", result.file, result.size, headers[:])
+            }
         }
         if result.status == 204 {
             empty: [0]u8
