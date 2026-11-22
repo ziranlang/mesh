@@ -3,7 +3,7 @@
     schema :: #import "sqlite_schema";
     sqlite :: #import "sqlite/SQLite";
     wire :: #import "wire_text";
-    env :: #import "std/environment_linux";
+    config_env :: #import "config_environment_native";
     memory :: #import "std/byte_text_linux";
     stdio :: #import "std/stdio_linux";
     #import "std/vec"
@@ -81,7 +81,7 @@
         if options.help { return ifx stdio.WriteOutput(Usage) then 0 else 1 }
         if options.error != "" { return Error(options.error) }
         path := options.path
-        if path == "" { path = wire.TrimSpace(env.EnvironmentText("MESH_DB")) }
+        if path == "" { path = wire.TrimSpace(config_env.Text("MESH_DB")) }
         if path == "" { path = "daochi.db" }
         opened := schema.OpenReadOnly(path)
         if opened.status != sqlite.SQLITE_OK { return Error("cannot open database read-only") }

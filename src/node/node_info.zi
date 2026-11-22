@@ -1,24 +1,13 @@
 // The advertised capability order is shared by node and sync responses.
 coding :: #import "content_coding";
+shared :: #import "node_capabilities";
 builtin :: #system_library "go:builtin";
 #scope_file
 Append :: (values: []string, value: string) -> []string #foreign builtin "append";
 #scope_export
 Capabilities :: () -> []string {
     if coding.ZstdRequestsEnabled() {
-        return Append(capabilities[:], "http-zstd-v1")
+        return Append(shared.Names[:], "http-zstd-v1")
     }
-    return capabilities[:]
+    return shared.Names[:]
 }
-
-#scope_file
-capabilities: [25]string = .[
-    "aliases", "friends", "v3-typed-sync", "v4-encrypted-records",
-    "v4-dual-write-transition", "v5-encrypted-primary", "v5-private-hierarchy",
-    "v5-dual-read", "v5-legacy-encrypted-collections",
-    "protocol-v1-v5-valid-through-2027-09-01",
-    "protocol-previous-version-grace-days-365", "v6-signed-transactions",
-    "v6-signed-app-manifests", "profile-stats", "pub-relay",
-    "node-mesh-encrypted-records", "node-identity-v1", "node-pairing-v1",
-"trust-space-names-v1", "monero-account-addresses", "monero-gifts", "record-pages-metadata-v1", "http-gzip-v1", "record-gzip-v1", "basic-storage-free-v1"
-];

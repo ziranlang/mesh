@@ -1,0 +1,39 @@
+// Mesh settings take precedence, including an explicitly empty value.
+// DAOCHI_* is a deployment compatibility alias; values are never rewritten.
+// This matches config_environment.zi, which the Go server reads through.
+#if TARGET == .C && OS == .LINUX {
+    environment :: #import "std/environment_linux";
+
+    #scope_file
+    libc :: #system_library "c";
+    Getenv :: (name: *u8) -> *u8 #foreign libc "getenv";
+    Prefix :: "MESH_";
+    LegacyPrefix :: "DAOCHI_";
+
+    // Copies `name` as a C string; false when it does not fit.
+    CName :: (name: string, output: []u8) -> bool {
+        if name.count >= output.count { return false }
+        for byte, index: name { output[index] = byte }
+        output[name.count] = 0
+        return true
+    }
+
+    Present :: (name: string) -> bool {
+        buffer: [256]u8
+        return CName(name, buffer[:]) && Getenv(*buffer[0]) != null
+    }
+
+    #scope_export
+    // The value of `key`, or of its DAOCHI_ alias when a MESH_ key is unset.
+    Text :: (key: string) -> string {
+        if Present(key) || key.count <= Prefix.count || key[:Prefix.count] != Prefix {
+            return environment.EnvironmentText(key)
+        }
+        legacy: [256]u8
+        rest := key[Prefix.count:]
+        if LegacyPrefix.count + rest.count >= legacy.count { return "" }
+        for byte, index: LegacyPrefix { legacy[index] = byte }
+        for byte, index: rest { legacy[LegacyPrefix.count + index] = byte }
+        return environment.EnvironmentText(TextView(legacy[:LegacyPrefix.count + rest.count]))
+    }
+}

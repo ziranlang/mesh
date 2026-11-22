@@ -41,6 +41,17 @@ def masked_frame(payload, opcode=1):
     return bytes([0x80 | opcode]) + length + mask + bytes(value ^ mask[i % 4] for i, value in enumerate(payload))
 
 
+NODE_CAPABILITIES = [
+    "aliases", "friends", "v3-typed-sync", "v4-encrypted-records", "v4-dual-write-transition",
+    "v5-encrypted-primary", "v5-private-hierarchy", "v5-dual-read", "v5-legacy-encrypted-collections",
+    "protocol-v1-v5-valid-through-2027-09-01", "protocol-previous-version-grace-days-365",
+    "v6-signed-transactions", "v6-signed-app-manifests", "profile-stats", "pub-relay",
+    "node-mesh-encrypted-records", "node-identity-v1", "node-pairing-v1", "trust-space-names-v1",
+    "monero-account-addresses", "monero-gifts", "record-pages-metadata-v1", "http-gzip-v1",
+    "record-gzip-v1", "basic-storage-free-v1",
+]
+
+
 def read_response(peer):
     result = bytearray()
     while chunk := peer.recv(4096):
@@ -1383,6 +1394,30 @@ def pairing_node(binary, database, *, arguments=(), **settings):
             assert server.returncode == 0, errors
 
 
+def check_legacy_environment(binary, directory):
+    """Deployed units still set DAOCHI_* names; MESH_* names take precedence."""
+    database = directory / "legacy-names.db"
+    env = {key: value for key, value in os.environ.items() if not key.startswith(("MESH_", "DAOCHI_"))}
+    env.update({"DAOCHI_ADDR": "127.0.0.1:0", "DAOCHI_DB": str(database), "DAOCHI_TOKEN_SECRET_HEX": "00" * 32,
+                "DAOCHI_NODE_IDENTITY_KEY_FILE": f"{database}.node-key", "DAOCHI_NODE_NAME": "Legacy node",
+                "DAOCHI_BASE_URL": "http://legacy.invalid", "MESH_BASE_URL": "http://127.0.0.1",
+                "DAOCHI_LAN_ONLY": "1", "DAOCHI_LAN_NETWORKS": "127.0.0.1/32",
+                "DAOCHI_NODE_SYNC_INTERVAL_SECONDS": "0"})
+    with subprocess.Popen([binary], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as server:
+        try:
+            ready, _, _ = select.select([server.stdout], [], [], 5)
+            assert ready, "legacy-named node did not report its bound port"
+            started = server.stdout.readline()
+            assert started, server.stderr.read(1000)
+            status = node_status("127.0.0.1", int(started))
+            assert status["node_name"] == "Legacy node" and status["base_url"] == "http://127.0.0.1", status
+            assert database.is_file() and Path(f"{database}.node-key").is_file()
+        finally:
+            server.terminate()
+            _, errors = server.communicate(timeout=5)
+    assert server.returncode == 0, errors
+
+
 def check_node_pairing(binary, directory, oracle):
     left_db, right_db = directory / "pairing-left.db", directory / "pairing-right.db"
     host = "127.0.0.1"
@@ -2074,7 +2109,8 @@ def check_node_status(binary, database):
         assert status["node_id"] == hashlib.sha256(public).hexdigest() and status["node_public_key"] == public.hex()
         assert status["status"] == "ok" and status["node_name"] == "Fixture node"
         assert status["protocol"] == {"min_supported": 1, "latest": 6} and status["build_version"]
-        assert {"http-zstd-v1", "node-mesh-encrypted-records", "trust-space-names-v1"} <= set(status["capabilities"])
+        # The exact Go order: node and sync responses share it, then configured extras.
+        assert status["capabilities"] == NODE_CAPABILITIES + ["http-zstd-v1"], status["capabilities"]
         assert status["known_nodes"] == [
             {"name": "mirror", "url": "http://127.0.0.1:43201", "sync": {
                 "direction": "pull", "collections": ["private.stats.*"], "data": ["encrypted_records"]}},
@@ -2504,6 +2540,7 @@ def main():
                 listener.bind((host, port))
                 listener.listen()
         if server_mode:
+            check_legacy_environment(binary, Path(directory))
             check_node_pairing(binary, Path(directory), oracle)
             check_peer_pulls(binary, Path(directory), oracle)
             check_node_status(binary, Path(directory) / "node-status.db")
@@ -2519,7 +2556,8 @@ def main():
                         "check_chat_http.py", "check_google_account_http.py", "check_lists_http.py",
                         "check_social_socket.py", "check_lumi_developer_http.py", "check_token_http.py",
                         "check_entitlements_http.py", "check_token_rewards_http.py", "check_alias_http.py",
-                        "check_game_evidence_http.py", "check_monero_http.py", "check_monero_reconcile.py"):
+                        "check_game_evidence_http.py", "check_monero_http.py", "check_monero_reconcile.py",
+                        "check_referral_http.py"):
             subprocess.run([sys.executable, "-B", fixture_dir / fixture, binary, oracle], check=True)
         for fixture in ("check_delegated_http.py", "check_delegated_ws.py",
                         "check_lumi_telegram_http.py", "check_telegram_account_http.py",

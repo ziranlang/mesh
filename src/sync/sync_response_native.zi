@@ -1,5 +1,6 @@
 #if TARGET == .C && OS == .LINUX {
     json :: #import "std/json_document";
+    shared_capabilities :: #import "node_capabilities";
     sql :: #import "sqlite_statement_native";
     sqlite :: #import "sqlite/SQLite";
 
@@ -42,9 +43,8 @@
     }
 
     AttachCapabilities :: (document: *json.JsonDocument, root: s32, zstd: bool) -> bool {
-        capabilityNames: [4]string = .["v6-signed-transactions", "http-gzip-v1", "record-gzip-v1", "basic-storage-free-v1"]
         array := json.JsonNewArray(document)
-        for name: capabilityNames {
+        for name: shared_capabilities.Names {
             if !json.JsonAppend(document, array, json.JsonNewStringCopy(document, name)) { return false }
         }
         return (!zstd || json.JsonAppend(document, array, json.JsonNewString(document, "http-zstd-v1"))) &&

@@ -1,0 +1,432 @@
+// Native referral routes with the same codes, claims and listings as the Go
+// referral_http and referral modules. Only the canonical issuer serves them.
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    mutex :: #import "std/mutex_linux";
+    digits :: #import "std/number_text";
+    numbers :: #import "token_payload";
+    random :: #import "std/random_linux";
+    response :: #import "http_json_native";
+    sha :: #import "crypto/sha256";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    strict :: #import "strict_json_native";
+    time :: #import "timestamp_value";
+    wire :: #import "wire_text";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    #scope_export
+    Authority :: "https://api.waozi.xyz";
+    WelcomeUnits :: 20000000;
+
+    #scope_file
+    MePath :: "/api/v1/referrals/me";
+    ClaimPath :: "/api/v1/referrals/claim";
+    AcceptedPath :: "/api/v1/referrals/accepted";
+    RotatePath :: "/api/v1/referrals/code/rotate";
+    InvitePrefix :: "https://dew.waozi.xyz/invite/";
+    ClaimBodyLimit :: 2048;
+    RotateBodyLimit :: 1024;
+    CodeLength :: 32;
+
+    AcceptedPage :: #string SQL
+SELECT c.account_id,COALESCE(u.alias,''),c.accepted_at,c.seq FROM referral_claims c
+LEFT JOIN server_users u ON u.user_id_hash=c.account_id
+WHERE c.referrer_id=?1 AND c.seq>?2 ORDER BY c.seq LIMIT ?3
+SQL;
+    Earnings :: #string SQL
+SELECT COALESCE(SUM(issued_units),0),COALESCE(SUM(reversed_units),0),
+COALESCE(SUM(MAX(0,issued_units-reversed_units-target_units)),0)
+FROM referral_commissions WHERE referrer_id=?1
+SQL;
+
+    // A failure carries the Go error text; status 0 means success.
+    Outcome :: struct {
+        status: u32
+        error: string
+    }
+
+    Fail :: (error: string) -> Outcome {
+        status: u32 = 503
+        message := error
+        if error == "invalid_request" {
+            status = 400
+        } else if error == "invalid_code" {
+            status = 404
+        } else if error == "revoked_code" || error == "self_referral" || error == "already_bound" || error == "request_conflict" {
+            status = 409
+        } else {
+            message = "unavailable"
+        }
+        return .{status = status, error = message}
+    }
+
+    Reply :: (connection: *void, method: string, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"}]
+        if method == "HEAD" {
+            empty: []u8
+            return http.WriteWithHeaders(connection, status, "application/json", empty, headers[:])
+        }
+        return response.ReplyWithHeaders(connection, status, document, root, headers[:])
+    }
+
+    Error :: (connection: *void, method: string, status: u32, error: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "error", error) { return 0 }
+        return Reply(connection, method, status, *document, root)
+    }
+
+    WrongNode :: (connection: *void, method: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "error", "wrong_node") || !ledger.PutText(*document, root, "authority", Authority) {
+            return 0
+        }
+        return Reply(connection, method, 409, *document, root)
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    // Reads the first column of a one-row query into a fixed buffer.
+    ReadText :: (database: *void, query: string, arguments: []sql.Argument, output: []u8) -> s64 {
+        row := sql.Prepare(database, query, arguments)
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return 0 }
+        if status != sqlite.SQLITE_ROW { return -1 }
+        found := sql.ColumnText(row.value, 0)
+        if found.count == 0 || found.count > output.count { return -1 }
+        for byte, index: found { output[index] = byte }
+        return found.count
+    }
+
+    // Returns the account's active invitation code, creating one when none is active.
+    ActiveCode :: (database: *void, account: string, at: string, code: []u8) -> bool {
+        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(""), sql.TextArg(at)]
+        found := ReadText(database, "SELECT code FROM referral_codes WHERE account_id=?1 AND revoked_at=''", arguments[:1], code)
+        if found == CodeLength { return true }
+        if found != 0 { return false }
+        raw: [16]u8
+        encoded: [33]u8
+        if !random.FillSecure(raw[:]) || sha.BytesToHex(*raw[0], raw.count, *encoded[0], encoded.count) != 1 {
+            return false
+        }
+        for index: 0..CodeLength - 1 { code[index] = encoded[index] }
+        arguments[1] = sql.TextArg(TextView(code[:CodeLength]))
+        values: [3]sql.Argument = .[arguments[1], arguments[0], arguments[2]]
+        return sql.Execute(database, "INSERT INTO referral_codes(code,account_id,created_at) VALUES(?1,?2,?3)", values[:]) == sqlite.SQLITE_OK
+    }
+
+    // Rotation with a request ID revokes the active code once per request.
+    Code :: (database: *void, account: string, request: string, at: string, code: []u8) -> Outcome {
+        if request != "" {
+            arguments: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(request)]
+            found := ReadText(database, "SELECT code FROM referral_rotations WHERE account_id=?1 AND request_id=?2", arguments[:], code)
+            if found == CodeLength { return .{} }
+            if found != 0 { return Fail("unavailable") }
+            revoked: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(at)]
+            if sql.Execute(database, "UPDATE referral_codes SET revoked_at=?2 WHERE account_id=?1 AND revoked_at=''", revoked[:]) != sqlite.SQLITE_OK {
+                return Fail("unavailable")
+            }
+        }
+        if !ActiveCode(database, account, at, code) { return Fail("unavailable") }
+        if request != "" {
+            values: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(request), sql.TextArg(TextView(code[:CodeLength]))]
+            if sql.Execute(database, "INSERT INTO referral_rotations(account_id,request_id,code) VALUES(?1,?2,?3)", values[:]) != sqlite.SQLITE_OK {
+                return Fail("unavailable")
+            }
+        }
+        return .{}
+    }
+
+    PutInvite :: (document: *json.JsonDocument, root: s32, code: string) -> bool {
+        invite: Vec(u8)
+        defer VecFree(invite)
+        return ledger.PutText(document, root, "code", code) && BuilderAppend(invite, InvitePrefix) && BuilderAppend(invite, code) &&
+            ledger.PutText(document, root, "invite_url", TextView(VecSlice(invite, 0, invite.count)))
+    }
+
+    Me :: (database: *void, connection: *void, method: string, account: string, at: string) -> s32 {
+        code: [CodeLength]u8
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Error(connection, method, 503, "unavailable")
+        }
+        defer Rollback(database)
+        made := Code(database, account, "", at, code[:])
+        if made.status != 0 { return Error(connection, method, made.status, made.error) }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "status", "ok") || !ledger.PutText(*document, root, "authority", Authority) ||
+            !ledger.PutText(*document, root, "account_id", account) || !PutInvite(*document, root, TextView(code[:])) {
+            return 0
+        }
+        arguments: [1]sql.Argument = .[sql.TextArg(account)]
+        claim := sql.Prepare(database, "SELECT referrer_id,accepted_at,welcome_receipt_id FROM referral_claims WHERE account_id=?1", arguments[:])
+        if claim.status != sqlite.SQLITE_OK { return Error(connection, method, 503, "unavailable") }
+        defer sqlite.SqliteFinalize(claim.value)
+        step := sqlite.SqliteStep(claim.value)
+        if step != sqlite.SQLITE_ROW && step != sqlite.SQLITE_DONE { return Error(connection, method, 503, "unavailable") }
+        bound := step == sqlite.SQLITE_ROW
+        names: [3]string = .["referrer_id", "accepted_at", "welcome_receipt_id"]
+        for name, index: names {
+            column := ifx bound then sql.ColumnText(claim.value, cast(s32)index) else ""
+            if !ledger.PutText(*document, root, name, column) { return 0 }
+        }
+        accepted := sql.ReadInteger(database, "SELECT COUNT(*) FROM referral_claims WHERE referrer_id=?1", arguments[:])
+        if accepted.status != sqlite.SQLITE_OK || !accepted.found ||
+            !ledger.PutInt(*document, root, "accepted_count", accepted.value) {
+            return Error(connection, method, 503, "unavailable")
+        }
+        earnings := sql.Prepare(database, Earnings, arguments[:])
+        if earnings.status != sqlite.SQLITE_OK { return Error(connection, method, 503, "unavailable") }
+        defer sqlite.SqliteFinalize(earnings.value)
+        if sqlite.SqliteStep(earnings.value) != sqlite.SQLITE_ROW { return Error(connection, method, 503, "unavailable") }
+        totals: [3]string = .["earned_units", "reversed_units", "pending_offset_units"]
+        for name, index: totals {
+            if !ledger.PutInt(*document, root, name, sqlite.SqliteColumnInt64(earnings.value, cast(s32)index)) { return 0 }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(connection, method, 503, "unavailable")
+        }
+        return Reply(connection, method, 200, *document, root)
+    }
+
+    // Codes compare case-insensitively after trimming, as in the Go module.
+    LowerCode :: (text: string, output: []u8) -> bool {
+        code := wire.TrimSpace(text)
+        if code.count != CodeLength || output.count < CodeLength { return false }
+        for byte, index: code {
+            output[index] = ifx byte >= #char "A" && byte <= #char "Z" then byte + 32 else byte
+        }
+        return true
+    }
+
+    ReadFields :: (connection: *void, input: []u8, overflow: bool, limit: s64, zstd: bool, names: []string,
+        document: *json.JsonDocument, fields: []s32) -> bool {
+        body: response.Body
+        read := response.Decode(connection, input, overflow || input.count > limit, limit, zstd, *body)
+        if read.status != 0 { return false }
+        raw := ifx read.decoded then VecSlice(body.scratch, 0, read.length) else input
+        return strict.ReadStringFields(document, raw, names, fields)
+    }
+
+    Claim :: (database: *void, signer: *issuer.Issuer, connection: *void, account: string, now: time.TimestampValue,
+        input: []u8, overflow: bool, zstd: bool) -> s32 {
+        names: [3]string = .["code", "request_id", "source_app_id"]
+        fields: [3]s32
+        source: json.JsonDocument
+        if !ReadFields(connection, input, overflow, ClaimBodyLimit, zstd, names[:], *source, fields[:]) {
+            return Error(connection, "POST", 400, "invalid_request")
+        }
+        lowered: [CodeLength]u8
+        // Absent and null fields read as empty text, as the Go decoder leaves them.
+        codeText: Text = json.JsonString(*source, fields[0])
+        requestText: Text = json.JsonString(*source, fields[1])
+        appText: Text = json.JsonString(*source, fields[2])
+        validCode := LowerCode(TextView(codeText), lowered[:])
+        code := TextView(lowered[:])
+        request := TextView(requestText)
+        app := TextView(appText)
+        if !identity.ValidUserID(account) || !identity.ValidClientID(request) || !validCode ||
+            (app != "" && !identity.ValidNamespace(app)) {
+            return Error(connection, "POST", 400, "invalid_request")
+        }
+        timestamp: [31]u8
+        at := signing.WireTime(now, false, timestamp[:])
+        if at == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Error(connection, "POST", 503, "unavailable")
+        }
+        defer Rollback(database)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        arguments: [1]sql.Argument = .[sql.TextArg(account)]
+        existing := sql.Prepare(database, "SELECT referrer_id,accepted_at,welcome_receipt_id,code,request_id FROM referral_claims WHERE account_id=?1", arguments[:])
+        if existing.status != sqlite.SQLITE_OK { return Error(connection, "POST", 503, "unavailable") }
+        defer sqlite.SqliteFinalize(existing.value)
+        step := sqlite.SqliteStep(existing.value)
+        if step == sqlite.SQLITE_ROW {
+            if sql.ColumnText(existing.value, 3) != code {
+                problem := ifx sql.ColumnText(existing.value, 4) == request then "request_conflict" else "already_bound"
+                return Error(connection, "POST", 409, problem)
+            }
+            if !ledger.PutText(*document, root, "status", "already_bound") ||
+                !ledger.PutText(*document, root, "referrer_id", sql.ColumnText(existing.value, 0)) ||
+                !ledger.PutText(*document, root, "accepted_at", sql.ColumnText(existing.value, 1)) ||
+                !ledger.PutInt(*document, root, "welcome_units", WelcomeUnits) ||
+                !ledger.PutText(*document, root, "welcome_receipt_id", sql.ColumnText(existing.value, 2)) ||
+                sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+                return Error(connection, "POST", 503, "unavailable")
+            }
+            return Reply(connection, "POST", 200, *document, root)
+        }
+        if step != sqlite.SQLITE_DONE { return Error(connection, "POST", 503, "unavailable") }
+        // Require a registered, live account even for internal callers.
+        live := sql.ReadInteger(database, "SELECT COUNT(*) FROM server_users WHERE user_id_hash=?1", arguments[:])
+        if live.status != sqlite.SQLITE_OK || !live.found { return Error(connection, "POST", 503, "unavailable") }
+        if live.value != 1 { return Error(connection, "POST", 400, "invalid_request") }
+        // Optional host attribution is untrusted audit data. It never requires or
+        // creates an app registration, token permission or spending entitlement.
+        codeArgument: [1]sql.Argument = .[sql.TextArg(code)]
+        owner := sql.Prepare(database, "SELECT c.account_id,c.revoked_at FROM referral_codes c JOIN server_users u ON u.user_id_hash=c.account_id WHERE c.code=?1", codeArgument[:])
+        if owner.status != sqlite.SQLITE_OK { return Error(connection, "POST", 503, "unavailable") }
+        defer sqlite.SqliteFinalize(owner.value)
+        step = sqlite.SqliteStep(owner.value)
+        if step == sqlite.SQLITE_DONE { return Error(connection, "POST", 404, "invalid_code") }
+        if step != sqlite.SQLITE_ROW { return Error(connection, "POST", 503, "unavailable") }
+        referrer := sql.ColumnText(owner.value, 0)
+        if sql.ColumnText(owner.value, 1) != "" { return Error(connection, "POST", 409, "revoked_code") }
+        if referrer == account { return Error(connection, "POST", 409, "self_referral") }
+        welcome: signing.Event = .{account = account, kind = "credit", amount = WelcomeUnits,
+            source = "referral_welcome", reference = account}
+        credit := writes.CreditPayment(database, signer, "referral_welcome", account, welcome, at)
+        if credit.status != 200 { return Error(connection, "POST", 503, "unavailable") }
+        receipt := TextView(credit.id[:])
+        receiptArgument: [1]sql.Argument = .[sql.TextArg(receipt)]
+        sequence := sql.ReadInteger(database, "SELECT ledger_seq FROM token_ledger WHERE receipt_id=?1", receiptArgument[:])
+        if sequence.status != sqlite.SQLITE_OK || !sequence.found { return Error(connection, "POST", 503, "unavailable") }
+        values: [8]sql.Argument = .[sql.TextArg(account), sql.TextArg(referrer), sql.TextArg(code), sql.TextArg(request),
+            sql.TextArg(app), sql.TextArg(at), sql.TextArg(receipt), sql.IntArg(sequence.value)]
+        if sql.Execute(database, "INSERT INTO referral_claims(account_id,referrer_id,code,request_id,source_app_id,accepted_at,welcome_receipt_id,welcome_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", values[:]) != sqlite.SQLITE_OK {
+            return Error(connection, "POST", 503, "unavailable")
+        }
+        if !ledger.PutText(*document, root, "status", "bound") || !ledger.PutText(*document, root, "referrer_id", referrer) ||
+            !ledger.PutText(*document, root, "accepted_at", at) || !ledger.PutInt(*document, root, "welcome_units", WelcomeUnits) ||
+            !ledger.PutText(*document, root, "welcome_receipt_id", receipt) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(connection, "POST", 503, "unavailable")
+        }
+        return Reply(connection, "POST", 200, *document, root)
+    }
+
+    Rotate :: (database: *void, connection: *void, account: string, now: time.TimestampValue,
+        input: []u8, overflow: bool, zstd: bool) -> s32 {
+        names: [1]string = .["request_id"]
+        fields: [1]s32
+        source: json.JsonDocument
+        if !ReadFields(connection, input, overflow, RotateBodyLimit, zstd, names[:], *source, fields[:]) {
+            return Error(connection, "POST", 400, "invalid_request")
+        }
+        requestText: Text = json.JsonString(*source, fields[0])
+        request := TextView(requestText)
+        if !identity.ValidClientID(request) { return Error(connection, "POST", 400, "invalid_request") }
+        timestamp: [31]u8
+        at := signing.WireTime(now, false, timestamp[:])
+        if at == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Error(connection, "POST", 503, "unavailable")
+        }
+        defer Rollback(database)
+        code: [CodeLength]u8
+        made := Code(database, account, request, at, code[:])
+        if made.status != 0 { return Error(connection, "POST", made.status, made.error) }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !PutInvite(*document, root, TextView(code[:])) || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(connection, "POST", 503, "unavailable")
+        }
+        return Reply(connection, "POST", 200, *document, root)
+    }
+
+    QueryInteger :: (connection: *void, name: string, fallback: s64) -> numbers.ParsedInteger {
+        text := http.QueryArgument(connection, name)
+        if text == "" { return .{is_ok = true, value = fallback} }
+        return numbers.ParseInteger(text)
+    }
+
+    Accepted :: (database: *void, connection: *void, method: string, account: string) -> s32 {
+        cursor := QueryInteger(connection, "cursor", 0)
+        limit := QueryInteger(connection, "limit", 50)
+        if !cursor.is_ok || !limit.is_ok || cursor.value < 0 || limit.value < 1 || limit.value > 100 {
+            return Error(connection, method, 400, "invalid_request")
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.IntArg(cursor.value), sql.IntArg(limit.value + 1)]
+        rows := sql.Prepare(database, AcceptedPage, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return Error(connection, method, 503, "unavailable") }
+        defer sqlite.SqliteFinalize(rows.value)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        list := json.JsonNewArray(*document)
+        count: s64 = 0
+        last: s64 = 0
+        next := false
+        while true {
+            step := sqlite.SqliteStep(rows.value)
+            if step == sqlite.SQLITE_DONE { break }
+            if step != sqlite.SQLITE_ROW { return Error(connection, method, 503, "unavailable") }
+            if count == limit.value {
+                next = true
+                break
+            }
+            friend := sql.ColumnText(rows.value, 0)
+            alias := sql.ColumnText(rows.value, 1)
+            last = sqlite.SqliteColumnInt64(rows.value, 3)
+            item := json.JsonNewObject(*document)
+            if !ledger.PutText(*document, item, "account_id", friend) ||
+                !ledger.PutText(*document, item, "display_name", ifx alias == "" then friend else alias) ||
+                !ledger.PutText(*document, item, "alias", alias) ||
+                !ledger.PutText(*document, item, "accepted_at", sql.ColumnText(rows.value, 2)) ||
+                !ledger.PutInt(*document, item, "cursor", last) || !json.JsonAppend(*document, list, item) {
+                return 0
+            }
+            count += 1
+        }
+        buffer: [24]u8
+        cursorText := ifx next then digits.FormatInteger(last, buffer[:]) else ""
+        if !json.JsonSet(*document, root, "accepted", list) || !ledger.PutText(*document, root, "next_cursor", cursorText) {
+            return 0
+        }
+        return Reply(connection, method, 200, *document, root)
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool {
+        return path == MePath || path == ClaimPath || path == AcceptedPath || path == RotatePath
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return method == "POST" && (path == ClaimPath || path == RotatePath)
+    }
+
+    Handle :: (signer: *issuer.Issuer, access: *accounts.AccountAccess, baseURL: string, connection: *void,
+        method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        reads := path == MePath || path == AcceptedPath
+        if (reads && method != "GET" && method != "HEAD") || (!reads && method != "POST") {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = ifx reads then "GET, HEAD" else "POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if !mutex.Lock(*access.databaseLock) { return Error(connection, method, 503, "unavailable") }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := signing.Now()
+        if !now.valid { return Error(connection, method, 503, "unavailable") }
+        actor := auth.Authenticate(database, connection, access.configuration.secret, now.seconds, "", false)
+        if actor.status != 0 { return Error(connection, method, actor.status, actor.message) }
+        if wire.TrimSpace(baseURL) != Authority { return WrongNode(connection, method) }
+        if issuer.Status(signer) != "ok" { return Error(connection, method, 503, "unavailable") }
+        account := TextView(actor.userID[:])
+        zstd := access.configuration.zstdRequests
+        if path == MePath {
+            timestamp: [31]u8
+            at := signing.WireTime(now, false, timestamp[:])
+            if at == "" { return Error(connection, method, 503, "unavailable") }
+            return Me(database, connection, method, account, at)
+        }
+        if path == AcceptedPath { return Accepted(database, connection, method, account) }
+        if path == ClaimPath { return Claim(database, signer, connection, account, now, input, overflow, zstd) }
+        return Rotate(database, connection, account, now, input, overflow, zstd)
+    }
+}

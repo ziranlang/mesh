@@ -11,6 +11,7 @@
     protocol :: #import "protocol";
     replies :: #import "http_json_native";
     sha :: #import "crypto/sha256";
+    shared_capabilities :: #import "node_capabilities";
     stats :: #import "store_stats_native";
     version :: #import "version";
     wire :: #import "wire_text";
@@ -48,11 +49,7 @@
             return replies.ErrorReply(connection, verb, 500, "node storage usage failed", zstdResponses)
         }
         capabilities := json.JsonNewArray(*document)
-        supported: [13]string = .["v3-typed-sync", "v4-encrypted-records", "v5-encrypted-primary",
-            "protocol-v1-v5-valid-through-2027-09-01", "protocol-previous-version-grace-days-365",
-            "v6-signed-transactions", "v6-signed-app-manifests", "node-mesh-encrypted-records", "node-identity-v1",
-            "node-pairing-v1", "trust-space-names-v1", "http-gzip-v1", "record-gzip-v1"]
-        for capability: supported {
+        for capability: shared_capabilities.Names {
             if !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, capability)) { return 0 }
         }
         if zstdRequests && !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, "http-zstd-v1")) { return 0 }

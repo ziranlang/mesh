@@ -2,7 +2,7 @@
     accounts :: #import "account_access_native";
     auth :: #import "http_auth_native";
     calendar :: #import "std/date_time_linux";
-    environment :: #import "std/environment_linux";
+    config_env :: #import "config_environment_native";
     files :: #import "std/file_linux";
     http :: #import "http_server_native";
     identity :: #import "identity";
@@ -79,9 +79,9 @@
     }
 
     Setting :: (key: string, fileKey: string) -> Text {
-        raw := wire.TrimSpace(environment.EnvironmentText(key))
+        raw := wire.TrimSpace(config_env.Text(key))
         if raw != "" { return TextCopy(raw) }
-        path := wire.TrimSpace(environment.EnvironmentText(fileKey))
+        path := wire.TrimSpace(config_env.Text(fileKey))
         if path == "" { return .{} }
         opened := files.OpenRead(path)
         if !opened.valid { return .{} }
@@ -424,8 +424,8 @@
         return .{credentials = .{serviceAccount = Setting("MESH_GOOGLE_SERVICE_ACCOUNT_JSON", "MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE"),
             oauthClient = Setting("MESH_GOOGLE_OAUTH_CLIENT_JSON", "MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE"),
             refreshToken = Setting("MESH_GOOGLE_OAUTH_REFRESH_TOKEN", "MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE")},
-            packageNames = TextCopy(environment.EnvironmentText("MESH_GOOGLE_PACKAGE_NAMES")),
-            packageApps = TextCopy(environment.EnvironmentText("MESH_GOOGLE_PACKAGE_APPS")), intervalMilliseconds = 60000}
+            packageNames = TextCopy(config_env.Text("MESH_GOOGLE_PACKAGE_NAMES")),
+            packageApps = TextCopy(config_env.Text("MESH_GOOGLE_PACKAGE_APPS")), intervalMilliseconds = 60000}
     }
 
     Open :: (state: *PlayState, access: *accounts.AccountAccess, tokenState: *tokens.State, configuration: *Configuration) -> bool {

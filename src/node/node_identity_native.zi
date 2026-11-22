@@ -1,7 +1,7 @@
 #if TARGET == .C && OS == .LINUX {
     keys :: #import "device_signature_native";
     binary :: #import "binary_codec";
-    environment :: #import "std/environment_linux";
+    config_env :: #import "config_environment_native";
     file :: #import "std/file_linux";
     file_tree :: #import "std/file_tree_linux";
     random :: #import "std/random_linux";
@@ -88,11 +88,11 @@
 
     #scope_export
     HexSetting :: (key: string, fileKey: string) -> binary.BinaryBytes {
-        raw := wire.TrimSpace(environment.EnvironmentText(key))
+        raw := wire.TrimSpace(config_env.Text(key))
         if raw != "" && raw.count % 2 == 0 && binary.IsHex(raw) { return binary.DecodeBinaryField(raw) }
         scratch: [4096]u8
         defer oqs.Cleanse(scratch[:])
-        return ReadHex(wire.TrimSpace(environment.EnvironmentText(fileKey)), scratch[:])
+        return ReadHex(wire.TrimSpace(config_env.Text(fileKey)), scratch[:])
     }
 
     LoadFile :: (path: string, identity: *Identity) -> bool {
@@ -107,7 +107,7 @@
 
     // A single canonical node-key format is shared with the released server.
     Load :: (databasePath: string, identity: *Identity) -> bool {
-        raw := environment.EnvironmentText("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX")
+        raw := config_env.Text("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX")
         if raw != "" {
             value := wire.TrimSpace(raw)
             if (value.count != 64 && value.count != 128) || !binary.IsHex(value) {
@@ -116,14 +116,14 @@
             configured := binary.DecodeBinaryField(value)
             return LoadConfigured(*configured, identity)
         }
-        configuredPath := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE"))
+        configuredPath := wire.TrimSpace(config_env.Text("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE"))
         if configuredPath != "" {
             scratch: [4096]u8
             defer oqs.Cleanse(scratch[:])
             configured := ReadHex(configuredPath, scratch[:])
             return LoadConfigured(*configured, identity)
         }
-        path := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_KEY_FILE"))
+        path := wire.TrimSpace(config_env.Text("MESH_NODE_IDENTITY_KEY_FILE"))
         defaultPath: Vec(u8)
         if path == "" {
             if !BuilderAppend(defaultPath, databasePath) || !BuilderAppend(defaultPath, ".node-key") {

@@ -10,8 +10,16 @@ suite under `tests/_go` is Go.
 `make test-ziran-native-server` passes locally against the native C build of
 `src/server/server_native.zi`.
 
-1. Compare every route, startup task and `/api/v1/node` field of the Go and
-   native servers, and close each gap with its regression test.
+1. Close the gaps between the Go and native servers, each with its regression
+   test. Done: `/readyz` direct purchases, chat-usage retention, the Telegram
+   Stars and Google Play suites, the shared capability list, `DAOCHI_*`
+   setting aliases and the four referral routes. Remaining:
+   - Referral settlement. Port the worker in `referral_settlement.zi` (10 s
+     outbox, `floor(net/20)` commissions, capped reversals, debt offset
+     through allocation lots, Monero holds, Google paid-proof and origin
+     backfill). Native creates the tables and triggers and requeues the
+     outbox, so commissions wait in `referral_outbox` until it runs.
+   - `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
 2. The generated C in the native build folder includes only libc and compiler
    headers. `ziran_exe_main.c` is the executable entry. CI builds and tests the
    native server, then adds that generated C to the deploy artifact. The origin

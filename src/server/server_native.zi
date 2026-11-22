@@ -36,6 +36,7 @@
     aliases :: #import "alias_http_native";
     token_issuer :: #import "token_issuer_native";
     token_rewards :: #import "token_rewards_http_native";
+    referrals :: #import "referral_http_native";
     reward_campaign :: #import "token_reward_native";
     reward_cli :: #import "reward_cli_native";
     entitlement_rules :: #import "entitlement_rules_native";
@@ -78,7 +79,7 @@
     oqs :: #import "oqs/Oqs";
     wire :: #import "wire_text";
     binary :: #import "binary_codec";
-    environment :: #import "std/environment_linux";
+    config_env :: #import "config_environment_native";
     files :: #import "std/file_linux";
     file_tree :: #import "std/file_tree_linux";
     mutex :: #import "std/mutex_linux";
@@ -158,7 +159,7 @@
     }
 
     Integer :: (key: string, fallback: s64, allowNonpositive: bool = false) -> IntegerSetting {
-        raw := environment.EnvironmentText(key)
+        raw := config_env.Text(key)
         if raw == "" {
             return .{value = fallback, valid = true}
         }
@@ -170,7 +171,7 @@
     }
 
     Enabled :: (key: string, fallback: bool) -> bool {
-        value := environment.EnvironmentText(key)
+        value := config_env.Text(key)
         if value == "1" || wire.MatchesToken(value, "true") {
             return true
         }
@@ -181,22 +182,22 @@
     }
 
     FlagSetting :: (key: string, fallback: bool) -> bool {
-        value := wire.TrimSpace(environment.EnvironmentText(key))
+        value := wire.TrimSpace(config_env.Text(key))
         if value == "" { return fallback }
         return value == "1" || wire.MatchesToken(value, "true") || wire.MatchesToken(value, "yes") || wire.MatchesToken(value, "on")
     }
 
     Setting :: (key: string, fallback: string) -> string {
-        value := environment.EnvironmentText(key)
+        value := config_env.Text(key)
         return ifx value != "" then value else fallback
     }
 
     SecretSetting :: (key: string, fileKey: string, scratch: []u8) -> string {
-        value := environment.EnvironmentText(key)
+        value := config_env.Text(key)
         if value != "" {
             return value
         }
-        path := wire.TrimSpace(environment.EnvironmentText(fileKey))
+        path := wire.TrimSpace(config_env.Text(fileKey))
         if path == "" {
             return ""
         }
@@ -311,6 +312,8 @@
                 uploads.Append(body, upload, <<size, stars.BodyLimit(route))
             } else if token_rewards.ReadsBody(route, verb) || entitlements.ReadsBody(route, verb) {
                 uploads.Append(body, upload, <<size, 1024)
+            } else if referrals.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, 2048)
             } else if reward_migration.ReadsBody(route, verb) {
                 uploads.Append(body, upload, <<size, reward_migration.BodyLimit)
             } else if game_evidence.ReadsBody(route, verb) {
@@ -404,6 +407,11 @@
         if tokens.Handles(route) {
             if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
             return tokens.Handle(*state.tokens, *state.accounts, state.registration.adminToken, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if referrals.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return referrals.Handle(*state.tokens.signer, *state.accounts, state.pairingConfiguration.baseURL, connection, verb, route,
                 VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
         }
         if token_rewards.Handles(route) {
@@ -665,7 +673,7 @@
         if !endpoint.valid { return Fail("invalid MESH_ADDR\n") }
         state: State
         networkProblem := network.Parse(*state.networkScope, Enabled("MESH_LAN_ONLY", false),
-            environment.EnvironmentText("MESH_LAN_NETWORKS"))
+            config_env.Text("MESH_LAN_NETWORKS"))
         if networkProblem != "" { return FailLine(networkProblem) }
         if !listener.AllowsBind(endpoint, *state.networkScope) {
             return Fail("LAN-only nodes require explicit private LAN networks and a local bind address\n")
@@ -692,7 +700,7 @@
             !moneroAmount.valid || !moneroUnits.valid || !trialUntil.valid || !islandLaunch.valid {
             return Fail("invalid Mesh server numeric setting\n")
         }
-        secretText := environment.EnvironmentText("MESH_TOKEN_SECRET_HEX")
+        secretText := config_env.Text("MESH_TOKEN_SECRET_HEX")
         if secretText.count % 2 != 0 || !binary.IsHex(secretText) {
             return Fail("invalid MESH_TOKEN_SECRET_HEX\n")
         }
@@ -734,7 +742,7 @@
         issuer := node_identity.HexSetting("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE")
         approvalKey := node_identity.HexSetting("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE")
         state.persistentSecret = persistent
-        state.registration = .{adminToken = environment.EnvironmentText("MESH_ADMIN_TOKEN"),
+        state.registration = .{adminToken = config_env.Text("MESH_ADMIN_TOKEN"),
             approvalKey = VecSlice(approvalKey.value, 0, approvalKey.value.count),
             nodeID = TextView(state.localNode.id[:64]), scope = *state.networkScope}
         feedbackSecret: [4096]u8
@@ -746,11 +754,11 @@
         chatSecret: [4096]u8
         defer oqs.Cleanse(chatSecret[:])
         state.chat = .{apiKey = SecretSetting("MESH_CHAT_API_KEY", "MESH_CHAT_API_KEY_FILE", chatSecret[:]),
-            endpoint = environment.EnvironmentText("MESH_CHAT_ENDPOINT"), model = Setting("MESH_CHAT_MODEL", "glm-4.7-flash"),
+            endpoint = config_env.Text("MESH_CHAT_ENDPOINT"), model = Setting("MESH_CHAT_MODEL", "glm-4.7-flash"),
             dailyLimit = chatDaily.value, globalDailyLimit = chatGlobal.value}
         lumiSecret: [4096]u8
         defer oqs.Cleanse(lumiSecret[:])
-        state.lumi = .{ownerID = environment.EnvironmentText("MESH_LUMI_OWNER_ID"),
+        state.lumi = .{ownerID = config_env.Text("MESH_LUMI_OWNER_ID"),
             developerToken = SecretSetting("MESH_LUMI_DEVELOPER_TOKEN", "MESH_LUMI_DEVELOPER_TOKEN_FILE", lumiSecret[:])}
         botSecret: [4096]u8
         webhookSecret: [4096]u8
@@ -765,21 +773,21 @@
             accountsEnabled = FlagSetting("MESH_TELEGRAM_ACCOUNTS_ENABLED", false), entryMenu = telegram_menu.Send,
             entryNode = state.registration.nodeID, entryAudience = state.pairingConfiguration.baseURL,
             payment = stars.Webhook, paymentContext = cast(*void)(*state.telegramStars)}
-        if !peer_settings.Read(environment.EnvironmentText("MESH_KNOWN_NODES"), *state.knownPeers) {
+        if !peer_settings.Read(config_env.Text("MESH_KNOWN_NODES"), *state.knownPeers) {
             return Fail("could not load configured Mesh peers\n")
         }
-        state.meshToken = environment.EnvironmentText("MESH_NODE_SYNC_TOKEN")
+        state.meshToken = config_env.Text("MESH_NODE_SYNC_TOKEN")
         state.meshBatch = Integer("MESH_NODE_SYNC_BATCH_LIMIT", 500).value
         state.issuerPublic = VecSlice(issuer.value, 0, issuer.value.count)
         issuerPrivate := node_identity.HexSetting("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE")
         privateKey := VecSlice(issuerPrivate.value, 0, issuerPrivate.value.count)
         directPurchases := FlagSetting("MESH_TOKEN_DIRECT_PURCHASES_ENABLED", false)
-        tokenReady := tokens.Open(*state.tokens, environment.EnvironmentText("MESH_TOKEN_PRODUCTS"), directPurchases, state.issuerPublic, privateKey)
+        tokenReady := tokens.Open(*state.tokens, config_env.Text("MESH_TOKEN_PRODUCTS"), directPurchases, state.issuerPublic, privateKey)
         oqs.Cleanse(privateKey)
         if !tokenReady { return Fail("could not initialize Mesh tokens\n") }
         defer tokens.Close(*state.tokens)
-        if !stars.Open(*state.telegramStars, *state.tokens, environment.EnvironmentText("MESH_TELEGRAM_STARS_APPS"),
-            environment.EnvironmentText("MESH_TELEGRAM_STARS_PRICES"), state.registration.nodeID,
+        if !stars.Open(*state.telegramStars, *state.tokens, config_env.Text("MESH_TELEGRAM_STARS_APPS"),
+            config_env.Text("MESH_TELEGRAM_STARS_PRICES"), state.registration.nodeID,
             state.pairingConfiguration.baseURL, state.lumiTelegram.accountsEnabled, state.lumiTelegram.webhookSecret != "") {
             return Fail("could not initialize Mesh Telegram Stars\n")
         }
@@ -824,8 +832,8 @@
         if !peer_http.Open() { return Fail("could not initialize the Mesh peer HTTP client\n") }
         defer peer_http.Close()
         rateInterval := Integer("MESH_XMR_RATE_REFRESH_INTERVAL_SECONDS", 600)
-        rateUpstreams: [3]string = .[environment.EnvironmentText("MESH_XMR_COINGECKO_URL"),
-            environment.EnvironmentText("MESH_XMR_KRAKEN_URL"), environment.EnvironmentText("MESH_XMR_COINPAPRIKA_URL")]
+        rateUpstreams: [3]string = .[config_env.Text("MESH_XMR_COINGECKO_URL"),
+            config_env.Text("MESH_XMR_KRAKEN_URL"), config_env.Text("MESH_XMR_COINPAPRIKA_URL")]
         if !rateInterval.valid || !rates.Open(*state.exchangeRates, .{database = database,
             databaseLock = *state.accounts.databaseLock, enabled = FlagSetting("MESH_XMR_RATE_REFRESH_ENABLED", true),
             intervalSeconds = rateInterval.value, upstreams = rateUpstreams}) {
@@ -859,8 +867,8 @@
             return Fail("could not initialize Mesh Monero purchases\n")
         }
         defer monero.Close(*state.moneroPurchases)
-        if !google.Open(*state.google, environment.EnvironmentText("MESH_GOOGLE_SIGNIN_CLIENT_IDS"),
-            environment.EnvironmentText("MESH_GOOGLE_SIGNIN_TEST_CERTIFICATES_URL")) {
+        if !google.Open(*state.google, config_env.Text("MESH_GOOGLE_SIGNIN_CLIENT_IDS"),
+            config_env.Text("MESH_GOOGLE_SIGNIN_TEST_CERTIFICATES_URL")) {
             return Fail("could not initialize Mesh Google sign-in\n")
         }
         defer google.Close(*state.google)
