@@ -1,0 +1,511 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    signing :: #import "token_signing_native";
+    issuer :: #import "token_issuer_native";
+    payment_allocation :: #import "token_payment_allocation_native";
+    identity :: #import "identity";
+    shop :: #import "token_shop_rules";
+    sha :: #import "crypto/sha256";
+    numbers :: #import "std/number_text";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Result :: struct {
+        status: u32
+        error: string
+        node: s32
+    }
+
+    EventResult :: struct {
+        id: [32]u8
+        status: u32
+        error: string
+        created: bool
+    }
+
+    #scope_file
+    InsertSQL :: #string SQL
+INSERT INTO token_ledger(receipt_id,issuer_id,asset_id,account_id,app_id,event_type,amount_delta,ledger_seq,
+    previous_hash,event_hash,signature,created_at,source_type,source_ref)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+SQL;
+    PaymentSQL :: "SELECT receipt_id,account_id,asset_id,amount FROM token_processed_payments WHERE provider=?1 AND provider_payment_id=?2";
+    NonceSQL :: "SELECT receipt_id,request_hash FROM token_spend_nonces WHERE account_id=?1 AND app_id=?2 AND idempotency_key=?3";
+    SpendFailed :: "token spend failed";
+    CreditFailed :: "token credit failed";
+    CheckpointFailed :: "token checkpoint failed";
+
+    TakeID :: (id: string, target: []u8) -> bool {
+        if id.count != target.count {
+            return false
+        }
+        for byte, index: id {
+            target[index] = byte
+        }
+        return true
+    }
+
+    AuditDebit :: (database: *void, debit: string, credit: string, units: s64) -> bool {
+        arguments: [3]sql.Argument = .[sql.TextArg(debit), sql.TextArg(credit), sql.IntArg(units)]
+        return sql.Execute(database, "INSERT INTO token_allocation_debits(debit_receipt_id,credit_receipt_id,units) VALUES(?1,?2,?3)",
+            arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    Lot :: struct {
+        id: [32]u8
+        remaining: s64
+        found: bool
+        ok: bool
+    }
+
+    FirstLot :: (database: *void, account: string, app: string) -> Lot {
+        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(ledger.AssetID), sql.TextArg(app)]
+        row := sql.Prepare(database, "SELECT receipt_id,remaining FROM token_allocations WHERE account_id=?1 AND asset_id=?2 AND app_id=?3 AND remaining>0 ORDER BY ledger_seq LIMIT 1", arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW || sqlite.SqliteColumnType(row.value, 1) != sqlite.SQLITE_INTEGER {
+            return .{}
+        }
+        lot: Lot
+        lot.ok = TakeID(sql.ColumnText(row.value, 0), lot.id[:])
+        lot.found = lot.ok
+        lot.remaining = sqlite.SqliteColumnInt64(row.value, 1)
+        return lot
+    }
+
+    Consume :: (database: *void, account: string, app: string, debit: string, units: s64) -> bool {
+        remaining := units
+        while remaining > 0 {
+            lot := FirstLot(database, account, app)
+            if !lot.ok {
+                return false
+            }
+            if !lot.found {
+                return app == "" && AuditDebit(database, debit, "", remaining)
+            }
+            taken := ifx lot.remaining < remaining then lot.remaining else remaining
+            if taken <= 0 {
+                return false
+            }
+            id := TextView(lot.id[:])
+            arguments: [2]sql.Argument = .[sql.TextArg(id), sql.IntArg(taken)]
+            if sql.Execute(database, "UPDATE token_allocations SET remaining=remaining-?2 WHERE receipt_id=?1 AND remaining>=?2", arguments[:]) != sqlite.SQLITE_OK ||
+                sqlite.SqliteChanges(database) != 1 || !AuditDebit(database, debit, id, taken) {
+                return false
+            }
+            remaining -= taken
+        }
+        return true
+    }
+
+    Allocation :: (database: *void, event: signing.Event, receipt: *signing.Receipt, pools: ledger.Pools,
+        originalPurchase: string) -> bool {
+        id := TextView(receipt.id[:32])
+        proof: [12]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(receipt.hash[:64])), sql.TextArg(event.account),
+            sql.TextArg(ledger.AssetID), sql.TextArg(event.app), sql.TextArg(event.source), sql.TextArg(event.reference), sql.IntArg(event.amount),
+            sql.IntArg(receipt.sequence), sql.TextArg(ledger.IssuerID), sql.TextArg(event.kind), sql.TextArg(TextView(receipt.signature[:128]))]
+        signed := sql.ReadInteger(database, "SELECT 1 FROM token_ledger WHERE receipt_id=?1 AND event_hash=?2 AND account_id=?3 AND asset_id=?4 AND app_id=?5 AND source_type=?6 AND source_ref=?7 AND amount_delta=?8 AND ledger_seq=?9 AND issuer_id=?10 AND event_type=?11 AND signature=?12", proof[:])
+        empty: []sql.Argument
+        cutoff := sql.ReadInteger(database, "SELECT historical_ledger_seq FROM token_allocation_migration WHERE version=1", empty)
+        if !signed.found || !cutoff.found {
+            return false
+        }
+        if receipt.sequence <= cutoff.value {
+            return true
+        }
+        if sql.Execute(database, "INSERT INTO token_allocation_receipts(receipt_id) VALUES(?1)", proof[:1]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteChanges(database) != 1 {
+            return false
+        }
+        if event.amount > 0 {
+            title := ifx event.source == payment_allocation.NativeGoogleLedgerProvider then event.app else ""
+            arguments: [8]sql.Argument = .[sql.TextArg(id), sql.TextArg(event.account), sql.TextArg(ledger.AssetID),
+                sql.TextArg(title), sql.TextArg(event.source), sql.TextArg(event.reference), sql.IntArg(event.amount), sql.IntArg(receipt.sequence)]
+            return sql.Execute(database, "INSERT INTO token_allocations(receipt_id,account_id,asset_id,app_id,source_receipt_id,source_type,provider_payment_id,issued,remaining,ledger_seq) VALUES(?1,?2,?3,?4,?1,?5,?6,?7,?7,?8)",
+                arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+        }
+        if payment_allocation.OriginatingLot(event.source) {
+            return payment_allocation.Refund(database, event, originalPurchase, id, cutoff.value)
+        }
+        amount := -event.amount
+        shared := ifx pools.shared > 0 then pools.shared else 0
+        matching := pools.spendable - shared
+        scoped := ifx matching < amount then matching else amount
+        return Consume(database, event.account, event.app, id, scoped) && Consume(database, event.account, "", id, amount - scoped)
+    }
+
+    Head :: struct {
+        hash: [64]u8
+        sequence: s64
+        ok: bool
+    }
+
+    LedgerHead :: (database: *void) -> Head {
+        empty: []sql.Argument
+        row := sql.Prepare(database, "SELECT ledger_seq,event_hash FROM token_ledger ORDER BY ledger_seq DESC LIMIT 1", empty)
+        if row.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        result: Head
+        result.sequence = sqlite.SqliteColumnInt64(row.value, 0)
+        result.ok = result.sequence > 0 && result.sequence < 9223372036854775807 && TakeID(sql.ColumnText(row.value, 1), result.hash[:])
+        return result
+    }
+
+    Insert :: (database: *void, signer: *issuer.Issuer, event: signing.Event, at: string, pools: ledger.Pools,
+        receipt: *signing.Receipt, originalPurchase: string = "") -> bool {
+        head := LedgerHead(database)
+        previous := ifx head.sequence == 0 then "" else TextView(head.hash[:])
+        if !head.ok || !signing.SignReceipt(signer, event, head.sequence + 1, previous, at, receipt) {
+            return false
+        }
+        arguments: [14]sql.Argument = .[sql.TextArg(TextView(receipt.id[:32])), sql.TextArg(ledger.IssuerID), sql.TextArg(ledger.AssetID),
+            sql.TextArg(event.account), sql.TextArg(event.app), sql.TextArg(event.kind), sql.IntArg(event.amount), sql.IntArg(receipt.sequence),
+            sql.TextArg(previous), sql.TextArg(TextView(receipt.hash[:64])), sql.TextArg(TextView(receipt.signature[:128])), sql.TextArg(at),
+            sql.TextArg(event.source), sql.TextArg(event.reference)]
+        return sql.Execute(database, InsertSQL, arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1 &&
+            Allocation(database, event, receipt, pools, originalPurchase) && ledger.ReadPools(database, event.account, event.app).ok
+    }
+
+    Payment :: (database: *void, provider: string, paymentID: string, input: signing.Event) -> EventResult {
+        arguments: [2]sql.Argument = .[sql.TextArg(provider), sql.TextArg(paymentID)]
+        row := sql.Prepare(database, PaymentSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = 400, error = CreditFailed}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = 400, error = CreditFailed}
+        }
+        if sql.ColumnText(row.value, 1) != input.account || sql.ColumnText(row.value, 2) != ledger.AssetID ||
+            sqlite.SqliteColumnType(row.value, 3) != sqlite.SQLITE_INTEGER || sqlite.SqliteColumnInt64(row.value, 3) != input.amount {
+            return .{status = 400, error = "provider payment id collision"}
+        }
+        result: EventResult = .{status = 200}
+        if !TakeID(sql.ColumnText(row.value, 0), result.id[:]) {
+            return .{status = 400, error = "processed payment receipt missing"}
+        }
+        receipt: [3]sql.Argument = .[sql.TextArg(TextView(result.id[:])), sql.TextArg(input.account), sql.TextArg(ledger.AssetID)]
+        if !sql.ReadInteger(database, "SELECT 1 FROM token_ledger WHERE receipt_id=?1 AND account_id=?2 AND asset_id=?3", receipt[:]).found {
+            return .{status = 400, error = "processed payment receipt missing"}
+        }
+        if payment_allocation.OriginatingLot(provider) {
+            event: [8]sql.Argument = .[receipt[0], receipt[1], receipt[2], sql.TextArg(input.app), sql.IntArg(input.amount), sql.TextArg(input.reference), sql.TextArg(provider), sql.TextArg(ledger.IssuerID)]
+            if !sql.ReadInteger(database, "SELECT 1 FROM token_ledger WHERE receipt_id=?1 AND account_id=?2 AND asset_id=?3 AND app_id=?4 AND amount_delta=?5 AND source_ref=?6 AND source_type=?7 AND issuer_id=?8 AND event_type='credit'", event[:]).found {
+                return .{status = 400, error = "provider payment id collision"}
+            }
+        }
+        return result
+    }
+
+    LegacyNonce :: (database: *void, input: signing.Event, key: string) -> EventResult {
+        if input.source != "spend" {
+            return .{}
+        }
+        action := wire.Cut(input.reference, #char ":")
+        if !action.found || action.after != key || shop.Title(action.before) != input.app {
+            return .{}
+        }
+        arguments: [7]sql.Argument = .[sql.TextArg(input.account), sql.TextArg(key), sql.TextArg(ledger.AssetID),
+            sql.TextArg(input.source), sql.TextArg(input.reference), sql.IntArg(input.amount), sql.TextArg("entity")]
+        found := sql.Prepare(database, "SELECT l.receipt_id FROM token_spend_nonces n JOIN token_ledger l ON l.receipt_id=n.receipt_id WHERE n.account_id=?1 AND n.app_id=?7 AND n.idempotency_key=?2 AND l.account_id=?1 AND l.app_id=?7 AND l.asset_id=?3 AND l.source_type=?4 AND l.source_ref=?5 AND l.amount_delta=?6", arguments[:])
+        if found.status != sqlite.SQLITE_OK {
+            return .{status = 500, error = SpendFailed}
+        }
+        defer sqlite.SqliteFinalize(found.value)
+        status := sqlite.SqliteStep(found.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        result: EventResult = .{status = 200}
+        if status != sqlite.SQLITE_ROW || !TakeID(sql.ColumnText(found.value, 0), result.id[:]) {
+            return .{status = 500, error = SpendFailed}
+        }
+        return result
+    }
+
+    Nonce :: (database: *void, input: signing.Event, key: string, hash: string) -> EventResult {
+        arguments: [3]sql.Argument = .[sql.TextArg(input.account), sql.TextArg(input.app), sql.TextArg(key)]
+        row := sql.Prepare(database, NonceSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = 500, error = SpendFailed}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = 500, error = SpendFailed}
+        }
+        previous := sql.ColumnText(row.value, 1)
+        if previous != "" && previous != hash {
+            return .{status = 409, error = "idempotency key reused for different spend"}
+        }
+        result: EventResult = .{status = 200}
+        if !TakeID(sql.ColumnText(row.value, 0), result.id[:]) {
+            return .{status = 500, error = SpendFailed}
+        }
+        return result
+    }
+
+    ReplyObject :: (database: *void, account: string, id: string, document: *json.JsonDocument, credit: bool) -> Result {
+        root := json.JsonNewObject(document)
+        receipt := ledger.Receipt(database, id, document)
+        if receipt.status != 200 {
+            return ifx credit then .{status = 400, error = "processed payment receipt missing"} else .{status = 500, error = SpendFailed}
+        }
+        owner: Text = json.JsonString(document, json.JsonMember(document, receipt.node, "account_id"))
+        if TextView(owner) != account {
+            return .{status = 500, error = "token receipt failed"}
+        }
+        balance := ledger.Balance(database, account)
+        if !balance.found || !ledger.PutInt(document, root, "balance", balance.value) || !ledger.PutText(document, root, "status", "ok") ||
+            !json.JsonSet(document, root, "receipt", receipt.node) {
+            return .{status = 500, error = "token balance failed"}
+        }
+        return .{status = 200, node = root}
+    }
+
+    IssueRefund :: (database: *void, signer: *issuer.Issuer, input: signing.Event, at: string, original: string) -> EventResult {
+        receipt: signing.Receipt
+        noSpend: ledger.Pools
+        if !Insert(database, signer, input, at, noSpend, *receipt, original) {
+            return .{status = 400, error = "payment refund failed"}
+        }
+        result: EventResult = .{status = 200, created = true}
+        unused TakeID(TextView(receipt.id[:32]), result.id[:])
+        return result
+    }
+
+    ExistingStarsRefund :: (database: *void, debit: signing.Event) -> EventResult {
+        values: [7]sql.Argument = .[sql.TextArg(debit.account), sql.TextArg(debit.app), sql.TextArg(ledger.AssetID), sql.TextArg(ledger.IssuerID),
+            sql.TextArg(debit.source), sql.TextArg(debit.reference), sql.IntArg(debit.amount)]
+        row := sql.Prepare(database, "SELECT receipt_id FROM token_ledger WHERE account_id=?1 AND app_id=?2 AND asset_id=?3 AND issuer_id=?4 AND source_type=?5 AND source_ref=?6 AND amount_delta=?7 AND event_type='debit' LIMIT 2", values[:])
+        if row.status != sqlite.SQLITE_OK { return .{status = 400, error = "payment refund failed"} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        result: EventResult = .{status = 200}
+        if status != sqlite.SQLITE_ROW || !TakeID(sql.ColumnText(row.value, 0), result.id[:]) || sqlite.SqliteStep(row.value) != sqlite.SQLITE_DONE {
+            return .{status = 400, error = "payment refund failed"}
+        }
+        return result
+    }
+
+    #scope_export
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    BindGoogleOrigin :: (database: *void, paymentID: string, account: string, packageName: string, app: string, units: s64) -> string {
+        return payment_allocation.Bind(database, paymentID, account, packageName, app, units)
+    }
+
+    // These write operations share the caller's transaction with authorization
+    // and the signed transaction reservation.
+    CreditPayment :: (database: *void, signer: *issuer.Issuer, provider: string, paymentID: string,
+        input: signing.Event, at: string) -> EventResult {
+        if provider == "" || paymentID == "" {
+            return .{status = 400, error = "provider payment id required"}
+        }
+        tracked := payment_allocation.OriginatingLot(provider) || payment_allocation.OriginatingLot(input.source)
+        if tracked && (sqlite.SqliteGetAutocommit(database) || provider != input.source || paymentID != input.reference || input.kind != "credit") {
+            return .{status = 400, error = "verified payment origin required"}
+        }
+        existing := Payment(database, provider, paymentID, input)
+        if existing.status != 0 {
+            return existing
+        }
+        problem := signing.Validate(input)
+        if problem != "" {
+            return .{status = 400, error = problem}
+        }
+        if input.amount < 0 || input.kind != "credit" {
+            return .{status = 400, error = "credit amount must be positive"}
+        }
+        if provider == payment_allocation.NativeGoogleLedgerProvider && !payment_allocation.Bound(database, paymentID, input.account, input.app, input.amount) {
+            return .{status = 400, error = "verified Google title binding required"}
+        }
+        receipt: signing.Receipt
+        noDebit: ledger.Pools
+        if !Insert(database, signer, input, at, noDebit, *receipt) {
+            return .{status = 400, error = CreditFailed}
+        }
+        id := TextView(receipt.id[:32])
+        arguments: [6]sql.Argument = .[sql.TextArg(provider), sql.TextArg(paymentID), sql.TextArg(input.account),
+            sql.TextArg(ledger.AssetID), sql.IntArg(input.amount), sql.TextArg(id)]
+        if sql.Execute(database, "INSERT INTO token_processed_payments(provider,provider_payment_id,account_id,asset_id,amount,receipt_id) VALUES(?1,?2,?3,?4,?5,?6)", arguments[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteChanges(database) != 1 {
+            return .{status = 400, error = CreditFailed}
+        }
+        result: EventResult = .{status = 200, created = true}
+        unused TakeID(id, result.id[:])
+        return result
+    }
+
+    Credit :: (database: *void, signer: *issuer.Issuer, input: signing.Event, at: string, document: *json.JsonDocument) -> Result {
+        result := CreditPayment(database, signer, "admin", input.reference, input, at)
+        if result.status != 200 {
+            return .{status = result.status, error = result.error}
+        }
+        return ReplyObject(database, input.account, TextView(result.id[:]), document, true)
+    }
+
+    // The caller reserves the verified provider event and rolls back all
+    // related changes if issuing the signed refund or saving its audit fails.
+    RefundGooglePlay :: (database: *void, signer: *issuer.Issuer, input: signing.Event, at: string, originalReceiptID: string) -> EventResult {
+        if sqlite.SqliteGetAutocommit(database) || input.kind != "debit" || input.source != payment_allocation.NativeGoogleLedgerProvider ||
+            input.amount >= 0 || input.amount == -9223372036854775807 - 1 || !identity.ValidResourceID(originalReceiptID) || signing.Validate(input) != "" {
+            return .{status = 400, error = "invalid Google refund"}
+        }
+        return IssueRefund(database, signer, input, at, originalReceiptID)
+    }
+
+    // Telegram Stars refunds the full verified charge. The caller holds the
+    // invoice transaction and supplies the original credit event.
+    RefundPayment :: (database: *void, signer: *issuer.Issuer, provider: string, paymentID: string,
+        input: signing.Event, at: string) -> EventResult {
+        if sqlite.SqliteGetAutocommit(database) || provider != payment_allocation.NativeStarsLedgerProvider ||
+            input.source != provider || input.reference != paymentID || input.kind != "credit" || input.amount <= 0 || signing.Validate(input) != "" {
+            return .{status = 400, error = "invalid payment refund"}
+        }
+        paid := Payment(database, provider, paymentID, input)
+        if paid.status != 200 {
+            return .{status = 400, error = "refund purchase source mismatch"}
+        }
+        debit := input
+        debit.kind = "debit"
+        debit.amount = -input.amount
+        existing := ExistingStarsRefund(database, debit)
+        if existing.status != 0 { return existing }
+        return IssueRefund(database, signer, debit, at, TextView(paid.id[:]))
+    }
+
+    SpendEvent :: (database: *void, signer: *issuer.Issuer, input: signing.Event, at: string, key: string) -> EventResult {
+        if input.amount >= 0 || payment_allocation.OriginatingLot(input.source) {
+            return .{status = 500, error = SpendFailed}
+        }
+        legacy := LegacyNonce(database, input, key)
+        if legacy.status != 0 {
+            return legacy
+        }
+        digest: [65]u8
+        if !signing.SpendHash(input, digest[:]) {
+            return .{status = 500, error = SpendFailed}
+        }
+        hash := TextView(digest[:64])
+        existing := Nonce(database, input, key, hash)
+        if existing.status != 0 {
+            return existing
+        }
+        title := ifx input.source == "spend" || input.source == "unlock" then input.app else ""
+        pools := ledger.ReadPools(database, input.account, title)
+        if !pools.ok {
+            return .{status = 500, error = SpendFailed}
+        }
+        if input.amount == -9223372036854775807 - 1 || -input.amount > pools.spendable {
+            return .{status = 409, error = "insufficient balance"}
+        }
+        if signing.Validate(input) != "" {
+            return .{status = 500, error = SpendFailed}
+        }
+        receipt: signing.Receipt
+        if !Insert(database, signer, input, at, pools, *receipt) {
+            return .{status = 500, error = SpendFailed}
+        }
+        id := TextView(receipt.id[:32])
+        arguments: [5]sql.Argument = .[sql.TextArg(input.account), sql.TextArg(input.app), sql.TextArg(key), sql.TextArg(id), sql.TextArg(hash)]
+        if sql.Execute(database, "INSERT INTO token_spend_nonces(account_id,app_id,idempotency_key,receipt_id,request_hash) VALUES(?1,?2,?3,?4,?5)", arguments[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteChanges(database) != 1 {
+            return .{status = 500, error = SpendFailed}
+        }
+        result: EventResult = .{status = 200, created = true}
+        unused TakeID(id, result.id[:])
+        return result
+    }
+
+    Spend :: (database: *void, signer: *issuer.Issuer, input: signing.Event, at: string, key: string, document: *json.JsonDocument) -> Result {
+        result := SpendEvent(database, signer, input, at, key)
+        if result.status != 200 {
+            return .{status = result.status, error = result.error}
+        }
+        return ReplyObject(database, input.account, TextView(result.id[:]), document, false)
+    }
+
+    Checkpoint :: (database: *void, signer: *issuer.Issuer, document: *json.JsonDocument) -> Result {
+        arguments: [2]sql.Argument = .[sql.TextArg(ledger.IssuerID), sql.TextArg(ledger.AssetID)]
+        digestContext: sha.Sha256Context
+        sha.Sha256Initialize(*digestContext)
+        sequence: s64 = 0
+        {
+            rows := sql.Prepare(database, "SELECT ledger_seq,event_hash FROM token_ledger WHERE issuer_id=?1 AND asset_id=?2 ORDER BY ledger_seq", arguments[:])
+            if rows.status != sqlite.SQLITE_OK {
+                return .{status = 500, error = CheckpointFailed}
+            }
+            defer sqlite.SqliteFinalize(rows.value)
+            step := sqlite.SqliteStep(rows.value)
+            while step == sqlite.SQLITE_ROW {
+                sequence = sqlite.SqliteColumnInt64(rows.value, 0)
+                sha.Sha256UpdateText(*digestContext, sql.ColumnText(rows.value, 1))
+                sha.Sha256UpdateText(*digestContext, "\n")
+                step = sqlite.SqliteStep(rows.value)
+            }
+            if step != sqlite.SQLITE_DONE {
+                return .{status = 500, error = CheckpointFailed}
+            }
+        }
+        digest: [32]u8
+        digestHex: [65]u8
+        sha.Sha256FinishBytes(*digestContext, digest[:])
+        if sha.BytesToHex(*digest[0], digest.count, *digestHex[0], digestHex.count) != 1 {
+            return .{status = 500, error = CheckpointFailed}
+        }
+        root := TextView(digestHex[:64])
+        digits: [24]u8
+        parts: [5]string = .["ksync-token-checkpoint-v1", ledger.IssuerID, ledger.AssetID, numbers.FormatInteger(sequence, digits[:]), root]
+        message: Vec(u8)
+        for part: parts {
+            if !BuilderAppend(message, part) || !BuilderAppend(message, "\n") {
+                return .{status = 500, error = CheckpointFailed}
+            }
+        }
+        signature: [129]u8
+        if !issuer.SignHex(signer, VecSlice(message, 0, message.count), signature[:]) {
+            return .{status = 500, error = CheckpointFailed}
+        }
+        row: [5]sql.Argument = .[sql.IntArg(sequence), sql.TextArg(ledger.IssuerID), sql.TextArg(ledger.AssetID), sql.TextArg(root), sql.TextArg(TextView(signature[:128]))]
+        if sql.Execute(database, "INSERT INTO token_checkpoints(ledger_seq,issuer_id,asset_id,ledger_root,signature) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(ledger_seq) DO UPDATE SET ledger_root=excluded.ledger_root,signature=excluded.signature,created_at=CURRENT_TIMESTAMP", row[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteChanges(database) != 1 {
+            return .{status = 500, error = CheckpointFailed}
+        }
+        latest := ledger.Latest(database, document)
+        if latest.status != 200 {
+            return .{status = 500, error = CheckpointFailed}
+        }
+        return .{status = 200, node = latest.node}
+    }
+}

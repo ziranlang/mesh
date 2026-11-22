@@ -1,0 +1,166 @@
+#if TARGET == .C && OS == .LINUX {
+    issuer :: #import "token_issuer_native";
+    ledger :: #import "token_ledger_native";
+    json :: #import "std/json_document";
+    sha :: #import "crypto/sha256";
+    timestamp :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    random :: #import "std/random_linux";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Event :: struct {
+        account: string
+        app: string
+        kind: string
+        amount: s64
+        source: string
+        reference: string
+    }
+
+    Receipt :: struct {
+        id: [33]u8
+        hash: [65]u8
+        signature: [129]u8
+        sequence: s64
+    }
+
+    #scope_file
+    libc :: #system_library "c";
+    Timespec :: struct {
+        seconds: isize
+        nanoseconds: isize
+    }
+    ClockGetTime :: (kind: s32, output: *Timespec) -> s32 #foreign libc "clock_gettime";
+
+    // Go's encoding/json escapes these bytes even in compact JSON. Signed
+    // receipts and idempotency hashes must retain that encoding byte for byte.
+    GoJSON :: (document: *json.JsonDocument, root: s32, prefix: string, output: *Vec(u8)) -> bool {
+        compact: Vec(u8)
+        if !json.JsonWriteInto(*compact, document, root, json.JsonCompactStyle(false)) || !BuilderAppend(<<output, prefix) {
+            return false
+        }
+        bytes := VecSlice(compact, 0, compact.count)
+        index: s64 = 0
+        while index < bytes.count {
+            byte := bytes[index]
+            escaped := ""
+            if byte == #char "<" {
+                escaped = "\\u003c"
+            } else if byte == #char ">" {
+                escaped = "\\u003e"
+            } else if byte == #char "&" {
+                escaped = "\\u0026"
+            } else if byte == 226 && index + 2 < bytes.count && bytes[index + 1] == 128 {
+                last := bytes[index + 2]
+                if last == 168 || last == 169 {
+                    escaped = ifx last == 168 then "\\u2028" else "\\u2029"
+                    index += 2
+                }
+            }
+            if escaped != "" {
+                if !BuilderAppend(<<output, escaped) {
+                    return false
+                }
+            } else if !VecPush(<<output, byte) {
+                return false
+            }
+            index += 1
+        }
+        return true
+    }
+
+    #scope_export
+    Now :: () -> timestamp.TimestampValue {
+        value: Timespec
+        if ClockGetTime(0, *value) != 0 || value.seconds <= 0 || value.nanoseconds < 0 || value.nanoseconds >= 1000000000 {
+            return .{}
+        }
+        return .{seconds = cast(s64)value.seconds, nanoseconds = cast(s32)value.nanoseconds, valid = true}
+    }
+
+    WireTime :: (now: timestamp.TimestampValue, fractions: bool, target: []u8) -> string {
+        count := format.UTC(now, target)
+        if count == 0 {
+            return ""
+        }
+        end := count - 1
+        if fractions {
+            while target[end - 1] == #char "0" {
+                end -= 1
+            }
+        } else {
+            end -= 9
+        }
+        if target[end - 1] == #char "." {
+            end -= 1
+        }
+        target[end] = #char "Z"
+        return TextView(target[:end + 1])
+    }
+
+    Validate :: (event: Event) -> string {
+        if !identity.ValidUserID(event.account) {
+            return "invalid account_id"
+        }
+        if event.app != "" && !identity.ValidNamespace(event.app) {
+            return "invalid app_id"
+        }
+        if event.amount == 0 {
+            return "amount required"
+        }
+        if event.kind == "credit" && event.amount < 0 {
+            return "credit amount must be positive"
+        }
+        if event.reference.count > 256 || wire.TrimSpace(event.reference) == "" {
+            return "invalid source"
+        }
+        return ""
+    }
+
+    HashHex :: (value: string, output: []u8) -> bool {
+        digest := sha.Sha256Of(value)
+        return output.count >= 65 && sha.BytesToHex(*digest[0], digest.count, *output[0], output.count) == 1
+    }
+
+    SpendHash :: (event: Event, output: []u8) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "AccountID", event.account) || !ledger.PutText(*document, root, "AppID", event.app) ||
+            !ledger.PutText(*document, root, "EventType", event.kind) || !ledger.PutInt(*document, root, "AmountDelta", event.amount) ||
+            !ledger.PutText(*document, root, "SourceType", event.source) || !ledger.PutText(*document, root, "SourceRef", event.reference) {
+            return false
+        }
+        bytes: Vec(u8)
+        return GoJSON(*document, root, "", *bytes) && HashHex(TextView(VecSlice(bytes, 0, bytes.count)), output)
+    }
+
+    SignReceipt :: (signer: *issuer.Issuer, event: Event, sequence: s64, previous: string, created: string, value: *Receipt) -> bool {
+        id: [16]u8
+        if !random.FillSecure(id[:]) || sha.BytesToHex(*id[0], id.count, *value.id[0], value.id.count) != 1 {
+            return false
+        }
+        value.sequence = sequence
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "receipt_id", TextView(value.id[:32])) || !ledger.PutText(*document, root, "issuer_id", ledger.IssuerID) ||
+            !ledger.PutText(*document, root, "asset_id", ledger.AssetID) || !ledger.PutText(*document, root, "account_id", event.account) ||
+            !ledger.PutText(*document, root, "app_id", event.app, true) || !ledger.PutText(*document, root, "event_type", event.kind) ||
+            !ledger.PutInt(*document, root, "amount_delta", event.amount) || !ledger.PutInt(*document, root, "ledger_seq", sequence) ||
+            !ledger.PutText(*document, root, "previous_hash", previous) || !ledger.PutText(*document, root, "event_hash", "") ||
+            !ledger.PutText(*document, root, "created_at", created) || !ledger.PutText(*document, root, "source_type", event.source) ||
+            !ledger.PutText(*document, root, "source_ref", event.reference) {
+            return false
+        }
+        prefix := "ksync-token-receipt-v1\n"
+        preimage: Vec(u8)
+        if !GoJSON(*document, root, prefix, *preimage) || !HashHex(TextView(VecSlice(preimage, 0, preimage.count)), value.hash[:]) ||
+            !ledger.PutText(*document, root, "event_hash", TextView(value.hash[:64])) {
+            return false
+        }
+        message: Vec(u8)
+        return GoJSON(*document, root, prefix, *message) &&
+            issuer.SignHex(signer, VecSlice(message, 0, message.count), value.signature[:])
+    }
+}

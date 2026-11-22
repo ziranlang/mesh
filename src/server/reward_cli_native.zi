@@ -1,0 +1,59 @@
+#if TARGET == .C && OS == .LINUX {
+    identity :: #import "node_identity_native";
+    issuer :: #import "token_issuer_native";
+    rewards :: #import "token_reward_native";
+    schema :: #import "sqlite_schema";
+    startup :: #import "store_startup_native";
+    sqlite :: #import "sqlite/SQLite";
+    oqs :: #import "oqs/Oqs";
+    numbers :: #import "std/number_text";
+    strings :: #import "std/byte_text_linux";
+    stdio :: #import "std/stdio_linux";
+    #import "std/vec"
+
+    #scope_file
+    Problem :: (message: string) -> s32 {
+        unused stdio.PrintError(message)
+        unused stdio.PrintError("\n")
+        return 1
+    }
+
+    #scope_export
+    Run :: (argc: s32, argv: **u8, path: string) -> s32 {
+        usage := "usage: mesh reward-dew REWARD ACCOUNT DEW"
+        if argc != 5 { return Problem(usage) }
+        amount := strings.TextFromCString(argv[4])
+        dew, digits := numbers.IntegerPrefix(amount)
+        if digits != amount.count || dew <= 0 || dew > 1000000 { return Problem(usage) }
+        reward := strings.TextFromCString(argv[2])
+        account := strings.TextFromCString(argv[3])
+        publicKey := identity.HexSetting("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE")
+        privateKey := identity.HexSetting("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE")
+        privateBytes := VecSlice(privateKey.value, 0, privateKey.value.count)
+        signer: issuer.Issuer
+        openedIssuer := issuer.Open(*signer, VecSlice(publicKey.value, 0, publicKey.value.count), privateBytes)
+        oqs.Cleanse(privateBytes)
+        defer issuer.Close(*signer)
+        if !openedIssuer || !signer.signing { return Problem("rewards need the Dew issuer private key") }
+        opened := schema.OpenCore(path)
+        if opened.status != sqlite.SQLITE_OK { return Problem("could not open the Mesh database") }
+        defer sqlite.SqliteClose(opened.database)
+        if startup.InitializeFeatures(opened.database) != sqlite.SQLITE_OK {
+            return Problem("could not initialize the Mesh database")
+        }
+        result := rewards.RewardDew(opened.database, *signer, reward, account, dew)
+        if result.error != "" { return Problem(result.error) }
+        status := ifx result.award.credited then " credited: " else " already credited: "
+        buffer: Vec(u8)
+        digitsBuffer: [24]u8
+        if !BuilderAppend(buffer, "Dew reward ") || !BuilderAppend(buffer, reward) || !BuilderAppend(buffer, status) ||
+            !BuilderAppend(buffer, numbers.FormatInteger(dew, digitsBuffer[:])) || !BuilderAppend(buffer, " Dew to account ") ||
+            !BuilderAppend(buffer, TextView(result.award.account[:])) || !BuilderAppend(buffer, ", balance now ") ||
+            !BuilderAppend(buffer, numbers.FormatInteger(result.award.balance, digitsBuffer[:])) ||
+            !BuilderAppend(buffer, " units\nDew checkpoint at ledger sequence ") ||
+            !BuilderAppend(buffer, numbers.FormatInteger(result.sequence, digitsBuffer[:])) ||
+            !BuilderAppend(buffer, ", root ") || !BuilderAppend(buffer, TextView(result.root[:])) ||
+            !VecPush(buffer, cast(u8)10) { return Problem("could not format the Dew reward receipt") }
+        return ifx stdio.WriteOutput(TextView(VecSlice(buffer, 0, buffer.count))) then 0 else 1
+    }
+}

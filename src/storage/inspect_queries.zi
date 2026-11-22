@@ -1,0 +1,113 @@
+// SQLite queries shared by Mesh inspection commands.
+
+SummaryTables :: () -> [9]string {
+    values: [9]string = .[
+        "server_users", "server_habits", "server_habit_days", "server_sessions",
+        "server_session_rounds", "server_meditation_logs", "server_encrypted_records",
+        "server_encrypted_payloads", "server_sync_audit"
+    ]
+    return values
+}
+UserTables :: () -> [6]string {
+    values: [6]string = .[
+        "server_habits", "server_habit_days", "server_sessions",
+        "server_session_rounds", "server_meditation_logs", "server_encrypted_records"
+    ]
+    return values
+}
+DoctorTables :: () -> [9]string {
+    values: [9]string = .[
+        "server_habits", "server_habit_days", "server_sessions", "server_meditation_logs",
+        "server_encrypted_records", "server_encrypted_payloads", "server_sync_ops",
+        "server_clients", "server_sync_audit"
+    ]
+    return values
+}
+
+UsersQuery :: #string SQL_END
+
+SELECT user_id_hash, hex(public_key), created_at, last_seen_at
+FROM server_users
+ORDER BY last_seen_at DESC
+SQL_END;
+UserQuery :: #string SQL_END
+
+SELECT hex(public_key), created_at, last_seen_at
+FROM server_users
+WHERE user_id_hash=?1
+SQL_END;
+DoctorQuery :: #string SQL_END
+
+SELECT created_at,last_seen_at
+FROM server_users
+WHERE user_id_hash=?1
+SQL_END;
+VersionQuery :: #string SQL_END
+
+SELECT server_version
+FROM server_sync_state
+WHERE user_id_hash=?1
+SQL_END;
+CompactionQuery :: #string SQL_END
+
+SELECT compacted_through_version
+FROM server_sync_compaction
+WHERE user_id_hash=?1
+SQL_END;
+LegacyClientsQuery :: #string SQL_END
+
+SELECT COUNT(*)
+FROM server_clients
+WHERE user_id_hash=?1 AND protocol_version>0 AND protocol_version<5
+SQL_END;
+PayloadsQuery :: #string SQL_END
+
+SELECT COUNT(*),SUM(LENGTH(payload_json))
+FROM server_encrypted_payloads
+WHERE user_id_hash=?1
+SQL_END;
+FullSnapshotsQuery :: #string SQL_END
+
+SELECT COUNT(*)
+FROM (
+	SELECT full_snapshot_required
+	FROM server_sync_audit
+	WHERE user_id_hash=?1
+	ORDER BY id DESC
+	LIMIT 8
+)
+WHERE full_snapshot_required!=0
+SQL_END;
+ClientsQuery :: #string SQL_END
+
+SELECT client_id,protocol_version,last_login_at,last_sync_at,last_seen_server_version,last_client_clock
+FROM server_clients
+WHERE user_id_hash=?1
+ORDER BY last_seen_at DESC,client_id
+LIMIT 12
+SQL_END;
+AuditQuery :: #string SQL_END
+
+SELECT client_id,protocol_version,server_version,remote_ops,full_snapshot_required,
+       snapshot_reason,encrypted_payload,encrypted_payload_bytes,created_at
+FROM server_sync_audit
+WHERE user_id_hash=?1
+ORDER BY id DESC
+LIMIT 8
+SQL_END;
+HabitsQuery :: #string SQL_END
+
+SELECT id, name, sync_mode, sync_activity, deleted_at, updated_at
+FROM server_habits
+WHERE user_id_hash=?1
+ORDER BY sort_order, id
+LIMIT 50
+SQL_END;
+SessionsQuery :: #string SQL_END
+
+SELECT id, started_at, local_date, topic, activity, deleted_at, updated_at
+FROM server_sessions
+WHERE user_id_hash=?1
+ORDER BY started_at DESC
+LIMIT 25
+SQL_END;

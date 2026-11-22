@@ -1,0 +1,296 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    accounts :: #import "account_state_native";
+    sessions :: #import "auth_sessions_native";
+    signatures :: #import "account_signature_native";
+    signed :: #import "signed_tx_native";
+    apps :: #import "record_scope_native";
+    packages :: #import "package_sequence_native";
+    rules :: #import "record_page_rules";
+    pages :: #import "record_page_native";
+    writes :: #import "record_write_native";
+    storage :: #import "storage_allowance_native";
+    quota :: #import "storage_usage_rules";
+    audit_queries :: #import "sync_audit_queries";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    identity :: #import "identity";
+    protocol :: #import "protocol";
+    validation :: #import "record_validation";
+    parser :: #import "record_request_native";
+    binary :: #import "binary_codec";
+    codec :: #import "codec";
+    wire :: #import "wire_text";
+    sha :: #import "crypto/sha256";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    RecordSyncRequest :: struct {
+        user: string
+        app: string
+        client: string
+        version: isize
+        records: []protocol.EncryptedRecord
+        sinceVersion: s64
+        clientClock: s64
+        cursorVersion: s64
+        cursorCollection: string
+        cursorID: string
+        hasCursor: bool
+        limit: s64
+        encoding: string
+        contentFreeDeletions: bool
+    }
+
+    Context :: struct {
+        database: *void
+        databasePath: string
+        tokenSecret: []u8
+        verify: signatures.VerifySignature
+        storageLimit: s64
+        storagePlansEnabled: bool
+    }
+
+    RequestProof :: struct {
+        bearer: string
+        signedTransaction: string
+        path: string
+        body: []u8
+        now: time.TimestampValue
+    }
+
+    RecordSyncResult :: struct {
+        page: pages.RecordPageResult
+        serverVersion: s64
+        applied: s64
+        usedBytes: s64
+        limitBytes: s64
+        protocolVersion: s64
+        packageSequence: s64
+        includeMetadata: bool
+        status: u32
+        error: string
+        databaseError: s32
+    }
+
+    #scope_file
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    ValidPage :: (request: RecordSyncRequest) -> bool {
+        if request.version < 6 || request.sinceVersion < 0 || request.limit < 0 || request.limit > rules.RecordPageLimit ||
+            request.records.count > rules.RecordPageLimit || (request.encoding != "" && request.encoding != "gzip-v1") {
+            return false
+        }
+        if !request.hasCursor {
+            return true
+        }
+        return request.cursorVersion > 0 && request.cursorVersion >= request.sinceVersion &&
+            identity.ValidNamespace(request.cursorCollection) && identity.ValidEncryptedRecordID(request.cursorID)
+    }
+
+    Audit :: (database: *void, request: RecordSyncRequest, version: s64, applied: s64) {
+        body: Vec(u8)
+        if !BuilderAppend(body, "{\"meditation_logs\":0,\"habits\":0,\"habit_days\":0,\"sessions\":0,\"social_cache\":0") {
+            return
+        }
+        digits: [24]u8
+        if applied != 0 && (!BuilderAppend(body, ",\"encrypted_records\":") ||
+            !BuilderAppend(body, numbers.FormatInteger(applied, digits[:]))) {
+            return
+        }
+        if !BuilderAppend(body, "}") {
+            return
+        }
+        arguments: [13]sql.Argument = .[sql.TextArg(request.user), sql.TextArg(request.client), sql.TextArg(request.app),
+            sql.IntArg(cast(s64)request.version), sql.IntArg(request.sinceVersion), sql.IntArg(request.clientClock), sql.IntArg(version),
+            sql.TextArg(TextView(VecSlice(body, 0, body.count))), sql.IntArg(0), sql.IntArg(0), sql.TextArg(""), sql.IntArg(0), sql.IntArg(0)]
+        // Audit storage is best-effort after the record transaction commits.
+        unused sql.Execute(database, audit_queries.InsertSyncAuditSQL, arguments[:])
+    }
+
+    Synchronize :: (context: Context, request: RecordSyncRequest, proof: RequestProof) -> RecordSyncResult {
+        if context.database == null || context.verify == null {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        if !identity.ValidUserID(request.user) {
+            return .{status = 400, error = "invalid user_id_hash"}
+        }
+        if !identity.ValidClientID(request.client) {
+            return .{status = 400, error = "invalid client_id"}
+        }
+        if !identity.ValidNamespace(request.app) {
+            return .{status = 400, error = "invalid app_id"}
+        }
+        if !ValidPage(request) {
+            return .{status = 400, error = "invalid encrypted record page request"}
+        }
+        audit: [31]u8
+        length := format.UTC(proof.now, audit[:])
+        if length == 0 {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        auditTime := TextView(audit[:length])
+        database := context.database
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK {
+            return .{databaseError = status}
+        }
+        defer RollbackIfActive(database)
+        authenticated := sessions.Authorize(database, context.tokenSecret, proof.bearer, request.user, proof.now.seconds, auditTime, false)
+        if authenticated.databaseError != sqlite.SQLITE_OK {
+            return .{databaseError = authenticated.databaseError}
+        }
+        if authenticated.accountMissing {
+            return .{status = 401, error = "sync account not found"}
+        }
+        if !authenticated.active {
+            return .{status = 401, error = "invalid bearer token"}
+        }
+        app := apps.Active(database, request.app, proof.now.seconds)
+        if app.status != sqlite.SQLITE_OK {
+            return .{databaseError = app.status}
+        }
+        if app.error != "" {
+            return .{status = 400, error = app.error}
+        }
+        for record: request.records {
+            if !validation.ValidForProtocol(record, request.version) {
+                return .{status = 400, error = "invalid encrypted record"}
+            }
+            scope := apps.OwnsSignedCollection(database, request.app, record.Collection)
+            if scope.status != sqlite.SQLITE_OK {
+                return .{databaseError = scope.status}
+            }
+            if scope.error != "" {
+                return .{status = 400, error = scope.error}
+            }
+        }
+        authorization := signed.VerifyTx(database, context.verify, proof.signedTransaction, request.user, request.app,
+            "POST", proof.path, proof.body, proof.now.seconds, auditTime)
+        if authorization.databaseError != sqlite.SQLITE_OK {
+            return .{databaseError = authorization.databaseError}
+        }
+        if authorization.status != 0 {
+            return .{status = authorization.status, error = authorization.message}
+        }
+        before := accounts.CurrentVersion(database, request.user)
+        if before.status != sqlite.SQLITE_OK {
+            return .{databaseError = before.status}
+        }
+        if request.sinceVersion > before.value || request.cursorVersion > before.value {
+            return .{status = 409, error = "record cursor is ahead of this node"}
+        }
+        allowance := storage.Allowance(database, request.user, proof.now.seconds, context.storageLimit, context.storagePlansEnabled)
+        if allowance.status != sqlite.SQLITE_OK {
+            return .{databaseError = allowance.status}
+        }
+        applied := writes.ApplyTx(database, request.user, request.records, request.version, proof.now, allowance.value)
+        if applied.status != sqlite.SQLITE_OK {
+            return .{databaseError = applied.status}
+        }
+        if applied.invalidRecord {
+            return .{status = 400, error = "invalid encrypted record"}
+        }
+        if applied.storageFull {
+            return .{status = 413, error = "account storage limit reached", usedBytes = applied.usedBytes, limitBytes = allowance.value}
+        }
+        current := accounts.CurrentVersion(database, request.user)
+        if current.status != sqlite.SQLITE_OK {
+            return .{databaseError = current.status}
+        }
+        arguments: [1]sql.Argument = .[sql.TextArg(request.user)]
+        used := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+        if used.status != sqlite.SQLITE_OK {
+            return .{databaseError = used.status}
+        }
+        after := ifx request.cursorVersion > 0 then request.cursorVersion else request.sinceVersion
+        page := pages.Read(database, .{user = request.user, app = request.app, afterVersion = after,
+            afterCollection = request.cursorCollection, afterID = request.cursorID, throughVersion = current.value,
+            limit = request.limit, encoding = request.encoding, contentFreeDeletions = request.contentFreeDeletions})
+        if page.status != sqlite.SQLITE_OK {
+            return .{databaseError = page.status}
+        }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        if status != sqlite.SQLITE_OK {
+            return .{databaseError = status}
+        }
+        Audit(database, request, current.value, applied.applied)
+        return .{page = page, serverVersion = current.value, applied = applied.applied, usedBytes = used.value, limitBytes = allowance.value}
+    }
+
+    #scope_export
+    DecodePublicKey :: (encoded: string, user: string) -> binary.BinaryBytes {
+        if encoded == "" {
+            return .{}
+        }
+        key := binary.DecodeBinaryField(encoded)
+        if key.error != "" {
+            return .{error = "invalid public_key"}
+        }
+        if key.value.count != codec.mlDSA44PublicKeySize {
+            return .{error = "wrong public_key size"}
+        }
+        digest := sha.Sha256Of(TextView(VecSlice(key.value, 0, key.value.count)))
+        hex: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *hex[0], hex.count) != 1 || TextView(hex[:64]) != user {
+            return .{error = "public_key does not match user_id_hash"}
+        }
+        return key
+    }
+
+    // The same decoded bytes supply the records and the signed body digest.
+    // Hold the database connection exclusively for the entire request.
+    Receive :: (context: Context, headerUser: string, proof: RequestProof) -> RecordSyncResult {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(proof.body)) { return .{status = 400, error = "invalid json"} }
+        return ReceiveDocument(context, headerUser, proof, *document)
+    }
+
+    ReceiveDocument :: (context: Context, headerUser: string, proof: RequestProof, document: *json.JsonDocument) -> RecordSyncResult {
+        parsed := parser.Read(document)
+        if parsed.error != "" {
+            return .{status = 400, error = parsed.error}
+        }
+        if headerUser == "" {
+            return .{status = 400, error = "missing X-Mesh-User"}
+        }
+        user: [64]u8
+        if !identity.NormalizeUserID(headerUser, user[:]) {
+            return .{status = 400, error = "invalid user_id_hash"}
+        }
+        requestedUser := wire.TrimSpace(TextView(parsed.user))
+        if requestedUser != "" {
+            bodyUser: [64]u8
+            if !identity.NormalizeUserID(requestedUser, bodyUser[:]) || TextView(bodyUser[:]) != TextView(user[:]) {
+                return .{status = 400, error = "X-Mesh-User does not match user_id_hash"}
+            }
+        }
+        account := TextView(user[:])
+        key := DecodePublicKey(wire.TrimSpace(TextView(parsed.publicKey)), account)
+        if key.error != "" {
+            return .{status = 400, error = key.error}
+        }
+        rows: [rules.RecordPageLimit]protocol.EncryptedRecord
+        for index: 0..parsed.count - 1 {
+            rows[index] = parser.Record(*parsed, index)
+        }
+        app := wire.TrimSpace(TextView(parsed.app))
+        result := Synchronize(context, .{user = account, app = app,
+            client = wire.TrimSpace(TextView(parsed.client)), version = cast(isize)parsed.protocolVersion,
+            records = rows[:parsed.count], sinceVersion = parsed.sinceVersion, clientClock = parsed.clientClock, cursorVersion = parsed.cursorVersion,
+            cursorCollection = TextView(parsed.cursorCollection), cursorID = TextView(parsed.cursorID), hasCursor = parsed.hasCursor,
+            limit = parsed.limit, encoding = TextView(parsed.encoding), contentFreeDeletions = parsed.contentFreeDeletions}, proof)
+        result.includeMetadata = parsed.includeMetadata
+        result.protocolVersion = parsed.protocolVersion
+        if result.status == 0 && result.databaseError == sqlite.SQLITE_OK && result.includeMetadata && !result.page.more {
+            result.packageSequence = packages.LatestSequence(context.databasePath, app)
+        }
+        return result
+    }
+}

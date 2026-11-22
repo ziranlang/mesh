@@ -1,0 +1,216 @@
+#if TARGET == .C && OS == .LINUX {
+    wallet :: #import "monero_wallet_native";
+    rpc :: #import "monero_rpc_native";
+    invoice :: #import "monero_invoice_native";
+    issuer :: #import "token_issuer_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    mutex :: #import "std/mutex_linux";
+    stdio :: #import "std/stdio_linux";
+    wire :: #import "wire_text";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    Notified :: struct {
+        invoices: HashMap(string, bool)
+        ids: Vec(Text)
+    }
+
+    #scope_file
+    InvoiceKey :: struct { account: Text; id: Text; }
+    Monitor :: struct { receipt: Text; payment: Text; atomic: s64; address: s64; }
+
+    PendingSQL :: #string SQL
+SELECT account_id,id FROM token_payment_intents WHERE provider='monero' AND status='pending'
+ORDER BY created_at LIMIT 100
+SQL;
+    ExpiredSQL :: #string SQL
+SELECT account_id,id FROM token_payment_intents WHERE provider='monero' AND status='expired' AND receipt_id=''
+    AND julianday(expires_at)>=julianday('now','-30 days')
+ORDER BY created_at LIMIT 50
+SQL;
+    SeedSQL :: #string SQL
+INSERT OR IGNORE INTO referral_monero_invoices(receipt_id)
+SELECT receipt_id FROM token_payment_intents WHERE provider='monero' AND status='paid' AND receipt_id<>''
+SQL;
+    MonitorSQL :: #string SQL
+SELECT i.receipt_id,i.provider_payment_id,i.provider_amount,CAST(i.provider_ref AS INTEGER)
+FROM referral_monero_invoices m JOIN token_payment_intents i ON i.receipt_id=m.receipt_id
+WHERE i.provider='monero' AND i.status='paid' AND m.state NOT IN ('finalized','compensated')
+ORDER BY m.checked_at,m.receipt_id LIMIT 50
+SQL;
+    UpdateSQL :: #string SQL
+UPDATE referral_monero_invoices SET state=CASE WHEN state='invalid' THEN state ELSE ?2 END,checked_at=CURRENT_TIMESTAMP
+WHERE receipt_id=?1 AND state NOT IN ('finalized','compensated')
+SQL;
+
+    ListInvoices :: (database: *void, lock: *mutex.Mutex, query: string, output: *Vec(InvoiceKey)) -> bool {
+        if !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        none: [0]sql.Argument
+        list := sql.Prepare(database, query, none[:])
+        if list.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(list.value)
+        status := sqlite.SqliteStep(list.value)
+        while status == sqlite.SQLITE_ROW {
+            item: InvoiceKey = .{account = TextCopy(sql.ColumnText(list.value, 0)), id = TextCopy(sql.ColumnText(list.value, 1))}
+            if !VecPush(<<output, item) { return false }
+            status = sqlite.SqliteStep(list.value)
+        }
+        return status == sqlite.SQLITE_DONE
+    }
+
+    ReportPartial :: (notified: *Notified, id: string) {
+        if HashMapHas(*notified.invoices, id) { return }
+        if !VecPush(notified.ids, TextCopy(id)) { return }
+        current := VecSlice(notified.ids, notified.ids.count - 1, notified.ids.count)
+        HashMapSet(*notified.invoices, TextView(current[0]), true)
+        unused stdio.PrintError("Monero invoice has uncredited funds\n")
+    }
+
+    Settle :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, item: *InvoiceKey,
+        expected: string, notified: *Notified, cancel: rpc.Cancellation) -> bool {
+        account := TextView(item.account)
+        if !mutex.Lock(lock) { return false }
+        current := invoice.Load(database, account, TextView(item.id))
+        mutex.Unlock(lock)
+        if current.corrupt { return false }
+        if !current.found || TextView(current.state) != expected { return true }
+        partial: bool
+        ok := invoice.Reconcile(database, lock, configuration, account, *current, cancel, *partial)
+        if ok && partial && expected == "expired" { ReportPartial(notified, TextView(item.id)) }
+        return ok
+    }
+
+    ReconcileState :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, expected: string,
+        notified: *Notified, cancel: rpc.Cancellation) -> bool {
+        items: Vec(InvoiceKey)
+        query := ifx expected == "pending" then PendingSQL else ExpiredSQL
+        if !ListInvoices(database, lock, query, *items) { return false }
+        success := true
+        for *item: VecSlice(items, 0, items.count) {
+            if rpc.Cancelled(cancel) { return false }
+            if !Settle(database, lock, configuration, item, expected, notified, cancel) { success = false }
+        }
+        return success
+    }
+
+    ListMonitors :: (database: *void, lock: *mutex.Mutex, output: *Vec(Monitor)) -> bool {
+        if !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        if sqlite.SqliteExecText(database, SeedSQL) != sqlite.SQLITE_OK { return false }
+        none: [0]sql.Argument
+        list := sql.Prepare(database, MonitorSQL, none[:])
+        if list.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(list.value)
+        status := sqlite.SqliteStep(list.value)
+        while status == sqlite.SQLITE_ROW {
+            item: Monitor = .{receipt = TextCopy(sql.ColumnText(list.value, 0)), payment = TextCopy(sql.ColumnText(list.value, 1)),
+                atomic = sqlite.SqliteColumnInt64(list.value, 2), address = sqlite.SqliteColumnInt64(list.value, 3)}
+            if !VecPush(<<output, item) { return false }
+            status = sqlite.SqliteStep(list.value)
+        }
+        return status == sqlite.SQLITE_DONE
+    }
+
+    Assess :: (configuration: wallet.Configuration, item: *Monitor, cancel: rpc.Cancellation) -> string {
+        entries := wallet.LoadTransfers(configuration, .{address = item.address, useAddress = true, incoming = true}, cancel)
+        if !entries.ok { return "" }
+        payment := TextView(item.payment)
+        suffix: Text = wallet.PaymentID("", 0, item.address, "")
+        end := TextView(suffix)
+        if end == "" || payment.count <= end.count || payment[payment.count - end.count:] != end { return "conflict" }
+        remaining := payment[:payment.count - end.count]
+        state := "monitoring"
+        allFinal := true
+        total: s64
+        finality := wallet.Finality(configuration)
+        while remaining != "" {
+            id := wire.Cut(remaining, #char "+")
+            remaining = id.after
+            found := false
+            for transfer: wallet.Entries(*entries) {
+                if TextView(transfer.id[:transfer.idLength]) != id.before || transfer.account != 0 || transfer.address != item.address { continue }
+                found = true
+                if transfer.doubleSpend { state = "invalid" }
+                if total > 9223372036854775807 - transfer.amount { return "" }
+                total += transfer.amount
+                if transfer.confirmations < finality || transfer.locked || transfer.unlockTime != 0 { allFinal = false }
+                break
+            }
+            if !found && state != "invalid" { state = "conflict" }
+        }
+        if total < item.atomic && state != "invalid" { state = "conflict" }
+        return ifx allFinal && state == "monitoring" then "finalized" else state
+    }
+
+    ReadDebit :: (database: *void, arguments: []sql.Argument, account: *Text, app: *Text, reference: *Text) -> s64 {
+        query := sql.Prepare(database,
+            "SELECT account_id,app_id,source_ref,amount_delta FROM token_ledger WHERE receipt_id=?1 AND event_type='credit' AND source_type='monero'", arguments)
+        if query.status != sqlite.SQLITE_OK { return 0 }
+        defer sqlite.SqliteFinalize(query.value)
+        if sqlite.SqliteStep(query.value) != sqlite.SQLITE_ROW { return 0 }
+        owner: Text = TextCopy(sql.ColumnText(query.value, 0))
+        title: Text = TextCopy(sql.ColumnText(query.value, 1))
+        proof: Text = TextCopy(sql.ColumnText(query.value, 2))
+        VecSwap(account.bytes, owner.bytes)
+        VecSwap(app.bytes, title.bytes)
+        VecSwap(reference.bytes, proof.bytes)
+        return sqlite.SqliteColumnInt64(query.value, 3)
+    }
+
+    Compensate :: (database: *void, configuration: wallet.Configuration, receipt: string) -> bool {
+        key: [1]sql.Argument = .[sql.TextArg(receipt)]
+        invalid := sql.ReadInteger(database, "SELECT 1 FROM referral_monero_invoices WHERE receipt_id=?1 AND state='invalid'", key[:])
+        if invalid.status != sqlite.SQLITE_OK { return false }
+        if !invalid.found { return true }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        account: Text
+        app: Text
+        reference: Text
+        units := ReadDebit(database, key[:], *account, *app, *reference)
+        if units <= 0 { return false }
+        timeBytes: [31]u8
+        at := signing.WireTime(signing.Now(), false, timeBytes[:])
+        idempotency: Vec(u8)
+        if at == "" || !BuilderAppend(idempotency, "invoice-reorg-") || !BuilderAppend(idempotency, receipt) { return false }
+        debit := writes.SpendEvent(database, configuration.signer, .{account = TextView(account), app = TextView(app), kind = "debit",
+            amount = -units, source = "monero", reference = TextView(reference)}, at, TextView(VecSlice(idempotency, 0, idempotency.count)))
+        if debit.status == 409 && debit.error == "insufficient balance" { return true }
+        return debit.status == 200 && sql.Execute(database, "UPDATE referral_monero_invoices SET state='compensated' WHERE receipt_id=?1", key[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Inspect :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, item: *Monitor, cancel: rpc.Cancellation) -> bool {
+        state := Assess(configuration, item, cancel)
+        if state == "" || rpc.Cancelled(cancel) || !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        if rpc.Cancelled(cancel) { return false }
+        receipt := TextView(item.receipt)
+        values: [2]sql.Argument = .[sql.TextArg(receipt), sql.TextArg(state)]
+        return sql.Execute(database, UpdateSQL, values[:]) == sqlite.SQLITE_OK && Compensate(database, configuration, receipt)
+    }
+
+    #scope_export
+    Reconcile :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, notified: *Notified, cancel: rpc.Cancellation) -> bool {
+        if configuration.signer == null || issuer.Status(configuration.signer) != "ok" { return true }
+        pending := ReconcileState(database, lock, configuration, "pending", notified, cancel)
+        if rpc.Cancelled(cancel) { return false }
+        expired := ReconcileState(database, lock, configuration, "expired", notified, cancel)
+        if rpc.Cancelled(cancel) { return false }
+        items: Vec(Monitor)
+        if !ListMonitors(database, lock, *items) { return false }
+        for *item: VecSlice(items, 0, items.count) {
+            if !Inspect(database, lock, configuration, item, cancel) { return false }
+        }
+        return pending && expired
+    }
+
+    Close :: (notified: *Notified) {
+        HashMapFree(*notified.invoices)
+        VecFree(notified.ids)
+    }
+}

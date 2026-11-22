@@ -1,0 +1,307 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    lookup :: #import "account_lookup_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    response :: #import "http_json_native";
+    limits :: #import "rate_limit_native";
+    peer :: #import "client_address_native";
+    invoice :: #import "monero_invoice_native";
+    account :: #import "monero_account_native";
+    rpc :: #import "monero_rpc_native";
+    wallet :: #import "monero_wallet_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    ledger :: #import "token_ledger_native";
+    tokens :: #import "token_http_native";
+    registry :: #import "app_registry_queries";
+    tx :: #import "signed_tx_native";
+    txQueries :: #import "signed_tx_queries";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    mutex :: #import "std/mutex_linux";
+    clock :: #import "std/timer";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    State :: struct {
+        configuration: wallet.Configuration
+        addressLock: mutex.Mutex
+        cancel: rpc.Cancellation
+    }
+
+    #scope_file
+    CreatePath :: "/api/v1/tokens/purchases/monero/invoices";
+    InvoicePrefix :: "/api/v1/tokens/purchases/monero/invoices/";
+    AddressPath :: "/api/v1/tokens/purchases/monero/address";
+    AddressPrefix :: "/api/v1/tokens/purchases/monero/address/";
+    DepositsPath :: "/api/v1/tokens/purchases/monero/deposits";
+    PrivateCache :: "private, no-store";
+    InvoiceFailed :: "monero invoice failed";
+    AddressFailed :: "monero address unavailable";
+
+    Problem :: struct { status: u32; message: string; }
+
+    Prefix :: (route: string, prefix: string) -> bool { return wire.TrimPrefix(route, prefix).count < route.count }
+
+    Authenticate :: (accounts: *access.AccountAccess, connection: *void, now: s64, at: string) -> auth.BearerAuthentication {
+        if !mutex.Lock(*accounts.databaseLock) { return .{status = 500, message = "authentication failed"} }
+        defer mutex.Unlock(*accounts.databaseLock)
+        return auth.Authenticate(accounts.configuration.database, connection, accounts.configuration.secret, now, at, false)
+    }
+
+    InvoiceFields :: (document: *json.JsonDocument, app: *s32, product: *s32) -> bool {
+        if json.JsonKindOf(document, document.root) == .Null { return true }
+        if json.JsonKindOf(document, document.root) != .Object { return false }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            key := TextView(name)
+            appKey := wire.MatchesToken(key, "app_id")
+            if appKey || wire.MatchesToken(key, "product_id") {
+                kind := json.JsonKindOf(document, node)
+                if kind == .String {
+                    if appKey { <<app = node } else { <<product = node }
+                } else if kind != .Null { return false }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    AuthorizeCreate :: (accounts: *access.AccountAccess, owner: string, app: string, header: string, body: []u8, now: s64, audit: string) -> Problem {
+        unauthorized: Problem = .{status = 500, message = "authentication failed"}
+        if !mutex.Lock(*accounts.databaseLock) { return unauthorized }
+        defer mutex.Unlock(*accounts.databaseLock)
+        database := accounts.configuration.database
+        args: [2]sql.Argument = .[sql.TextArg(app), sql.TextArg(ledger.AssetID)]
+        exists := sql.ReadInteger(database, registry.ActiveAppSQL, args[:1])
+        if exists.status != sqlite.SQLITE_OK || !exists.found { return .{status = 500, message = InvoiceFailed} }
+        if exists.value == 0 { return .{status = 400, message = "unknown app_id"} }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return unauthorized }
+        defer writes.Rollback(database)
+        if header != "" {
+            verified := tx.VerifyTx(database, accounts.configuration.verify, header, owner, app, "POST", CreatePath, body, now, audit)
+            if verified.status != 0 { return .{status = verified.status, message = verified.message} }
+            if verified.databaseError != sqlite.SQLITE_OK { return unauthorized }
+        }
+        policy := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM token_app_permissions WHERE app_id=?1)", args[:1])
+        if policy.status != sqlite.SQLITE_OK || !policy.found { return unauthorized }
+        if policy.value != 0 {
+            permission := sql.ReadInteger(database,
+                "SELECT legacy_unsigned_until FROM token_app_permissions WHERE app_id=?1 AND asset_id=?2 AND permission='purchase' AND status='active'", args[:])
+            if permission.status != sqlite.SQLITE_OK { return unauthorized }
+            if !permission.found { return .{status = 403, message = "app token permission denied"} }
+            if header == "" && (permission.value == 0 || now > permission.value) {
+                return .{status = 401, message = "signed transaction required"}
+            }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return unauthorized }
+        return .{}
+    }
+
+    ForgetFailedInvoice :: (accounts: *access.AccountAccess, owner: string, app: string, header: string, saved: *bool) {
+        if <<saved || header == "" || !mutex.Lock(*accounts.databaseLock) { return }
+        defer mutex.Unlock(*accounts.databaseLock)
+        envelope := tx.Read(header)
+        if !envelope.valid { return }
+        args: [4]sql.Argument = .[sql.TextArg(owner), sql.TextArg(wire.TrimSpace(TextView(envelope.id))),
+            sql.TextArg(app), sql.TextArg(wire.TrimSpace(TextView(envelope.nonce)))]
+        unused sql.Execute(accounts.configuration.database, txQueries.DeleteSignedTransactionSQL, args[:])
+    }
+
+    WriteNewInvoice :: (accounts: *access.AccountAccess, owner: string, id: string, app: string, product: string,
+        price: invoice.Product, allocation: *wallet.Allocation, saved: *bool, document: *json.JsonDocument) -> s32 {
+        if !mutex.Lock(*accounts.databaseLock) { return -1 }
+        defer mutex.Unlock(*accounts.databaseLock)
+        database := accounts.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return -1 }
+        defer writes.Rollback(database)
+        if !invoice.Insert(database, owner, id, app, product, price, allocation) { return -1 }
+        created := invoice.Load(database, owner, id)
+        if !created.found { return -1 }
+        node := invoice.Write(database, owner, *created, document)
+        if node < 0 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return -1 }
+        <<saved = true
+        return node
+    }
+
+    Create :: (state: *State, tokenState: *tokens.State, accounts: *access.AccountAccess, connection: *void,
+        owner: string, inbound: []u8, overflow: bool, now: s64, at: string) -> s32 {
+        settings := accounts.configuration
+        zstd := settings.zstdResponses
+        decoded: response.Body
+        body := response.Decode(connection, inbound, overflow, settings.maximumBodyBytes, settings.zstdRequests, *decoded)
+        if body.status != 0 { return response.ErrorReply(connection, "POST", 400, body.error, zstd) }
+        raw := ifx body.decoded then VecSlice(decoded.scratch, 0, body.length) else inbound
+        document: json.JsonDocument
+        appIndex: s32 = -1
+        productIndex: s32 = -1
+        if !json.JsonRead(*document, TextView(raw)) || !InvoiceFields(*document, *appIndex, *productIndex) {
+            return response.ErrorReply(connection, "POST", 400, "invalid json", zstd)
+        }
+        appText: Text = json.JsonString(*document, appIndex)
+        productText: Text = json.JsonString(*document, productIndex)
+        app := wire.TrimSpace(TextView(appText))
+        product := wire.TrimSpace(TextView(productText))
+        if !identity.ValidNamespace(app) { return response.ErrorReply(connection, "POST", 400, "invalid app_id", zstd) }
+        if product == "" { return response.ErrorReply(connection, "POST", 400, "product_id required", zstd) }
+        if !state.configuration.directPurchases { return response.ErrorReply(connection, "POST", 503, "direct token purchases disabled", zstd) }
+        price := invoice.FindProduct(VecSlice(tokenState.products, 0, tokenState.products.count), product)
+        if price.atomic <= 0 { return response.ErrorReply(connection, "POST", 400, "unknown monero product_id", zstd) }
+        header := wire.TrimSpace(http.Header(connection, "X-Mesh-Tx"))
+        denied := AuthorizeCreate(accounts, owner, app, header, raw, now, at)
+        if denied.status != 0 { return response.ErrorReply(connection, "POST", denied.status, denied.message, zstd) }
+        saved := false
+        defer ForgetFailedInvoice(accounts, owner, app, header, *saved)
+        identifier: [33]u8
+        if !wallet.NewID(identifier[:]) { return response.ErrorReply(connection, "POST", 500, InvoiceFailed, zstd) }
+        id := TextView(identifier[:32])
+        allocation := wallet.CreateAddress(state.configuration, "daochi-", id, state.cancel)
+        if !allocation.valid { return response.ErrorReply(connection, "POST", 500, InvoiceFailed, zstd) }
+        output: json.JsonDocument
+        node := WriteNewInvoice(accounts, owner, id, app, product, price, *allocation, *saved, *output)
+        if node < 0 { return response.ErrorReply(connection, "POST", 500, InvoiceFailed, zstd) }
+        return response.Reply(connection, "POST", 201, *output, node, zstd)
+    }
+
+    LoadInvoice :: (accounts: *access.AccountAccess, owner: string, id: string) -> invoice.Invoice {
+        if !mutex.Lock(*accounts.databaseLock) { return .{corrupt = true} }
+        defer mutex.Unlock(*accounts.databaseLock)
+        return invoice.Load(accounts.configuration.database, owner, id)
+    }
+
+    InvoiceJSON :: (accounts: *access.AccountAccess, owner: string, id: string, document: *json.JsonDocument) -> s32 {
+        if !mutex.Lock(*accounts.databaseLock) { return -1 }
+        defer mutex.Unlock(*accounts.databaseLock)
+        database := accounts.configuration.database
+        found := invoice.Load(database, owner, id)
+        if !found.found { return -1 }
+        return invoice.Write(database, owner, *found, document)
+    }
+
+    ReadInvoice :: (state: *State, accounts: *access.AccountAccess, connection: *void, verb: string, owner: string, id: string) -> s32 {
+        zstd := accounts.configuration.zstdResponses
+        if !identity.ValidResourceID(id) { return response.ErrorReply(connection, verb, 400, "invalid invoice id", zstd) }
+        found := LoadInvoice(accounts, owner, id)
+        if found.corrupt { return response.ErrorReply(connection, verb, 500, InvoiceFailed, zstd) }
+        if !found.found { return response.ErrorReply(connection, verb, 404, "invoice not found", zstd) }
+        if TextView(found.state) == "pending" {
+            unused invoice.Reconcile(accounts.configuration.database, *accounts.databaseLock, state.configuration, owner, *found, state.cancel, null)
+        }
+        output: json.JsonDocument
+        node := InvoiceJSON(accounts, owner, id, *output)
+        if node < 0 { return response.ErrorReply(connection, verb, 500, InvoiceFailed, zstd) }
+        return response.Reply(connection, verb, 200, *output, node, zstd)
+    }
+
+    Resolve :: (accounts: *access.AccountAccess, reference: string) -> lookup.AccountLookup {
+        if !mutex.Lock(*accounts.databaseLock) { return .{status = sqlite.SQLITE_BUSY} }
+        defer mutex.Unlock(*accounts.databaseLock)
+        normalized: [64]u8
+        return lookup.ResolveNormalized(accounts.configuration.database, lookup.Normalize(reference, normalized[:]))
+    }
+
+    LoadAddress :: (accounts: *access.AccountAccess, owner: string) -> account.AccountAddress {
+        if !mutex.Lock(*accounts.databaseLock) { return .{status = sqlite.SQLITE_BUSY} }
+        defer mutex.Unlock(*accounts.databaseLock)
+        return account.Load(accounts.configuration.database, owner)
+    }
+
+    Allocate :: (state: *State, accounts: *access.AccountAccess, owner: string) -> account.AccountAddress {
+        if !mutex.Lock(*state.addressLock) { return .{status = sqlite.SQLITE_BUSY} }
+        defer mutex.Unlock(*state.addressLock)
+        existing := LoadAddress(accounts, owner)
+        if existing.found || existing.status != sqlite.SQLITE_OK { return existing }
+        identifier: [33]u8
+        if !wallet.NewID(identifier[:]) { return .{status = sqlite.SQLITE_MISUSE} }
+        id := TextView(identifier[:32])
+        allocation := wallet.CreateAddress(state.configuration, "daochi-account-", id, state.cancel)
+        if !allocation.valid || !mutex.Lock(*accounts.databaseLock) { return .{status = sqlite.SQLITE_BUSY} }
+        defer mutex.Unlock(*accounts.databaseLock)
+        return account.Insert(accounts.configuration.database, owner, id, *allocation)
+    }
+
+    Address :: (state: *State, accounts: *access.AccountAccess, connection: *void, verb: string, route: string, now: s64, at: string) -> s32 {
+        zstd := accounts.configuration.zstdResponses
+        configuration := state.configuration
+        if !configuration.directPurchases || !wallet.ValidRate(configuration) || wire.TrimSpace(configuration.wallet.url) == "" {
+            return response.ErrorReply(connection, verb, 503, "monero purchases disabled", zstd)
+        }
+        client := peer.FromRequest(connection)
+        bucket: Vec(u8)
+        if !BuilderAppend(bucket, "monero-address:") || !BuilderAppend(bucket, TextView(client.bytes[:client.count])) ||
+            !limits.Allow(*accounts.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 60, 3600000, clock.MonotonicMilliseconds()) {
+            return response.ErrorReply(connection, verb, 429, "too many address requests", zstd)
+        }
+        reference := ifx route == AddressPath then "" else wire.TrimSpace(wire.TrimPrefix(route, AddressPrefix))
+        owner: [64]u8
+        if reference == "" {
+            user := Authenticate(accounts, connection, now, at)
+            if user.status != 0 { return response.ErrorReply(connection, verb, user.status, user.message, zstd) }
+            owner = user.userID
+        } else {
+            found := Resolve(accounts, reference)
+            if found.status != sqlite.SQLITE_OK { return response.ErrorReply(connection, verb, 500, "recipient lookup failed", zstd) }
+            if !found.found { return response.ErrorReply(connection, verb, 404, "recipient not found", zstd) }
+            owner = found.id
+        }
+        userID := TextView(owner[:])
+        allocated := Allocate(state, accounts, userID)
+        if !allocated.found { return response.ErrorReply(connection, verb, 500, AddressFailed, zstd) }
+        output: json.JsonDocument
+        node := account.Write(configuration, userID, *allocated, *output)
+        if node < 0 { return response.ErrorReply(connection, verb, 500, AddressFailed, zstd) }
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = PrivateCache}]
+        return response.ReplyWithHeaders(connection, 200, *output, node, headers[:])
+    }
+
+    Deposits :: (accounts: *access.AccountAccess, connection: *void, verb: string, owner: string) -> s32 {
+        zstd := accounts.configuration.zstdResponses
+        if !mutex.Lock(*accounts.databaseLock) { return response.ErrorReply(connection, verb, 500, "monero deposits unavailable", zstd) }
+        defer mutex.Unlock(*accounts.databaseLock)
+        output: json.JsonDocument
+        node := account.Deposits(accounts.configuration.database, owner, *output)
+        if node < 0 { return response.ErrorReply(connection, verb, 500, "monero deposits unavailable", zstd) }
+        return response.Reply(connection, verb, 200, *output, node, zstd)
+    }
+
+    #scope_export
+    Open :: (state: *State, configuration: wallet.Configuration, cancellation: rpc.Cancellation) -> bool {
+        state.configuration = configuration
+        state.cancel = cancellation
+        return mutex.Open(*state.addressLock)
+    }
+
+    Close :: (state: *State) { unused mutex.Close(*state.addressLock) }
+
+    Handles :: (route: string) -> bool {
+        return route == CreatePath || Prefix(route, InvoicePrefix) || route == AddressPath || Prefix(route, AddressPrefix) || route == DepositsPath
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool { return route == CreatePath && verb == "POST" }
+
+    Handle :: (state: *State, tokenState: *tokens.State, accounts: *access.AccountAccess, connection: *void,
+        verb: string, route: string, body: []u8, overflow: bool) -> s32 {
+        creating := route == CreatePath
+        if (creating && verb != "POST") || (!creating && verb != "GET" && verb != "HEAD") {
+            allow := ifx creating then "POST" else "GET, HEAD"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        now := signing.Now()
+        stamp: [31]u8
+        at := signing.WireTime(now, true, stamp[:])
+        if at == "" { return response.ErrorReply(connection, verb, 500, "authentication failed", accounts.configuration.zstdResponses) }
+        if route == AddressPath || Prefix(route, AddressPrefix) { return Address(state, accounts, connection, verb, route, now.seconds, at) }
+        authn := Authenticate(accounts, connection, now.seconds, at)
+        if authn.status != 0 { return response.ErrorReply(connection, verb, authn.status, authn.message, accounts.configuration.zstdResponses) }
+        owner := TextView(authn.userID[:])
+        if creating { return Create(state, tokenState, accounts, connection, owner, body, overflow, now.seconds, at) }
+        if route == DepositsPath { return Deposits(accounts, connection, verb, owner) }
+        return ReadInvoice(state, accounts, connection, verb, owner, wire.TrimPrefix(route, InvoicePrefix))
+    }
+}

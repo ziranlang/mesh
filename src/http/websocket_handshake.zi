@@ -1,0 +1,79 @@
+binary :: #import "binary_codec";
+sha1 :: #import "crypto/sha1";
+text :: #import "wire_text";
+#import "std/vec"
+
+#scope_file
+GUID :: "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+Exact :: (value: string, token: string) -> bool {
+    return value == token
+}
+
+#scope_export
+UpgradeRequested :: (upgrade: string, connection: string) -> bool {
+    return text.MatchesToken(upgrade, "websocket") &&
+        text.ContainsToken(connection, "upgrade", text.MatchesToken)
+}
+
+ProtocolRequested :: (header: string, protocol: string) -> bool {
+    return text.ContainsToken(header, protocol, Exact)
+}
+
+SelectProtocol :: (header: string) -> string {
+    protocols: [4]string = .["mesh-sync-v1", "daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
+    for protocol: protocols {
+        if ProtocolRequested(header, protocol) { return protocol }
+    }
+    return ""
+}
+
+BearerToken :: (header: string) -> string {
+    prefix := "bearer."
+    remaining := header
+    while true {
+        part := text.Cut(remaining, #char ",")
+        token := text.TrimSpace(part.before)
+        if token.count > prefix.count && token[:prefix.count] == prefix {
+            return token[prefix.count:]
+        }
+        if !part.found { return "" }
+        remaining = part.after
+    }
+}
+
+ValidKey :: (key: string) -> bool {
+    decoded := binary.DecodeBase64(key, false, true)
+    return decoded.error == "" && decoded.value.count == 16
+}
+
+AcceptKey :: (key: string) -> Vec(u8) {
+    // RFC 6455 requires SHA-1 over the header text and the fixed GUID.
+    input: Vec(u8)
+    if !BuilderAppend(input, key) || !BuilderAppend(input, GUID) {
+        return .{}
+    }
+    digest: [20]u8
+    if !sha1.Sha1(VecSlice(input, 0, input.count), digest[:]) {
+        return .{}
+    }
+    encoded := binary.EncodeBase64(TextView(digest[:]), false, true)
+    return encoded.value
+}
+
+UpgradeReply :: (key: string, protocols: string) -> Vec(u8) {
+    accepted := AcceptKey(key)
+    if accepted.count == 0 { return .{} }
+    response: Vec(u8)
+    if !BuilderAppend(response, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ") ||
+        !BuilderAppend(response, TextView(VecSlice(accepted, 0, accepted.count))) {
+        return .{}
+    }
+    protocol := SelectProtocol(protocols)
+    if protocol != "" && (!BuilderAppend(response, "\r\nSec-WebSocket-Protocol: ") ||
+        !BuilderAppend(response, protocol)) {
+        return .{}
+    }
+    if !BuilderAppend(response, "\r\n\r\n") { return .{} }
+    return response
+}

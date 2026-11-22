@@ -1,0 +1,328 @@
+#if TARGET == .C && OS == .LINUX {
+    issuer :: #import "token_issuer_native";
+    ledger :: #import "token_ledger_native";
+    provider :: #import "google_play_provider_native";
+    schema :: #import "google_play_schema";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    writes :: #import "token_writes_native";
+
+    PlaySource :: "google_play";
+
+    Purchase :: struct {
+        product: provider.PlayProduct
+        app: string
+        account: string
+        amount: s64
+        at: string
+        millis: s64
+    }
+
+    Lifecycle :: struct {
+        packageName: Text
+        productID: Text
+        app: Text
+        account: Text
+        binding: Text
+        order: Text
+        state: Text
+        receipt: Text
+        amount: s64
+        found: bool
+        failed: bool
+    }
+
+    PurchaseResult :: struct {
+        receipt: Text
+        missingBinding: bool
+        ok: bool
+    }
+
+    #scope_file
+    ReadLifecycle :: "SELECT package_name,product_id,app_id,account_id,account_binding,order_id,state,receipt_id,amount FROM google_play_purchase_lifecycle WHERE provider='google_play' AND purchase_token=?1";
+    ReadPayment :: #string SQL
+SELECT p.receipt_id,p.account_id,p.asset_id,p.amount,l.account_id,l.app_id,l.asset_id,l.amount_delta,l.source_type,l.source_ref,l.event_type
+FROM token_processed_payments p LEFT JOIN token_ledger l ON l.receipt_id=p.receipt_id
+WHERE p.provider='google_play' AND p.provider_payment_id=?1
+SQL;
+    SavePurchase :: #string SQL
+INSERT INTO google_play_purchase_lifecycle(purchase_token,package_name,product_id,app_id,account_id,account_binding,order_id,state,amount,receipt_id)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+ON CONFLICT(provider,purchase_token) DO UPDATE SET app_id=excluded.app_id,account_id=excluded.account_id,
+ account_binding=excluded.account_binding,order_id=excluded.order_id,state=excluded.state,receipt_id=excluded.receipt_id,
+ updated_at=CURRENT_TIMESTAMP WHERE google_play_purchase_lifecycle.state='binding_missing'
+SQL;
+    RecordProof :: #string SQL
+INSERT INTO google_play_purchase_proofs(purchase_token,payment_kind,snapshot_refunded,verified_at) VALUES(?1,?2,?3,?4)
+ON CONFLICT(purchase_token) DO UPDATE SET snapshot_refunded=MAX(snapshot_refunded,excluded.snapshot_refunded),verified_at=excluded.verified_at
+WHERE payment_kind=excluded.payment_kind
+SQL;
+
+    Payment :: struct {
+        receipt: Text
+        app: Text
+        reference: Text
+        found: bool
+        failed: bool
+    }
+
+    PaymentFor :: (database: *void, key: string, purchase: Purchase, expectedReference: string = "") -> Payment {
+        args: [1]sql.Argument = .[sql.TextArg(key)]
+        row := sql.Prepare(database, ReadPayment, args[:])
+        if row.status != sqlite.SQLITE_OK { return .{failed = true} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{failed = true} }
+        reference := sql.ColumnText(row.value, 9)
+        if sql.ColumnText(row.value, 1) != purchase.account || sql.ColumnText(row.value, 2) != ledger.AssetID ||
+            sqlite.SqliteColumnInt64(row.value, 3) != purchase.amount || sql.ColumnText(row.value, 4) != purchase.account ||
+            sql.ColumnText(row.value, 6) != ledger.AssetID || sqlite.SqliteColumnInt64(row.value, 7) != purchase.amount ||
+            sql.ColumnText(row.value, 8) != PlaySource || reference == "" || (expectedReference != "" && reference != expectedReference) ||
+            sql.ColumnText(row.value, 10) != "credit" { return .{failed = true} }
+        return .{found = true, receipt = TextCopy(sql.ColumnText(row.value, 0)),
+            app = TextCopy(sql.ColumnText(row.value, 5)), reference = TextCopy(reference)}
+    }
+
+    AdoptLegacy :: (database: *void, purchase: Purchase, reference: string) -> Payment {
+        legacy := PaymentFor(database, reference, purchase, reference)
+        if legacy.failed { return .{failed = true} }
+        if !legacy.found { return .{} }
+        token := purchase.product.token
+        existing := PaymentFor(database, token, purchase, reference)
+        if existing.failed { return .{failed = true} }
+        {
+            receipt := TextView(legacy.receipt)
+            if existing.found {
+                if TextView(existing.receipt) != receipt { return .{failed = true} }
+            } else {
+                args: [5]sql.Argument = .[sql.TextArg(token), sql.TextArg(purchase.account), sql.TextArg(ledger.AssetID),
+                    sql.IntArg(purchase.amount), sql.TextArg(receipt)]
+                if sql.Execute(database, "INSERT INTO token_processed_payments(provider,provider_payment_id,account_id,asset_id,amount,receipt_id) VALUES('google_play',?1,?2,?3,?4,?5)",
+                    args[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return .{failed = true} }
+            }
+        }
+        return legacy
+    }
+
+    Save :: (database: *void, purchase: Purchase, inspected: *provider.PlayInspection, state: string, receipt: string) -> bool {
+        unclaimed := state == "binding_missing"
+        args: [10]sql.Argument = .[sql.TextArg(purchase.product.token), sql.TextArg(purchase.product.packageName),
+            sql.TextArg(purchase.product.productID), sql.TextArg(ifx unclaimed then "" else purchase.app),
+            sql.TextArg(ifx unclaimed then "" else purchase.account), sql.TextArg(TextView(inspected.binding)),
+            sql.TextArg(TextView(inspected.order)), sql.TextArg(state), sql.IntArg(purchase.amount), sql.TextArg(receipt)]
+        return sql.Execute(database, SavePurchase, args[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    Record :: (database: *void, purchase: Purchase, inspected: *provider.PlayInspection) -> bool {
+        values: [2]sql.Argument = .[sql.TextArg(purchase.product.token), sql.IntArg(inspected.quantity)]
+        if sql.Execute(database, "INSERT OR IGNORE INTO google_play_purchase_quantities(purchase_token,paid_quantity) VALUES(?1,?2)", values[:]) != sqlite.SQLITE_OK { return false }
+        paid := sql.ReadInteger(database, "SELECT paid_quantity FROM google_play_purchase_quantities WHERE purchase_token=?1", values[:1])
+        if !paid.found || paid.value != inspected.quantity { return false }
+        snapshot := ifx inspected.hasRefundable then inspected.quantity - inspected.refundable else -1
+        proof: [4]sql.Argument = .[values[0], sql.TextArg(inspected.kind), sql.IntArg(snapshot), sql.IntArg(purchase.millis)]
+        return sql.Execute(database, RecordProof, proof[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    Refund :: (database: *void, signer: *issuer.Issuer, purchase: Purchase, payment: *Payment,
+        quantity: s64, current: s64, target: s64) -> Text {
+        delta := (purchase.amount / quantity) * (target - current)
+        receipt := TextView(payment.receipt)
+        event: signing.Event = .{account = purchase.account, app = TextView(payment.app), kind = "debit",
+            amount = -delta, source = PlaySource, reference = TextView(payment.reference)}
+        debited := writes.RefundGooglePlay(database, signer, event, purchase.at, receipt)
+        if debited.status != 200 { return .{} }
+        refund := TextView(debited.id[:])
+        update: [4]sql.Argument = .[sql.TextArg(purchase.product.token), sql.IntArg(target), sql.IntArg(quantity), sql.TextArg(refund)]
+        if sql.Execute(database, "INSERT INTO google_play_purchase_quantities(purchase_token,paid_quantity,refunded_quantity) VALUES(?1,?3,?2) ON CONFLICT(purchase_token) DO UPDATE SET refunded_quantity=?2", update[:3]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, "UPDATE google_play_purchase_lifecycle SET refund_receipt_id=?4,state=CASE WHEN ?2=?3 THEN 'refunded' ELSE state END,updated_at=CURRENT_TIMESTAMP WHERE provider='google_play' AND purchase_token=?1",
+                update[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return .{} }
+        return TextCopy(refund)
+    }
+
+    ApplySnapshot :: (database: *void, signer: *issuer.Issuer, purchase: Purchase, payment: *Payment, inspected: *provider.PlayInspection) -> bool {
+        if !inspected.hasRefundable { return true }
+        args: [1]sql.Argument = .[sql.TextArg(purchase.product.token)]
+        applied := sql.ReadInteger(database, "SELECT refunded_quantity FROM google_play_purchase_quantities WHERE purchase_token=?1", args[:])
+        if !applied.found || inspected.quantity < 1 || purchase.amount % inspected.quantity != 0 { return false }
+        target := inspected.quantity - inspected.refundable
+        if target <= applied.value { return true }
+        receipt: Text = Refund(database, signer, purchase, payment, inspected.quantity, applied.value, target)
+        return TextView(receipt) != ""
+    }
+
+    RefundProgress :: struct {
+        total: s64
+        refunded: s64
+        snapshot: s64
+        verifiedAt: s64
+        ok: bool
+    }
+
+    Refunding :: (database: *void, token: string) -> RefundProgress {
+        args: [1]sql.Argument = .[sql.TextArg(token)]
+        row := sql.Prepare(database, "SELECT COALESCE(q.paid_quantity,1),COALESCE(q.refunded_quantity,0),COALESCE(p.snapshot_refunded,-1),COALESCE(p.verified_at,0) FROM (SELECT ?1 AS token) t LEFT JOIN google_play_purchase_quantities q ON q.purchase_token=t.token LEFT JOIN google_play_purchase_proofs p ON p.purchase_token=t.token", args[:])
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW { return .{} }
+        return .{total = sqlite.SqliteColumnInt64(row.value, 0), refunded = sqlite.SqliteColumnInt64(row.value, 1),
+            snapshot = sqlite.SqliteColumnInt64(row.value, 2), verifiedAt = sqlite.SqliteColumnInt64(row.value, 3), ok = true}
+    }
+
+    Bound :: (row: *Lifecycle) -> bool {
+        current := TextView(row.state)
+        return row.found && TextView(row.account) != "" && (current == "consume_pending" || current == "consumed")
+    }
+
+    SameOrder :: (expected: string, actual: string, optional: bool) -> bool {
+        return expected == "" || (optional && actual == "") || expected == actual
+    }
+
+    #scope_export
+    Ensure :: (database: *void) -> bool {
+        return sqlite.SqliteExecText(database, schema.Lifecycle) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, schema.Quantities) == sqlite.SQLITE_OK
+    }
+
+    Load :: (database: *void, token: string) -> Lifecycle {
+        args: [1]sql.Argument = .[sql.TextArg(token)]
+        row := sql.Prepare(database, ReadLifecycle, args[:])
+        if row.status != sqlite.SQLITE_OK { return .{failed = true} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{failed = true} }
+        return .{found = true, packageName = TextCopy(sql.ColumnText(row.value, 0)), productID = TextCopy(sql.ColumnText(row.value, 1)),
+            app = TextCopy(sql.ColumnText(row.value, 2)), account = TextCopy(sql.ColumnText(row.value, 3)),
+            binding = TextCopy(sql.ColumnText(row.value, 4)), order = TextCopy(sql.ColumnText(row.value, 5)),
+            state = TextCopy(sql.ColumnText(row.value, 6)), receipt = TextCopy(sql.ColumnText(row.value, 7)),
+            amount = sqlite.SqliteColumnInt64(row.value, 8)}
+    }
+
+    // Authorize, credit, apply cumulative refunds and commit in the caller's transaction.
+    Process :: (database: *void, signer: *issuer.Issuer, purchase: Purchase, inspected: *provider.PlayInspection) -> PurchaseResult {
+        if sqlite.SqliteGetAutocommit(database) || !inspected.purchased || purchase.amount <= 0 || !Record(database, purchase, inspected) { return .{} }
+        product := purchase.product
+        current := Load(database, product.token)
+        if current.failed { return .{} }
+        binding := TextView(inspected.binding)
+        order := TextView(inspected.order)
+        state := TextView(current.state)
+        if current.found {
+            knownOrder := TextView(current.order)
+            knownAccount := TextView(current.account)
+            knownBinding := TextView(current.binding)
+            if TextView(current.packageName) != product.packageName || TextView(current.productID) != product.productID ||
+                current.amount != purchase.amount || (knownOrder != "" && knownOrder != order) ||
+                (knownAccount != "" && (knownAccount != purchase.account || TextView(current.app) != purchase.app)) ||
+                (knownBinding != "" && binding != "" && knownBinding != binding) || state == "refunded" { return .{} }
+        }
+        if current.found && state != "binding_missing" {
+            payment := PaymentFor(database, product.token, purchase)
+            if payment.failed || !payment.found || TextView(payment.receipt) != TextView(current.receipt) ||
+                !ApplySnapshot(database, signer, purchase, *payment, inspected) { return .{} }
+            return .{receipt = TextCopy(TextView(payment.receipt)), ok = true}
+        }
+        expected: [65]u8
+        if !provider.Hash(purchase.account, expected[:]) { return .{} }
+        matches := binding == TextView(expected[:64])
+        if binding != "" && !matches { return .{} }
+        legacy := AdoptLegacy(database, purchase, TextView(inspected.reference))
+        if legacy.failed { return .{} }
+        next := ifx inspected.consumed then "consumed" else "consume_pending"
+        if legacy.found {
+            if !Save(database, purchase, inspected, next, TextView(legacy.receipt)) ||
+                !ApplySnapshot(database, signer, purchase, *legacy, inspected) { return .{} }
+            return .{receipt = TextCopy(TextView(legacy.receipt)), ok = true}
+        }
+        if !matches {
+            if !current.found && !Save(database, purchase, inspected, "binding_missing", "") { return .{} }
+            return .{missingBinding = true, ok = true}
+        }
+        if inspected.consumed || writes.BindGoogleOrigin(database, product.token, purchase.account, product.packageName, purchase.app, purchase.amount) != "" { return .{} }
+        event: signing.Event = .{account = purchase.account, app = purchase.app, kind = "credit", amount = purchase.amount,
+            source = PlaySource, reference = product.token}
+        credited := writes.CreditPayment(database, signer, PlaySource, product.token, event, purchase.at)
+        if credited.status != 200 || !credited.created { return .{} }
+        receipt := TextView(credited.id[:])
+        payment: Payment = .{found = true, receipt = TextCopy(receipt), app = TextCopy(purchase.app), reference = TextCopy(product.token)}
+        if !Save(database, purchase, inspected, next, receipt) || !ApplySnapshot(database, signer, purchase, *payment, inspected) { return .{} }
+        return .{receipt = TextCopy(receipt), ok = true}
+    }
+
+    WatchVoid :: (database: *void, packageName: string, token: string, voided: *provider.PlayVoid) -> bool {
+        if voided.quantity <= 0 { return false }
+        current := Load(database, token)
+        if !Bound(*current) || TextView(current.packageName) != packageName || !SameOrder(TextView(current.order), TextView(voided.order), true) { return false }
+        proof := Refunding(database, token)
+        if !proof.ok || proof.snapshot < 0 { return false }
+        args: [1]sql.Argument = .[sql.TextArg(token)]
+        return sql.Execute(database, "INSERT OR IGNORE INTO google_play_snapshot_watch(purchase_token) VALUES(?1)", args[:]) == sqlite.SQLITE_OK
+    }
+
+    RefreshSnapshot :: (database: *void, signer: *issuer.Issuer, product: provider.PlayProduct,
+        inspected: *provider.PlayInspection, at: string, millis: s64) -> bool {
+        if sqlite.SqliteGetAutocommit(database) || inspected.status != 0 || (!inspected.purchased && !inspected.cancelledPurchase) ||
+            (inspected.cancelledPurchase && !inspected.hasRefundable) { return false }
+        current := Load(database, product.token)
+        if current.failed { return false }
+        if !Bound(*current) { return true }
+        if TextView(current.packageName) != product.packageName || TextView(current.productID) != product.productID ||
+            !SameOrder(TextView(current.order), TextView(inspected.order), false) { return false }
+        account := TextView(current.account)
+        binding := TextView(inspected.binding)
+        expected: [65]u8
+        if binding != "" && (!provider.Hash(account, expected[:]) || binding != TextView(expected[:64])) { return false }
+        purchase: Purchase = .{product = product, app = TextView(current.app), account = account, amount = current.amount,
+            at = at, millis = millis}
+        payment := PaymentFor(database, product.token, purchase)
+        if payment.failed || !payment.found || TextView(payment.receipt) != TextView(current.receipt) ||
+            !Record(database, purchase, inspected) || !ApplySnapshot(database, signer, purchase, *payment, inspected) { return false }
+        args: [1]sql.Argument = .[sql.TextArg(TextView(current.receipt))]
+        return sql.Execute(database, "UPDATE referral_outbox SET done=0 WHERE receipt_id=?1", args[:]) == sqlite.SQLITE_OK
+    }
+
+    ApplyVoid :: (database: *void, signer: *issuer.Issuer, packageName: string, voided: *provider.PlayVoid, at: string) -> bool {
+        if sqlite.SqliteGetAutocommit(database) { return false }
+        token := TextView(voided.token)
+        current := Load(database, token)
+        if current.failed { return false }
+        if !Bound(*current) || TextView(current.packageName) != packageName { return true }
+        if !SameOrder(TextView(current.order), TextView(voided.order), true) { return false }
+        receipt: Text
+        event: [4]sql.Argument = .[sql.TextArg(token), sql.IntArg(voided.millis), sql.IntArg(voided.quantity), sql.TextArg("")]
+        duplicate := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM google_play_refund_events WHERE purchase_token=?1 AND voided_millis=?2 AND voided_quantity=?3)", event[:3])
+        if !duplicate.found { return false }
+        if duplicate.value != 0 { return true }
+        proof := Refunding(database, token)
+        if !proof.ok || proof.total <= 0 || voided.quantity < 0 || voided.quantity > proof.total || current.amount <= 0 ||
+            current.amount % proof.total != 0 { return false }
+        if proof.snapshot >= 0 && voided.quantity != 0 {
+            // Each observed partial void is audited once. Its amount comes from a fresh cumulative snapshot.
+            if voided.millis > proof.verifiedAt { return false }
+        } else {
+            available := proof.total - proof.refunded
+            delta := ifx voided.quantity == 0 then available else voided.quantity
+            if delta < 1 || delta > available { return false }
+            product: provider.PlayProduct = .{packageName = packageName, productID = TextView(current.productID), token = token}
+            purchase: Purchase = .{product = product, app = TextView(current.app), account = TextView(current.account), amount = current.amount, at = at}
+            payment := PaymentFor(database, token, purchase)
+            if !payment.found || payment.failed || TextView(payment.receipt) != TextView(current.receipt) { return false }
+            issued: Text = Refund(database, signer, purchase, *payment, proof.total, proof.refunded, proof.refunded + delta)
+            if TextView(issued) == "" { return false }
+            VecSwap(receipt.bytes, issued.bytes)
+            change: [3]sql.Argument = .[event[0], event[1], sql.IntArg(proof.total)]
+            if sql.Execute(database, "UPDATE google_play_purchase_lifecycle SET voided_millis=?2 WHERE provider='google_play' AND purchase_token=?1", change[:2]) != sqlite.SQLITE_OK { return false }
+            if voided.quantity == 0 && sql.Execute(database, "UPDATE google_play_purchase_proofs SET snapshot_refunded=?3 WHERE purchase_token=?1 AND snapshot_refunded>=0 AND ?2>0", change[:]) != sqlite.SQLITE_OK { return false }
+        }
+        event[3] = sql.TextArg(TextView(receipt))
+        return sql.Execute(database, "INSERT INTO google_play_refund_events(purchase_token,voided_millis,voided_quantity,receipt_id) VALUES(?1,?2,?3,?4)", event[:]) == sqlite.SQLITE_OK
+    }
+
+    MarkConsumed :: (database: *void, token: string) -> bool {
+        args: [1]sql.Argument = .[sql.TextArg(token)]
+        return sql.Execute(database, "UPDATE google_play_purchase_lifecycle SET state='consumed',updated_at=CURRENT_TIMESTAMP WHERE provider='google_play' AND purchase_token=?1 AND state='consume_pending'",
+            args[:]) == sqlite.SQLITE_OK
+    }
+}

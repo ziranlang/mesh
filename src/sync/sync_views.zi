@@ -2,6 +2,7 @@
 #import "protocol"
 #import "sync_types"
 sql :: #import "std/sql_go";
+queries :: #import "sync_view_queries";
 ctx :: #import "std/context_go";
 text :: #import "std/text_go";
 state :: #import "account_state";
@@ -295,7 +296,7 @@ HabitsSince :: (database: *sql.Database, context: ctx.Context, userID: string, s
     arguments: [2]Any = .[userID, sinceVersion]
     result: HabitsResult
     queried := sql.Query(database, context,
-        "\nSELECT id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at,server_version\nFROM (\n\tSELECT id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at,server_version\n\tFROM server_habits\n\tWHERE user_id_hash=?1 AND server_version>?2\n\tUNION ALL\n\tSELECT hd.habit_id,\n\t       'Recovered ' || hd.habit_id,\n\t       99,196,165,\n\t       0,0,0,\n\t       1000,\n\t       0,\n\t       MAX(hd.updated_at),\n\t       MAX(hd.server_version)\n\tFROM server_habit_days hd\n\tWHERE hd.user_id_hash=?1\n\t  AND hd.server_version>?2\n\t  AND NOT EXISTS (\n\t\tSELECT 1 FROM server_habits h\n\t\tWHERE h.user_id_hash=hd.user_id_hash AND h.id=hd.habit_id\n\t  )\n\tGROUP BY hd.habit_id\n)\nORDER BY server_version,sort_order,id", arguments[:])
+        queries.HabitsSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -308,7 +309,7 @@ HabitDaysSince :: (database: *sql.Database, context: ctx.Context, userID: string
     arguments: [2]Any = .[userID, sinceVersion]
     result: HabitDaysResult
     queried := sql.Query(database, context,
-        "\nSELECT habit_id,local_date,completed,count,updated_at\nFROM server_habit_days\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,habit_id,local_date", arguments[:])
+        queries.HabitDaysSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -320,14 +321,14 @@ HabitDaysSince :: (database: *sql.Database, context: ctx.Context, userID: string
 SessionsSince :: (database: *sql.Database, context: ctx.Context, userID: string, sinceVersion: s64) -> SessionsResult {
     arguments: [2]Any = .[userID, sinceVersion]
     return ReadSessionQuery(database, context, userID,
-        "\n\tSELECT id,started_at,local_date,topic,activity,source,rounds_hash,\n\t       mood_before,mood_after,energy,stress,note,tags,deleted_at,updated_at\n\tFROM server_sessions\n\tWHERE user_id_hash=?1 AND server_version>?2\n\tORDER BY server_version,started_at,id", arguments[:])
+        queries.SessionsSince, arguments[:])
 }
 
 SessionRounds :: (database: *sql.Database, context: ctx.Context, userID: string, sessionID: string) -> RoundsResult {
     arguments: [2]Any = .[userID, sessionID]
     result: RoundsResult
     queried := sql.Query(database, context,
-        "\nSELECT round_index,breaths,hold_seconds\nFROM server_session_rounds\nWHERE user_id_hash=?1 AND session_id=?2\nORDER BY round_index", arguments[:])
+        queries.SessionRounds, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -340,7 +341,7 @@ MeditationsSince :: (database: *sql.Database, context: ctx.Context, userID: stri
     arguments: [2]Any = .[userID, sinceVersion]
     result: MeditationsResult
     queried := sql.Query(database, context,
-        "\nSELECT id,session_id,duration_seconds,completed_at\nFROM server_meditation_logs\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,completed_at,id", arguments[:])
+        queries.MeditationsSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -353,7 +354,7 @@ SocialSince :: (database: *sql.Database, context: ctx.Context, userID: string, s
     arguments: [2]Any = .[userID, sinceVersion]
     result: SocialSnapshotsResult
     queried := sql.Query(database, context,
-        "\nSELECT kind,json,updated_at\nFROM server_social_snapshots\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,kind", arguments[:])
+        queries.SocialSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -366,7 +367,7 @@ RecordsSince :: (database: *sql.Database, context: ctx.Context, userID: string, 
     arguments: [2]Any = .[userID, sinceVersion]
     result: RecordsResult
     queried := sql.Query(database, context,
-        "\nSELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes\nFROM server_encrypted_records\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,collection,id", arguments[:])
+        queries.RecordsSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -379,7 +380,7 @@ OperationsSince :: (database: *sql.Database, context: ctx.Context, userID: strin
     arguments: [2]Any = .[userID, sinceVersion]
     result: OperationsResult
     queried := sql.Query(database, context,
-        "\nSELECT op_id,client_id,seq,entity_type,entity_id,local_date,op_type,payload_json,created_at\nFROM server_sync_ops\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,client_id,seq,op_id", arguments[:])
+        queries.OperationsSince, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -392,7 +393,7 @@ CleanHabits :: (database: *sql.Database, context: ctx.Context, userID: string) -
     arguments: [1]Any = .[userID]
     result: HabitsResult
     queried := sql.Query(database, context,
-        "\nSELECT id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at\nFROM server_habits\nWHERE user_id_hash=?1 AND deleted_at=0\nORDER BY sort_order,id", arguments[:])
+        queries.CleanHabits, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -405,7 +406,7 @@ CleanHabitDays :: (database: *sql.Database, context: ctx.Context, userID: string
     arguments: [1]Any = .[userID]
     result: CleanHabitDaysResult
     queried := sql.Query(database, context,
-        "\nSELECT hd.habit_id,h.name,hd.local_date,hd.completed,hd.count,hd.updated_at\nFROM server_habit_days hd\nJOIN server_habits h ON h.user_id_hash=hd.user_id_hash AND h.id=hd.habit_id\nWHERE hd.user_id_hash=?1\n  AND h.deleted_at=0\n  AND (hd.completed!=0 OR hd.count>0)\nORDER BY hd.local_date DESC,h.sort_order,hd.habit_id", arguments[:])
+        queries.CleanHabitDays, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -417,14 +418,14 @@ CleanHabitDays :: (database: *sql.Database, context: ctx.Context, userID: string
 CleanSessions :: (database: *sql.Database, context: ctx.Context, userID: string) -> SessionsResult {
     arguments: [1]Any = .[userID]
     return ReadSessionQuery(database, context, userID,
-        "\n\tSELECT id,started_at,local_date,topic,activity,source,rounds_hash,\n\t       mood_before,mood_after,energy,stress,note,tags,deleted_at,updated_at\n\tFROM server_sessions\n\tWHERE user_id_hash=?1 AND deleted_at=0\n\tORDER BY started_at DESC,id", arguments[:])
+        queries.CleanSessions, arguments[:])
 }
 
 CleanMeditations :: (database: *sql.Database, context: ctx.Context, userID: string) -> MeditationsResult {
     arguments: [1]Any = .[userID]
     result: MeditationsResult
     queried := sql.Query(database, context,
-        "\nSELECT id,session_id,duration_seconds,completed_at\nFROM server_meditation_logs\nWHERE user_id_hash=?1\nORDER BY completed_at DESC,id", arguments[:])
+        queries.CleanMeditations, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result

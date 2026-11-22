@@ -1,0 +1,27 @@
+#if TARGET == .C {
+    oqs :: #import "oqs/Oqs";
+
+    // The Mesh protocol requires exact sizes and a nonempty signed message.
+    Verify :: (publicKey: []u8, message: []u8, signature: []u8) -> bool {
+        if publicKey.count != oqs.MlDsa44PublicKeyBytes || message.count == 0 ||
+            signature.count != oqs.MlDsa44SignatureBytes {
+            return false
+        }
+        return oqs.MlDsa44Verify(message, signature, publicKey)
+    }
+
+    Sign :: (privateKey: []u8, message: []u8, signature: []u8) -> bool {
+        if privateKey.count != oqs.MlDsa44SecretKeyBytes || message.count == 0 ||
+            signature.count != oqs.MlDsa44SignatureBytes {
+            return false
+        }
+        return oqs.MlDsa44Sign(signature, message, privateKey) == signature.count
+    }
+
+    KeyPair :: (publicKey: []u8, privateKey: []u8) -> bool {
+        if publicKey.count != oqs.MlDsa44PublicKeyBytes || privateKey.count != oqs.MlDsa44SecretKeyBytes {
+            return false
+        }
+        return oqs.MlDsa44KeyPair(publicKey, privateKey)
+    }
+}

@@ -1,8 +1,5 @@
 // Exact normalized names only: adding a suffix does not inherit a price.
 // Sources and selection policy are documented in docs/premium-usernames.md.
-strings :: #system_library "go:strings";
-Fields :: (value: string) -> []string #foreign strings;
-
 DewUnits :: 1000000
 FourCharacterDew :: 100
 CommonDew :: 250
@@ -65,12 +62,15 @@ AliasOffer :: struct {
 
 #scope_file
 Has :: (words: string, alias: string) -> bool {
-    for word: Fields(words) {
-        if word == alias {
-            return true
+    // These catalog literals contain only ASCII names, spaces and newlines.
+    start: s64 = 0
+    for byte, index: words {
+        if byte == #char " " || byte == #char "\n" {
+            if index > start && words[start:index] == alias { return true }
+            start = index + 1
         }
     }
-    return false
+    return start < words.count && words[start:] == alias
 }
 
 #scope_export

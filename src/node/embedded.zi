@@ -7,6 +7,7 @@ application :: #import "server";
 verification :: #import "ml_dsa44";
 signatures :: #import "account_access";
 errors :: #import "std/errors_go";
+routes :: #import "embedded_routes";
 
 EmbeddedCore :: struct {
     server: *application.Server
@@ -46,16 +47,6 @@ Close :: (core: EmbeddedCore) -> Error {
     return storage.Close(core.store)
 }
 
-// Bundled nodes deliberately omit unrelated social and payment routes.
 AllowedPath :: (path: string) -> bool {
-    return path == "/healthz" || path == "/readyz" ||
-        path == "/api/v1/node" || path == "/api/v1/node/peers" ||
-        path == "/api/v1/node/pairing/invites" ||
-        path == "/api/v1/node/pairing/accept" ||
-        path == "/api/v1/node/pairing/complete" ||
-        path == "/api/v1/node/mesh/export" || path == "/api/v1/node/mesh/import" ||
-        path == "/api/v1/sync/challenge" || path == "/api/v1/sync/login" ||
-        path == "/api/v1/sync" || path == "/api/v1/sync/diagnostics" ||
-        path == "/api/v1/sync/ws" || path == "/api/v1/apps" ||
-        path == "/api/v1/apps/register-signed"
+    return routes.Allowed(path)
 }

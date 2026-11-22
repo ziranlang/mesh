@@ -1,0 +1,216 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+    fields :: #import "sync_json_fields";
+    protocol :: #import "protocol";
+    #import "std/vec"
+
+    HabitInput :: struct {
+        id: Text
+        name: Text
+        updatedAt: Text
+        row: protocol.Habit
+        valid: bool
+    }
+
+    DayInput :: struct {
+        id: Text
+        updatedAt: Text
+        row: protocol.HabitDay
+        valid: bool
+    }
+
+    MeditationInput :: struct {
+        id: Text
+        session: Text
+        completed: Text
+        timestamp: Text
+        row: protocol.MeditationLog
+        valid: bool
+    }
+
+    SessionInput :: struct {
+        id: Text
+        startedAt: Text
+        topic: Text
+        source: Text
+        roundsHash: Text
+        note: Text
+        tags: Text
+        updatedAt: Text
+        rounds: Vec(protocol.SessionRound)
+        row: protocol.Session
+        valid: bool
+    }
+
+    Request :: struct {
+        app: Text
+        user: Text
+        client: Text
+        publicKey: Text
+        lastServerHash: Text
+        protocolVersion: s64
+        since: s64
+        clock: s64
+        full: bool
+        bootstrap: bool
+        legacy: bool
+        recordsOnly: bool
+        contentFreeDeletions: bool
+        habits: s32
+        habitDays: s32
+        meditations: s32
+        sessions: s32
+        social: s32
+        encrypted: s32
+        ops: s32
+        valid: bool
+    }
+
+    // Holds decoded strings for a row until its SQL statements finish.
+    ReadHabit :: (document: *json.JsonDocument, node: s32) -> HabitInput {
+        keys: [11]string = .["id", "name", "updated_at", "color_r", "color_g", "color_b", "sync_mode",
+            "sync_activity", "counter_enabled", "sort_order", "deleted_at"]
+        kinds: [11]json.JsonKind = .[.String, .String, .String, .Number, .Number, .Number, .Number, .Number, .Number, .Number, .Number]
+        slots: [11]s32
+        if !fields.Read(document, node, keys[:], kinds[:], slots[:]) {
+            return .{}
+        }
+        result: HabitInput
+        result.id = json.JsonString(document, slots[0])
+        result.name = json.JsonString(document, slots[1])
+        result.updatedAt = json.JsonString(document, slots[2])
+        result.row.ColorR = cast(isize)fields.Number(document, slots[3])
+        result.row.ColorG = cast(isize)fields.Number(document, slots[4])
+        result.row.ColorB = cast(isize)fields.Number(document, slots[5])
+        result.row.SyncMode = cast(isize)fields.Number(document, slots[6])
+        result.row.SyncActivity = cast(isize)fields.Number(document, slots[7])
+        result.row.CounterEnabled = cast(isize)fields.Number(document, slots[8])
+        result.row.SortOrder = cast(isize)fields.Number(document, slots[9])
+        result.row.DeletedAt = fields.Number(document, slots[10])
+        result.valid = true
+        return result
+    }
+
+    ReadDay :: (document: *json.JsonDocument, node: s32) -> DayInput {
+        keys: [5]string = .["habit_id", "updated_at", "local_date", "completed", "count"]
+        kinds: [5]json.JsonKind = .[.String, .String, .Number, .True, .Number]
+        slots: [5]s32
+        if !fields.Read(document, node, keys[:], kinds[:], slots[:]) {
+            return .{}
+        }
+        result: DayInput
+        result.id = json.JsonString(document, slots[0])
+        result.updatedAt = json.JsonString(document, slots[1])
+        result.row.LocalDate = cast(isize)fields.Number(document, slots[2])
+        result.row.Completed = json.JsonKindOf(document, slots[3]) == .True
+        result.row.Count = cast(isize)fields.Number(document, slots[4])
+        result.valid = true
+        return result
+    }
+
+    ReadMeditation :: (document: *json.JsonDocument, node: s32) -> MeditationInput {
+        keys: [6]string = .["id", "session_id", "completed_at", "timestamp", "duration_seconds", "duration"]
+        kinds: [6]json.JsonKind = .[.String, .String, .String, .String, .Number, .Number]
+        slots: [6]s32
+        if !fields.Read(document, node, keys[:], kinds[:], slots[:]) {
+            return .{}
+        }
+        result: MeditationInput
+        result.id = json.JsonString(document, slots[0])
+        result.session = json.JsonString(document, slots[1])
+        result.completed = json.JsonString(document, slots[2])
+        result.timestamp = json.JsonString(document, slots[3])
+        result.row.DurationSeconds = cast(isize)fields.Number(document, slots[4])
+        result.row.Duration = cast(isize)fields.Number(document, slots[5])
+        result.valid = true
+        return result
+    }
+
+    ReadSession :: (document: *json.JsonDocument, node: s32) -> SessionInput {
+        keys: [16]string = .["id", "started_at", "topic", "source", "rounds_hash", "note", "tags", "updated_at",
+            "local_date", "activity", "mood_before", "mood_after", "energy", "stress", "deleted_at", "rounds"]
+        kinds: [16]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String, .String,
+            .Number, .Number, .Number, .Number, .Number, .Number, .Number, .Array]
+        slots: [16]s32
+        if !fields.Read(document, node, keys[:], kinds[:], slots[:]) {
+            return .{}
+        }
+        result: SessionInput
+        result.id = json.JsonString(document, slots[0])
+        result.startedAt = json.JsonString(document, slots[1])
+        result.topic = json.JsonString(document, slots[2])
+        result.source = json.JsonString(document, slots[3])
+        result.roundsHash = json.JsonString(document, slots[4])
+        result.note = json.JsonString(document, slots[5])
+        result.tags = json.JsonString(document, slots[6])
+        result.updatedAt = json.JsonString(document, slots[7])
+        result.row.LocalDate = cast(isize)fields.Number(document, slots[8])
+        result.row.Activity = cast(isize)fields.Number(document, slots[9])
+        result.row.MoodBefore = cast(isize)fields.Number(document, slots[10])
+        result.row.MoodAfter = cast(isize)fields.Number(document, slots[11])
+        result.row.Energy = cast(isize)fields.Number(document, slots[12])
+        result.row.Stress = cast(isize)fields.Number(document, slots[13])
+        result.row.DeletedAt = fields.Number(document, slots[14])
+        roundKeys: [3]string = .["round_index", "breaths", "hold_seconds"]
+        roundKinds: [3]json.JsonKind = .[.Number, .Number, .Number]
+        roundSlots: [3]s32
+        count := json.JsonCount(document, slots[15])
+        if !VecResize(result.rounds, cast(s64)count) {
+            return .{}
+        }
+        round := json.JsonFirst(document, slots[15])
+        index: s64 = 0
+        while round >= 0 {
+            if !fields.Read(document, round, roundKeys[:], roundKinds[:], roundSlots[:]) {
+                return .{}
+            }
+            result.rounds[index] = .{RoundIndex = cast(isize)fields.Number(document, roundSlots[0]),
+                Breaths = cast(isize)fields.Number(document, roundSlots[1]), HoldSeconds = cast(isize)fields.Number(document, roundSlots[2])}
+            round = json.JsonNext(document, round)
+            index += 1
+        }
+        result.valid = true
+        return result
+    }
+
+    Read :: (document: *json.JsonDocument) -> Request {
+        keys: [21]string = .["app_id", "user_id_hash", "client_id", "public_key", "last_server_state_hash", "protocol_version",
+            "since_server_version", "client_clock", "full_sync_requested", "bootstrap", "include_legacy_data", "habits", "habit_days",
+            "meditation_logs", "sessions", "social_cache", "encrypted_records", "ops", "encrypted_records_only", "client_state_hash", "client_capabilities"]
+        kinds: [21]json.JsonKind = .[.String, .String, .String, .String, .String, .Number, .Number, .Number, .True, .True, .True,
+            .Array, .Array, .Array, .Array, .Array, .Array, .Array, .True, .String, .Array]
+        slots: [21]s32
+        if !fields.Read(document, document.root, keys[:], kinds[:], slots[:]) {
+            return .{}
+        }
+        result: Request
+        result.app = json.JsonString(document, slots[0])
+        result.user = json.JsonString(document, slots[1])
+        result.client = json.JsonString(document, slots[2])
+        result.publicKey = json.JsonString(document, slots[3])
+        result.lastServerHash = json.JsonString(document, slots[4])
+        result.protocolVersion = fields.Number(document, slots[5])
+        result.since = fields.Number(document, slots[6])
+        result.clock = fields.Number(document, slots[7])
+        result.full = json.JsonKindOf(document, slots[8]) == .True
+        result.bootstrap = json.JsonKindOf(document, slots[9]) == .True
+        result.legacy = json.JsonKindOf(document, slots[10]) == .True
+        result.habits = slots[11]
+        result.habitDays = slots[12]
+        result.meditations = slots[13]
+        result.sessions = slots[14]
+        result.social = slots[15]
+        result.encrypted = slots[16]
+        result.ops = slots[17]
+        result.recordsOnly = json.JsonKindOf(document, slots[18]) == .True
+        capability := json.JsonFirst(document, slots[20])
+        while capability >= 0 {
+            kind := json.JsonKindOf(document, capability)
+            if kind != .String && kind != .Null { return .{} }
+            if json.JsonIs(document, capability, "content-free-deletions") { result.contentFreeDeletions = true }
+            capability = json.JsonNext(document, capability)
+        }
+        result.valid = true
+        return result
+    }
+}

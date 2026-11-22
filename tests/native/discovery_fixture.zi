@@ -1,0 +1,36 @@
+discovery :: #import "discovery_native";
+environment :: #import "std/environment_linux";
+numbers :: #import "std/number_text";
+stdio :: #import "std/stdio";
+
+#scope_file
+c :: #system_library "c";
+GetChar :: () -> s32 #foreign c "getchar";
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    enabled := environment.EnvironmentText("MESH_LAN_DISCOVERY") != "0"
+    port, digits := numbers.IntegerPrefix(environment.EnvironmentText("MESH_DISCOVERY_FIXTURE_PORT"))
+    if digits == 0 || port < 0 || port > 65535 { return 1 }
+    name := environment.EnvironmentText("MESH_NODE_NAME")
+    id := environment.EnvironmentText("MESH_DISCOVERY_FIXTURE_ID")
+    worker: discovery.Worker
+    defer discovery.Stop(*worker)
+    while true {
+        problem := discovery.Start(*worker, enabled, cast(u16)port, name, id)
+        if problem != "" {
+            if !stdio.WriteOutput(problem) || !stdio.WriteOutput("\n") { return 1 }
+            return 0
+        }
+        if enabled && discovery.Start(*worker, true, cast(u16)port, name, id) != "LAN discovery is already running" {
+            return 1
+        }
+        if !stdio.WriteOutput("ready\n") { return 1 }
+        action := GetChar()
+        discovery.Stop(*worker)
+        if !stdio.WriteOutput("stopped\n") { return 1 }
+        if action != cast(s32)(#char "r") { return 0 }
+        if GetChar() != cast(s32)(#char "\n") { return 1 }
+    }
+}

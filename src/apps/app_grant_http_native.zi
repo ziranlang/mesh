@@ -1,0 +1,293 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    grants :: #import "app_grants_native";
+    rules :: #import "app_grant_rules";
+    signed :: #import "signed_tx_native";
+    bearer :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    replies :: #import "http_json_native";
+    sqlite :: #import "sqlite/SQLite";
+    sha :: #import "crypto/sha256";
+    wire :: #import "wire_text";
+    limits :: #import "server_limits";
+    format :: #import "timestamp_format";
+    calendar :: #import "std/date_time_linux";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    text :: #import "std/text_tools";
+    #import "std/vec"
+
+    #scope_file
+    ListPath :: "/api/v1/account/app-grants";
+    GrantPath :: "/api/v1/account/app-grants/";
+    SignedPath :: "/api/v1/account/app-grants/signed";
+    RecordsPath :: "/api/v1/account/app-records";
+
+    Fields :: struct {
+        source: Text
+        target: Text
+        prefix: Text
+        permission: Text
+        valid: bool
+    }
+
+    ReadFields :: (document: *json.JsonDocument, node: s32) -> Fields {
+        kind := json.JsonKindOf(document, node)
+        if kind != .Object && kind != .Null && kind != .Missing {
+            return .{}
+        }
+        names: [4]string = .["source_app_id", "target_app_id", "collection_prefix", "permission"]
+        indices: [4]s32 = .[-1, -1, -1, -1]
+        child := json.JsonFirst(document, node)
+        while child >= 0 {
+            field := json.JsonKindOf(document, child)
+            if field != .Null {
+                key: Text = json.JsonKey(document, child)
+                for name, index: names {
+                    if !wire.MatchesToken(TextView(key), name) {
+                        continue
+                    }
+                    if field != .String {
+                        return .{}
+                    }
+                    indices[index] = child
+                    break
+                }
+            }
+            child = json.JsonNext(document, child)
+        }
+        return .{source = json.JsonString(document, indices[0]), target = json.JsonString(document, indices[1]),
+            prefix = json.JsonString(document, indices[2]), permission = json.JsonString(document, indices[3]), valid = true}
+    }
+
+    Canonical :: (grant: grants.Grant) -> Vec(u8) {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        names: [4]string = .["source_app_id", "target_app_id", "collection_prefix", "permission"]
+        values: [4]string = .[grant.source, grant.target, grant.prefix, grant.permission]
+        for name, index: names {
+            if !json.JsonSet(*document, root, name, json.JsonNewString(*document, values[index])) {
+                return .{}
+            }
+        }
+        bytes: Vec(u8)
+        if !json.JsonWriteInto(*bytes, *document, root, json.JsonCompactStyle(false)) {
+            return .{}
+        }
+        return bytes
+    }
+
+    Authorize :: (settings: access.Configuration, request: *json.JsonDocument, user: string, target: string,
+        payload: []u8, now: s64, auditTime: string) -> grants.Result {
+        transaction := json.JsonMember(request, request.root, "tx")
+        transactionKind := json.JsonKindOf(request, transaction)
+        if transactionKind == .Missing || transactionKind == .Null {
+            return .{status = 400, message = "signed transaction protocol too old"}
+        }
+        if transactionKind != .Object {
+            return .{status = 400, message = "invalid json"}
+        }
+        digest := sha.Sha256Of(TextView(payload))
+        encoded: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) != 1 {
+            return .{status = 500, message = "app grant failed"}
+        }
+        expected := TextView(encoded[:64])
+        field := json.JsonMember(request, transaction, "body_sha256")
+        kind := json.JsonKindOf(request, field)
+        if kind != .String && kind != .Null && kind != .Missing {
+            return .{status = 400, message = "invalid json"}
+        }
+        hash: Text = json.JsonString(request, field)
+        provided := wire.TrimSpace(TextView(hash))
+        if provided != "" && !wire.MatchesToken(provided, expected) {
+            return .{status = 400, message = "signed transaction body hash must cover grant payload"}
+        }
+        if !json.JsonSet(request, transaction, "body_sha256", json.JsonNewStringCopy(request, expected)) {
+            return .{status = 500, message = "app grant failed"}
+        }
+        header: Vec(u8)
+        if !json.JsonWriteInto(*header, request, transaction, json.JsonCompactStyle(false)) {
+            return .{status = 500, message = "app grant failed"}
+        }
+        proof := signed.VerifyTx(settings.database, settings.verify, TextView(VecSlice(header, 0, header.count)),
+            user, target, "POST", SignedPath, payload, now, auditTime)
+        if proof.databaseError != sqlite.SQLITE_OK {
+            return .{status = 500, message = "app grant failed"}
+        }
+        return .{status = proof.status, message = proof.message}
+    }
+
+    Create :: (settings: access.Configuration, user: string, signedGrant: bool, body: []u8, now: s64,
+        auditTime: string, response: *json.JsonDocument) -> grants.Result {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(body)) {
+            return .{status = 400, message = "invalid json"}
+        }
+        rootKind := json.JsonKindOf(*document, document.root)
+        if rootKind != .Object && rootKind != .Null {
+            return .{status = 400, message = "invalid json"}
+        }
+        node := ifx signedGrant then json.JsonMember(*document, document.root, "grant") else document.root
+        fields := ReadFields(*document, node)
+        if !fields.valid {
+            return .{status = 400, message = "invalid json"}
+        }
+        grant: grants.Grant = .{source = wire.TrimSpace(TextView(fields.source)), target = wire.TrimSpace(TextView(fields.target)),
+            prefix = wire.TrimSpace(TextView(fields.prefix)), permission = wire.TrimSpace(TextView(fields.permission))}
+        if grant.permission == "" {
+            grant.permission = "read"
+        }
+        if !rules.Valid(grant.source, grant.target, grant.prefix, grant.permission) {
+            return .{status = 400, message = "invalid app grant"}
+        }
+        payload := Canonical(grant)
+        if payload.count == 0 {
+            return .{status = 500, message = "app grant failed"}
+        }
+        bytes := VecSlice(payload, 0, payload.count)
+        if signedGrant {
+            authorized := Authorize(settings, *document, user, grant.target, bytes, now, auditTime)
+            if authorized.status != 0 {
+                return authorized
+            }
+        }
+        return grants.CreateTx(settings.database, user, grant, TextView(bytes), auditTime, response)
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    Mutate :: (settings: access.Configuration, method: string, path: string, user: string,
+        body: []u8, now: s64, auditTime: string, document: *json.JsonDocument) -> grants.Result {
+        database := settings.database
+        failed: grants.Result = .{status = 500, message = "app grant failed"}
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return failed
+        }
+        defer RollbackIfActive(database)
+        result: grants.Result
+        if method == "DELETE" {
+            result = grants.RevokeTx(database, user, path[GrantPath.count:], document)
+        } else {
+            result = Create(settings, user, path == SignedPath, body, now, auditTime, document)
+        }
+        if result.message != "" {
+            return result
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return failed
+        }
+        return result
+    }
+
+    ReadRecords :: (settings: access.Configuration, connection: *void, method: string, user: string,
+        now: s64, auditTime: string, document: *json.JsonDocument) -> grants.Result {
+        source := wire.TrimSpace(http.QueryArgument(connection, "source_app_id"))
+        target := wire.TrimSpace(http.QueryArgument(connection, "target_app_id"))
+        prefix := wire.TrimSpace(http.QueryArgument(connection, "collection_prefix"))
+        if !rules.Valid(source, target, prefix, "read") {
+            return .{status = 400, message = "invalid app records query"}
+        }
+        database := settings.database
+        failed: grants.Result = .{status = 500, message = "app records failed"}
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return failed
+        }
+        defer RollbackIfActive(database)
+        empty: []u8
+        proof := signed.VerifyTx(database, settings.verify, http.Header(connection, "X-Mesh-Tx"), user,
+            target, method, RecordsPath, empty, now, auditTime)
+        if proof.databaseError != sqlite.SQLITE_OK {
+            return failed
+        }
+        if proof.status != 0 {
+            return .{status = proof.status, message = proof.message}
+        }
+        result := grants.AuthorizedRecords(database, user, source, target, prefix, document)
+        if result.message != "" {
+            return result
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return failed
+        }
+        return result
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool {
+        return path == ListPath || path == RecordsPath || text.TextHasPrefix(path, GrantPath)
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return (path == ListPath || path == SignedPath) && method == "POST"
+    }
+
+    Handle :: (state: *access.AccountAccess, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        get := method == "GET" || method == "HEAD"
+        listing := path == ListPath && get
+        records := path == RecordsPath && get
+        deleting := text.TextHasPrefix(path, GrantPath) && method == "DELETE"
+        if !listing && !records && !deleting && !ReadsBody(path, method) {
+            allowed := ifx path == ListPath then "GET, HEAD, POST" else ifx path == RecordsPath then "GET, HEAD" else ifx path == SignedPath then "DELETE, POST" else "DELETE"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allowed}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        settings := state.configuration
+        milliseconds := calendar.UnixMilliseconds()
+        audit: [31]u8
+        now := milliseconds / 1000
+        length := format.UTC(.{seconds = now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, audit[:])
+        if length == 0 || !mutex.Lock(*state.databaseLock) {
+            return replies.ErrorReply(connection, method, 500, "app grants failed", settings.zstdResponses)
+        }
+        defer mutex.Unlock(*state.databaseLock)
+        auditTime := TextView(audit[:length])
+        authenticated := bearer.Authenticate(settings.database, connection, settings.secret, now, auditTime, false)
+        if authenticated.status != 0 {
+            return replies.ErrorReply(connection, method, authenticated.status, authenticated.message, settings.zstdResponses)
+        }
+        user := TextView(authenticated.userID[:])
+        body := input
+        decoded: Vec(u8)
+        if ReadsBody(path, method) {
+            if overflow || input.count > settings.maximumBodyBytes {
+                return replies.ErrorReply(connection, method, 400, "request body too large", settings.zstdResponses)
+            }
+            encoding: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+            if count < 0 {
+                return replies.ErrorReply(connection, method, 400, "unsupported content encoding", settings.zstdResponses)
+            }
+            header := wire.TrimSpace(TextView(encoding[:count]))
+            if header != "" && !wire.MatchesToken(header, "identity") {
+                if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+                    return replies.ErrorReply(connection, method, 503, "request decoder unavailable", settings.zstdResponses)
+                }
+                unpacked := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
+                if unpacked.error != "" {
+                    return replies.ErrorReply(connection, method, 400, unpacked.error, settings.zstdResponses)
+                }
+                body = unpacked.bytes
+            }
+        }
+        document: json.JsonDocument
+        result: grants.Result
+        if listing {
+            result = grants.List(settings.database, user, *document)
+        } else if records {
+            result = ReadRecords(settings, connection, method, user, now, auditTime, *document)
+        } else {
+            result = Mutate(settings, method, path, user, body, now, auditTime, *document)
+        }
+        if result.message != "" {
+            return replies.ErrorReply(connection, method, result.status, result.message, settings.zstdResponses)
+        }
+        return replies.Reply(connection, method, result.status, *document, result.node, settings.zstdResponses)
+    }
+}

@@ -1,0 +1,5 @@
+Recent :: "\nSELECT id,client_id,payload_json,created_at,server_version\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1\nORDER BY id DESC\nLIMIT ?2";
+Bytes :: "\nSELECT SUM(LENGTH(payload_json))\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1";
+Insert :: "\nINSERT INTO server_encrypted_payloads(user_id_hash,client_id,payload_json,server_version,created_at)\nVALUES(?1,?2,?3,?4,?5)";
+Since :: "\nSELECT id,client_id,payload_json,created_at,server_version\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,id";
+PruneBefore :: "\nDELETE FROM server_encrypted_payloads\nWHERE user_id_hash=?1 AND created_at<?2";

@@ -1,0 +1,207 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    accounts :: #import "account_keys_native";
+    identity :: #import "identity";
+    account_signatures :: #import "account_signature_native";
+    device_signatures :: #import "device_signature_native";
+    codec :: #import "codec";
+    binary :: #import "binary_codec";
+    wire :: #import "wire_text";
+    queries :: #import "signed_tx_queries";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    sha :: #import "crypto/sha256";
+    #import "std/vec"
+
+    Authorization :: struct {
+        status: u32
+        message: string
+        databaseError: s32
+    }
+
+    #scope_file
+    SignatureContext :: "daochi-tx-v1";
+    #scope_export
+    Envelope :: struct {
+        version: s64
+        expiresAt: s64
+        id: Text
+        account: Text
+        app: Text
+        device: Text
+        method: Text
+        path: Text
+        digest: Text
+        nonce: Text
+        context: Text
+        signature: Text
+        deviceSignature: Text
+        valid: bool
+    }
+
+    #scope_file
+    Parse :: (raw: string) -> Envelope {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, raw) || json.JsonKindOf(*document, document.root) != .Object { return .{} }
+        fieldNames: [11]string = .["tx_id", "account_id", "app_id", "device_key_id", "method", "path",
+            "body_sha256", "nonce", "signature_context", "signature", "device_signature"]
+        result: Envelope
+        indices: [11]s32
+        for index: 0..10 { indices[index] = -1 }
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            kind := json.JsonKindOf(*document, node)
+            if kind != .Null {
+                name: Text = json.JsonKey(*document, node)
+                key := TextView(name)
+                isVersion := wire.MatchesToken(key, "protocol_version")
+                if isVersion || wire.MatchesToken(key, "expires_at") {
+                    value, valid := json.JsonInteger(*document, node)
+                    if !valid { return .{} }
+                    if isVersion { result.version = value } else { result.expiresAt = value }
+                } else {
+                    for field, index: fieldNames {
+                        if !wire.MatchesToken(key, field) { continue }
+                        if kind != .String { return .{} }
+                        indices[index] = node
+                        break
+                    }
+                }
+            }
+            node = json.JsonNext(*document, node)
+        }
+        result.id = json.JsonString(*document, indices[0])
+        result.account = json.JsonString(*document, indices[1])
+        result.app = json.JsonString(*document, indices[2])
+        result.device = json.JsonString(*document, indices[3])
+        result.method = json.JsonString(*document, indices[4])
+        result.path = json.JsonString(*document, indices[5])
+        result.digest = json.JsonString(*document, indices[6])
+        result.nonce = json.JsonString(*document, indices[7])
+        result.context = json.JsonString(*document, indices[8])
+        result.signature = json.JsonString(*document, indices[9])
+        result.deviceSignature = json.JsonString(*document, indices[10])
+        result.valid = true
+        return result
+    }
+
+    #scope_export
+    Read :: (header: string) -> Envelope {
+        if header == "" { return .{} }
+        if header[0] == #char "{" { return Parse(header) }
+        raw := binary.DecodeBase64(header, true, false)
+        if raw.error == "" { return Parse(TextView(VecSlice(raw.value, 0, raw.value.count))) }
+        padded := binary.DecodeBase64(header, true, true)
+        if padded.error != "" { return .{} }
+        return Parse(TextView(VecSlice(padded.value, 0, padded.value.count)))
+    }
+
+    #scope_file
+    MatchMethod :: (actual: string, expected: string) -> bool {
+        if expected.count > 16 { return false }
+        lower: [16]u8
+        for byte, index: expected {
+            lower[index] = ifx byte >= #char "A" && byte <= #char "Z" then byte + 32 else byte
+        }
+        return wire.MatchesToken(actual, TextView(lower[:expected.count]))
+    }
+
+    Canonical :: (transaction: *Envelope, account: string, app: string, method: string, path: string,
+        digest: string) -> Vec(u8) {
+        protocolDigits: [24]u8
+        expiryDigits: [24]u8
+        parts: [11]string = .[SignatureContext, numbers.FormatInteger(transaction.version, protocolDigits[:]),
+            wire.TrimSpace(TextView(transaction.id)), account, app, wire.TrimSpace(TextView(transaction.device)), method, path, digest,
+            wire.TrimSpace(TextView(transaction.nonce)), numbers.FormatInteger(transaction.expiresAt, expiryDigits[:])]
+        output: Vec(u8)
+        for part: parts {
+            if !BuilderAppend(output, part) || !BuilderAppend(output, "\n") { return .{} }
+        }
+        return output
+    }
+
+    VerifyDevice :: (database: *void, arguments: []sql.Argument, proof: string, message: []u8) -> Authorization {
+        key := sql.Prepare(database, queries.ReadDeviceVerifyKeySQL, arguments)
+        if key.status != sqlite.SQLITE_OK { return .{databaseError = key.status} }
+        defer sqlite.SqliteFinalize(key.value)
+        step := sqlite.SqliteStep(key.value)
+        if step == sqlite.SQLITE_DONE { return .{status = 401, message = "device key not registered"} }
+        if step != sqlite.SQLITE_ROW { return .{databaseError = step} }
+        publicKey := binary.DecodeBinaryField(sql.ColumnText(key.value, 0))
+        if publicKey.error != "" || publicKey.value.count != 32 { return .{status = 401, message = "invalid app public key"} }
+        signature := binary.DecodeBinaryField(proof)
+        if signature.error != "" || signature.value.count != 64 { return .{status = 400, message = "invalid device signature"} }
+        if !device_signatures.Verify(VecSlice(publicKey.value, 0, publicKey.value.count), message,
+            VecSlice(signature.value, 0, signature.value.count)) { return .{status = 401, message = "device signature rejected"} }
+        return .{}
+    }
+
+    #scope_export
+    // Run on the connection that will apply the verified request. On failure,
+    // roll back the transaction, including any nonce reservation or device touch.
+    VerifyTx :: (database: *void, verify: account_signatures.VerifySignature, header: string, account: string,
+        app: string, method: string, path: string, body: []u8, now: s64, auditTime: string) -> Authorization {
+        if database == null || verify == null || sqlite.SqliteGetAutocommit(database) || now < 0 ||
+            now > 9223372036854774907 { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        value := wire.TrimSpace(header)
+        if value == "" { return .{status = 401, message = "signed transaction required"} }
+        transaction := Read(value)
+        if !transaction.valid { return .{status = 400, message = "invalid signed transaction"} }
+        if transaction.version < 6 { return .{status = 400, message = "signed transaction protocol too old"} }
+        context := wire.TrimSpace(TextView(transaction.context))
+        if context != "" && context != SignatureContext { return .{status = 400, message = "invalid signed transaction context"} }
+        id := wire.TrimSpace(TextView(transaction.id))
+        nonce := wire.TrimSpace(TextView(transaction.nonce))
+        if !identity.ValidClientID(id) || !identity.ValidClientID(nonce) { return .{status = 400, message = "invalid signed transaction id"} }
+        normalized: [64]u8
+        if !identity.NormalizeUserID(wire.TrimSpace(TextView(transaction.account)), normalized[:]) || TextView(normalized[:]) != account {
+            return .{status = 401, message = "signed transaction account mismatch"}
+        }
+        if !identity.ValidNamespace(app) || wire.TrimSpace(TextView(transaction.app)) != app {
+            return .{status = 401, message = "signed transaction app mismatch"}
+        }
+        if !MatchMethod(wire.TrimSpace(TextView(transaction.method)), method) || wire.TrimSpace(TextView(transaction.path)) != path {
+            return .{status = 401, message = "signed transaction route mismatch"}
+        }
+        digest := sha.Sha256Of(TextView(body))
+        digestHex: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *digestHex[0], digestHex.count) != 1 { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        digestText := TextView(digestHex[:64])
+        if !identity.NormalizeUserID(wire.TrimSpace(TextView(transaction.digest)), normalized[:]) || TextView(normalized[:]) != digestText {
+            return .{status = 401, message = "signed transaction body mismatch"}
+        }
+        if transaction.expiresAt <= now || transaction.expiresAt > now + 900 {
+            return .{status = 401, message = "signed transaction expired"}
+        }
+        key := accounts.Read(database, account)
+        if key.status != sqlite.SQLITE_OK { return .{databaseError = key.status} }
+        if !key.found { return .{status = 401, message = "sync account not found"} }
+        signature := binary.DecodeBinaryField(wire.TrimSpace(TextView(transaction.signature)))
+        if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
+            return .{status = 400, message = "invalid signed transaction signature"}
+        }
+        message := Canonical(*transaction, account, app, method, path, digestText)
+        if message.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
+        bytes := VecSlice(message, 0, message.count)
+        if key.count != codec.mlDSA44PublicKeySize || !verify(key.bytes[:], bytes, VecSlice(signature.value, 0, signature.value.count)) {
+            return .{status = 401, message = "signed transaction rejected"}
+        }
+        device := wire.TrimSpace(TextView(transaction.device))
+        if !identity.ValidClientID(device) { return .{status = 400, message = "invalid device key id"} }
+        deviceArgs: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(app), sql.TextArg(device), sql.TextArg(auditTime)]
+        authorized := VerifyDevice(database, deviceArgs[:3], wire.TrimSpace(TextView(transaction.deviceSignature)), bytes)
+        if authorized.status != 0 || authorized.databaseError != sqlite.SQLITE_OK { return authorized }
+        expired: [1]sql.Argument = .[sql.IntArg(now)]
+        status := sql.Execute(database, queries.DeleteExpiredSignedTransactionsSQL, expired[:])
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        reservation: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(app),
+            sql.TextArg(nonce), sql.IntArg(transaction.expiresAt)]
+        status = sql.Execute(database, queries.ReserveSignedTransactionSQL, reservation[:])
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        if sqlite.SqliteChanges(database) == 0 { return .{status = 409, message = "signed transaction replay"} }
+        status = sql.Execute(database, queries.TouchSignedDeviceSQL, deviceArgs[:])
+        if status == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) != 1 { status = sqlite.SQLITE_DONE }
+        return .{databaseError = status}
+    }
+}

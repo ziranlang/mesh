@@ -1,0 +1,168 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    rules :: #import "account_passkey_rules";
+    queries :: #import "account_passkey_queries";
+    bearer :: #import "http_auth_native";
+    transport :: #import "http_server_native";
+    recovery :: #import "account_recovery_http_native";
+    strict :: #import "strict_json_native";
+    secure :: #import "std/constant_time";
+    calendar :: #import "std/date_time_linux";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+
+    #scope_file
+    PasskeyOpenPath :: "/api/v1/account-backup/passkey/open";
+    PasskeyListPath :: "/api/v1/account/passkeys";
+    PasskeyRemovePath :: "/api/v1/account/passkeys/remove";
+    PasskeyShortRequest :: 1024;
+    PasskeyStoreRequest :: rules.PasskeyWrapperMaximum + PasskeyShortRequest;
+    PasskeyUnavailable :: "account passkey unavailable";
+
+    Open :: (database: *void, connection: *void, document: *json.JsonDocument, payload: []u8) -> s32 {
+        names: [3]string = .["account", "credential", "proof"]
+        fields: [3]s32
+        if !strict.ReadStringFields(document, payload, names[:], fields[:]) {
+            return recovery.ErrorReply(connection, 400, "invalid passkey request")
+        }
+        account: Text = json.JsonString(document, fields[0])
+        credential: Text = json.JsonString(document, fields[1])
+        proof: Text = json.JsonString(document, fields[2])
+        if !rules.LowerHex64(TextView(account)) || !rules.LowerHex64(TextView(credential)) || !rules.LowerHex64(TextView(proof)) {
+            return recovery.ErrorReply(connection, 400, "invalid passkey request")
+        }
+        hex: [65]u8
+        if !recovery.ProofDigest(TextView(proof), hex[:]) { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        arguments: [2]sql.Argument = .[sql.TextArg(TextView(account)), sql.TextArg(TextView(credential))]
+        read := sql.Prepare(database, queries.OpenAccountPasskeySQL, arguments[:])
+        if read.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status != sqlite.SQLITE_ROW && status != sqlite.SQLITE_DONE { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        if status == sqlite.SQLITE_DONE || !secure.ConstantTimeTextEqual(TextView(hex[:64]), sql.ColumnText(read.value, 0)) {
+            return recovery.ErrorReply(connection, 403, "passkey not recognized")
+        }
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        if !json.JsonSet(*response, root, "account_id", json.JsonNewString(*response, TextView(account))) ||
+            !json.JsonSet(*response, root, "wrapper", json.JsonNewString(*response, sql.ColumnText(read.value, 1))) {
+            return 0
+        }
+        return recovery.Reply(connection, 200, *response, root)
+    }
+
+    Store :: (database: *void, connection: *void, account: string, now: s64,
+        document: *json.JsonDocument, payload: []u8) -> s32 {
+        names: [4]string = .["credential", "label", "verifier", "wrapper"]
+        fields: [4]s32
+        if !strict.ReadStringFields(document, payload, names[:], fields[:]) {
+            return recovery.ErrorReply(connection, 400, "invalid passkey copy")
+        }
+        credential: Text = json.JsonString(document, fields[0])
+        label: Text = json.JsonString(document, fields[1])
+        verifier: Text = json.JsonString(document, fields[2])
+        wrapper: Text = json.JsonString(document, fields[3])
+        if !rules.PasskeyWrapperValid(TextView(wrapper), TextView(credential)) ||
+            !rules.PasskeyLabelValid(TextView(label)) || !rules.LowerHex64(TextView(verifier)) {
+            return recovery.ErrorReply(connection, 400, "invalid passkey copy")
+        }
+        arguments: [7]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(credential)), sql.TextArg(TextView(wrapper)),
+            sql.TextArg(TextView(verifier)), sql.TextArg(TextView(label)), sql.IntArg(now), sql.IntArg(rules.MaximumAccountPasskeys)]
+        if sql.Execute(database, queries.StoreAccountPasskeySQL, arguments[:]) != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, PasskeyUnavailable)
+        }
+        if sqlite.SqliteChanges(database) == 0 {
+            others := sql.ReadInteger(database, queries.CountOtherPasskeysSQL, arguments[:2])
+            if others.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+            if others.value >= rules.MaximumAccountPasskeys { return recovery.ErrorReply(connection, 409, "too many passkeys") }
+            return recovery.ErrorReply(connection, 401, "sync account not found")
+        }
+        return recovery.BooleanReply(connection, "stored", true)
+    }
+
+    List :: (database: *void, connection: *void, account: string) -> s32 {
+        arguments: [1]sql.Argument = .[sql.TextArg(account)]
+        read := sql.Prepare(database, queries.ListAccountPasskeysSQL, arguments[:])
+        if read.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        defer sqlite.SqliteFinalize(read.value)
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        entries := json.JsonNewArray(*response)
+        status := sqlite.SqliteStep(read.value)
+        while status == sqlite.SQLITE_ROW {
+            entry := json.JsonNewObject(*response)
+            if !json.JsonSet(*response, entry, "credential", json.JsonNewStringCopy(*response, sql.ColumnText(read.value, 0))) ||
+                !json.JsonSet(*response, entry, "label", json.JsonNewStringCopy(*response, sql.ColumnText(read.value, 1))) ||
+                !json.JsonSet(*response, entry, "created_at", json.JsonNewInteger(*response, sqlite.SqliteColumnInt64(read.value, 2))) ||
+                !json.JsonAppend(*response, entries, entry) {
+                return 0
+            }
+            status = sqlite.SqliteStep(read.value)
+        }
+        if status != sqlite.SQLITE_DONE { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        if !json.JsonSet(*response, root, "passkeys", entries) { return 0 }
+        return recovery.Reply(connection, 200, *response, root)
+    }
+
+    Remove :: (database: *void, connection: *void, account: string, document: *json.JsonDocument, payload: []u8) -> s32 {
+        names: [1]string = .["credential"]
+        fields: [1]s32
+        if !strict.ReadStringFields(document, payload, names[:], fields[:]) {
+            return recovery.ErrorReply(connection, 400, "invalid passkey")
+        }
+        credential: Text = json.JsonString(document, fields[0])
+        if !rules.LowerHex64(TextView(credential)) { return recovery.ErrorReply(connection, 400, "invalid passkey") }
+        arguments: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(credential))]
+        if sql.Execute(database, queries.RemoveAccountPasskeySQL, arguments[:]) != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, PasskeyUnavailable)
+        }
+        return recovery.BooleanReply(connection, "deleted", sqlite.SqliteChanges(database) != 0)
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool {
+        return path == PasskeyOpenPath || path == PasskeyListPath || path == PasskeyRemovePath
+    }
+
+    RequestBytes :: (path: string) -> s64 {
+        return ifx path == PasskeyListPath then PasskeyStoreRequest else PasskeyShortRequest
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        listing := path == PasskeyListPath && (method == "GET" || method == "HEAD")
+        if !listing && method != "POST" {
+            allow := ifx path == PasskeyListPath then "GET, HEAD, POST" else "POST"
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        opening := path == PasskeyOpenPath
+        if opening && !recovery.AllowAddress(access, connection, "account-passkey-open:", 20) {
+            return recovery.ErrorReply(connection, 429, "too many attempts", 60)
+        }
+        settings := access.configuration
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || !mutex.Lock(*access.databaseLock) { return recovery.ErrorReply(connection, 500, PasskeyUnavailable) }
+        defer mutex.Unlock(*access.databaseLock)
+        account: [64]u8
+        if !opening {
+            actor := bearer.Authenticate(settings.database, connection, settings.secret, now, "", false)
+            if actor.status != 0 { return recovery.ErrorReply(connection, actor.status, actor.message) }
+            account = actor.userID
+        }
+        if listing { return List(settings.database, connection, TextView(account[:])) }
+        limit := RequestBytes(path)
+        scratch: [PasskeyStoreRequest]u8
+        decoded := recovery.DecodeBody(connection, input, overflow, settings.zstdRequests, scratch[:limit])
+        if decoded.error != "" {
+            problem := ifx opening then "invalid passkey request" else ifx path == PasskeyRemovePath then "invalid passkey" else "invalid passkey copy"
+            return recovery.ErrorReply(connection, 400, problem)
+        }
+        document: json.JsonDocument
+        if opening { return Open(settings.database, connection, *document, decoded.bytes) }
+        if path == PasskeyRemovePath { return Remove(settings.database, connection, TextView(account[:]), *document, decoded.bytes) }
+        return Store(settings.database, connection, TextView(account[:]), now, *document, decoded.bytes)
+    }
+}

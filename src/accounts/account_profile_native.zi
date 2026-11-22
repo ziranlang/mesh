@@ -1,0 +1,65 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "account_profile_rules";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    IconRequest :: struct {
+        icon: s64
+        matchesUser: bool
+        valid: bool
+    }
+
+    ReadIcon :: (payload: []u8, header: string) -> IconRequest {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(payload)) {
+            return .{}
+        }
+        kind := json.JsonKindOf(*document, document.root)
+        if kind != .Object && kind != .Null {
+            return .{}
+        }
+        result: IconRequest = .{matchesUser = true}
+        account: [64]u8
+        headerValid := identity.NormalizeUserID(header, account[:])
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(*document, node)
+            key := TextView(name)
+            valueKind := json.JsonKindOf(*document, node)
+            if valueKind != .Null {
+                if wire.MatchesToken(key, "profile_icon") {
+                    number, valid := json.JsonInteger(*document, node)
+                    if valueKind != .Number || !valid {
+                        return .{}
+                    }
+                    result.icon = number
+                } else if wire.MatchesToken(key, "user_id_hash") {
+                    if valueKind != .String {
+                        return .{}
+                    }
+                    value: Text = json.JsonString(*document, node)
+                    provided := wire.TrimSpace(TextView(value))
+                    user: [64]u8
+                    result.matchesUser = provided == "" || (headerValid &&
+                        identity.NormalizeUserID(provided, user[:]) && TextView(account[:]) == TextView(user[:]))
+                }
+            }
+            node = json.JsonNext(*document, node)
+        }
+        result.valid = true
+        return result
+    }
+
+    SetIcon :: (database: *void, user: string, icon: s64, timestamp: string) -> s32 {
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(icon), sql.TextArg(timestamp)]
+        status := sql.Execute(database, rules.SetIconSQL, arguments[:])
+        if status == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 0 {
+            return sqlite.SQLITE_DONE
+        }
+        return status
+    }
+}

@@ -1,0 +1,136 @@
+Header :: struct {
+    opcode: u8
+    finished: bool
+    masked: bool
+    length: u64
+    extendedBytes: s64
+    error: string
+}
+
+EncodedHeader :: struct {
+    bytes: [10]u8
+    count: s64
+}
+
+ReadExact :: #type (context: *void, bytes: []u8) -> bool;
+WriteExact :: #type (context: *void, bytes: []u8) -> bool;
+FrameHeader :: struct {
+    header: Header
+    mask: [4]u8
+    readFailed: bool
+}
+MaxPayloadBytes :: 1048576;
+
+#scope_file
+ValidOpcode :: (opcode: u8) -> bool {
+    return opcode == 0 || opcode == 1 || opcode == 2 ||
+        opcode == 8 || opcode == 9 || opcode == 10
+}
+
+#scope_export
+ReadPrefix :: (first: u8, second: u8, requireMask: bool) -> Header {
+    if (first & 112) != 0 {
+        return .{error = "websocket reserved bits set"}
+    }
+    opcode := first & 15
+    if !ValidOpcode(opcode) {
+        return .{error = "websocket unsupported opcode"}
+    }
+    masked := (second & 128) != 0
+    if requireMask && !masked {
+        return .{error = "websocket client frame not masked"}
+    }
+    header: Header = .{
+        opcode = opcode,
+        finished = (first & 128) != 0,
+        masked = masked,
+        length = cast(u64)(second & 127)
+    }
+    if header.length == 126 {
+        header.extendedBytes = 2
+    } else if header.length == 127 {
+        header.extendedBytes = 8
+    }
+    return header
+}
+
+ReadLength :: (header: Header, extended: []u8) -> Header {
+    if header.error != "" {
+        return header
+    }
+    if extended.count != header.extendedBytes {
+        return .{error = "websocket invalid length"}
+    }
+    if extended.count > 0 {
+        header.length = 0
+        for byte: extended {
+            header.length = (header.length << cast(u64)8) | cast(u64)byte
+        }
+    }
+    if header.length >= (cast(u64)1 << cast(u64)63) {
+        return .{error = "websocket invalid length"}
+    }
+    if header.opcode >= 8 && (!header.finished || header.length > 125) {
+        return .{error = "websocket invalid control frame"}
+    }
+    if !header.finished {
+        return .{error = "websocket fragmented frames unsupported"}
+    }
+    if header.length > MaxPayloadBytes {
+        return .{error = "websocket frame too large"}
+    }
+    return header
+}
+
+// Read one header without consuming any payload or the next frame.
+ReadFrameHeader :: (context: *void, read: ReadExact, requireMask: bool) -> FrameHeader {
+    prefix: [2]u8
+    if !read(context, prefix[:]) { return .{readFailed = true} }
+    header := ReadPrefix(prefix[0], prefix[1], requireMask)
+    if header.error != "" { return .{header = header} }
+
+    extended: [8]u8
+    if header.extendedBytes != 0 && !read(context, extended[:header.extendedBytes]) {
+        return .{readFailed = true}
+    }
+    header = ReadLength(header, extended[:header.extendedBytes])
+    result: FrameHeader = .{header = header}
+    if header.error == "" && header.masked && !read(context, result.mask[:]) {
+        result.readFailed = true
+    }
+    return result
+}
+
+Encode :: (opcode: u8, length: u64) -> EncodedHeader {
+    header: EncodedHeader
+    header.bytes[0] = cast(u8)128 | opcode
+    if length < 126 {
+        header.bytes[1] = cast(u8)length
+        header.count = 2
+        return header
+    }
+    if length <= 65535 {
+        header.bytes[1] = 126
+        header.bytes[2] = cast(u8)(length >> cast(u64)8)
+        header.bytes[3] = cast(u8)length
+        header.count = 4
+        return header
+    }
+    header.bytes[1] = 127
+    for index: 0..7 {
+        header.bytes[index + 2] = cast(u8)(length >> cast(u64)((7 - index) * 8))
+    }
+    header.count = 10
+    return header
+}
+
+WriteFrame :: (context: *void, write: WriteExact, opcode: u8, payload: []u8) -> bool {
+    header := Encode(opcode, cast(u64)payload.count)
+    return write(context, header.bytes[:header.count]) && write(context, payload)
+}
+
+Unmask :: (payload: []u8, mask: [4]u8) {
+    for byte, index: payload {
+        payload[index] = byte ^ mask[index % 4]
+    }
+}

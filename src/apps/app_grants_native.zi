@@ -1,0 +1,241 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    queries :: #import "app_grant_queries";
+    registry :: #import "app_registry_queries";
+    accounts :: #import "account_state_native";
+    rows :: #import "record_rows_native";
+    scopes :: #import "scope";
+    random :: #import "std/random_linux";
+    sha :: #import "crypto/sha256";
+    json :: #import "std/json_document";
+    text :: #import "std/text_tools";
+    #import "std/vec"
+
+    Grant :: struct {
+        source: string
+        target: string
+        prefix: string
+        permission: string
+    }
+
+    Result :: struct {
+        status: u32
+        message: string
+        node: s32
+    }
+
+    CollectionAccess :: struct {
+        status: s32
+        found: bool
+        privateCollection: bool
+    }
+
+    #scope_file
+    Failure :: () -> Result {
+        return .{status = 500, message = "app grant failed"}
+    }
+
+    Row :: (document: *json.JsonDocument, statement: *void) -> s32 {
+        object := json.JsonNewObject(document)
+        names: [10]string = .["id", "user_id_hash", "source_app_id", "target_app_id", "collection_prefix",
+            "permission", "status", "created_at", "updated_at", "revoked_at"]
+        for name, index: names {
+            field := sql.ColumnText(statement, cast(s32)index)
+            if (index == 1 || index >= 7) && field == "" {
+                continue
+            }
+            if !json.JsonSet(document, object, name, json.JsonNewStringCopy(document, field)) {
+                return -1
+            }
+        }
+        return object
+    }
+
+    CheckScope :: (database: *void, grant: Grant) -> Result {
+        apps: [2]string = .[grant.source, grant.target]
+        for app: apps {
+            argument: [1]sql.Argument = .[sql.TextArg(app)]
+            found := sql.ReadInteger(database, registry.ActiveAppSQL, argument[:])
+            if found.status != sqlite.SQLITE_OK {
+                return Failure()
+            }
+            if found.value == 0 {
+                return .{status = 404, message = "app not found"}
+            }
+        }
+        visible := Collection(database, grant.source, grant.prefix)
+        if visible.status != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        if !visible.found {
+            return .{status = 400, message = "collection is not registered for source app"}
+        }
+        if visible.privateCollection {
+            return .{status = 400, message = "private collections cannot be granted across apps"}
+        }
+        return .{}
+    }
+
+    Collection :: (database: *void, source: string, prefix: string) -> CollectionAccess {
+        arguments: [2]sql.Argument = .[sql.TextArg(source), sql.TextArg(prefix)]
+        selected := sql.Prepare(database, queries.VisibilitySQL, arguments[:])
+        if selected.status != sqlite.SQLITE_OK {
+            return .{status = selected.status}
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        status := sqlite.SqliteStep(selected.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = status}
+        }
+        return .{found = true, privateCollection = sql.ColumnText(selected.value, 0) == "private"}
+    }
+
+    OpenRecords :: (database: *void, user: string, prefix: string) -> sql.Statement {
+        if text.TextHasSuffix(prefix, ".*") {
+            pattern := scopes.LikePatternForCollectionPrefix(prefix)
+            if pattern.count == 0 {
+                return .{status = sqlite.SQLITE_NOMEM}
+            }
+            arguments: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(VecSlice(pattern, 0, pattern.count))),
+                sql.TextArg(prefix[:prefix.count - 1])]
+            return sql.Prepare(database, queries.PrefixRecordsSQL, arguments[:])
+        }
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(prefix)]
+        return sql.Prepare(database, queries.ExactRecordsSQL, arguments[:])
+    }
+
+    #scope_export
+    List :: (database: *void, user: string, document: *json.JsonDocument) -> Result {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        selected := sql.Prepare(database, queries.GrantListSQL, arguments[:])
+        failed: Result = .{status = 500, message = "app grants failed"}
+        if selected.status != sqlite.SQLITE_OK {
+            return failed
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        array := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(selected.value)
+            if status == sqlite.SQLITE_DONE {
+                break
+            }
+            if status != sqlite.SQLITE_ROW || !json.JsonAppend(document, array, Row(document, selected.value)) {
+                return failed
+            }
+        }
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "grants", array) {
+            return failed
+        }
+        return .{status = 200, node = root}
+    }
+
+    // The caller owns the transaction, including any signed proof reservation.
+    CreateTx :: (database: *void, user: string, grant: Grant, payload: string, now: string, document: *json.JsonDocument) -> Result {
+        scope := CheckScope(database, grant)
+        if scope.status != 0 {
+            return scope
+        }
+        entropy: [16]u8
+        encoded: [33]u8
+        if !random.FillSecure(entropy[:]) || sha.BytesToHex(*entropy[0], entropy.count, *encoded[0], encoded.count) != 1 ||
+            accounts.Touch(database, user, now) != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        id := TextView(encoded[:32])
+        fields: [6]sql.Argument = .[sql.TextArg(id), sql.TextArg(user), sql.TextArg(grant.source), sql.TextArg(grant.target),
+            sql.TextArg(grant.prefix), sql.TextArg(grant.permission)]
+        audit: [3]sql.Argument = .[fields[0], fields[1], sql.TextArg(payload)]
+        if sql.Execute(database, queries.GrantInsertSQL, fields[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, queries.CreateAuditSQL, audit[:]) != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        arguments: [2]sql.Argument = .[fields[1], fields[0]]
+        selected := sql.Prepare(database, queries.GrantByIDSQL, arguments[:])
+        if selected.status != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        if sqlite.SqliteStep(selected.value) != sqlite.SQLITE_ROW {
+            return Failure()
+        }
+        root := Row(document, selected.value)
+        if root < 0 {
+            return Failure()
+        }
+        return .{status = 201, node = root}
+    }
+
+    RevokeTx :: (database: *void, user: string, id: string, document: *json.JsonDocument) -> Result {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(id)]
+        if sql.Execute(database, queries.GrantRevokeSQL, arguments[:]) != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        if sqlite.SqliteChanges(database) == 0 {
+            return .{status = 404, message = "app grant not found"}
+        }
+        audit: [2]sql.Argument = .[arguments[1], arguments[0]]
+        if sql.Execute(database, queries.RevokeAuditSQL, audit[:]) != sqlite.SQLITE_OK {
+            return Failure()
+        }
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "status", json.JsonNewString(document, "revoked")) {
+            return Failure()
+        }
+        return .{status = 200, node = root}
+    }
+
+    AuthorizedRecords :: (database: *void, user: string, source: string, target: string, prefix: string,
+        document: *json.JsonDocument) -> Result {
+        failed: Result = .{status = 500, message = "app records failed"}
+        visible := Collection(database, source, prefix)
+        if visible.status != sqlite.SQLITE_OK {
+            return failed
+        }
+        if !visible.found {
+            return .{status = 400, message = "source app does not own collection scope"}
+        }
+        app: [1]sql.Argument = .[sql.TextArg(target)]
+        found := sql.ReadInteger(database, registry.ActiveAppSQL, app[:])
+        if found.status != sqlite.SQLITE_OK {
+            return failed
+        }
+        if found.value == 0 {
+            return .{status = 404, message = "app not found"}
+        }
+        if source != target {
+            arguments: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(source), sql.TextArg(target), sql.TextArg(prefix)]
+            allowed := sql.ReadInteger(database, queries.AuthorizedScopeSQL, arguments[:])
+            if allowed.status != sqlite.SQLITE_OK {
+                return failed
+            }
+            if allowed.value == 0 {
+                return .{status = 403, message = "app grant required"}
+            }
+        }
+        selected := OpenRecords(database, user, prefix)
+        if selected.status != sqlite.SQLITE_OK {
+            return failed
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        array := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(selected.value)
+            if status == sqlite.SQLITE_DONE {
+                break
+            }
+            if status != sqlite.SQLITE_ROW || !rows.Append(document, array, rows.Read(selected.value, 10)) {
+                return failed
+            }
+        }
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "records", array) {
+            return failed
+        }
+        return .{status = 200, node = root}
+    }
+}

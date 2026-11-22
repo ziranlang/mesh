@@ -1,0 +1,200 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "entitlement_rules_native";
+    ledger :: #import "token_ledger_native";
+    issuer :: #import "token_issuer_native";
+    binary :: #import "binary_codec";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    #import "std/vec"
+
+    #scope_file
+    TaiChi :: "inbe.practice.taichi";
+    Island :: "shovey.island";
+    Catalog: [2]string = .["inbe.practice.taichi", "shovey.island"];
+    ReadUnlock :: "SELECT receipt_id FROM account_unlocks WHERE account_id=?1 AND product=?2";
+    ReadNonce :: "SELECT receipt_id FROM token_spend_nonces WHERE account_id=?1 AND app_id=?2 AND idempotency_key=?3";
+
+    RegularPrice :: (product: string) -> s64 {
+        if product == TaiChi { return 100000000 }
+        if product == Island { return 85000000 }
+        return 0
+    }
+
+    Price :: (product: string, configuration: rules.Configuration, now: s64) -> s64 {
+        if product == TaiChi && now < configuration.trialUntil { return 60000000 }
+        launch := configuration.islandLaunchAt
+        if product == Island && launch > 0 && now >= launch && now < rules.AddMonths(launch, 6, false) { return 51000000 }
+        return RegularPrice(product)
+    }
+
+    ReceiptRef :: struct {
+        value: Vec(u8)
+        found: bool
+        ok: bool
+    }
+
+    Reference :: (database: *void, query: string, arguments: []sql.Argument) -> ReceiptRef {
+        statement := sql.Prepare(database, query, arguments)
+        if statement.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(statement.value)
+        step := sqlite.SqliteStep(statement.value)
+        if step == sqlite.SQLITE_DONE { return .{ok = true} }
+        if step != sqlite.SQLITE_ROW { return .{} }
+        receipt: ReceiptRef
+        receipt.found = true
+        receipt.ok = BuilderAppend(receipt.value, sql.ColumnText(statement.value, 0))
+        return receipt
+    }
+
+    Paid :: (database: *void, user: string, product: string, app: string, key: string) -> ReceiptRef {
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(app), sql.TextArg(key)]
+        current := Reference(database, ReadNonce, arguments[:])
+        if current.ok && !current.found && product == Island {
+            // Earlier Island receipts used the shared Entity audit scope.
+            arguments[1] = sql.TextArg("entity")
+            return Reference(database, ReadNonce, arguments[:])
+        }
+        return current
+    }
+
+    Settled :: (database: *void, user: string, product: string, app: string, id: string,
+        document: *json.JsonDocument) -> rules.Result {
+        unavailable := rules.Failure(503, "unlock unavailable")
+        receipt := ledger.Receipt(database, id, document)
+        if receipt.status != 200 { return unavailable }
+        row := receipt.node
+        amount, valid := json.JsonInteger(document, json.JsonMember(document, row, "amount_delta"))
+        appText: Text = rules.TextField(document, row, "app_id")
+        attributedApp := TextView(appText)
+        legacy := product == Island && attributedApp == "entity"
+        if !valid || amount >= 0 || amount == -rules.MaxInt - 1 ||
+            (product == Island && amount != -RegularPrice(Island) && amount != -51000000) ||
+            !rules.TextEquals(document, row, "account_id", user) || (attributedApp != app && !legacy) ||
+            !rules.TextEquals(document, row, "asset_id", ledger.AssetID) || !rules.TextEquals(document, row, "event_type", "debit") ||
+            !rules.TextEquals(document, row, "source_type", "unlock") || !rules.TextEquals(document, row, "source_ref", product) {
+            return unavailable
+        }
+        balance := ledger.Balance(database, user)
+        root := json.JsonNewObject(document)
+        if !balance.found || !ledger.PutText(document, root, "product", product) ||
+            !json.JsonSet(document, root, "unlocked", json.JsonNewBool(document, true)) ||
+            !ledger.PutInt(document, root, "price_units", -amount) || !ledger.PutInt(document, root, "balance", balance.value) ||
+            !ledger.PutText(document, root, "receipt_id", id) { return unavailable }
+        return .{status = 200, node = root}
+    }
+
+    Products :: (configuration: rules.Configuration, now: s64, document: *json.JsonDocument) -> s32 {
+        products := json.JsonNewArray(document)
+        for name: Catalog {
+            product := json.JsonNewObject(document)
+            trial := ifx name == TaiChi && now < configuration.trialUntil then configuration.trialUntil else 0
+            if !ledger.PutText(document, product, "product", name) || !ledger.PutInt(document, product, "price_units", Price(name, configuration, now)) ||
+                !ledger.PutInt(document, product, "regular_price_units", RegularPrice(name)) ||
+                !ledger.PutInt(document, product, "trial_until", trial) || !json.JsonAppend(document, products, product) { return -1 }
+        }
+        return products
+    }
+
+    #scope_export
+    Prices :: (configuration: rules.Configuration, now: s64, document: *json.JsonDocument) -> rules.Result {
+        root := json.JsonNewObject(document)
+        products := Products(configuration, now, document)
+        if products < 0 || !json.JsonSet(document, root, "products", products) {
+            return rules.Failure(503, "unlocks unavailable")
+        }
+        return .{status = 200, node = root}
+    }
+
+    List :: (database: *void, configuration: rules.Configuration, user: string, now: s64,
+        document: *json.JsonDocument) -> rules.Result {
+        unavailable := rules.Failure(503, "unlocks unavailable")
+        result := Prices(configuration, now, document)
+        if result.status != 200 { return result }
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        statement := sql.Prepare(database, "SELECT product,receipt_id,created_at FROM account_unlocks WHERE account_id=?1 ORDER BY created_at,product", arguments[:])
+        if statement.status != sqlite.SQLITE_OK { return unavailable }
+        defer sqlite.SqliteFinalize(statement.value)
+        entries := json.JsonNewArray(document)
+        step := sqlite.SqliteStep(statement.value)
+        while step == sqlite.SQLITE_ROW {
+            item := json.JsonNewObject(document)
+            if sqlite.SqliteColumnType(statement.value, 2) != sqlite.SQLITE_INTEGER ||
+                !ledger.PutText(document, item, "product", sql.ColumnText(statement.value, 0)) ||
+                !ledger.PutText(document, item, "receipt_id", sql.ColumnText(statement.value, 1)) ||
+                !ledger.PutInt(document, item, "created_at", sqlite.SqliteColumnInt64(statement.value, 2)) ||
+                !json.JsonAppend(document, entries, item) { return unavailable }
+            step = sqlite.SqliteStep(statement.value)
+        }
+        if step != sqlite.SQLITE_DONE || !json.JsonSet(document, result.node, "unlocks", entries) { return unavailable }
+        return result
+    }
+
+    Purchase :: (database: *void, configuration: rules.Configuration, user: string, product: string,
+        expected: s64, now: s64, at: string, document: *json.JsonDocument) -> rules.Result {
+        price := Price(product, configuration, now)
+        if price == 0 { return rules.Failure(404, "unknown product") }
+        unavailable := rules.Failure(503, "unlock unavailable")
+        app := ifx product == Island then "shovey" else "inbe"
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(product)]
+        existing := Reference(database, ReadUnlock, arguments[:])
+        if !existing.ok { return unavailable }
+        if existing.found {
+            return Settled(database, user, product, app, TextView(VecSlice(existing.value, 0, existing.value.count)), document)
+        }
+        nonce: Vec(u8)
+        if !BuilderAppend(nonce, "unlock:") || !BuilderAppend(nonce, product) { return unavailable }
+        key := TextView(VecSlice(nonce, 0, nonce.count))
+        paid := Paid(database, user, product, app, key)
+        if !paid.ok { return unavailable }
+        debit: json.JsonDocument
+        id: Vec(u8)
+        if !BuilderAppend(id, TextView(VecSlice(paid.value, 0, paid.value.count))) { return unavailable }
+        if !paid.found {
+            if product == Island && expected != price { return rules.Failure(409, "price changed; confirm a fresh quote") }
+            outcome := rules.Debit(database, configuration.signer, .{account = user, app = app, kind = "debit",
+                source = "unlock", reference = product, amount = -price}, at, key, *debit)
+            if outcome.status == 402 { return rules.Failure(402, "insufficient balance") }
+            if outcome.status != 200 { return unavailable }
+            receipt: Text = rules.TextField(*debit, outcome.node, "receipt_id")
+            if !BuilderAppend(id, TextView(receipt)) { return unavailable }
+        }
+        receiptID := TextView(VecSlice(id, 0, id.count))
+        result := Settled(database, user, product, app, receiptID, document)
+        if result.status != 200 { return result }
+        save: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(product), sql.TextArg(receiptID), sql.IntArg(now)]
+        if sql.Execute(database, "INSERT INTO account_unlocks(account_id,product,receipt_id,created_at) VALUES(?1,?2,?3,?4)", save[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteChanges(database) != 1 { return unavailable }
+        return result
+    }
+
+    Grant :: (database: *void, signer: *issuer.Issuer, user: string, product: string, now: s64,
+        document: *json.JsonDocument) -> rules.Result {
+        unavailable := rules.Failure(503, "pack grants unavailable")
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(product)]
+        existing := Reference(database, ReadUnlock, arguments[:])
+        if !existing.ok { return unavailable }
+        if !existing.found { return rules.Failure(403, "product not unlocked") }
+        if signer == null || issuer.Status(signer) != "ok" { return unavailable }
+        expires := now + 3600
+        digits: [24]u8
+        payload: Vec(u8)
+        if !BuilderAppend(payload, "daochi-pack-grant-v1\n") || !BuilderAppend(payload, product) || !BuilderAppend(payload, "\n") ||
+            !BuilderAppend(payload, numbers.FormatInteger(expires, digits[:])) { return unavailable }
+        signature: [129]u8
+        bytes := VecSlice(payload, 0, payload.count)
+        if !issuer.SignHex(signer, bytes, signature[:]) { return unavailable }
+        decoded := binary.DecodeBinaryField(TextView(signature[:128]))
+        if decoded.error != "" || decoded.value.count != 64 { return unavailable }
+        message := binary.EncodeBase64(TextView(bytes), true, false)
+        proof := binary.EncodeBase64(TextView(VecSlice(decoded.value, 0, decoded.value.count)), true, false)
+        grant: Vec(u8)
+        if message.error != "" || proof.error != "" || !BuilderAppend(grant, TextView(VecSlice(message.value, 0, message.value.count))) ||
+            !BuilderAppend(grant, ".") || !BuilderAppend(grant, TextView(VecSlice(proof.value, 0, proof.value.count))) { return unavailable }
+        root := json.JsonNewObject(document)
+        if !ledger.PutText(document, root, "grant", TextView(VecSlice(grant, 0, grant.count))) ||
+            !ledger.PutInt(document, root, "expires_at", expires) { return unavailable }
+        return .{status = 200, node = root}
+    }
+}

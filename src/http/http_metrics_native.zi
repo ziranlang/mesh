@@ -1,0 +1,183 @@
+#if TARGET == .C && OS == .LINUX {
+    mutex :: #import "std/mutex_linux";
+    numbers :: #import "std/number_text";
+    text :: #import "std/text_tools";
+    time :: #import "std/timer_linux";
+    #import "std/vec"
+
+    Request :: struct {
+        method: s64
+        route: s64
+        started: s64
+    }
+
+    Series :: struct {
+        status: u32
+        count: s64
+        milliseconds: s64
+    }
+
+    Bucket :: struct {
+        statuses: Vec(Series)
+    }
+
+    Counters :: struct {
+        lock: mutex.Mutex
+        buckets: Vec(Bucket)
+    }
+
+    #scope_file
+    Methods: [10]string = .["OTHER", "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT"];
+    Routes: [125]string = .["unmatched", "/healthz", "/readyz", "/metrics", "/api/v1/rates", "/api/v1/node", "/api/v1/node/peers",
+        "/api/v1/node/pairing/invites", "/api/v1/node/pairing/accept", "/api/v1/node/pairing/complete",
+        "/api/v1/node/mesh/export", "/api/v1/node/mesh/import", "/api/v1/namespaces", "/api/v1/namespaces/claims",
+        "/api/v1/namespaces/resolve", "/api/v1/sync", "/api/v1/sync/challenge", "/api/v1/sync/login", "/api/v1/sync/logout",
+        "/api/v1/sync/ws", "/api/v1/sync/diagnostics", "/api/v1/account", "/api/v1/account/delete",
+        "/api/v1/account/delete-with-key", "/api/v1/account/devices", "/api/v1/account/profile-icon", "/api/v1/account/export",
+        "/api/v1/account/backup", "/api/v1/account/passkeys", "/api/v1/account/passkeys/remove", "/api/v1/account-backup/open",
+        "/api/v1/account-backup/salt", "/api/v1/account-backup/passkey/open", "/api/v1/account/app-grants",
+        "/api/v1/account/app-records", "/api/v1/link/put", "/api/v1/link/get", "/api/v1/link/close", "/api/v1/apps",
+        "/api/v1/apps/{app_id}", "/api/v1/apps/{app_id}/collections", "/api/v1/account/app-grants/{id}",
+        "/api/v1/blobs/{path}", "/api/v1/packages/{path}", "/api/v2/packages/{path}",
+        "/", "/openapi.json", "/api/v1/feedback", "/api/v1/admin/feedback", "/api/v1/admin/feedback/reply",
+        "/api/v1/publications", "/api/v1/publications/{id}", "/api/v1/friends", "/api/v1/friends/requests",
+        "/api/v1/friends/stats", "/api/v1/friends/{user_id_hash}", "/api/v1/friends/requests/{id}", "/api/v1/profile/stats",
+        "/api/v1/chat/completions", "/api/v1/chat/spelling", "/api/v1/chat/habit-icons", "/api/v1/lists",
+        "/api/v1/account-backup/methods", "/api/v1/account-backup/google", "/api/v1/account/google", "/api/v1/account/google/remove",
+        "/api/v1/lumi/developer", "/api/v1/admin/lumi/developer", "/api/v1/tokens/assets", "/api/v1/tokens/products",
+        "/api/v1/tokens/issuer", "/api/v1/tokens/balance", "/api/v1/tokens/ledger", "/api/v1/tokens/activity",
+        "/api/v1/tokens/checkpoints/latest", "/api/v1/tokens/receipts/{id}", "/api/v1/tokens/spend",
+        "/api/v1/admin/tokens/manual-credit", "/api/v1/admin/tokens/checkpoint", "/api/v1/authorization/requests",
+        "/api/v1/authorization/rendezvous", "/api/v1/authorization/cancel", "/api/v1/authorization/claim",
+        "/api/v1/authorization/approve", "/api/v1/authorization/revoke", "/api/v1/authorization/challenge",
+        "/api/v1/authorization/session", "/api/v1/delegated/sync", "/api/v1/lumi/telegram/link",
+        "/api/v1/lumi/telegram/updates", "/api/v1/lumi/telegram/ack", "/api/v1/lumi/telegram/messages",
+        "/api/v1/lumi/telegram/webhook", "/api/v1/delegated/ws", "/api/v1/storage/plan", "/api/v1/unlocks",
+        "/api/v1/unlocks/grant", "/api/v1/unlocks/products", "/api/v1/tokens/gifts", "/api/v1/rewards",
+        "/api/v1/telegram/environment", "/api/v1/telegram/entry", "/api/v1/telegram/entry/verify",
+        "/api/v1/telegram/entry/status", "/api/v1/telegram/entry/rendezvous", "/api/v1/telegram/entry/cancel",
+        "/api/v1/telegram/account/bind", "/api/v1/account/alias", "/api/v1/account/alias/purchase",
+        "/api/v1/rewards/migration", "/api/v1/admin/game-maps", "/api/v1/game-completions", "/api/v1/telegram/launch",
+        "/api/v1/tokens/purchases/telegram/catalog", "/api/v1/tokens/purchases/telegram/balance",
+        "/api/v1/tokens/purchases/telegram/invoices", "/api/v1/tokens/purchases/telegram/invoices/{id}",
+        "/api/v1/tokens/purchases/telegram/invoices/{id}/cancel", "/api/v1/admin/tokens/purchases/telegram/reconcile",
+        "/api/v1/tokens/purchases/monero/invoices", "/api/v1/tokens/purchases/monero/invoices/{id}",
+        "/api/v1/tokens/purchases/monero/address", "/api/v1/tokens/purchases/monero/address/{reference}",
+        "/api/v1/tokens/purchases/monero/deposits", "/api/v1/tokens/purchases/google/verify"];
+
+    Route :: (path: string) -> s64 {
+        normalized := path
+        if text.TextHasPrefix(path, "/api/v1/apps/") {
+            normalized = ifx text.TextHasSuffix(path, "/collections") then "/api/v1/apps/{app_id}/collections" else "/api/v1/apps/{app_id}"
+        } else if text.TextHasPrefix(path, "/api/v1/account/app-grants/") {
+            normalized = "/api/v1/account/app-grants/{id}"
+        } else if text.TextHasPrefix(path, "/api/v1/blobs/") {
+            normalized = "/api/v1/blobs/{path}"
+        } else if text.TextHasPrefix(path, "/api/v1/packages/") {
+            normalized = "/api/v1/packages/{path}"
+        } else if text.TextHasPrefix(path, "/api/v2/packages/") {
+            normalized = "/api/v2/packages/{path}"
+        } else if text.TextHasPrefix(path, "/api/v1/publications/") {
+            normalized = "/api/v1/publications/{id}"
+        } else if text.TextHasPrefix(path, "/api/v1/tokens/receipts/") {
+            normalized = "/api/v1/tokens/receipts/{id}"
+        } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/telegram/invoices/") {
+            normalized = "/api/v1/tokens/purchases/telegram/invoices/{id}"
+            if text.TextHasSuffix(path, "/cancel") { normalized = "/api/v1/tokens/purchases/telegram/invoices/{id}/cancel" }
+        } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/monero/invoices/") {
+            normalized = "/api/v1/tokens/purchases/monero/invoices/{id}"
+        } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/monero/address/") {
+            normalized = "/api/v1/tokens/purchases/monero/address/{reference}"
+        } else if text.TextHasPrefix(path, "/api/v1/friends/requests/") {
+            normalized = "/api/v1/friends/requests/{id}"
+        } else if text.TextHasPrefix(path, "/api/v1/friends/") && path != "/api/v1/friends/requests" && path != "/api/v1/friends/stats" {
+            normalized = "/api/v1/friends/{user_id_hash}"
+        }
+        for name, index: Routes {
+            if normalized == name { return index }
+        }
+        return 0
+    }
+
+    FindBucket :: (state: *Counters, route: s64, method: s64) -> *Bucket {
+        return *state.buckets[route * Methods.count + method]
+    }
+
+    Sample :: (output: *Vec(u8), name: string, route: string, method: string, entry: Series, duration: bool) -> bool {
+        status: [24]u8
+        value: [24]u8
+        count := ifx duration then entry.milliseconds else entry.count
+        return BuilderAppend(<<output, name) && BuilderAppend(<<output, "{method=\"") &&
+            BuilderAppend(<<output, method) && BuilderAppend(<<output, "\",route=\"") &&
+            BuilderAppend(<<output, route) && BuilderAppend(<<output, "\",status=\"") &&
+            BuilderAppend(<<output, numbers.FormatInteger(cast(s64)entry.status, status[:])) &&
+            BuilderAppend(<<output, "\"} ") && BuilderAppend(<<output, numbers.FormatInteger(count, value[:])) &&
+            BuilderAppend(<<output, "\n")
+    }
+
+    Family :: (state: *Counters, output: *Vec(u8), name: string, duration: bool) -> bool {
+        if !BuilderAppend(<<output, "# TYPE ") || !BuilderAppend(<<output, name) ||
+            !BuilderAppend(<<output, " counter\n") { return false }
+        for route, routeIndex: Routes {
+            for method, methodIndex: Methods {
+                bucket := FindBucket(state, routeIndex, methodIndex)
+                for entry: VecSlice(bucket.statuses, 0, bucket.statuses.count) {
+                    if !Sample(output, name, route, method, entry, duration) {
+                        return false
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    #scope_export
+    Open :: (state: *Counters) -> bool {
+        if !VecResize(state.buckets, Routes.count * Methods.count) {
+            return false
+        }
+        if !mutex.Open(*state.lock) {
+            VecFree(state.buckets)
+            return false
+        }
+        return true
+    }
+
+    Close :: (state: *Counters) {
+        VecFree(state.buckets)
+        unused mutex.Close(*state.lock)
+    }
+
+    Begin :: (method: string, path: string) -> Request {
+        for name, index: Methods {
+            if method == name { return .{method = index, route = Route(path), started = time.MonotonicMilliseconds()} }
+        }
+        return .{route = Route(path), started = time.MonotonicMilliseconds()}
+    }
+
+    Finish :: (state: *Counters, request: Request, status: u32) {
+        if status < 100 || status > 599 || !mutex.Lock(*state.lock) { return }
+        defer mutex.Unlock(*state.lock)
+        elapsed := time.MonotonicMilliseconds() - request.started
+        if elapsed < 0 { elapsed = 0 }
+        bucket := FindBucket(state, request.route, request.method)
+        for index: 0..bucket.statuses.count - 1 {
+            if bucket.statuses[index].status == status {
+                bucket.statuses[index].count += 1
+                bucket.statuses[index].milliseconds += elapsed
+                return
+            }
+        }
+        entry: Series = .{status = status, count = 1, milliseconds = elapsed}
+        unused VecPush(bucket.statuses, entry)
+    }
+
+    Report :: (state: *Counters, output: *Vec(u8)) -> bool {
+        if !mutex.Lock(*state.lock) { return false }
+        defer mutex.Unlock(*state.lock)
+        return Family(state, output, "mesh_http_requests_total", false) &&
+            Family(state, output, "mesh_http_request_duration_milliseconds_total", true) &&
+            Family(state, output, "ksync_http_requests_total", false) &&
+            Family(state, output, "ksync_http_request_duration_milliseconds_total", true)
+    }
+}

@@ -6,6 +6,7 @@ json :: #import "std/json_go";
 ed :: #import "std/ed25519_go";
 errors :: #import "std/errors_go";
 text :: #import "std/text_go";
+wire_text :: #import "wire_text";
 go_strings :: #system_library "go:strings";
 go_hex :: #system_library "go:encoding/hex";
 builtin :: #system_library "go:builtin";
@@ -41,7 +42,6 @@ BytesResult :: struct {
     value: []u8
     error: Error
 }
-TrimSpace :: (value: string) -> string #foreign go_strings;
 Join :: (values: []string, separator: string) -> string #foreign go_strings;
 DecodeHex :: (value: string) -> BytesResult #go_results #foreign go_hex "DecodeString";
 EncodeHex :: (value: []u8) -> string #foreign go_hex "EncodeToString";
@@ -67,7 +67,7 @@ Validate :: (input: TokenEventInput) -> Error {
     if input.EventType == "debit" && input.AmountDelta > 0 {
         return errors.New("debit amount must be negative")
     }
-    if !identity.ValidNamespace(input.SourceType) || TrimSpace(input.SourceRef) == "" || input.SourceRef.count > 256 {
+    if !identity.ValidNamespace(input.SourceType) || wire_text.TrimSpace(input.SourceRef) == "" || input.SourceRef.count > 256 {
         return errors.New("invalid source")
     }
     return null

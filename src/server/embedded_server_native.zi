@@ -1,0 +1,201 @@
+#if TARGET == .C && OS == .LINUX {
+    server :: #import "server_native";
+    routes :: #import "embedded_routes";
+    profile :: #import "embedded_profile_native";
+    accounts :: #import "account_access_native";
+    notifications :: #import "sync_hub_native";
+    replication :: #import "mesh_pull_native";
+    keys :: #import "node_identity_native";
+    network :: #import "network_scope_native";
+    peer_settings :: #import "mesh_peer_settings_native";
+    listener :: #import "listen_native";
+    http :: #import "http_server_native";
+    transport :: #import "peer_http_native";
+    counters :: #import "http_metrics_native";
+    schema :: #import "sqlite_schema";
+    startup :: #import "store_startup_native";
+    sqlite :: #import "sqlite/SQLite";
+    signatures :: #import "ml_dsa44_native";
+    sha :: #import "crypto/sha256";
+    oqs :: #import "oqs/Oqs";
+    files :: #import "std/file_linux";
+    directories :: #import "std/file_tree_linux";
+    strings :: #import "std/byte_text_linux";
+    c_string :: #import "std/c_string";
+    numbers :: #import "std/number_text";
+    mutex :: #import "std/mutex_linux";
+    #import "std/vec"
+
+    EmbeddedServer :: struct {
+        state: server.State
+        operator: *void
+        peer: *void
+        admission: mutex.Mutex
+        worker: replication.Worker
+        path: [4096]u8
+        baseURL: [64]u8
+        secret: [32]u8
+        admin: [65]u8
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    AllocateEmbedded :: () -> *void #foreign c "mesh_allocate_embedded_server";
+    Free :: (pointer: *void) #foreign c "free";
+
+    PrivateName :: "Private app node";
+
+    Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8, version: *u8,
+        upload: *u8, size: *usize, request: **void) -> s32 {
+        if <<request == null && !routes.Allowed(strings.TextFromCString(path)) {
+            // Run the usual two MHD callbacks before returning a response.
+            if <<size != 0 {
+                <<size = 0
+                return 1
+            }
+            <<request = context
+            return 1
+        }
+        if <<request == context {
+            if <<size != 0 {
+                <<size = 0
+                return 1
+            }
+            body: Text = TextCopy("404 page not found\n")
+            return http.Write(connection, 404, "text/plain; charset=utf-8", VecSlice(body.bytes, 0, body.bytes.count))
+        }
+        node := cast(*EmbeddedServer)context
+        return server.Dispatch(cast(*void)(*node.state), connection, path, method, version, upload, size, request)
+    }
+
+    PeerDispatch :: (context: *void, connection: *void, path: *u8, method: *u8, version: *u8,
+        upload: *u8, size: *usize, request: **void) -> s32 {
+        node := cast(*EmbeddedServer)context
+        if !mutex.Lock(*node.admission) { return 0 }
+        serving := node.peer != null
+        unused mutex.Unlock(*node.admission)
+        if !serving { return 0 }
+        return Dispatch(context, connection, path, method, version, upload, size, request)
+    }
+
+    Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+        if <<request == context { return }
+        node := cast(*EmbeddedServer)context
+        server.Completed(cast(*void)(*node.state), connection, request, reason)
+    }
+
+    SetEndpoint :: (node: *EmbeddedServer, peer: *void) -> bool {
+        port := http.BoundPort(peer)
+        if port == 0 { return false }
+        endpoint: Vec(u8)
+        digits: [24]u8
+        if !BuilderAppend(endpoint, "http://127.0.0.1:") || !BuilderAppend(endpoint, numbers.FormatInteger(port, digits[:])) ||
+            !c_string.CopyCString(TextView(VecSlice(endpoint, 0, endpoint.count)), node.baseURL[:]) { return false }
+        node.state.pairingConfiguration.baseURL = strings.TextFromCString(*node.baseURL[0])
+        return true
+    }
+
+    #scope_export
+    ResumeEmbedded :: (node: *EmbeddedServer) -> bool {
+        if node.peer != null { return true }
+        if !notifications.Resume(*node.state.notificationHub) || !mutex.Lock(*node.admission) { return false }
+        peer := listener.Start("127.0.0.1:0", 128, cast(*void)node, PeerDispatch, Completed)
+        if peer == null {
+            unused mutex.Unlock(*node.admission)
+            return false
+        }
+        settings: replication.Configuration = .{access = *node.state.accounts, scope = *node.state.networkScope,
+            local = *node.state.localNode, batch = node.state.meshBatch, interval = 30}
+        ready := SetEndpoint(node, peer) && replication.Start(*node.worker, settings)
+        if ready { node.peer = peer }
+        unused mutex.Unlock(*node.admission)
+        if !ready { http.Stop(peer) }
+        return ready
+    }
+
+    SuspendEmbedded :: (node: *EmbeddedServer) {
+        if node.peer == null { return }
+        replication.Stop(*node.worker)
+        notifications.Stop(*node.state.notificationHub)
+        http.Stop(node.peer)
+        node.peer = null
+    }
+
+    CloseEmbedded :: (node: *EmbeddedServer) {
+        SuspendEmbedded(node)
+        http.Stop(node.operator)
+        counters.Close(*node.state.counters)
+        notifications.Close(*node.state.notificationHub)
+        accounts.Close(*node.state.accounts)
+        VecFree(node.state.knownPeers.nodes)
+        VecFree(node.state.networkScope.networks)
+        unused mutex.Close(*node.admission)
+        unused sqlite.SqliteClose(node.state.accounts.configuration.database)
+        oqs.Cleanse(node.state.localNode.seed[:])
+        oqs.Cleanse(node.admin[:])
+        oqs.Cleanse(node.secret[:])
+        Free(cast(*void)node)
+    }
+
+    OpenEmbedded :: (directory: files.FileHandle, root: string) -> *EmbeddedServer {
+        node := cast(*EmbeddedServer)AllocateEmbedded()
+        if node == null { return null }
+        ready := false
+        defer {
+            if !ready {
+                oqs.Cleanse(node.state.localNode.seed[:])
+                oqs.Cleanse(node.admin[:])
+                oqs.Cleanse(node.secret[:])
+                Free(cast(*void)node)
+            }
+        }
+        rawAdmin: [32]u8
+        defer oqs.Cleanse(rawAdmin[:])
+        if !profile.Secret(directory, root, "token-secret", node.secret[:]) ||
+            !profile.Secret(directory, root, "admin-secret", rawAdmin[:]) ||
+            sha.BytesToHex(*rawAdmin[0], rawAdmin.count, *node.admin[0], node.admin.count) != 1 { return null }
+        identityPath: Text = directories.JoinPath(root, "node-key")
+        databasePath: Text = directories.JoinPath(root, "mesh.sqlite")
+        if identityPath.bytes.count == 0 || databasePath.bytes.count == 0 || !profile.StateFileAllowed(identityPath) ||
+            !profile.StateFileAllowed(databasePath) || !keys.LoadFile(identityPath, *node.state.localNode) ||
+            !c_string.CopyCString(databasePath, node.path[:]) { return null }
+        path := strings.TextFromCString(*node.path[0])
+        opened := schema.OpenCore(path)
+        if opened.status != sqlite.SQLITE_OK { return null }
+        database := opened.database
+        defer { if !ready { unused sqlite.SqliteClose(database) } }
+        if !directories.SetPathMode(path, 384) || startup.InitializeFeatures(database) != sqlite.SQLITE_OK ||
+            sqlite.SqliteExecText(database, "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL") != sqlite.SQLITE_OK { return null }
+        defer { if !ready { VecFree(node.state.networkScope.networks) } }
+        if network.Parse(*node.state.networkScope, true, "127.0.0.0/8,::1/128") != "" { return null }
+        if !peer_settings.Read("", *node.state.knownPeers) { return null }
+        defer { if !ready { VecFree(node.state.knownPeers.nodes) } }
+        settings: accounts.Configuration = .{database = database, path = path, secret = node.secret[:],
+            challengeSeconds = 60, tokenSeconds = 3600, maximumBodyBytes = 1048576, verify = signatures.Verify}
+        if !accounts.Open(*node.state.accounts, settings) { return null }
+        defer { if !ready { accounts.Close(*node.state.accounts) } }
+        if !mutex.Open(*node.admission) { return null }
+        defer { if !ready { unused mutex.Close(*node.admission) } }
+        if !notifications.Open(*node.state.notificationHub) { return null }
+        defer { if !ready { notifications.Close(*node.state.notificationHub) } }
+        if !counters.Open(*node.state.counters) { return null }
+        defer { if !ready { counters.Close(*node.state.counters) } }
+        adminToken := strings.TextFromCString(*node.admin[0])
+        nodeID := strings.TextFromCString(*node.state.localNode.id[0])
+        node.state.persistentSecret = true
+        node.state.meshBatch = 128
+        node.state.registration = .{adminToken = adminToken, nodeID = nodeID, scope = *node.state.networkScope}
+        node.state.pairingConfiguration = .{admin = adminToken, displayName = PrivateName,
+            local = *node.state.localNode, scope = *node.state.networkScope}
+        node.operator = http.StartPrivate(cast(*void)node, Dispatch, Completed)
+        if node.operator == null { return null }
+        defer { if !ready { http.Stop(node.operator) } }
+        ready = ResumeEmbedded(node)
+        return ifx ready then node else null
+    }
+
+    RequestEmbedded :: (node: *EmbeddedServer, verb: string, target: string, body: string,
+        maximum: s64, response: *transport.Response) -> bool {
+        return transport.PrivateRequest(node.operator, verb, target, body, node.state.registration.adminToken, maximum, response)
+    }
+}

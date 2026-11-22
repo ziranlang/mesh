@@ -1,0 +1,89 @@
+#if TARGET == .C && OS == .LINUX {
+    transport :: #import "http_server_native";
+    readiness :: #import "readiness";
+    diagnostics :: #import "sqlite_diagnostics";
+    fields :: #import "sync_json_fields";
+    hub :: #import "sync_hub_native";
+    http_metrics :: #import "http_metrics_native";
+    json :: #import "std/json_document";
+    metrics :: #import "metrics_native";
+    node :: #import "node_identity_native";
+    protocol :: #import "protocol";
+    replies :: #import "http_json_native";
+    sha :: #import "crypto/sha256";
+    stats :: #import "store_stats_native";
+    version :: #import "version";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Health :: (connection: *void) -> s32 {
+        body: Vec(u8)
+        if !BuilderAppend(body, readiness.HealthBody) {
+            return 0
+        }
+        return transport.Write(connection, 200, "application/json", VecSlice(body, 0, body.count))
+    }
+
+    Ready :: (connection: *void, database: *void, inputs: readiness.ReadinessInputs) -> s32 {
+        inputs.databaseAvailable = diagnostics.Health(database)
+        status := readiness.Evaluate(inputs)
+        body := readiness.Body(status)
+        if body.count == 0 {
+            return 0
+        }
+        return transport.Write(connection, cast(u32)status.status, "application/json", VecSlice(body, 0, body.count))
+    }
+
+    Node :: (connection: *void, verb: string, database: *void, path: string, local: *node.Identity,
+        name: string, base: string, knownPeers: *json.JsonDocument, clients: hub.ConnectionStats,
+        premiumAliasesEnabled: bool, playVerifier: bool, zstdRequests: bool, zstdResponses: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        usage := json.JsonNewObject(*document)
+        if !stats.Usage(database, clients.users, clients.clients, hub.ConnectionLimitPerUser, *document, usage) {
+            return replies.ErrorReply(connection, verb, 500, "node usage failed", zstdResponses)
+        }
+        storage := json.JsonNewObject(*document)
+        if !stats.Storage(database, path, *document, storage) {
+            return replies.ErrorReply(connection, verb, 500, "node storage usage failed", zstdResponses)
+        }
+        capabilities := json.JsonNewArray(*document)
+        supported: [13]string = .["v3-typed-sync", "v4-encrypted-records", "v5-encrypted-primary",
+            "protocol-v1-v5-valid-through-2027-09-01", "protocol-previous-version-grace-days-365",
+            "v6-signed-transactions", "v6-signed-app-manifests", "node-mesh-encrypted-records", "node-identity-v1",
+            "node-pairing-v1", "trust-space-names-v1", "http-gzip-v1", "record-gzip-v1"]
+        for capability: supported {
+            if !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, capability)) { return 0 }
+        }
+        if zstdRequests && !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, "http-zstd-v1")) { return 0 }
+        if playVerifier && !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, "google-play-purchases")) { return 0 }
+        if premiumAliasesEnabled && !json.JsonAppend(*document, capabilities, json.JsonNewString(*document, "premium-usernames-v1")) { return 0 }
+        versions := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, versions, "min_supported", json.JsonNewInteger(*document, protocol.MinSupportedProtocol)) ||
+            !json.JsonSet(*document, versions, "latest", json.JsonNewInteger(*document, protocol.LatestProtocol)) { return 0 }
+        public: [65]u8
+        if sha.BytesToHex(*local.public[0], local.public.count, *public[0], public.count) != 1 ||
+            !fields.SetString(*document, root, "status", "ok") ||
+            !fields.SetString(*document, root, "node_id", TextView(local.id[:64])) ||
+            !fields.SetString(*document, root, "node_public_key", TextView(public[:64])) ||
+            !fields.SetString(*document, root, "node_name", name) ||
+            !fields.SetString(*document, root, "base_url", wire.TrimSpace(base)) ||
+            !fields.SetString(*document, root, "build_version", version.BuildVersion) ||
+            !json.JsonSet(*document, root, "known_nodes", json.JsonCopy(*document, knownPeers, knownPeers.root)) ||
+            !json.JsonSet(*document, root, "protocol", versions) || !json.JsonSet(*document, root, "capabilities", capabilities) ||
+            !json.JsonSet(*document, root, "usage", usage) || !json.JsonSet(*document, root, "storage", storage) { return 0 }
+        return replies.Reply(connection, verb, 200, *document, root, zstdResponses)
+    }
+
+    Metrics :: (connection: *void, database: *void, path: string, clients: hub.ConnectionStats,
+        counters: *http_metrics.Counters, rateLimited: s64) -> s32 {
+        document: json.JsonDocument
+        usage := json.JsonNewObject(*document)
+        storage := json.JsonNewObject(*document)
+        unused stats.Usage(database, clients.users, clients.clients, hub.ConnectionLimitPerUser, *document, usage)
+        unused stats.Storage(database, path, *document, storage)
+        body: Vec(u8)
+        if !metrics.Report(counters, *document, usage, storage, rateLimited, *body) { return 0 }
+        return transport.Write(connection, 200, "text/plain; version=0.0.4; charset=utf-8", VecSlice(body, 0, body.count))
+    }
+}

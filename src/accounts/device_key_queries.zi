@@ -1,0 +1,29 @@
+DeleteDeviceNoncesSQL :: "DELETE FROM server_device_registration_nonces WHERE created_at<?1";
+InsertDeviceNonceSQL :: "INSERT INTO server_device_registration_nonces(account_id,nonce,created_at) VALUES(?1,?2,?3) ON CONFLICT(account_id,nonce) DO NOTHING";
+RegisterDeviceSQL :: #string SQL_END
+
+INSERT INTO server_device_keys(account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at)
+VALUES(?1,?2,?3,?4,?5,?6,?6,'')
+ON CONFLICT(account_id,app_id,device_key_id) DO UPDATE SET
+ client_id=excluded.client_id,
+ public_key=excluded.public_key,
+ last_used_at=excluded.last_used_at
+WHERE server_device_keys.revoked_at=''
+SQL_END;
+RevokeAccountDeviceSQL :: #string SQL_END
+
+UPDATE server_device_keys SET revoked_at=?4
+WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
+SQL_END;
+ActiveAccountDeviceSQL :: #string SQL_END
+
+SELECT account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at
+FROM server_device_keys
+WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
+SQL_END;
+ListAccountDevicesSQL :: #string SQL_END
+
+SELECT account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at
+FROM server_device_keys WHERE account_id=?1 ORDER BY app_id,device_key_id
+SQL_END;
+DeviceClientSQL :: "SELECT client_id FROM server_device_keys WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3";

@@ -21,18 +21,16 @@ mesh :: #import "mesh";
 discovery :: #import "discovery";
 retention :: #import "retention";
 exchange_rates :: #import "exchange_rate";
-middleware :: #import "middleware";
+http_server :: #import "http_server";
 ctx :: #import "std/context_go";
 clock :: #import "std/time_go";
 net :: #import "std/net_go";
 selection :: #import "std/select_go";
-io :: #import "std/io_go";
 errors :: #import "std/errors_go";
 go_os :: #system_library "go:os";
 go_signal :: #system_library "go:os/signal";
 go_syscall :: #system_library "go:syscall";
 go_sync :: #system_library "go:sync";
-go_http :: #system_library "go:net/http";
 go_log :: #system_library "go:log";
 go_slog :: #system_library "go:log/slog";
 go_strings :: #system_library "go:strings";
@@ -40,7 +38,6 @@ go_net :: #system_library "go:net";
 go_format :: #system_library "go:fmt";
 builtin :: #system_library "go:builtin";
 
-HTTPServer :: #type #foreign go_http "Server";
 WorkerGroup :: #type #foreign go_sync "WaitGroup";
 Worker :: #type (server: *application.Server, context: ctx.Context) -> void;
 Workers :: struct {
@@ -53,12 +50,11 @@ Workers :: struct {
     referrals: Worker
 }
 VerifierFactory :: #type () -> verification.VerifierResult;
-Listen :: #type (server: *HTTPServer) -> Error;
-Shutdown :: #type (server: *HTTPServer, context: ctx.Context) -> Error;
+Listen :: #type (server: *http_server.HTTPServer) -> Error;
+Shutdown :: #type (server: *http_server.HTTPServer, context: ctx.Context) -> Error;
 
 #scope_file
 Signal :: #type #foreign go_os "Signal";
-Logger :: #type #foreign go_log "Logger";
 CancelCallback :: #type (callback: ctx.CancelFunc) -> void;
 CloseCallback :: #type (store: *storage.Store) -> void;
 WorkerTask :: struct {
@@ -68,7 +64,7 @@ WorkerTask :: struct {
     context: ctx.Context
 }
 ShutdownTask :: struct {
-    server: *HTTPServer
+    server: *http_server.HTTPServer
     context: ctx.Context
     shutdown: Shutdown
 }
@@ -94,21 +90,6 @@ LogError :: (message: string, key: string, error: Error) #foreign go_slog "Error
 LogSettled :: (message: string, accountsKey: string, accounts: s64, unitsKey: string, units: s64) #foreign go_slog "Info";
 LogListening :: (message: string, urlKey: string, url: string, addressKey: string, address: string,
     baseURLKey: string, baseURL: string, databaseKey: string, database: string) #foreign go_slog "Info";
-AllocateHTTP :: () -> *HTTPServer #foreign builtin "new";
-SetAddress :: (server: *HTTPServer, address: string) #go_field #foreign go_http "(*Server).Addr";
-SetHandler :: (server: *HTTPServer, handler: middleware.Handler) #go_field #foreign go_http "(*Server).Handler";
-SetReadHeaderTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).ReadHeaderTimeout";
-SetReadTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).ReadTimeout";
-SetWriteTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).WriteTimeout";
-SetIdleTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).IdleTimeout";
-SetMaxHeaderBytes :: (server: *HTTPServer, size: isize) #go_field #foreign go_http "(*Server).MaxHeaderBytes";
-SetErrorLog :: (server: *HTTPServer, logger: *Logger) #go_field #foreign go_http "(*Server).ErrorLog";
-StandardError :: () -> io.Writer #go_field #foreign go_os "Stderr";
-StandardLogFlags :: () -> isize #go_field #foreign go_log "LstdFlags";
-NewLogger :: (writer: io.Writer, prefix: string, flags: isize) -> *Logger #foreign go_log "New";
-ListenHTTP :: (server: *HTTPServer) -> Error #foreign go_http "(*Server).ListenAndServe";
-ShutdownHTTP :: (server: *HTTPServer, context: ctx.Context) -> Error #foreign go_http "(*Server).Shutdown";
-ServerClosed :: () -> Error #go_field #foreign go_http "ErrServerClosed";
 PrintRescale :: (format: string, status: string, factor: s64, accounts: s64, before: s64, after: s64,
     intents: s64, deposits: s64) #foreign go_format "Printf";
 PrintCheckpoint :: (format: string, sequence: s64, root: string) #foreign go_format "Printf";
@@ -146,14 +127,6 @@ StartWorker :: (group: *WorkerGroup, callback: Worker, server: *application.Serv
 
 RunShutdown :: (task: ShutdownTask) {
     ShutdownOnCancel(task.server, task.context, task.shutdown)
-}
-
-ListenNative :: (server: *HTTPServer) -> Error {
-    return ListenHTTP(server)
-}
-
-ShutdownNative :: (server: *HTTPServer, context: ctx.Context) -> Error {
-    return ShutdownHTTP(server, context)
 }
 
 RunInvoices :: (server: *application.Server, context: ctx.Context) {
@@ -230,22 +203,7 @@ StartWorkers :: (server: *application.Server, context: ctx.Context, group: *Work
     StartWorker(group, workers.rates, server, context)
 }
 
-NewHTTPServer :: (address: string, handler: middleware.Handler) -> *HTTPServer {
-    server := AllocateHTTP()
-    SetAddress(server, address)
-    SetHandler(server, handler)
-    SetReadHeaderTimeout(server, cast(clock.Duration)(5 * Second))
-    SetReadTimeout(server, cast(clock.Duration)(15 * Second))
-    SetWriteTimeout(server, cast(clock.Duration)(15 * Second))
-    SetIdleTimeout(server, cast(clock.Duration)(60 * Second))
-    // Mesh's headers are small; Go's 1 MiB default lets each request park
-    // large values in rate-limit and challenge keys.
-    SetMaxHeaderBytes(server, cast(isize)65536)
-    SetErrorLog(server, NewLogger(StandardError(), "http: ", StandardLogFlags()))
-    return server
-}
-
-ShutdownOnCancel :: (server: *HTTPServer, context: ctx.Context, shutdown: Shutdown) {
+ShutdownOnCancel :: (server: *http_server.HTTPServer, context: ctx.Context, shutdown: Shutdown) {
     cases: [1]selection.Case
     cases[0] = selection.Receive(ctx.Done(context))
     selection.Select(cases[:])
@@ -257,7 +215,7 @@ ShutdownOnCancel :: (server: *HTTPServer, context: ctx.Context, shutdown: Shutdo
     }
 }
 
-Serve :: (server: *HTTPServer, configuration: config.Config, context: ctx.Context,
+Serve :: (server: *http_server.HTTPServer, configuration: config.Config, context: ctx.Context,
     stop: ctx.CancelFunc, group: *WorkerGroup, listen: Listen, shutdown: Shutdown) {
     task: ShutdownTask
     task.server = server
@@ -267,7 +225,7 @@ Serve :: (server: *HTTPServer, configuration: config.Config, context: ctx.Contex
     LogListening("Mesh sync server listening", "url", LocalHTTPURL(configuration.Addr), "addr", configuration.Addr,
         "base_url", configuration.BaseURL, "db", configuration.DBPath)
     error := listen(server)
-    if error != null && error != ServerClosed() {
+    if error != null && error != http_server.Closed() {
         LogError("serve failed", "error", error)
     }
     ctx.Cancel(stop)
@@ -508,8 +466,8 @@ RunPrepared :: (configuration: config.Config, arguments: []string, createVerifie
     CancelAtReturn(ctx.Cancel, runtime.cancel)
     group: WorkerGroup
     StartWorkers(server, runtime.value, *group, NativeWorkers())
-    http := NewHTTPServer(configuration.Addr, application.Routes(server))
-    Serve(http, configuration, runtime.value, runtime.cancel, *group, ListenNative, ShutdownNative)
+    http := http_server.New(configuration.Addr, application.Routes(server))
+    Serve(http, configuration, runtime.value, runtime.cancel, *group, http_server.Listen, http_server.Shutdown)
 }
 
 #scope_export

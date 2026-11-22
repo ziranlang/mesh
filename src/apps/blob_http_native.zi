@@ -1,0 +1,267 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    scope :: #import "record_scope_native";
+    signed :: #import "signed_tx_native";
+    blob :: #import "blob_files_native";
+    blob_store :: #import "blob_store_native";
+    rules :: #import "blob_rules";
+    queries :: #import "blob_queries";
+    quota :: #import "storage_usage_rules";
+    allowance :: #import "storage_allowance_native";
+    digest :: #import "file_digest_native";
+    output :: #import "sync_response_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    sha :: #import "crypto/sha256";
+    json :: #import "std/json_document";
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    mutex :: #import "std/mutex_linux";
+    calendar :: #import "std/date_time_linux";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    #import "std/vec"
+
+    #scope_export
+    MaxBlobBytes :: rules.MaxBytes;
+
+    #scope_file
+    Prefix :: "/api/v1/blobs/";
+    PrivateCache :: "private, no-store";
+    Operation :: enum { Invalid; Get; Put; Delete; Trash; Restore; }
+
+    Address :: struct {
+        app: string
+        hash: string
+        action: string
+        valid: bool
+    }
+
+    Result :: struct {
+        status: u32
+        message: string
+        file: files.FileHandle
+        size: s64
+        used: s64
+        limit: s64
+    }
+
+    State :: struct {
+        size: s64
+        trashed: bool
+        found: bool
+        status: s32
+    }
+
+    StorageFailure :: () -> Result { return .{status = 500, message = "blob storage unavailable"} }
+    StoreFailure :: () -> Result { return .{status = 507, message = "could not store blob"} }
+    DeleteFailure :: () -> Result { return .{status = 507, message = "could not delete blob"} }
+    Missing :: () -> Result { return .{status = 404, message = "blob not found"} }
+
+    BlobAddress :: (path: string) -> Address {
+        app := wire.Cut(wire.TrimPrefix(path, Prefix), #char "/")
+        file := wire.Cut(app.after, #char "/")
+        if !app.found || !identity.ValidNamespace(app.before) || !rules.ValidHash(file.before) ||
+            (file.found && file.after != "trash" && file.after != "restore") { return .{} }
+        return .{app = app.before, hash = file.before, action = file.after, valid = true}
+    }
+
+    Requested :: (method: string, action: string) -> Operation {
+        if action != "" {
+            if method != "POST" { return .Invalid }
+            return ifx action == "trash" then .Trash else .Restore
+        }
+        if method == "GET" || method == "HEAD" { return .Get }
+        if method == "PUT" { return .Put }
+        if method == "DELETE" { return .Delete }
+        return .Invalid
+    }
+
+    MatchesHash :: (bytes: []u8, hash: string) -> bool {
+        computed := sha.Sha256Of(TextView(bytes))
+        encoded: [65]u8
+        return sha.BytesToHex(*computed[0], computed.count, *encoded[0], encoded.count) == 1 && TextView(encoded[:64]) == hash
+    }
+
+    CheckApplication :: (database: *void, app: string, now: s64) -> Result {
+        active := scope.Active(database, app, now + 1)
+        if active.status != sqlite.SQLITE_OK { return .{status = 500, message = "blob registry unavailable"} }
+        if active.error != "" { return .{status = 403, message = "active app required"} }
+        return .{}
+    }
+
+    BlobState :: (database: *void, arguments: []sql.Argument) -> State {
+        result := sql.Prepare(database, queries.BlobStateSQL, arguments)
+        if result.status != sqlite.SQLITE_OK { return .{status = result.status} }
+        defer sqlite.SqliteFinalize(result.value)
+        step := sqlite.SqliteStep(result.value)
+        if step == sqlite.SQLITE_DONE { return .{} }
+        if step != sqlite.SQLITE_ROW { return .{status = step} }
+        return .{found = true, size = sqlite.SqliteColumnInt64(result.value, 0),
+            trashed = sqlite.SqliteColumnInt64(result.value, 1) != 0}
+    }
+
+    Limit :: (settings: accounts.Configuration, user: string, now: s64, additional: s64) -> Result {
+        maximum := allowance.Allowance(settings.database, user, now, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if maximum.status != sqlite.SQLITE_OK { return .{status = 503, message = "storage unavailable"} }
+        if maximum.value <= 0 || additional <= 0 { return .{} }
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        used := sql.ReadInteger(settings.database, quota.UsageSQL, arguments[:])
+        if used.status != sqlite.SQLITE_OK { return StorageFailure() }
+        if !quota.RoomForPacking(used.value, maximum.value, additional) {
+            return .{status = 413, message = "account storage limit reached", used = used.value, limit = maximum.value}
+        }
+        return .{}
+    }
+
+    Committed :: (database: *void) -> bool { return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK }
+
+    Put :: (settings: accounts.Configuration, user: string, address: Address, bytes: []u8,
+        arguments: []sql.Argument, now: s64) -> Result {
+        existing := BlobState(settings.database, arguments[:3])
+        if existing.status != sqlite.SQLITE_OK { return StorageFailure() }
+        added := ifx !existing.found || existing.trashed then bytes.count else 0
+        limit := Limit(settings, user, now, added)
+        if limit.status != 0 { return limit }
+        opened := blob.Open(settings.path, user, address.app, true)
+        if !opened.handle.valid { return StoreFailure() }
+        defer files.CloseFile(opened.handle)
+        if sql.Execute(settings.database, queries.BlobRecordSQL, arguments) != sqlite.SQLITE_OK { return StoreFailure() }
+        status: s32
+        previous := tree.OpenChildRegularFile(opened.handle, address.hash, *status)
+        matches := previous.valid && digest.Matches(previous, bytes.count, address.hash)
+        if previous.valid { unused files.CloseFile(previous) }
+        if !matches && !blob.Save(opened.handle, address.hash, bytes) { return StoreFailure() }
+        if !Committed(settings.database) {
+            if status == blob.Missing { unused tree.RemoveChildFile(opened.handle, address.hash, true) }
+            return StoreFailure()
+        }
+        return .{status = 204}
+    }
+
+    Mark :: (settings: accounts.Configuration, user: string, operation: Operation, arguments: []sql.Argument, now: s64) -> Result {
+        stored := BlobState(settings.database, arguments[:3])
+        if stored.status != sqlite.SQLITE_OK { return StorageFailure() }
+        if !stored.found { return Missing() }
+        if operation == .Trash {
+            if sql.Execute(settings.database, queries.BlobTrashSQL, arguments) != sqlite.SQLITE_OK { return StorageFailure() }
+        } else if stored.trashed {
+            limit := Limit(settings, user, now, stored.size)
+            if limit.status != 0 { return limit }
+            if sql.Execute(settings.database, queries.BlobRestoreSQL, arguments[:3]) != sqlite.SQLITE_OK { return StorageFailure() }
+        }
+        if !Committed(settings.database) { return StorageFailure() }
+        return .{status = 204}
+    }
+
+    Delete :: (database: *void, opened: blob.Directory, hash: string, arguments: []sql.Argument) -> Result {
+        removed := blob_store.Delete(database, opened, hash, queries.BlobForgetSQL, arguments, false)
+        if removed == .FileError { return DeleteFailure() }
+        if removed != .Deleted { return StorageFailure() }
+        return .{status = 204}
+    }
+
+    Get :: (database: *void, directory: files.FileHandle, hash: string) -> Result {
+        if !directory.valid { return Missing() }
+        file := tree.OpenChildRegularFile(directory, hash)
+        if !file.valid { return Missing() }
+        size := files.FileSize(file)
+        if size < 0 || size > MaxBlobBytes || !digest.Matches(file, size, hash) {
+            unused files.CloseFile(file)
+            return .{status = 503, message = "blob integrity failure"}
+        }
+        if !Committed(database) {
+            unused files.CloseFile(file)
+            return StorageFailure()
+        }
+        return .{status = 200, file = file, size = size}
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    Apply :: (access: *accounts.AccountAccess, connection: *void, method: string, route: string,
+        bytes: []u8, overflow: bool) -> Result {
+        milliseconds := calendar.UnixMilliseconds()
+        if milliseconds < 0 || !mutex.Lock(*access.databaseLock) { return StorageFailure() }
+        defer mutex.Unlock(*access.databaseLock)
+        now := milliseconds / 1000
+        instant: time.TimestampValue = .{seconds = now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
+        audit: [31]u8
+        length := format.UTC(instant, audit[:])
+        if length == 0 { return StorageFailure() }
+        auditTime := TextView(audit[:length])
+        settings := access.configuration
+        database := settings.database
+        authenticated := auth.Authenticate(database, connection, settings.secret, now, auditTime, false)
+        if authenticated.status != 0 { return .{status = authenticated.status, message = authenticated.message} }
+        address := BlobAddress(route)
+        if !address.valid { return .{status = 400, message = "invalid blob address"} }
+        application := CheckApplication(database, address.app, now)
+        if application.status != 0 { return application }
+        operation := Requested(method, address.action)
+        if operation == .Invalid { return .{status = 405, message = "unsupported blob method"} }
+        if operation == .Put {
+            if overflow || bytes.count == 0 || bytes.count > MaxBlobBytes { return .{status = 413, message = "blob exceeds limit or is empty"} }
+            if !MatchesHash(bytes, address.hash) { return .{status = 400, message = "blob hash mismatch"} }
+        }
+        header := wire.TrimSpace(http.Header(connection, "X-Mesh-Tx"))
+        signer := address.app
+        transaction := signed.Read(ifx address.app == "entity" then header else "")
+        if address.app == "entity" && header != "" {
+            if !transaction.valid { return .{status = 400, message = "invalid signed transaction"} }
+            signer = wire.TrimSpace(TextView(transaction.app))
+            active := CheckApplication(database, signer, now)
+            if active.status != 0 { return active }
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return StorageFailure() }
+        defer Rollback(database)
+        user := TextView(authenticated.userID[:])
+        verified := signed.VerifyTx(database, settings.verify, header, user, signer, method, route, bytes, now, auditTime)
+        if verified.databaseError != sqlite.SQLITE_OK { return StorageFailure() }
+        if verified.status != 0 { return .{status = verified.status, message = verified.message} }
+        arguments: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(address.app), sql.TextArg(address.hash), sql.IntArg(now)]
+        if operation == .Put {
+            arguments[3] = sql.IntArg(bytes.count)
+            return Put(settings, user, address, bytes, arguments[:], now)
+        }
+        if operation == .Trash || operation == .Restore { return Mark(settings, user, operation, arguments[:], now) }
+        opened := blob.Open(settings.path, user, address.app, false)
+        if opened.handle.valid {
+            defer files.CloseFile(opened.handle)
+            if operation == .Delete { return Delete(database, opened, address.hash, arguments[:3]) }
+            return Get(database, opened.handle, address.hash)
+        }
+        if operation == .Delete { return Delete(database, opened, address.hash, arguments[:3]) }
+        return Missing()
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return wire.TrimPrefix(route, Prefix) != route }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, route: string,
+        bytes: []u8, overflow: bool) -> s32 {
+        result := Apply(access, connection, method, route, bytes, overflow)
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = PrivateCache}]
+        if result.file.valid {
+            return http.WriteFile(connection, 200, "application/octet-stream", result.file, result.size, headers[:])
+        }
+        if result.status == 204 {
+            empty: [0]u8
+            return http.WriteWithHeaders(connection, result.status, "", empty[:], headers[:])
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !output.TextField(*document, root, "error", result.message) { return 0 }
+        if result.limit > 0 && (!output.TextField(*document, root, "code", "storage_full") ||
+            !output.Storage(*document, root, result.used, result.limit)) { return 0 }
+        body: Vec(u8)
+        if !json.JsonWriteInto(*body, *document, root, json.JsonCompactStyle(false)) || !BuilderAppend(body, "\n") { return 0 }
+        return http.WriteWithHeaders(connection, result.status, "application/json", VecSlice(body, 0, body.count), headers[:])
+    }
+}

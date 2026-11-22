@@ -1,6 +1,7 @@
 // A bot menu rendezvous proves a numeric Telegram sender and possession of
 // separate delegate keys. It never creates an account, session or grant.
 #import "std/go_types"
+features :: #import "schema_features";
 authorization :: #import "authorization";
 session :: #import "session";
 telegram :: #import "telegram_init";
@@ -105,41 +106,6 @@ EntryRendezvous :: struct {
 #scope_export
 // The global digest table is shared with authorization rendezvous claims.
 // It has no request foreign key because bot entries precede owner approval.
-Schema :: #string SQL_ENTRY
-CREATE TABLE IF NOT EXISTS server_telegram_account_entries (
-    entry_id TEXT PRIMARY KEY,
-    mode TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    audience TEXT NOT NULL,
-    bot_id INTEGER NOT NULL,
-    telegram_id INTEGER NOT NULL,
-    challenge TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    account_id TEXT NOT NULL DEFAULT '',
-    client_id TEXT NOT NULL DEFAULT '',
-    signing_key TEXT NOT NULL DEFAULT '',
-    encryption_key TEXT NOT NULL DEFAULT '',
-    init_digest TEXT NOT NULL DEFAULT '',
-    verified_at INTEGER NOT NULL DEFAULT 0,
-    bound_at INTEGER NOT NULL DEFAULT 0,
-    consumed_at INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS server_telegram_account_entries_expiry
-ON server_telegram_account_entries(expires_at);
-CREATE TABLE IF NOT EXISTS server_telegram_init_replays (
-    digest TEXT PRIMARY KEY,
-    expires_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS server_telegram_entry_nonces (
-    entry_id TEXT NOT NULL REFERENCES server_telegram_account_entries(entry_id) ON DELETE CASCADE,
-    nonce TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    PRIMARY KEY(entry_id,nonce)
-);
-SQL_ENTRY;
-
 #scope_file
 RollbackAtReturn :: (transaction: *sql.Transaction) #go_defer #foreign native "(*Tx).Rollback";
 Join :: (values: []string, separator: string) -> string #foreign strings;
@@ -225,10 +191,6 @@ IssueTx :: (service: AccountEntries, transaction: *sql.Transaction, context: ctx
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return Schema
-}
-
 Environment :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.Request) {
     if !Guard(service, writer, request) {
         return
@@ -796,4 +758,9 @@ Rendezvous :: (service: AccountEntries, writer: http.ResponseWriter, request: *h
         return
     }
     response.JSON(writer, 200, result)
+}
+
+#scope_export
+SchemaSQL :: () -> string {
+    return features.TelegramAccountEntries
 }

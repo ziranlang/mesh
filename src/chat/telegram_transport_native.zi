@@ -1,0 +1,171 @@
+// Bounded Telegram Bot API transport, shared by callers that own their own authorization.
+#if TARGET == .C && OS == .LINUX {
+    constant :: #import "std/constant_time";
+    fields :: #import "sync_json_fields";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    limits :: #import "server_limits";
+    network :: #import "network_scope_native";
+    transfer :: #import "peer_http_native";
+    #import "std/vec"
+
+    Configuration :: struct {
+        token: string
+        endpoint: string
+    }
+
+    Receipt :: struct {
+        messageID: s64
+        errorCode: s64
+    }
+
+    DefaultEndpoint :: "https://api.telegram.org";
+
+    #scope_file
+    PathPart :: (value: string, token: bool) -> bool {
+        if value == "" {
+            return false
+        }
+        for byte: value {
+            alpha := (byte >= #char "A" && byte <= #char "Z") || (byte >= #char "a" && byte <= #char "z")
+            digit := byte >= #char "0" && byte <= #char "9"
+            if !alpha && !digit && !(token && (byte == #char ":" || byte == #char "-" || byte == #char "_")) {
+                return false
+            }
+        }
+        return true
+    }
+
+    SetChat :: (document: *json.JsonDocument, root: s32, chat: s64) -> bool {
+        return json.JsonSet(document, root, "chat_id", json.JsonNewInteger(document, chat))
+    }
+
+    #scope_export
+    BotID :: (token: string) -> s64 {
+        id: s64
+        digits: s64
+        for byte: token {
+            if byte == #char ":" {
+                return ifx digits > 0 then id else 0
+            }
+            if byte < #char "0" || byte > #char "9" {
+                return 0
+            }
+            digit := cast(s64)(byte - #char "0")
+            if id > (9223372036854775807 - digit) / 10 {
+                return 0
+            }
+            id = id * 10 + digit
+            digits += 1
+        }
+        return 0
+    }
+
+    TrustedWebhook :: (connection: *void, secret: string) -> bool {
+        if secret == "" {
+            return false
+        }
+        name := "X-Telegram-Bot-Api-Secret-Token"
+        joined: [limits.MaxHeaderBytes]u8
+        count := http.JoinHeader(connection, name, joined[:])
+        return count > 0 && constant.ConstantTimeTextEqual(TextView(joined[:count]), secret) &&
+            constant.ConstantTimeTextEqual(http.Header(connection, name), secret)
+    }
+
+    // Returns bounded response bytes and HTTP status. Callers validate the
+    // Bot API response and any fields they rely on.
+    Call :: (settings: Configuration, method: string, document: *json.JsonDocument, root: s32,
+        response: *transfer.Response, timeout: s64 = 10) -> bool {
+        if !PathPart(settings.token, true) || !PathPart(method, false) {
+            return false
+        }
+        body: Vec(u8)
+        path: Vec(u8)
+        if !json.JsonWriteInto(*body, document, root, json.JsonCompactStyle(false)) ||
+            !BuilderAppend(path, "/bot") || !BuilderAppend(path, settings.token) ||
+            !BuilderAppend(path, "/") || !BuilderAppend(path, method) {
+            return false
+        }
+        endpoint := ifx settings.endpoint != "" then settings.endpoint else DefaultEndpoint
+        scope: network.Scope
+        return transfer.Request(*scope, endpoint, TextView(VecSlice(path, 0, path.count)), VecSlice(body, 0, body.count),
+            .{timeout = timeout, maximum = 65536}, response)
+    }
+
+    Accepted :: (settings: Configuration, method: string, document: *json.JsonDocument, root: s32) -> bool {
+        response: transfer.Response
+        if !Call(settings, method, document, root, *response) || response.status != 200 {
+            return false
+        }
+        answer: json.JsonDocument
+        if !json.JsonRead(*answer, TextView(VecSlice(response.bytes, 0, response.bytes.count))) {
+            return false
+        }
+        accepted, valid := json.JsonBool(*answer, json.JsonMember(*answer, answer.root, "ok"))
+        return valid && accepted
+    }
+
+    Send :: (settings: Configuration, chat: s64, text: string, canvas: string) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !SetChat(*document, root, chat) || !fields.SetString(*document, root, "text", text) {
+            return false
+        }
+        if canvas != "" {
+            markup := json.JsonNewObject(*document)
+            keyboard := json.JsonNewArray(*document)
+            row := json.JsonNewArray(*document)
+            button := json.JsonNewObject(*document)
+            web := json.JsonNewObject(*document)
+            if !fields.SetString(*document, button, "text", "Open Inner Breeze") ||
+                !fields.SetString(*document, web, "url", canvas) || !json.JsonSet(*document, button, "web_app", web) ||
+                !json.JsonAppend(*document, row, button) || !json.JsonAppend(*document, keyboard, row) ||
+                !json.JsonSet(*document, markup, "inline_keyboard", keyboard) ||
+                !json.JsonSet(*document, root, "reply_markup", markup) {
+                return false
+            }
+        }
+        return Accepted(settings, "sendMessage", *document, root)
+    }
+
+    Typing :: (settings: Configuration, chat: s64) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        return SetChat(*document, root, chat) && fields.SetString(*document, root, "action", "typing") &&
+            Accepted(settings, "sendChatAction", *document, root)
+    }
+
+    AnswerCallback :: (settings: Configuration, id: string) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        return fields.SetString(*document, root, "callback_query_id", id) &&
+            Accepted(settings, "answerCallbackQuery", *document, root)
+    }
+
+    Reply :: (settings: Configuration, chat: s64, original: s64, thread: s64, text: string, allowWithoutReply: bool) -> Receipt {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        parameters := json.JsonNewObject(*document)
+        if !SetChat(*document, root, chat) || !fields.SetString(*document, root, "text", text) ||
+            !json.JsonSet(*document, parameters, "message_id", json.JsonNewInteger(*document, original)) ||
+            !json.JsonSet(*document, parameters, "allow_sending_without_reply", json.JsonNewBool(*document, allowWithoutReply)) ||
+            !json.JsonSet(*document, root, "reply_parameters", parameters) ||
+            (thread != 0 && !json.JsonSet(*document, root, "message_thread_id", json.JsonNewInteger(*document, thread))) {
+            return .{}
+        }
+        response: transfer.Response
+        if !Call(settings, "sendMessage", *document, root, *response) {
+            return .{}
+        }
+        answer: json.JsonDocument
+        if !json.JsonRead(*answer, TextView(VecSlice(response.bytes, 0, response.bytes.count))) {
+            return .{}
+        }
+        accepted, ok := json.JsonBool(*answer, json.JsonMember(*answer, answer.root, "ok"))
+        if !ok || !accepted || response.status != 200 {
+            return .{errorCode = fields.Number(*answer, json.JsonMember(*answer, answer.root, "error_code"))}
+        }
+        result := json.JsonMember(*answer, answer.root, "result")
+        return .{messageID = fields.Number(*answer, json.JsonMember(*answer, result, "message_id"))}
+    }
+}

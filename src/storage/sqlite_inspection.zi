@@ -1,0 +1,344 @@
+#if TARGET == .C {
+    sqlite :: #import "sqlite/SQLite";
+    bytes :: #import "std/byte_text_linux";
+    queries :: #import "inspect_queries";
+    storage_queries :: #import "storage_queries";
+    report :: #import "inspect_text";
+    habit_name :: #import "inspect_habit_name";
+    wire_text :: #import "wire_text";
+    text :: #import "std/text";
+    identity :: #import "identity";
+    #import "std/vec"
+
+    WriteReport :: #type (context: *void, text: string) -> bool;
+    #scope_file
+    SQLITE_NOTFOUND :: 12;
+    SQLITE_MISMATCH :: 20;
+    SQLITE_IOERR_WRITE :: 778;
+
+    ColumnText :: (statement: *void, column: s32) -> string {
+        value := sqlite.SqliteColumnText(statement, column)
+        size := sqlite.SqliteColumnBytes(statement, column)
+        return TextView(bytes.BytesFromPointer(value, cast(u64)size))
+    }
+
+    Statement :: struct {
+        handle: *void
+        code: s32
+    }
+
+    Numbers :: struct {
+        first: s64
+        second: s64
+        code: s32
+    }
+
+    Prepare :: (database: *void, query: string, id: string) -> Statement {
+        result: Statement
+        result.code = sqlite.SqlitePrepareText(database, query, -1, *result.handle, null)
+        if result.code == sqlite.SQLITE_OK && id != "" {
+            result.code = sqlite.SqliteBindTextString(result.handle, 1, id, cast(s32)id.count)
+            if result.code != sqlite.SQLITE_OK {
+                sqlite.SqliteFinalize(result.handle)
+                result.handle = null
+            }
+        }
+        return result
+    }
+
+    ReadNumbers :: (database: *void, query: string, id: string, payloadSum: bool) -> Numbers {
+        prepared := Prepare(database, query, id)
+        if prepared.code != sqlite.SQLITE_OK {
+            return .{code = prepared.code}
+        }
+        defer sqlite.SqliteFinalize(prepared.handle)
+        code := sqlite.SqliteStep(prepared.handle)
+        if code != sqlite.SQLITE_ROW {
+            return .{code = code}
+        }
+        if sqlite.SqliteColumnType(prepared.handle, 0) != sqlite.SQLITE_INTEGER {
+            return .{code = SQLITE_MISMATCH}
+        }
+        result: Numbers = .{first = sqlite.SqliteColumnInt64(prepared.handle, 0)}
+        if payloadSum && sqlite.SqliteColumnType(prepared.handle, 1) != sqlite.SQLITE_NULL {
+            if sqlite.SqliteColumnType(prepared.handle, 1) != sqlite.SQLITE_INTEGER {
+                return .{code = SQLITE_MISMATCH}
+            }
+            result.second = sqlite.SqliteColumnInt64(prepared.handle, 1)
+        }
+        return result
+    }
+
+    Emit :: (context: *void, write: WriteReport, line: Vec(u8)) -> s32 {
+        if line.count == 0 {
+            return sqlite.SQLITE_NOMEM
+        }
+        if !write(context, TextView(VecSlice(line, 0, line.count))) {
+            return SQLITE_IOERR_WRITE
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    WriteCounts :: (database: *void, context: *void, write: WriteReport, tables: []string, id: string, doctor: bool) -> s32 {
+        filter := ifx id == "" then "" else storage_queries.UserFilter
+        for table: tables {
+            query := storage_queries.CountQuery(table, filter)
+            sql := TextView(VecSlice(query, 0, query.count))
+            if sql == "" {
+                return sqlite.SQLITE_NOMEM
+            }
+            count := ReadNumbers(database, sql, id, false)
+            if count.code != sqlite.SQLITE_OK {
+                return count.code
+            }
+            code := Emit(context, write, report.CountLine(table, doctor, count.first))
+            if code != sqlite.SQLITE_OK {
+                return code
+            }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    Warnings :: (database: *void, context: *void, write: WriteReport, id: string) -> s32 {
+        legacy := ReadNumbers(database, queries.LegacyClientsQuery, id, false)
+        if legacy.code != sqlite.SQLITE_OK {
+            return legacy.code
+        }
+        payloads := ReadNumbers(database, queries.PayloadsQuery, id, true)
+        if payloads.code != sqlite.SQLITE_OK {
+            return payloads.code
+        }
+        snapshots := ReadNumbers(database, queries.FullSnapshotsQuery, id, false)
+        if snapshots.code != sqlite.SQLITE_OK {
+            return snapshots.code
+        }
+        output: Vec(u8)
+        report.AppendWarnings(*output, .{legacy_clients = legacy.first, queued_payloads = payloads.first,
+            payload_bytes = payloads.second, full_snapshots = snapshots.first})
+        return Emit(context, write, output)
+    }
+
+    FormattedRow :: struct {
+        bytes: Vec(u8)
+        code: s32
+    }
+
+    FormatRow :: #type (statement: *void) -> FormattedRow;
+
+    ClientRow :: (row: *void) -> FormattedRow {
+        if sqlite.SqliteColumnType(row, 0) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 1) != sqlite.SQLITE_INTEGER ||
+            sqlite.SqliteColumnType(row, 4) != sqlite.SQLITE_INTEGER ||
+            sqlite.SqliteColumnType(row, 5) != sqlite.SQLITE_INTEGER {
+            return .{code = SQLITE_MISMATCH}
+        }
+        return .{bytes = report.ClientLine(ColumnText(row, 0), sqlite.SqliteColumnInt64(row, 1), ColumnText(row, 2),
+            ColumnText(row, 3), sqlite.SqliteColumnInt64(row, 4), sqlite.SqliteColumnInt64(row, 5))}
+    }
+
+    AuditRow :: (row: *void) -> FormattedRow {
+        if sqlite.SqliteColumnType(row, 0) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 5) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 8) == sqlite.SQLITE_NULL {
+            return .{code = SQLITE_MISMATCH}
+        }
+        columns: [6]s32 = .[1, 2, 3, 4, 6, 7]
+        for column: columns {
+            if sqlite.SqliteColumnType(row, column) != sqlite.SQLITE_INTEGER {
+                return .{code = SQLITE_MISMATCH}
+            }
+        }
+        return .{bytes = report.AuditLine(ColumnText(row, 0), sqlite.SqliteColumnInt64(row, 1), sqlite.SqliteColumnInt64(row, 2),
+            sqlite.SqliteColumnInt64(row, 3), sqlite.SqliteColumnInt64(row, 4) != 0, ColumnText(row, 5),
+            sqlite.SqliteColumnInt64(row, 6) != 0, sqlite.SqliteColumnInt64(row, 7), ColumnText(row, 8))}
+    }
+
+    HabitRow :: (row: *void) -> FormattedRow {
+        if sqlite.SqliteColumnType(row, 0) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 1) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 5) == sqlite.SQLITE_NULL {
+            return .{code = SQLITE_MISMATCH}
+        }
+        for column: 2..4 {
+            if sqlite.SqliteColumnType(row, cast(s32)column) != sqlite.SQLITE_INTEGER {
+                return .{code = SQLITE_MISMATCH}
+            }
+        }
+        name := habit_name.Quote(ColumnText(row, 1))
+        return .{bytes = report.HabitLine(ColumnText(row, 0), TextView(VecSlice(name, 0, name.count)),
+            sqlite.SqliteColumnInt64(row, 2), sqlite.SqliteColumnInt64(row, 3), sqlite.SqliteColumnInt64(row, 4), ColumnText(row, 5))}
+    }
+
+    SessionRow :: (row: *void) -> FormattedRow {
+        if sqlite.SqliteColumnType(row, 0) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 1) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 3) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 6) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(row, 2) != sqlite.SQLITE_INTEGER ||
+            sqlite.SqliteColumnType(row, 4) != sqlite.SQLITE_INTEGER ||
+            sqlite.SqliteColumnType(row, 5) != sqlite.SQLITE_INTEGER {
+            return .{code = SQLITE_MISMATCH}
+        }
+        return .{bytes = report.SessionLine(ColumnText(row, 0), ColumnText(row, 1), sqlite.SqliteColumnInt64(row, 2),
+            ColumnText(row, 3), sqlite.SqliteColumnInt64(row, 4), sqlite.SqliteColumnInt64(row, 5), ColumnText(row, 6))}
+    }
+
+    WriteRows :: (database: *void, context: *void, write: WriteReport, query: string, id: string,
+        heading: string, format: FormatRow) -> s32 {
+        prepared := Prepare(database, query, id)
+        if prepared.code != sqlite.SQLITE_OK {
+            return prepared.code
+        }
+        defer sqlite.SqliteFinalize(prepared.handle)
+        if !write(context, heading) {
+            return SQLITE_IOERR_WRITE
+        }
+        code := sqlite.SqliteStep(prepared.handle)
+        while code == sqlite.SQLITE_ROW {
+            row := format(prepared.handle)
+            if row.code != sqlite.SQLITE_OK {
+                return row.code
+            }
+            written := Emit(context, write, row.bytes)
+            if written != sqlite.SQLITE_OK {
+                return written
+            }
+            code = sqlite.SqliteStep(prepared.handle)
+        }
+        return ifx code == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else code
+    }
+
+    WriteAccountHeader :: (database: *void, context: *void, write: WriteReport, id: string, full: bool, doctor: bool) -> s32 {
+        query := ifx doctor then queries.DoctorQuery else queries.UserQuery
+        prepared := Prepare(database, query, id)
+        if prepared.code != sqlite.SQLITE_OK {
+            return prepared.code
+        }
+        defer sqlite.SqliteFinalize(prepared.handle)
+        code := sqlite.SqliteStep(prepared.handle)
+        if code == sqlite.SQLITE_DONE {
+            return SQLITE_NOTFOUND
+        }
+        if code != sqlite.SQLITE_ROW {
+            return code
+        }
+        dateColumn: s32 = ifx doctor then 0 else 1
+        if sqlite.SqliteColumnType(prepared.handle, dateColumn) == sqlite.SQLITE_NULL ||
+            sqlite.SqliteColumnType(prepared.handle, dateColumn + 1) == sqlite.SQLITE_NULL {
+            return SQLITE_MISMATCH
+        }
+        created := ColumnText(prepared.handle, dateColumn)
+        seen := ColumnText(prepared.handle, dateColumn + 1)
+        if !doctor {
+            return Emit(context, write, report.UserHeader(id, ColumnText(prepared.handle, 0), created, seen, full))
+        }
+        version := ReadNumbers(database, queries.VersionQuery, id, false)
+        compacted := ReadNumbers(database, queries.CompactionQuery, id, false)
+        return Emit(context, write, report.DoctorHeader(id, full, created, seen, version.first, compacted.first))
+    }
+
+    AccountReport :: (database: *void, context: *void, write: WriteReport, userID: string, full: bool, doctor: bool) -> s32 {
+        if database == null {
+            return sqlite.SQLITE_MISUSE
+        }
+        value := wire_text.TrimSpace(userID)
+        idBytes: [64]u8
+        if value.count != idBytes.count {
+            return sqlite.SQLITE_MISUSE
+        }
+        index: s64 = 0
+        while index < idBytes.count {
+            idBytes[index] = text.LowerASCII(value[index])
+            index += 1
+        }
+        id := TextView(idBytes[:])
+        if !identity.ValidUserID(id) {
+            return sqlite.SQLITE_MISUSE
+        }
+        code := WriteAccountHeader(database, context, write, id, full, doctor)
+        if code != sqlite.SQLITE_OK {
+            return code
+        }
+        if !doctor {
+            tables := queries.UserTables()
+            code = WriteCounts(database, context, write, tables[:], id, false)
+            if code != sqlite.SQLITE_OK {
+                return code
+            }
+            code = WriteRows(database, context, write, queries.HabitsQuery, id, "\nHabits\n", HabitRow)
+            if code != sqlite.SQLITE_OK {
+                return code
+            }
+            return WriteRows(database, context, write, queries.SessionsQuery, id, "\nRecent sessions\n", SessionRow)
+        }
+        tables := queries.DoctorTables()
+        code = WriteCounts(database, context, write, tables[:], id, true)
+        if code != sqlite.SQLITE_OK {
+            return code
+        }
+        code = Warnings(database, context, write, id)
+        if code != sqlite.SQLITE_OK {
+            return code
+        }
+        code = WriteRows(database, context, write, queries.ClientsQuery, id, "\nClients\n", ClientRow)
+        if code != sqlite.SQLITE_OK {
+            return code
+        }
+        return WriteRows(database, context, write, queries.AuditQuery, id, "\nRecent sync audit\n", AuditRow)
+    }
+
+    #scope_export
+    // Callbacks receive borrowed report text valid for the duration of a write.
+    // The caller supplies an open database and retains ownership of its handle.
+    Summary :: (database: *void, context: *void, write: WriteReport) -> s32 {
+        if database == null {
+            return sqlite.SQLITE_MISUSE
+        }
+        if !write(context, "Mesh data summary\n") {
+            return SQLITE_IOERR_WRITE
+        }
+        tables := queries.SummaryTables()
+        return WriteCounts(database, context, write, tables[:], "", false)
+    }
+
+    Users :: (database: *void, context: *void, write: WriteReport, full: bool) -> s32 {
+        if database == null {
+            return sqlite.SQLITE_MISUSE
+        }
+        statement: *void = null
+        code := sqlite.SqlitePrepareText(database, queries.UsersQuery, -1, *statement, null)
+        if code != sqlite.SQLITE_OK {
+            return code
+        }
+        defer sqlite.SqliteFinalize(statement)
+        if !write(context, "Users\n") {
+            return SQLITE_IOERR_WRITE
+        }
+        code = sqlite.SqliteStep(statement)
+        while code == sqlite.SQLITE_ROW {
+            if sqlite.SqliteColumnType(statement, 0) == sqlite.SQLITE_NULL ||
+                sqlite.SqliteColumnType(statement, 2) == sqlite.SQLITE_NULL ||
+                sqlite.SqliteColumnType(statement, 3) == sqlite.SQLITE_NULL {
+                return SQLITE_MISMATCH
+            }
+            line := report.UserListLine(ColumnText(statement, 0), ColumnText(statement, 1),
+                ColumnText(statement, 2), ColumnText(statement, 3), full)
+            if !write(context, TextView(VecSlice(line, 0, line.count))) {
+                return SQLITE_IOERR_WRITE
+            }
+            code = sqlite.SqliteStep(statement)
+        }
+        if code == sqlite.SQLITE_DONE {
+            return sqlite.SQLITE_OK
+        }
+        return code
+    }
+
+    User :: (database: *void, context: *void, write: WriteReport, userID: string, full: bool) -> s32 {
+        return AccountReport(database, context, write, userID, full, false)
+    }
+
+    Doctor :: (database: *void, context: *void, write: WriteReport, userID: string, full: bool) -> s32 {
+        return AccountReport(database, context, write, userID, full, true)
+    }
+}

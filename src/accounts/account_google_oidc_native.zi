@@ -1,0 +1,310 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    calendar :: #import "std/date_time_linux";
+    clock :: #import "std/timer";
+    curl :: #import "std/net_http_curl_linux";
+    http :: #import "std/net_http";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    utf8 :: #import "std/utf8";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    MaxTokenBytes :: 4096;
+
+    Certificates :: struct {
+        url: Vec(u8)
+        response: Vec(u8)
+        received: s64
+        attempted: s64
+        tried: bool
+        lock: mutex.Mutex
+    }
+
+    Claims :: struct {
+        subject: Text
+        nonce: Text
+        valid: bool
+    }
+
+    #scope_file
+    GoogleCertificates :: "https://www.googleapis.com/oauth2/v1/certs";
+    MaximumCertificates :: 65536;
+    RefreshAfter :: 3600000;
+    StopTrustingAfter :: 86400000;
+    RetryAfter :: 60000;
+    ClockLeeway :: 60;
+
+    crypto :: #system_library "crypto";
+    OpenMemory :: (buffer: *u8, count: s32) -> *void #foreign crypto "BIO_new_mem_buf";
+    CloseMemory :: (buffer: *void) -> s32 #foreign crypto "BIO_free";
+    ReadCertificate :: (buffer: *void, output: **void, password: *void, context: *void) -> *void #foreign crypto "PEM_read_bio_X509";
+    FreeCertificate :: (certificate: *void) #foreign crypto "X509_free";
+    ReadKey :: (certificate: *void) -> *void #foreign crypto "X509_get_pubkey";
+    FreeKey :: (key: *void) #foreign crypto "EVP_PKEY_free";
+    KeyType :: (key: *void) -> s32 #foreign crypto "EVP_PKEY_get_base_id";
+    NewContext :: () -> *void #foreign crypto "EVP_MD_CTX_new";
+    FreeContext :: (context: *void) #foreign crypto "EVP_MD_CTX_free";
+    SHA256 :: () -> *void #foreign crypto "EVP_sha256";
+    VerifyInit :: (context: *void, keyContext: **void, digest: *void, engine: *void, key: *void) -> s32 #foreign crypto "EVP_DigestVerifyInit";
+    RSAPadding :: (context: *void, mode: s32) -> s32 #foreign crypto "EVP_PKEY_CTX_set_rsa_padding";
+    VerifyMessage :: (context: *void, signature: *u8, signatureBytes: usize, message: *u8, messageBytes: usize) -> s32 #foreign crypto "EVP_DigestVerify";
+    RSAKeyType :: 6;
+    PKCS1Padding :: 1;
+
+    LocalCertificateURL :: (url: string) -> bool {
+        if !http.HttpUrlValid(url) {
+            return false
+        }
+        address := wire.TrimPrefix(url, "http://127.0.0.1:")
+        if address.count == url.count {
+            return false
+        }
+        port := wire.Cut(address, #char "/")
+        if !port.found || port.before.count < 1 || port.before.count > 5 {
+            return false
+        }
+        number: s64 = 0
+        for byte: port.before {
+            if byte < #char "0" || byte > #char "9" {
+                return false
+            }
+            number = number * 10 + cast(s64)(byte - #char "0")
+        }
+        return number > 0 && number <= 65535
+    }
+
+    Object :: (document: *json.JsonDocument, bytes: string) -> bool {
+        if !utf8.Valid(bytes) || !json.JsonRead(document, bytes) || json.JsonKindOf(document, document.root) != .Object {
+            return false
+        }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            if json.JsonMember(document, document.root, TextView(name)) != node {
+                return false
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    FindCertificate :: (store: *Certificates, key: string, now: s64) -> Text {
+        if store.response.count == 0 || now - store.received > StopTrustingAfter {
+            return .{}
+        }
+        document: json.JsonDocument
+        source := TextView(VecSlice(store.response, 0, store.response.count))
+        if !json.JsonRead(*document, source) {
+            return .{}
+        }
+        return json.JsonString(*document, json.JsonMember(*document, document.root, key))
+    }
+
+    Refresh :: (store: *Certificates) {
+        output: [MaximumCertificates + 1]u8
+        request: http.HttpRequest = .{method = "GET", url = TextView(VecSlice(store.url, 0, store.url.count)), accept = "application/json"}
+        response := curl.SendCurlDirectWithin(request, output[:], 10000)
+        if response.problem != .None || response.status != 200 || response.length <= 0 || response.length > MaximumCertificates {
+            return
+        }
+        document: json.JsonDocument
+        text := TextView(output[:response.length])
+        if !Object(*document, text) || json.JsonCount(*document, document.root) == 0 {
+            return
+        }
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            if json.JsonKindOf(*document, node) != .String {
+                return
+            }
+            node = json.JsonNext(*document, node)
+        }
+        bytes: Vec(u8)
+        if !BuilderAppend(bytes, text) || !mutex.Lock(*store.lock) {
+            return
+        }
+        defer mutex.Unlock(*store.lock)
+        VecSwap(bytes, store.response)
+        store.received = clock.MonotonicMilliseconds()
+    }
+
+    // One request refreshes a trusted endpoint outside the cache mutex.
+    // During a provider outage, the last usable set expires after one day.
+    CertificateFor :: (store: *Certificates, key: string) -> Text {
+        now := clock.MonotonicMilliseconds()
+        if now < 0 || !mutex.Lock(*store.lock) {
+            return .{}
+        }
+        age := now - store.received
+        cached: Text = FindCertificate(store, key, now)
+        refresh := (!store.tried || now - store.attempted >= RetryAfter) &&
+            (TextView(cached) == "" || age > RefreshAfter)
+        if refresh {
+            store.tried = true
+            store.attempted = now
+        }
+        unused mutex.Unlock(*store.lock)
+        if !refresh {
+            return cached
+        }
+        Refresh(store)
+        if !mutex.Lock(*store.lock) {
+            return .{}
+        }
+        defer mutex.Unlock(*store.lock)
+        return FindCertificate(store, key, clock.MonotonicMilliseconds())
+    }
+
+    SignatureValid :: (certificate: string, signed: []u8, signature: []u8) -> bool {
+        if certificate == "" || signed.count == 0 || signature.count == 0 {
+            return false
+        }
+        certificateBytes: Vec(u8)
+        if !BuilderAppend(certificateBytes, certificate) {
+            return false
+        }
+        pem := VecSlice(certificateBytes, 0, certificateBytes.count)
+        buffer := OpenMemory(*pem[0], cast(s32)pem.count)
+        if buffer == null {
+            return false
+        }
+        defer CloseMemory(buffer)
+        parsed := ReadCertificate(buffer, null, null, null)
+        if parsed == null {
+            return false
+        }
+        defer FreeCertificate(parsed)
+        key := ReadKey(parsed)
+        if key == null {
+            return false
+        }
+        defer FreeKey(key)
+        if KeyType(key) != RSAKeyType {
+            return false
+        }
+        context := NewContext()
+        if context == null {
+            return false
+        }
+        defer FreeContext(context)
+        keyContext: *void
+        if VerifyInit(context, *keyContext, SHA256(), null, key) != 1 || keyContext == null ||
+            RSAPadding(keyContext, PKCS1Padding) <= 0 {
+            return false
+        }
+        return VerifyMessage(context, *signature[0], cast(usize)signature.count, *signed[0], cast(usize)signed.count) == 1
+    }
+
+    AudienceAllowed :: (clientIDs: string, audience: string) -> bool {
+        if audience == "" {
+            return false
+        }
+        remaining := clientIDs
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            if wire.TrimSpace(item.before) == audience {
+                return true
+            }
+            remaining = item.after
+        }
+        return false
+    }
+
+    ReadClaims :: (payload: string, clientIDs: string) -> Claims {
+        document: json.JsonDocument
+        if !Object(*document, payload) {
+            return .{}
+        }
+        root := document.root
+        issuer: Text = json.JsonString(*document, json.JsonMember(*document, root, "iss"))
+        audience: Text = json.JsonString(*document, json.JsonMember(*document, root, "aud"))
+        subject: Text = json.JsonString(*document, json.JsonMember(*document, root, "sub"))
+        nonceNode := json.JsonMember(*document, root, "nonce")
+        nonceKind := json.JsonKindOf(*document, nonceNode)
+        expires, hasExpiry := json.JsonInteger(*document, json.JsonMember(*document, root, "exp"))
+        issuedNode := json.JsonMember(*document, root, "iat")
+        issued, hasIssued := json.JsonInteger(*document, issuedNode)
+        issuedKind := json.JsonKindOf(*document, issuedNode)
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || (TextView(issuer) != "https://accounts.google.com" && TextView(issuer) != "accounts.google.com") ||
+            !AudienceAllowed(clientIDs, TextView(audience)) || TextView(subject) == "" ||
+            !hasExpiry || expires < now - ClockLeeway ||
+            (!hasIssued && issuedKind != .Missing && issuedKind != .Null) || issued > now + ClockLeeway ||
+            (nonceKind != .Missing && nonceKind != .Null && nonceKind != .String) {
+            return .{}
+        }
+        // The provider's signed subject is the identity. Email is neither
+        // used as an account key nor persisted by the recovery protocol.
+        nonce: Text = json.JsonString(*document, nonceNode)
+        return .{subject = subject, nonce = nonce, valid = true}
+    }
+
+    #scope_export
+    Open :: (store: *Certificates, fixtureURL: string) -> bool {
+        if fixtureURL != "" && !LocalCertificateURL(fixtureURL) {
+            return false
+        }
+        url := ifx fixtureURL == "" then GoogleCertificates else fixtureURL
+        copied: Vec(u8)
+        if !BuilderAppend(copied, url) || !mutex.Open(*store.lock) {
+            return false
+        }
+        VecSwap(store.url, copied)
+        return true
+    }
+
+    Close :: (store: *Certificates) {
+        unused mutex.Close(*store.lock)
+        VecFree(store.response)
+        VecFree(store.url)
+    }
+
+    FirstClientID :: (clientIDs: string) -> string {
+        remaining := clientIDs
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            trimmed := wire.TrimSpace(item.before)
+            if trimmed != "" {
+                return trimmed
+            }
+            remaining = item.after
+        }
+        return ""
+    }
+
+    Verify :: (store: *Certificates, clientIDs: string, token: string) -> Claims {
+        if token.count == 0 || token.count > MaxTokenBytes {
+            return .{}
+        }
+        first := wire.Cut(token, #char ".")
+        second := wire.Cut(first.after, #char ".")
+        if !first.found || !second.found {
+            return .{}
+        }
+        head := binary.DecodeBase64(first.before, true, false)
+        payload := binary.DecodeBase64(second.before, true, false)
+        signature := binary.DecodeBase64(second.after, true, false)
+        if head.error != "" || payload.error != "" || signature.error != "" || signature.value.count == 0 {
+            return .{}
+        }
+        document: json.JsonDocument
+        if !Object(*document, TextView(VecSlice(head.value, 0, head.value.count))) {
+            return .{}
+        }
+        algorithm: Text = json.JsonString(*document, json.JsonMember(*document, document.root, "alg"))
+        key: Text = json.JsonString(*document, json.JsonMember(*document, document.root, "kid"))
+        if TextView(algorithm) != "RS256" || TextView(key) == "" {
+            return .{}
+        }
+        signed: Vec(u8)
+        if !BuilderAppend(signed, token[:first.before.count + 1 + second.before.count]) {
+            return .{}
+        }
+        certificate: Text = CertificateFor(store, TextView(key))
+        if !SignatureValid(TextView(certificate), VecSlice(signed, 0, signed.count), VecSlice(signature.value, 0, signature.value.count)) {
+            return .{}
+        }
+        return ReadClaims(TextView(VecSlice(payload.value, 0, payload.value.count)), clientIDs)
+    }
+}

@@ -1,0 +1,261 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    IssuerID :: "waozi";
+    AssetID :: "waozi:token";
+    SumSQL :: "SELECT COALESCE(SUM(amount_delta),0) FROM token_ledger WHERE account_id=?1 AND asset_id=?2 AND (?3='' OR app_id=?3)";
+    PoolsSQL :: #string SQL
+WITH total AS (
+    SELECT COALESCE(SUM(amount_delta),0) AS units FROM token_ledger
+    WHERE account_id=?1 AND asset_id=?2 AND receipt_id<>?4
+), pools AS (
+    SELECT COALESCE(SUM(CASE WHEN app_id<>'' THEN remaining ELSE 0 END),0) AS scoped,
+           COALESCE(SUM(CASE WHEN app_id<>'' AND app_id=?3 THEN remaining ELSE 0 END),0) AS matching
+    FROM token_allocations WHERE account_id=?1 AND asset_id=?2
+)
+SELECT total.units,pools.scoped,total.units-pools.scoped,
+       MAX(total.units-pools.scoped,0)+MAX(pools.matching,0)
+FROM total,pools
+SQL;
+
+    #scope_file
+    ListSQL :: #string SQL
+SELECT receipt_id,issuer_id,asset_id,account_id,app_id,event_type,amount_delta,ledger_seq,
+       previous_hash,event_hash,created_at,source_type,source_ref,signature
+FROM token_ledger WHERE account_id=?1 AND asset_id=?2 AND ledger_seq>?3 AND (?4='' OR app_id=?4)
+ORDER BY ledger_seq LIMIT ?5
+SQL;
+    ActivitySQL :: #string SQL
+SELECT l.receipt_id,l.event_type,l.app_id,l.amount_delta,l.ledger_seq,l.created_at,l.source_type,l.source_ref,
+       d.tx_id,d.amount_atomic,d.usd_cents,d.usd_updated_at,d.usd_sources
+FROM token_ledger l LEFT JOIN monero_deposits d ON d.receipt_id=l.receipt_id
+WHERE l.account_id=?1 AND l.asset_id=?2 AND l.ledger_seq<?3 ORDER BY l.ledger_seq DESC LIMIT ?4
+SQL;
+    ReceiptSQL :: #string SQL
+SELECT receipt_id,issuer_id,asset_id,account_id,app_id,event_type,amount_delta,ledger_seq,
+       previous_hash,event_hash,created_at,source_type,source_ref,signature
+FROM token_ledger WHERE receipt_id=?1
+SQL;
+    CheckpointSQL :: #string SQL
+SELECT ledger_seq,issuer_id,asset_id,ledger_root,signature,created_at
+FROM token_checkpoints ORDER BY ledger_seq DESC LIMIT 1
+SQL;
+
+    #scope_export
+    PutText :: (document: *json.JsonDocument, root: s32, key: string, value: string, optional: bool = false) -> bool {
+        return (optional && value == "") || json.JsonSet(document, root, key, json.JsonNewStringCopy(document, value))
+    }
+
+    PutInt :: (document: *json.JsonDocument, root: s32, key: string, value: s64, optional: bool = false) -> bool {
+        return (optional && value == 0) || json.JsonSet(document, root, key, json.JsonNewInteger(document, value))
+    }
+
+    Pools :: struct {
+        scoped: s64
+        shared: s64
+        spendable: s64
+        ok: bool
+    }
+
+    ReadPools :: (database: *void, account: string, app: string) -> Pools {
+        arguments: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(AssetID), sql.TextArg(app), sql.TextArg("")]
+        row := sql.Prepare(database, PoolsSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        // A SQLite expression overflowing int64 may produce REAL. Go's integer scan rejects it.
+        for index: 0..3 {
+            if sqlite.SqliteColumnType(row.value, cast(s32)index) != sqlite.SQLITE_INTEGER {
+                return .{}
+            }
+        }
+        return .{scoped = sqlite.SqliteColumnInt64(row.value, 1), shared = sqlite.SqliteColumnInt64(row.value, 2),
+            spendable = sqlite.SqliteColumnInt64(row.value, 3), ok = true}
+    }
+
+    Balance :: (database: *void, account: string, app: string = "") -> sql.IntegerResult {
+        arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(AssetID), sql.TextArg(app)]
+        row := sql.Prepare(database, SumSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = row.status}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status != sqlite.SQLITE_ROW {
+            return .{status = status}
+        }
+        if sqlite.SqliteColumnType(row.value, 0) != sqlite.SQLITE_INTEGER {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        return .{found = true, value = sqlite.SqliteColumnInt64(row.value, 0)}
+    }
+
+    BalanceObject :: (database: *void, account: string, app: string, document: *json.JsonDocument) -> s32 {
+        amount := Balance(database, account, app)
+        pools := ReadPools(database, account, app)
+        root := json.JsonNewObject(document)
+        if !amount.found || !pools.ok || !PutText(document, root, "account_id", account) ||
+            !PutText(document, root, "asset_id", AssetID) || !PutText(document, root, "app_id", app, true) ||
+            !PutInt(document, root, "balance", amount.value) || !PutInt(document, root, "shared_balance", pools.shared, true) ||
+            !PutInt(document, root, "scoped_balance", pools.scoped, true) || !PutInt(document, root, "spendable_balance", pools.spendable, true) {
+            return -1
+        }
+        return root
+    }
+
+    #scope_file
+    FieldKind :: enum { RequiredText; OptionalText; Integer; }
+    Field :: struct {
+        name: string
+        kind: FieldKind
+    }
+    RowObject :: (document: *json.JsonDocument, row: *void, fields: []Field) -> s32 {
+        item := json.JsonNewObject(document)
+        for field, index: fields {
+            column := cast(s32)index
+            kind := sqlite.SqliteColumnType(row, column)
+            if field.kind == .Integer {
+                if kind != sqlite.SQLITE_INTEGER || !PutInt(document, item, field.name, sqlite.SqliteColumnInt64(row, column)) {
+                    return -1
+                }
+            } else if kind == sqlite.SQLITE_NULL || !PutText(document, item, field.name,
+                sql.ColumnText(row, column), field.kind == .OptionalText) {
+                return -1
+            }
+        }
+        return item
+    }
+
+    Assets :: (document: *json.JsonDocument, row: *void) -> s32 {
+        fields: [5]Field = .[.{"issuer_id", .RequiredText}, .{"asset_id", .RequiredText}, .{"display_name", .RequiredText},
+            .{"decimals", .Integer}, .{"status", .RequiredText}]
+        return RowObject(document, row, fields[:])
+    }
+
+    #scope_export
+    ReceiptRow :: (document: *json.JsonDocument, row: *void) -> s32 {
+        fields: [14]Field = .[.{"receipt_id", .RequiredText}, .{"issuer_id", .RequiredText}, .{"asset_id", .RequiredText}, .{"account_id", .RequiredText},
+            .{"app_id", .OptionalText}, .{"event_type", .RequiredText}, .{"amount_delta", .Integer}, .{"ledger_seq", .Integer},
+            .{"previous_hash", .RequiredText}, .{"event_hash", .RequiredText}, .{"created_at", .RequiredText}, .{"source_type", .RequiredText},
+            .{"source_ref", .RequiredText}, .{"signature", .RequiredText}]
+        return RowObject(document, row, fields[:])
+    }
+
+    #scope_file
+    Activity :: (document: *json.JsonDocument, row: *void) -> s32 {
+        fields: [8]Field = .[.{"receipt_id", .RequiredText}, .{"event_type", .RequiredText}, .{"app_id", .OptionalText},
+            .{"amount_delta", .Integer}, .{"seq", .Integer}, .{"created_at", .RequiredText}, .{"source_type", .RequiredText}, .{"source_ref", .OptionalText}]
+        item := RowObject(document, row, fields[:])
+        if item < 0 || sqlite.SqliteColumnType(row, 8) == sqlite.SQLITE_NULL {
+            return item
+        }
+        monero := json.JsonNewObject(document)
+        if !PutText(document, monero, "tx_id", sql.ColumnText(row, 8), true) ||
+            !PutInt(document, monero, "amount_atomic", sqlite.SqliteColumnInt64(row, 9)) ||
+            !PutInt(document, monero, "usd_cents", sqlite.SqliteColumnInt64(row, 10), true) ||
+            !PutInt(document, monero, "usd_rate_time", sqlite.SqliteColumnInt64(row, 11), true) ||
+            !PutText(document, monero, "usd_sources", sql.ColumnText(row, 12), true) || !json.JsonSet(document, item, "monero", monero) {
+            return -1
+        }
+        return item
+    }
+
+    Checkpoint :: (document: *json.JsonDocument, row: *void) -> s32 {
+        fields: [6]Field = .[.{"ledger_seq", .Integer}, .{"issuer_id", .RequiredText}, .{"asset_id", .RequiredText},
+            .{"ledger_root", .RequiredText}, .{"signature", .RequiredText}, .{"created_at", .RequiredText}]
+        return RowObject(document, row, fields[:])
+    }
+
+    Serializer :: #type (document: *json.JsonDocument, row: *void) -> s32;
+    List :: (database: *void, query: string, arguments: []sql.Argument, document: *json.JsonDocument,
+        serialize: Serializer) -> s32 {
+        row := sql.Prepare(database, query, arguments)
+        if row.status != sqlite.SQLITE_OK {
+            return -1
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE {
+            return json.JsonNewNull(document)
+        }
+        array := json.JsonNewArray(document)
+        while step == sqlite.SQLITE_ROW {
+            item := serialize(document, row.value)
+            if item < 0 || !json.JsonAppend(document, array, item) {
+                return -1
+            }
+            step = sqlite.SqliteStep(row.value)
+        }
+        return ifx step == sqlite.SQLITE_DONE then array else -1
+    }
+
+    #scope_export
+    Single :: struct {
+        node: s32
+        status: u32
+    }
+
+    #scope_file
+    ReadSingle :: (database: *void, query: string, arguments: []sql.Argument, document: *json.JsonDocument,
+        serialize: Serializer) -> Single {
+        row := sql.Prepare(database, query, arguments)
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = 500}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE {
+            return .{status = 404}
+        }
+        if step != sqlite.SQLITE_ROW {
+            return .{status = 500}
+        }
+        item := serialize(document, row.value)
+        return .{node = item, status = ifx item < 0 then 500 else 200}
+    }
+
+    #scope_export
+    AssetsObject :: (database: *void, document: *json.JsonDocument) -> s32 {
+        root := json.JsonNewObject(document)
+        arguments: []sql.Argument
+        items := List(database, "SELECT issuer_id,asset_id,display_name,decimals,status FROM token_assets ORDER BY issuer_id,asset_id",
+            arguments, document, Assets)
+        return ifx items >= 0 && json.JsonSet(document, root, "assets", items) then root else -1
+    }
+
+    LedgerObject :: (database: *void, account: string, app: string, since: s64, limit: s64, document: *json.JsonDocument) -> s32 {
+        root := json.JsonNewObject(document)
+        arguments: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(AssetID), sql.IntArg(since), sql.TextArg(app), sql.IntArg(limit)]
+        items := List(database, ListSQL, arguments[:], document, ReceiptRow)
+        return ifx items >= 0 && json.JsonSet(document, root, "events", items) then root else -1
+    }
+
+    ActivityObject :: (database: *void, account: string, before: s64, limit: s64, document: *json.JsonDocument) -> s32 {
+        root := json.JsonNewObject(document)
+        arguments: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(AssetID), sql.IntArg(before), sql.IntArg(limit)]
+        events := List(database, ActivitySQL, arguments[:], document, Activity)
+        amount := Balance(database, account)
+        if events < 0 || !amount.found || !PutText(document, root, "account_id", account) || !PutText(document, root, "asset_id", AssetID) ||
+            !PutInt(document, root, "balance", amount.value) || !json.JsonSet(document, root, "events", events) {
+            return -1
+        }
+        return root
+    }
+
+    Receipt :: (database: *void, id: string, document: *json.JsonDocument) -> Single {
+        arguments: [1]sql.Argument = .[sql.TextArg(id)]
+        return ReadSingle(database, ReceiptSQL, arguments[:], document, ReceiptRow)
+    }
+
+    Latest :: (database: *void, document: *json.JsonDocument) -> Single {
+        arguments: []sql.Argument
+        return ReadSingle(database, CheckpointSQL, arguments, document, Checkpoint)
+    }
+}

@@ -1,0 +1,120 @@
+#if TARGET == .C && OS == .LINUX {
+    keys :: #import "device_signature_native";
+    binary :: #import "binary_codec";
+    environment :: #import "std/environment_linux";
+    file :: #import "std/file_linux";
+    file_tree :: #import "std/file_tree_linux";
+    random :: #import "std/random_linux";
+    secure :: #import "std/constant_time";
+    text :: #import "std/text_tools";
+    wire :: #import "wire_text";
+    sha :: #import "crypto/sha256";
+    oqs :: #import "oqs/Oqs";
+    #import "std/vec"
+
+    Identity :: struct {
+        seed: [32]u8
+        public: [32]u8
+        id: [65]u8
+    }
+
+    #scope_file
+    // This reads only bounded hexadecimal configuration files. The caller owns
+    // the scratch bytes so private key input can be cleansed at the call site.
+    ReadHex :: (path: string, scratch: []u8) -> binary.BinaryBytes {
+        if path == "" || file_tree.PathStatus(path).kind != .File { return .{} }
+        opened := file.OpenRead(path)
+        if !opened.valid { return .{} }
+        defer file.CloseFile(opened)
+        size := file.FileSize(opened)
+        if size <= 0 || size > scratch.count || file.ReadAt(opened, scratch[:size], 0) != size { return .{} }
+        raw := wire.TrimSpace(TextView(scratch[:size]))
+        if raw == "" || raw.count % 2 != 0 || !binary.IsHex(raw) { return .{} }
+        return binary.DecodeBinaryField(raw)
+    }
+
+    EnsureParents :: (path: string) -> bool {
+        for byte, index: path {
+            if byte == #char "/" && index > 0 && !file.CreatePrivateDirectory(path[:index]) { return false }
+        }
+        return true
+    }
+
+    MakeKey :: (path: string) -> bool {
+        if !EnsureParents(path) { return false }
+        privateBytes: [64]u8
+        encoded: [129]u8
+        defer { oqs.Cleanse(privateBytes[:]); oqs.Cleanse(encoded[:]) }
+        if !random.FillSecure(privateBytes[:32]) || !keys.DerivePublic(privateBytes[:32], privateBytes[32:]) ||
+            sha.BytesToHex(*privateBytes[0], privateBytes.count, *encoded[0], encoded.count) != 1 { return false }
+        encoded[128] = 10
+        suffix: [12]u8
+        suffixHex: [25]u8
+        if !random.FillSecure(suffix[:]) || sha.BytesToHex(*suffix[0], suffix.count, *suffixHex[0], suffixHex.count) != 1 { return false }
+        temporary: Vec(u8)
+        if !BuilderAppend(temporary, path) || !BuilderAppend(temporary, ".tmp.") ||
+            !BuilderAppend(temporary, TextView(suffixHex[:24])) { return false }
+        staged := TextView(VecSlice(temporary, 0, temporary.count))
+        opened := file.OpenExclusivePrivate(staged)
+        if !opened.valid { return false }
+        defer file.RemoveFile(staged)
+        written := file.WriteAt(opened, encoded[:], 0) == encoded.count && file.SyncFile(opened)
+        closed := file.CloseFile(opened)
+        if !written || !closed { return false }
+        // The first concurrent startup establishes the key. A second startup
+        // loads the winning key without replacing the installed identity.
+        return file.LinkFile(staged, path) || file_tree.PathStatus(path).kind == .File
+    }
+
+    LoadSeed :: (key: []u8, identity: *Identity) -> bool {
+        if key.count != 32 && key.count != 64 { return false }
+        if !keys.DerivePublic(key[:32], identity.public[:]) { return false }
+        if key.count == 64 && !secure.ConstantTimeEqual(identity.public[:], key[32:]) { return false }
+        for index: 0..31 { identity.seed[index] = key[index] }
+        return true
+    }
+
+    SetID :: (identity: *Identity) -> bool {
+        public := identity.public
+        digest := sha.Sha256Of(TextView(public[:]))
+        return sha.BytesToHex(*digest[0], digest.count, *identity.id[0], identity.id.count) == 1
+    }
+
+    #scope_export
+    HexSetting :: (key: string, fileKey: string) -> binary.BinaryBytes {
+        raw := wire.TrimSpace(environment.EnvironmentText(key))
+        if raw != "" && raw.count % 2 == 0 && binary.IsHex(raw) { return binary.DecodeBinaryField(raw) }
+        scratch: [4096]u8
+        defer oqs.Cleanse(scratch[:])
+        return ReadHex(wire.TrimSpace(environment.EnvironmentText(fileKey)), scratch[:])
+    }
+
+    LoadFile :: (path: string, identity: *Identity) -> bool {
+        // An existing invalid file must keep its contents for recovery.
+        if file_tree.PathQuery(path).missing && !MakeKey(path) { return false }
+        scratch: [4096]u8
+        defer oqs.Cleanse(scratch[:])
+        key := ReadHex(path, scratch[:])
+        defer oqs.Cleanse(VecSlice(key.value, 0, key.value.count))
+        return LoadSeed(VecSlice(key.value, 0, key.value.count), identity) && SetID(identity)
+    }
+
+    // A single canonical node-key format is shared with the released server.
+    Load :: (databasePath: string, identity: *Identity) -> bool {
+        configured := HexSetting("MESH_NODE_IDENTITY_PRIVATE_KEY_HEX", "MESH_NODE_IDENTITY_PRIVATE_KEY_HEX_FILE")
+        defer oqs.Cleanse(VecSlice(configured.value, 0, configured.value.count))
+        if configured.error != "" { return false }
+        if configured.value.count != 0 {
+            if !LoadSeed(VecSlice(configured.value, 0, configured.value.count), identity) { return false }
+        } else {
+            path := wire.TrimSpace(environment.EnvironmentText("MESH_NODE_IDENTITY_KEY_FILE"))
+            defaultPath: Vec(u8)
+            if path == "" {
+                if !BuilderAppend(defaultPath, databasePath) || !BuilderAppend(defaultPath, ".node-key") { return false }
+                path = TextView(VecSlice(defaultPath, 0, defaultPath.count))
+            }
+            return LoadFile(path, identity)
+        }
+        return SetID(identity)
+    }
+}

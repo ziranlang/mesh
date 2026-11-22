@@ -1,0 +1,14 @@
+EnsureVersion :: "INSERT OR IGNORE INTO server_sync_state(user_id_hash,server_version) VALUES(?1,0)";
+AdvanceVersion :: "UPDATE server_sync_state SET server_version=server_version+1 WHERE user_id_hash=?1";
+ReadVersion :: "\nSELECT server_version\nFROM server_sync_state\nWHERE user_id_hash=?1";
+ReadNewVersion :: "SELECT server_version FROM server_sync_state WHERE user_id_hash=?1";
+Touch :: "UPDATE server_users SET last_seen_at=?2 WHERE user_id_hash=?1";
+Upsert :: "INSERT INTO server_users(user_id_hash,public_key) VALUES(?1,?2) ON CONFLICT(user_id_hash) DO UPDATE SET last_seen_at=?3";
+ClearTombstone :: "DELETE FROM server_account_tombstones WHERE user_id_hash=?1";
+WriteTombstone :: "\nINSERT INTO server_account_tombstones(user_id_hash,deleted_at)\nVALUES(?1,CURRENT_TIMESTAMP)\nON CONFLICT(user_id_hash) DO UPDATE SET deleted_at=CURRENT_TIMESTAMP";
+DisableMoneroAddresses :: "\nUPDATE monero_account_addresses SET disabled_at=CURRENT_TIMESTAMP\nWHERE account_id=?1 AND disabled_at=''";
+DeleteChatUsage :: "DELETE FROM server_chat_usage WHERE account_id=?1";
+DeleteBackup :: "DELETE FROM server_account_backups WHERE user_id_hash=?1";
+DeletePasskeys :: "DELETE FROM server_account_passkeys WHERE user_id_hash=?1";
+DeleteGoogleLinks :: "DELETE FROM server_account_google WHERE user_id_hash=?1";
+DeleteUser :: "DELETE FROM server_users WHERE user_id_hash=?1";

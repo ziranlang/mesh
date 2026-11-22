@@ -1,0 +1,33 @@
+tools :: #import "std/text_tools";
+
+PasskeyWrapperMaximum :: 17800;
+PasskeyWrapperPrefix :: "waozi-account-passkey-v1\nalgorithm=ML-DSA-44\nkdf=WebAuthn-PRF-SHA-256\ncredential=";
+MaximumAccountPasskeys :: 8;
+
+LowerHex64 :: (value: string) -> bool {
+    if value.count != 64 { return false }
+    for byte: value {
+        if !(byte >= #char "0" && byte <= #char "9") && !(byte >= #char "a" && byte <= #char "f") { return false }
+    }
+    return true
+}
+
+// Labels are displayed on the account's other devices.
+PasskeyLabelValid :: (label: string) -> bool {
+    if label.count > 40 { return false }
+    for byte: label {
+        lower := byte >= #char "a" && byte <= #char "z"
+        upper := byte >= #char "A" && byte <= #char "Z"
+        digit := byte >= #char "0" && byte <= #char "9"
+        if !lower && !upper && !digit && byte != #char " " && byte != #char "-" && byte != #char "_" { return false }
+    }
+    return true
+}
+
+PasskeyWrapperValid :: (wrapper: string, credential: string) -> bool {
+    if wrapper.count > PasskeyWrapperMaximum || !LowerHex64(credential) { return false }
+    start := PasskeyWrapperPrefix.count
+    end := start + credential.count
+    return wrapper.count > end + 1 && tools.TextHasPrefix(wrapper, PasskeyWrapperPrefix) &&
+        wrapper[start:end] == credential && wrapper[end] == #char "\n"
+}

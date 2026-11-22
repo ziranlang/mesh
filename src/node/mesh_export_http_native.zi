@@ -1,0 +1,131 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    app_network :: #import "app_network_native";
+    auth :: #import "node_auth_native";
+    calendar :: #import "std/date_time_linux";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    names :: #import "name_store_native";
+    network :: #import "network_scope_native";
+    policy :: #import "mesh_policy_native";
+    records :: #import "mesh_records_export_native";
+    reply :: #import "http_json_native";
+    schema :: #import "trust_schema";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Path :: "/api/v1/node/mesh/export";
+
+    #scope_file
+    Failure :: "mesh export failed";
+
+    Result :: struct {
+        status: u32
+        error: string
+        root: s32
+    }
+
+    Apps :: (database: *void, filters: *json.JsonDocument, filter: s32,
+        document: *json.JsonDocument, root: s32) -> bool {
+        allowed := json.JsonMember(filters, filter, "apps")
+        if json.JsonCount(filters, allowed) == 0 ||
+            !policy.Includes(filters, json.JsonMember(filters, filter, "data"), "app_registry", true) { return true }
+        args: []sql.Argument
+        rows := sql.Prepare(database, schema.ExportAppsSQL, args)
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        apps := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { break }
+            if status != sqlite.SQLITE_ROW { return false }
+            if !policy.Includes(filters, allowed, sql.ColumnText(rows.value, 0), true) { continue }
+            manifest: json.JsonDocument
+            if !json.JsonRead(*manifest, sql.ColumnText(rows.value, 1)) ||
+                json.JsonKindOf(*manifest, manifest.root) != .Object { return false }
+            object := json.JsonNewObject(document)
+            if !json.JsonSet(document, object, "manifest", json.JsonCopy(document, *manifest, manifest.root)) ||
+                !fields.SetString(document, object, "manifest_signature", sql.ColumnText(rows.value, 2)) ||
+                !fields.SetString(document, object, "approval_signature", sql.ColumnText(rows.value, 3)) ||
+                !json.JsonAppend(document, apps, object) { return false }
+        }
+        return json.JsonCount(document, apps) == 0 || json.JsonSet(document, root, "apps", apps)
+    }
+
+    Names :: (database: *void, filters: *json.JsonDocument, filter: s32,
+        document: *json.JsonDocument, root: s32) -> bool {
+        if !policy.Includes(filters, json.JsonMember(filters, filter, "data"), "names", true) { return true }
+        spaces := json.JsonNewArray(document)
+        claims := json.JsonNewArray(document)
+        item := json.JsonFirst(filters, json.JsonMember(filters, filter, "spaces"))
+        while item >= 0 {
+            id: Text = json.JsonString(filters, item)
+            if !names.Export(database, document, spaces, claims, TextView(id)) { return false }
+            item = json.JsonNext(filters, item)
+        }
+        return (json.JsonCount(document, spaces) == 0 || json.JsonSet(document, root, "spaces", spaces)) &&
+            (json.JsonCount(document, claims) == 0 || json.JsonSet(document, root, "names", claims))
+    }
+
+    Export :: (database: *void, connection: *void, scope: *network.Scope, token: string, configured: s64,
+        body: []u8, document: *json.JsonDocument) -> Result {
+        if app_network.StoredAllowed(scope, database) != "" {
+            return .{status = 403, error = "app manifests forbid this node network scope"}
+        }
+        authorized := auth.Authorize(database, connection, Path, body, token, scope.lanOnly, calendar.UnixMilliseconds() / 1000)
+        if authorized.status != 0 { return .{status = authorized.status, error = authorized.error} }
+        input: json.JsonDocument
+        keys: [3]string = .["cursor", "limit", "policy"]
+        kinds: [3]json.JsonKind = .[.String, .Number, .Object]
+        locations: [3]s32
+        raw := TextView(body)
+        if (wire.TrimSpace(raw) != "" && !json.JsonRead(*input, raw)) ||
+            !fields.Read(*input, input.root, keys[:], kinds[:], locations[:]) {
+            return .{status = 400, error = "invalid mesh export request"}
+        }
+        filters: json.JsonDocument
+        selected := policy.Policy(*filters, *input, locations[2])
+        if selected < 0 { return .{status = 400, error = "invalid mesh export request"} }
+        if !policy.ValidInbound(*filters, selected) { return .{status = 400, error = "explicit mesh policy required"} }
+        permission := auth.CheckPolicy(database, authorized.nodeID, *filters, selected, true)
+        if permission.status != 0 { return .{status = permission.status, error = permission.error} }
+        root := json.JsonNewObject(document)
+        if !fields.SetString(document, root, "status", "ok") { return .{status = 500, error = Failure} }
+        if !Apps(database, *filters, selected, document, root) { return .{status = 500, error = "mesh app registry export failed"} }
+        requested := fields.Number(*input, locations[1])
+        limit := ifx configured > 0 then configured else 500
+        if requested > 0 && requested < limit { limit = requested }
+        if limit > 2000 { limit = 2000 }
+        cursor: Text = json.JsonString(*input, locations[0])
+        if !records.Export(database, *filters, selected, document, root, TextView(cursor), limit) {
+            return .{status = 500, error = Failure}
+        }
+        if !Names(database, *filters, selected, document, root) { return .{status = 500, error = "mesh name export failed"} }
+        return .{status = 200, root = root}
+    }
+
+    #scope_export
+    Handle :: (access: *accounts.AccountAccess, scope: *network.Scope, token: string, batchLimit: s64,
+        connection: *void, method: string, body: []u8, overflow: bool) -> s32 {
+        if method != "POST" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        zstd := access.configuration.zstdResponses
+        received: reply.Body
+        decoded := reply.Decode(connection, body, overflow, access.configuration.maximumBodyBytes, access.configuration.zstdRequests, *received)
+        if decoded.status != 0 { return reply.ErrorReply(connection, method, decoded.status, decoded.error, zstd) }
+        source := ifx decoded.decoded then VecSlice(received.scratch, 0, decoded.length) else body
+        document: json.JsonDocument
+        if !mutex.Lock(*access.databaseLock) { return reply.ErrorReply(connection, method, 503, Failure, zstd) }
+        built := Export(access.configuration.database, connection, scope, token, batchLimit, source, *document)
+        mutex.Unlock(*access.databaseLock)
+        if built.status != 200 { return reply.ErrorReply(connection, method, built.status, built.error, zstd) }
+        return reply.Reply(connection, method, 200, *document, built.root, zstd)
+    }
+}

@@ -1,0 +1,217 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    accounts :: #import "account_state_native";
+    lookup :: #import "account_lookup_native";
+    identity :: #import "identity";
+    storage :: #import "friend_snapshots_native";
+    queries :: #import "friend_read_queries";
+    sha :: #import "crypto/sha256";
+    random :: #import "std/random_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Result :: struct {
+        status: u32
+        message: string
+        node: s32
+        peer: [64]u8
+        notifyFriends: bool
+    }
+
+    Fail :: (status: u32, message: string) -> Result {
+        return .{status = status, message = message, node = -1}
+    }
+
+    TextField :: (document: *json.JsonDocument, root: s32, name: string, value: string) -> bool {
+        return json.JsonSet(document, root, name, json.JsonNewStringCopy(document, value))
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    #scope_file
+    RequestFailed :: "friend request failed";
+    RequestMissing :: "friend request not found";
+    RequestsBetween :: #string SQL
+DELETE FROM server_friend_requests
+WHERE (requester_user_id_hash=?1 AND target_user_id_hash=?2)
+   OR (requester_user_id_hash=?2 AND target_user_id_hash=?1)
+SQL;
+
+    RevokeCollaborators :: #string SQL
+UPDATE server_list_invitations SET status='declined',updated_at=CURRENT_TIMESTAMP
+WHERE status IN ('pending','accepted') AND
+    ((target=?1 AND list_id IN (SELECT id FROM server_shared_lists WHERE owner=?2)) OR
+     (target=?2 AND list_id IN (SELECT id FROM server_shared_lists WHERE owner=?1)))
+SQL;
+
+    CreateRequest :: #string SQL
+INSERT INTO server_friend_requests(id,requester_user_id_hash,target_user_id_hash,status,created_at,updated_at)
+VALUES(?1,?2,?3,'pending',?4,?4)
+ON CONFLICT(requester_user_id_hash,target_user_id_hash) DO UPDATE SET
+    status='pending', updated_at=excluded.updated_at
+WHERE server_friend_requests.status='declined'
+SQL;
+
+    SelectRequest :: (database: *void, condition: string, arguments: []sql.Argument) -> sql.Statement {
+        query: Vec(u8)
+        if !BuilderAppend(query, queries.FriendRequestFieldsSQL) || !BuilderAppend(query, condition) {
+            return .{status = sqlite.SQLITE_NOMEM}
+        }
+        return sql.Prepare(database, TextView(VecSlice(query, 0, query.count)), arguments)
+    }
+
+    RequestReply :: (statement: *void, response: *json.JsonDocument, user: string, status: u32, state: string) -> Result {
+        root := json.JsonNewObject(response)
+        row := storage.RequestRow(statement, response)
+        if !TextField(response, root, "status", state) || !json.JsonSet(response, root, "request", row) {
+            return Fail(500, RequestFailed)
+        }
+        requester := sql.ColumnText(statement, 1)
+        peer := ifx requester == user then sql.ColumnText(statement, 3) else requester
+        result: Result = .{status = status, node = root}
+        unused identity.NormalizeUserID(peer, result.peer[:])
+        return result
+    }
+
+    #scope_export
+    // The HTTP handler holds the common database lock and owns the transaction.
+    Create :: (database: *void, user: string, reference: string, now: string, response: *json.JsonDocument) -> Result {
+        normalizedBytes: [64]u8
+        normalized := lookup.Normalize(reference, normalizedBytes[:])
+        if !identity.ValidUserID(normalized) && !identity.ValidAccountAlias(normalized) {
+            return Fail(404, "friend target not found")
+        }
+        account := lookup.ResolveNormalized(database, normalized)
+        if account.status != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        if !account.found {
+            return Fail(404, "friend target not found")
+        }
+        target := TextView(account.id[:])
+        if user == target {
+            return Fail(409, "cannot friend self")
+        }
+        pair: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(target)]
+        existing := sql.ReadInteger(database,
+            "SELECT EXISTS(SELECT 1 FROM server_friendships WHERE user_id_a=min(?1,?2) AND user_id_b=max(?1,?2))", pair[:])
+        if existing.status != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        if existing.value != 0 {
+            return Fail(409, "already friends")
+        }
+        bytes: [16]u8
+        id: [33]u8
+        if !random.FillSecure(bytes[:]) || sha.BytesToHex(*bytes[0], bytes.count, *id[0], id.count) != 1 {
+            return Fail(500, RequestFailed)
+        }
+        arguments: [4]sql.Argument = .[sql.TextArg(TextView(id[:32])), pair[0], pair[1], sql.TextArg(now)]
+        if sql.Execute(database, CreateRequest, arguments[:]) != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        selected := SelectRequest(database, "\nWHERE fr.requester_user_id_hash=?1 AND fr.target_user_id_hash=?2", pair[:])
+        if selected.status != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        if sqlite.SqliteStep(selected.value) != sqlite.SQLITE_ROW {
+            return Fail(500, RequestFailed)
+        }
+        return RequestReply(selected.value, response, user, 201, "ok")
+    }
+
+    Action :: (database: *void, user: string, id: string, accepting: bool, now: string, response: *json.JsonDocument) -> Result {
+        arguments: [3]sql.Argument = .[sql.TextArg(id), sql.TextArg(ifx accepting then "accepted" else "declined"), sql.TextArg(now)]
+        selected := SelectRequest(database, "\nWHERE fr.id=?1", arguments[:1])
+        if selected.status != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        step := sqlite.SqliteStep(selected.value)
+        if step == sqlite.SQLITE_DONE {
+            return Fail(404, RequestMissing)
+        }
+        if step != sqlite.SQLITE_ROW {
+            return Fail(500, RequestFailed)
+        }
+        requester := sql.ColumnText(selected.value, 1)
+        target := sql.ColumnText(selected.value, 3)
+        if user != target && (accepting || user != requester) {
+            return Fail(403, "friend request not owned by user")
+        }
+        if sql.ColumnText(selected.value, 5) != "pending" {
+            return Fail(409, "request not pending")
+        }
+        if accepting {
+            pair: [3]sql.Argument = .[sql.TextArg(requester), sql.TextArg(target), sql.TextArg(now)]
+            if sql.Execute(database, "INSERT OR IGNORE INTO server_friendships(user_id_a,user_id_b,created_at) VALUES(min(?1,?2),max(?1,?2),?3)", pair[:]) != sqlite.SQLITE_OK {
+                return Fail(500, RequestFailed)
+            }
+        }
+        if sql.Execute(database, "UPDATE server_friend_requests SET status=?2,updated_at=?3 WHERE id=?1", arguments[:]) != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        refreshed := SelectRequest(database, "\nWHERE fr.id=?1", arguments[:1])
+        if refreshed.status != sqlite.SQLITE_OK {
+            return Fail(500, RequestFailed)
+        }
+        defer sqlite.SqliteFinalize(refreshed.value)
+        if sqlite.SqliteStep(refreshed.value) != sqlite.SQLITE_ROW {
+            return Fail(500, RequestFailed)
+        }
+        return RequestReply(refreshed.value, response, user, 200, arguments[1].text)
+    }
+
+    Remove :: (database: *void, user: string, target: string, response: *json.JsonDocument) -> Result {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(target)]
+        if sql.Execute(database, "DELETE FROM server_friendships WHERE user_id_a=min(?1,?2) AND user_id_b=max(?1,?2)", arguments[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, RequestsBetween, arguments[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, RevokeCollaborators, arguments[:]) != sqlite.SQLITE_OK {
+            return Fail(500, "friend remove failed")
+        }
+        root := json.JsonNewObject(response)
+        if !TextField(response, root, "status", "removed") {
+            return Fail(500, "friend remove failed")
+        }
+        result: Result = .{status = 200, node = root}
+        unused identity.NormalizeUserID(target, result.peer[:])
+        return result
+    }
+
+    // The response remains readable if its advisory sync snapshot cannot be cached.
+    Cache :: (database: *void, user: string, kind: string, now: string, response: *json.JsonDocument, root: s32) -> bool {
+        if kind.count > 96 {
+            return false
+        }
+        payload: Vec(u8)
+        if !json.JsonWriteInto(*payload, response, root, json.JsonCompactStyle(false)) ||
+            sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer RollbackIfActive(database)
+        arguments: [5]sql.Argument = .[sql.TextArg(user), sql.TextArg(kind),
+            sql.TextArg(TextView(VecSlice(payload, 0, payload.count))), sql.TextArg(now), .{}]
+        same := sql.ReadInteger(database,
+            "SELECT EXISTS(SELECT 1 FROM server_social_snapshots WHERE user_id_hash=?1 AND kind=?2 AND json=?3)", arguments[:3])
+        if same.status != sqlite.SQLITE_OK || same.value != 0 {
+            return false
+        }
+        version := accounts.NextVersion(database, user)
+        if version.status != sqlite.SQLITE_OK {
+            return false
+        }
+        arguments[4] = sql.IntArg(version.value)
+        upsert := #string SQL
+INSERT INTO server_social_snapshots(user_id_hash,kind,json,updated_at,server_version) VALUES(?1,?2,?3,?4,?5)
+ON CONFLICT(user_id_hash,kind) DO UPDATE SET
+    json=excluded.json, updated_at=excluded.updated_at, server_version=excluded.server_version
+SQL;
+        return sql.Execute(database, upsert, arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+}

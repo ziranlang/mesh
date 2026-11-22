@@ -1,0 +1,23 @@
+HabitsSQL :: "\nSELECT id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at\nFROM server_habits\nWHERE user_id_hash=?1\nORDER BY id";
+HabitDaysSQL :: "\nSELECT habit_id,local_date,completed,count,updated_at\nFROM server_habit_days\nWHERE user_id_hash=?1\nORDER BY habit_id,local_date";
+SessionsSQL :: "\n\tSELECT id,started_at,local_date,topic,activity,source,rounds_hash,\n\t       mood_before,mood_after,energy,stress,note,tags,deleted_at,updated_at\n\tFROM server_sessions\n\tWHERE user_id_hash=?1\n\tORDER BY id";
+RoundsSQL :: "\nSELECT round_index,breaths,hold_seconds\nFROM server_session_rounds\nWHERE user_id_hash=?1 AND session_id=?2\nORDER BY round_index";
+MeditationsSQL :: "\nSELECT id,session_id,duration_seconds,completed_at\nFROM server_meditation_logs\nWHERE user_id_hash=?1\nORDER BY id";
+SocialSQL :: "\nSELECT kind,json,updated_at\nFROM server_social_snapshots\nWHERE user_id_hash=?1\nORDER BY kind";
+RecordsSQL :: "\nSELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id\nFROM server_encrypted_records\nWHERE user_id_hash=?1\nORDER BY collection,id";
+
+// The native digest walks all rounds after all sessions. Joining the parent
+// uses the same session membership and ordering as the Go per-session walk.
+AllRoundsSQL :: #string SQL
+SELECT r.session_id,r.round_index,r.breaths,r.hold_seconds
+FROM server_session_rounds r JOIN server_sessions s
+    ON s.user_id_hash=r.user_id_hash AND s.id=r.session_id
+WHERE s.user_id_hash=?1 ORDER BY s.id,r.round_index
+SQL;
+HabitsFormat :: "habit\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n";
+HabitDaysFormat :: "habit_day\t%s\t%d\t%d\t%d\t%s\n";
+SessionsFormat :: "session\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%s\n";
+RoundsFormat :: "round\t%s\t%d\t%d\t%d\n";
+MeditationsFormat :: "meditation_log\t%s\t%s\t%d\t%s\n";
+SocialFormat :: "social_cache\t%s\t%s\t%s\n";
+RecordsFormat :: "encrypted_record\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\n";

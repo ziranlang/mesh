@@ -23,6 +23,7 @@ packages :: #import "package_http";
 atomic :: #import "std/atomic_go";
 errors :: #import "std/errors_go";
 readable :: #import "encrypted_record";
+page_rules :: #import "record_page_rules";
 native :: #system_library "go:database/sql";
 builtin :: #system_library "go:builtin";
 
@@ -78,29 +79,6 @@ AllocateRecords :: (count: isize) -> []EncryptedRecord #foreign builtin "make";
 AppendRecord :: (values: []EncryptedRecord, record: EncryptedRecord) -> []EncryptedRecord #foreign builtin "append";
 AllocateCursor :: () -> *RecordCursor #foreign builtin "new";
 
-// A page holds the requesting app's records and the account's entity
-// records, which every app of the account shares.
-PageSQL :: #string SQL_END
-
-SELECT r.collection,r.id,r.key_id,
-       CASE WHEN ?8='gzip-v1' AND p.nonce IS NOT NULL THEN p.nonce ELSE r.nonce END,
-       CASE WHEN ?8='gzip-v1' AND p.ciphertext IS NOT NULL THEN p.ciphertext ELSE r.ciphertext END,
-       r.updated_at,
-       r.deleted_at,r.content_hash,r.schema_version,r.parent_id,r.server_version,r.free_bytes
-FROM server_encrypted_records r
-LEFT JOIN server_record_packing p
-  ON p.user_id_hash=r.user_id_hash AND p.collection=r.collection AND p.id=r.id
-WHERE r.user_id_hash=?1 AND r.server_version>=?3 AND r.server_version<=?6
-  AND (r.server_version>?3 OR (r.server_version=?3 AND ?4!='' AND
-       (r.collection>?4 OR (r.collection=?4 AND r.id>?5))))
-  AND EXISTS (SELECT 1 FROM server_app_collections c WHERE (c.app_id=?2 OR c.app_id='entity')
-       AND (r.collection=c.collection_prefix OR
-            (substr(c.collection_prefix,-2)='.*' AND
-             substr(r.collection,1,length(c.collection_prefix)-1)=
-             substr(c.collection_prefix,1,length(c.collection_prefix)-1))))
-ORDER BY r.server_version,r.collection,r.id LIMIT ?7
-SQL_END;
-
 #scope_export
 Read :: (bytes: []u8) -> RecordPageOptionsResult {
     result: RecordPageOptionsResult
@@ -111,7 +89,7 @@ Read :: (bytes: []u8) -> RecordPageOptionsResult {
 Valid :: (input: SyncRequest, options: RecordPageOptions) -> bool {
     if input.ProtocolVersion < cast(isize)6 || input.AppID == "" ||
         input.SinceServerVersion < 0 || options.RecordLimit < cast(isize)0 ||
-        options.RecordLimit > cast(isize)200 || input.EncryptedRecords.count > 200 ||
+        options.RecordLimit > cast(isize)page_rules.RecordPageLimit || input.EncryptedRecords.count > page_rules.RecordPageLimit ||
         input.IncludeLegacyData || input.FullSyncRequested || input.Bootstrap ||
         input.LastServerStateHash != "" || input.ClientStateHash != "" ||
         (options.RecordEncoding != "" && options.RecordEncoding != "gzip-v1") ||
@@ -141,10 +119,10 @@ Page :: (database: *sql.Database, context: ctx.Context, input: SyncRequest,
     }
     limit := options.RecordLimit
     if limit == cast(isize)0 {
-        limit = cast(isize)200
+        limit = cast(isize)page_rules.RecordPageLimit
     }
     arguments: [8]Any = .[input.UserIDHash, input.AppID, version, collection, id, through, limit + cast(isize)1, options.RecordEncoding]
-    queried := sql.Query(database, context, PageSQL, arguments[:])
+    queried := sql.Query(database, context, page_rules.RecordPageQuery, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -164,8 +142,7 @@ Page :: (database: *sql.Database, context: ctx.Context, input: SyncRequest,
             return result
         }
         // Bound both record count and ciphertext bytes, including wide imports.
-        if result.records.count >= cast(s64)limit ||
-            (result.records.count > 0 && bytes + item.Ciphertext.count > 4194304) {
+        if !page_rules.Room(result.records.count, cast(s64)limit, bytes, item.Ciphertext.count) {
             result.cursor = AllocateCursor()
             result.cursor.Version = last.Version
             result.cursor.Collection = last.Collection

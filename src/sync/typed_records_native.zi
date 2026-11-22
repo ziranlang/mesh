@@ -1,0 +1,71 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    output :: #import "sync_response_native";
+    parser :: #import "record_request_native";
+    rows_io :: #import "record_rows_native";
+    validation :: #import "record_validation";
+    writes :: #import "record_write_native";
+    scope :: #import "scope";
+    apps :: #import "record_scope_native";
+    views :: #import "sync_view_queries";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    json :: #import "std/json_document";
+
+    Validate :: (database: *void, records: *parser.Request, app: string, version: s64) -> apps.AppScope {
+        requestApp := ifx app == "" then "inbe" else app
+        for index: 0..records.count - 1 {
+            record := parser.Record(records, index)
+            if !validation.ValidForProtocol(record, cast(isize)version) { return .{error = "invalid encrypted record"} }
+            if version >= 6 {
+                permitted := apps.OwnsSignedCollection(database, app, record.Collection)
+                if permitted.status != sqlite.SQLITE_OK || permitted.error != "" { return permitted }
+                continue
+            }
+            owner := scope.CollectionOwnerApp(record.Collection)
+            if owner == "entity" { return .{error = "entity records need a signed request"} }
+            if owner != "" && owner != requestApp { return .{error = "encrypted record collection belongs to another app"} }
+        }
+        return .{}
+    }
+
+    Apply :: (database: *void, user: string, records: *parser.Request, allowance: s64,
+        now: time.TimestampValue) -> writes.RecordWriteResult {
+        latest := now
+        latest.seconds += 300
+        buffer: [31]u8
+        size := format.UTC(latest, buffer[:])
+        if size == 0 { return .{status = sqlite.SQLITE_MISUSE} }
+        applied: s64 = 0
+        for index: 0..records.count - 1 {
+            written := writes.Write(database, user, parser.Record(records, index), allowance, latest, TextView(buffer[:size]))
+            if written.status != sqlite.SQLITE_OK { return written }
+            applied += written.applied
+        }
+        return .{applied = applied}
+    }
+
+    Attach :: (database: *void, user: string, since: s64, contentFreeDeletions: bool, document: *json.JsonDocument,
+        root: s32, counts: s32) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(since)]
+        rows := sql.Prepare(database, views.RecordsSince, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        array := json.JsonNewArray(document)
+        if array < 0 { return false }
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                count := cast(s64)json.JsonCount(document, array)
+                return count == 0 || (json.JsonSet(document, root, "encrypted_records", array) &&
+                    (counts < 0 || output.IntegerField(document, counts, "encrypted_records", count)))
+            }
+            if status != sqlite.SQLITE_ROW { return false }
+            item := rows_io.Read(rows.value, 10)
+            if (contentFreeDeletions || validation.ReadableByLegacy(item)) && !rows_io.Append(document, array, item) { return false }
+        }
+        return false
+    }
+
+}

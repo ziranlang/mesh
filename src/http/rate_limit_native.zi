@@ -1,0 +1,92 @@
+#if TARGET == .C && OS == .LINUX {
+    mutex :: #import "std/mutex_linux";
+    #import "std/hash_map"
+    sha :: #import "crypto/sha256";
+
+    MaximumBuckets :: 65536;
+
+    RateWindow :: struct {
+        resetAt: s64
+        count: s64
+    }
+
+    RateLimiter :: struct {
+        lock: mutex.Mutex
+        windows: HashMap(u64, RateWindow)
+        pruneAfter: s64
+        rejected: s64
+    }
+
+    #scope_file
+    Bucket :: (key: string) -> u64 {
+        digest := sha.Sha256Of(key)
+        value: u64 = 0
+        for index: 0..7 { value = (value << 8) | cast(u64)digest[index] }
+        return value
+    }
+
+    Prune :: (limiter: *RateLimiter, now: s64) {
+        for index: 0..limiter.windows.states.count - 1 {
+            if limiter.windows.states[index] == 1 && limiter.windows.values[index].resetAt < now {
+                limiter.windows.states[index] = 2
+                limiter.windows.count -= 1
+                limiter.windows.removed += 1
+            }
+        }
+    }
+
+    Reject :: (limiter: *RateLimiter) -> bool {
+        if limiter.rejected < 9223372036854775807 {
+            limiter.rejected += 1
+        }
+        return false
+    }
+
+    #scope_export
+    Open :: (limiter: *RateLimiter) -> bool {
+        return limiter != null && mutex.Open(*limiter.lock)
+    }
+
+    // Wait for request workers before closing the limiter.
+    Close :: (limiter: *RateLimiter) {
+        if limiter != null && mutex.Close(*limiter.lock) {
+            HashMapFree(*limiter.windows)
+            limiter.pruneAfter = 0
+            limiter.rejected = 0
+        }
+    }
+
+    Rejected :: (limiter: *RateLimiter) -> s64 {
+        if limiter == null || !mutex.Lock(*limiter.lock) { return 0 }
+        defer mutex.Unlock(*limiter.lock)
+        return limiter.rejected
+    }
+
+    // The instant and window are in monotonic milliseconds. The count stops
+    // growing when a bucket is full, and active buckets survive saturation.
+    Allow :: (limiter: *RateLimiter, key: string, limit: s64, window: s64, now: s64) -> bool {
+        if limiter == null || key == "" || limit <= 0 || window <= 0 { return true }
+        if now < 0 || now > 9223372036854775807 - window { return false }
+        hash := Bucket(key)
+        if !mutex.Lock(*limiter.lock) { return false }
+        defer mutex.Unlock(*limiter.lock)
+        slot := HashMapFind(*limiter.windows, hash)
+        if slot >= 0 {
+            current := *limiter.windows.values[slot]
+            if current.resetAt < now { <<current = .{resetAt = now + window} }
+            if current.count >= limit { return Reject(limiter) }
+            current.count += 1
+            return true
+        }
+        if limiter.windows.count >= MaximumBuckets {
+            if now >= limiter.pruneAfter {
+                Prune(limiter, now)
+                limiter.pruneAfter = now + ifx window < 1000 then window else 1000
+            }
+            if limiter.windows.count >= MaximumBuckets { return Reject(limiter) }
+        }
+        item: RateWindow = .{resetAt = now + window, count = 1}
+        HashMapSet(*limiter.windows, hash, item)
+        return true
+    }
+}

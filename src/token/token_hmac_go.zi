@@ -1,0 +1,32 @@
+#import "std/go_types"
+text :: #import "std/text_go";
+go_hash :: #system_library "go:hash";
+go_hmac :: #system_library "go:crypto/hmac";
+go_sha :: #system_library "go:crypto/sha256";
+
+#scope_file
+Hash :: #type #foreign go_hash "Hash";
+Factory :: #type () -> Hash;
+
+NewSHA256 :: () -> Hash #foreign go_sha "New";
+NewHMAC :: (factory: Factory, key: []u8) -> Hash #foreign go_hmac "New";
+Write :: (state: Hash, payload: []u8) #foreign go_hash "(Hash).Write";
+Sum :: (state: Hash, tag: []u8) -> []u8 #foreign go_hash "(Hash).Sum";
+
+CreateSHA256 :: () -> Hash {
+    return NewSHA256()
+}
+
+#scope_export
+Compute :: (key: []u8, payload: string, tag: []u8) -> bool {
+    if key.count == 0 || tag.count != 32 {
+        return false
+    }
+    state := NewHMAC(CreateSHA256, key)
+    Write(state, text.ToBytes(payload))
+    digest := Sum(state, tag[:0])
+    for index: 0..31 {
+        tag[index] = digest[index]
+    }
+    return true
+}

@@ -1,0 +1,135 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    policy :: #import "mesh_policy_native";
+    unicode :: #import "std/unicode";
+    wire :: #import "wire_text";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    Peer :: struct {
+        name: string
+        address: string
+        root: s32
+        failed: bool
+    }
+
+    TrimAddress :: (address: string) -> string {
+        value := wire.TrimSpace(address)
+        end := value.count
+        while end > 0 && value[end - 1] == 47 { end -= 1 }
+        return value[:end]
+    }
+
+    #scope_file
+    List :: (document: *json.JsonDocument, source: string) -> s32 {
+        array := json.JsonNewArray(document)
+        start: s64 = 0
+        end: s64 = 0
+        while end <= source.count {
+            if end == source.count || source[end] == 32 || source[end] == 43 || source[end] == 124 {
+                entry := wire.TrimSpace(source[start:end])
+                if entry != "" && !policy.Includes(document, array, entry, false) &&
+                    !json.JsonAppend(document, array, json.JsonNewStringCopy(document, entry)) { return -1 }
+                start = end + 1
+            }
+            end += 1
+        }
+        return array
+    }
+
+    Key :: (name: string) -> string {
+        if wire.MatchesToken(name, "app") || wire.MatchesToken(name, "apps") ||
+            wire.MatchesToken(name, "app_id") || wire.MatchesToken(name, "app_ids") { return "apps" }
+        if wire.MatchesToken(name, "collection") || wire.MatchesToken(name, "collections") { return "collections" }
+        if wire.MatchesToken(name, "space") || wire.MatchesToken(name, "spaces") ||
+            wire.MatchesToken(name, "space_id") || wire.MatchesToken(name, "space_ids") { return "spaces" }
+        if wire.MatchesToken(name, "data") || wire.MatchesToken(name, "type") || wire.MatchesToken(name, "types") { return "data" }
+        return ""
+    }
+
+    Enabled :: (value: string) -> bool {
+        return value == "" || wire.MatchesToken(value, "true") || wire.MatchesToken(value, "yes") ||
+            wire.MatchesToken(value, "1") || wire.MatchesToken(value, "on")
+    }
+
+    NormalizeDirection :: (value: string) -> string {
+        if wire.MatchesToken(value, "none") || wire.MatchesToken(value, "off") ||
+            wire.MatchesToken(value, "disabled") || wire.MatchesToken(value, "false") ||
+            wire.MatchesToken(value, "0") || wire.MatchesToken(value, "no") { return "none" }
+        return policy.Direction(value)
+    }
+
+    Parse :: (entry: string, document: *json.JsonDocument) -> Peer {
+        parts := wire.Cut(entry, 59)
+        raw := wire.TrimSpace(parts.before)
+        label := wire.Cut(raw, 61)
+        if !label.found { label = wire.Cut(raw, 124) }
+        address := TrimAddress(ifx label.found then label.after else raw)
+        if address == "" { return .{root = -1} }
+        root := json.JsonNewObject(document)
+        remaining := parts.after
+        direction: string
+        while remaining != "" {
+            option := wire.Cut(remaining, 59)
+            setting := wire.Cut(option.before, 61)
+            if setting.found {
+                name := wire.TrimSpace(setting.before)
+                value := wire.TrimSpace(setting.after)
+                if wire.MatchesToken(name, "sync") || wire.MatchesToken(name, "mode") || wire.MatchesToken(name, "direction") {
+                    direction = value
+                } else if wire.MatchesToken(name, "enabled") && !Enabled(value) {
+                    direction = "none"
+                } else {
+                    key := Key(name)
+                    if key != "" && !json.JsonSet(document, root, key, List(document, value)) {
+                        return .{root = -1, failed = true}
+                    }
+                }
+            }
+            remaining = option.after
+        }
+        name := ifx label.found then wire.TrimSpace(label.before) else ""
+        if direction == "" {
+            keys: [4]string = .["apps", "collections", "spaces", "data"]
+            for key: keys {
+                if json.JsonCount(document, json.JsonMember(document, root, key)) > 0 {
+                    direction = "bidirectional"
+                    break
+                }
+            }
+        }
+        if direction == "" { return .{name = name, address = address, root = -1} }
+        normalized := NormalizeDirection(direction)
+        lower: Text = unicode.Lower(direction)
+        if !fields.SetString(document, root, "direction", ifx normalized != "" then normalized else TextView(lower)) {
+            return .{root = -1, failed = true}
+        }
+        return .{name = name, address = address, root = root}
+    }
+
+    #scope_export
+    Read :: (configured: string, document: *json.JsonDocument) -> bool {
+        array := json.JsonNewArray(document)
+        seen: HashMap(string, bool)
+        defer HashMapFree(*seen)
+        remaining := configured
+        while remaining != "" {
+            entry := wire.Cut(remaining, 44)
+            remaining = entry.after
+            source: json.JsonDocument
+            parsed := Parse(entry.before, *source)
+            if parsed.failed { return false }
+            if parsed.address == "" || HashMapHas(*seen, parsed.address) { continue }
+            HashMapSet(*seen, parsed.address, true)
+            peer := json.JsonNewObject(document)
+            if !fields.SetString(document, peer, "url", parsed.address) ||
+                (parsed.name != "" && !fields.SetString(document, peer, "name", parsed.name)) { return false }
+            if parsed.root >= 0 && !json.JsonSet(document, peer, "sync",
+                policy.Policy(document, *source, parsed.root)) { return false }
+            if !json.JsonAppend(document, array, peer) { return false }
+        }
+        document.root = array
+        return true
+    }
+}

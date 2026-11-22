@@ -1,0 +1,99 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    http_metrics :: #import "http_metrics_native";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    version :: #import "version";
+    #import "std/vec"
+
+    #scope_file
+    Label :: (output: *Vec(u8), value: string) -> bool {
+        for character: value {
+            if character == 10 {
+                if !BuilderAppend(<<output, "\\n") { return false }
+                continue
+            }
+            if (character == 34 || character == 92) && !VecPush(<<output, cast(u8)92) { return false }
+            if !VecPush(<<output, character) { return false }
+        }
+        return true
+    }
+
+    FamilyType :: (output: *Vec(u8), name: string, kind: string = "gauge") -> bool {
+        return BuilderAppend(<<output, "# TYPE ") && BuilderAppend(<<output, name) &&
+            BuilderAppend(<<output, " ") && BuilderAppend(<<output, kind) && BuilderAppend(<<output, "\n")
+    }
+
+    Sample :: (output: *Vec(u8), value: s64) -> bool {
+        buffer: [24]u8
+        safe := ifx value < 0 then 0 else value
+        return BuilderAppend(<<output, " ") &&
+            BuilderAppend(<<output, numbers.FormatInteger(safe, buffer[:])) && BuilderAppend(<<output, "\n")
+    }
+
+    Number :: (document: *json.JsonDocument, root: s32, key: string) -> s64 {
+        return fields.Number(document, json.JsonMember(document, root, key))
+    }
+
+    Scalar :: (output: *Vec(u8), name: string, value: s64, kind: string = "gauge") -> bool {
+        return FamilyType(output, name, kind) && BuilderAppend(<<output, name) && Sample(output, value)
+    }
+
+    Apps :: (document: *json.JsonDocument, storage: s32, output: *Vec(u8)) -> bool {
+        appMetric := "mesh_storage_app_logical_bytes"
+        collectionMetric := "mesh_storage_collection_logical_bytes"
+        apps := json.JsonMember(document, storage, "apps")
+        if !FamilyType(output, appMetric) { return false }
+        app := json.JsonFirst(document, apps)
+        while app >= 0 {
+            id: Text = fields.StringField(document, app, "app_id")
+            if !BuilderAppend(<<output, appMetric) || !BuilderAppend(<<output, "{app_id=\"") ||
+                !Label(output, TextView(id)) || !BuilderAppend(<<output, "\"}") ||
+                !Sample(output, Number(document, app, "logical_bytes")) { return false }
+            app = json.JsonNext(document, app)
+        }
+        if !FamilyType(output, collectionMetric) { return false }
+        app = json.JsonFirst(document, apps)
+        while app >= 0 {
+            id: Text = fields.StringField(document, app, "app_id")
+            collection := json.JsonFirst(document, json.JsonMember(document, app, "collections"))
+            while collection >= 0 {
+                name: Text = fields.StringField(document, collection, "collection")
+                if !BuilderAppend(<<output, collectionMetric) || !BuilderAppend(<<output, "{app_id=\"") ||
+                    !Label(output, TextView(id)) || !BuilderAppend(<<output, "\",collection=\"") ||
+                    !Label(output, TextView(name)) || !BuilderAppend(<<output, "\"}") ||
+                    !Sample(output, Number(document, collection, "logical_bytes")) { return false }
+                collection = json.JsonNext(document, collection)
+            }
+            app = json.JsonNext(document, app)
+        }
+        return true
+    }
+
+    #scope_export
+    Report :: (counters: *http_metrics.Counters, document: *json.JsonDocument, usage: s32,
+        storage: s32, rateLimited: s64, output: *Vec(u8)) -> bool {
+        versions := "mesh_build_info"
+        websocket := Number(document, usage, "connected_websocket_clients")
+        if !FamilyType(output, versions) || !BuilderAppend(<<output, versions) ||
+            !BuilderAppend(<<output, "{version=\"") || !Label(output, version.BuildVersion) ||
+            !BuilderAppend(<<output, "\"} 1\n") ||
+            !Scalar(output, "mesh_websocket_active", websocket) ||
+            !Scalar(output, "ksync_websocket_active", websocket) ||
+            !Scalar(output, "mesh_rate_limited_requests_total", rateLimited, "counter") ||
+            !Scalar(output, "ksync_rate_limited_requests_total", rateLimited, "counter") ||
+            !Scalar(output, "mesh_connected_users", Number(document, usage, "connected_users")) ||
+            !Scalar(output, "mesh_registered_users", Number(document, usage, "registered_users")) ||
+            !Scalar(output, "mesh_active_users_30d", Number(document, usage, "active_users_30d")) ||
+            !Scalar(output, "mesh_registered_clients", Number(document, usage, "registered_clients")) ||
+            !Scalar(output, "mesh_active_clients_30d", Number(document, usage, "active_clients_30d")) ||
+            !Scalar(output, "mesh_websocket_connection_limit_per_user", Number(document, usage, "websocket_connection_limit_per_user")) ||
+            !Scalar(output, "mesh_storage_database_total_bytes", Number(document, storage, "database_total_bytes")) ||
+            !Scalar(output, "mesh_storage_sqlite_page_bytes", Number(document, storage, "sqlite_page_bytes")) ||
+            !Scalar(output, "mesh_storage_logical_bytes", Number(document, storage, "logical_bytes")) ||
+            !Scalar(output, "mesh_storage_encrypted_record_bytes", Number(document, storage, "encrypted_record_bytes")) ||
+            !Scalar(output, "mesh_storage_encrypted_payload_bytes", Number(document, storage, "encrypted_payload_bytes")) ||
+            !Apps(document, storage, output) { return false }
+        return http_metrics.Report(counters, output)
+    }
+}

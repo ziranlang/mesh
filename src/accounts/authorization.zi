@@ -11,6 +11,7 @@ sql :: #import "std/sql_go";
 json :: #import "std/json_go";
 text :: #import "std/text_go";
 clock :: #import "std/time_go";
+wire_text :: #import "wire_text";
 strings :: #system_library "go:strings";
 numbers :: #system_library "go:strconv";
 
@@ -55,7 +56,6 @@ Join :: (values: []string, separator: string) -> string #foreign strings;
 FormatInteger :: (value: s64, base: isize) -> string #foreign numbers "FormatInt";
 Compare :: (left: string, right: string) -> isize #foreign strings;
 HasPrefix :: (value: string, prefix: string) -> bool #foreign strings;
-TrimSpace :: (value: string) -> string #foreign strings;
 
 #scope_export
 HexID :: (value: string, length: s64) -> bool {
@@ -75,7 +75,7 @@ SafeCollection :: (appID: string, collection: string) -> bool {
     // Released Inbe private v1 collections share one global content key.
     // Giving out any of those keys exceeds an exact collection grant. Lumi
     // v2 has an independently derived key and is the initial private scope.
-    return collection == TrimSpace(collection) &&
+    return collection == wire_text.TrimSpace(collection) &&
         !(appID == "inbe" && HasPrefix(collection, "private.inbe.v1."))
 }
 

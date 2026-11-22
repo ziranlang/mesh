@@ -1,0 +1,174 @@
+#if TARGET == .C && OS == .LINUX {
+    address_rules :: #import "network_address";
+    c_string :: #import "std/c_string";
+    numbers :: #import "std/number_text";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    IP :: struct {
+        bytes: [16]u8
+        count: s64
+    }
+
+    Subnet :: struct {
+        address: IP
+        mask: [16]u8
+    }
+
+    Scope :: struct {
+        lanOnly: bool
+        networks: Vec(Subnet)
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    IPv4 :: 2;
+    IPv6 :: 10;
+    MissingLANConfig :: "LAN-only nodes require explicit private LAN networks and a local bind address";
+
+    InterfaceAddress :: struct {
+        next: *InterfaceAddress
+        name: *u8
+        flags: u32
+        address: *u8
+        netmask: *u8
+        peer: *u8
+        data: *void
+    }
+
+    ParseAddress :: (family: s32, input: *u8, output: *u8) -> s32 #foreign c "inet_pton";
+    InterfaceAddresses :: (first: **InterfaceAddress) -> s32 #foreign c "getifaddrs";
+    FreeInterfaceAddresses :: (first: *InterfaceAddress) #foreign c "freeifaddrs";
+
+    #scope_export
+    SocketIP :: (socket: *u8) -> IP {
+        if socket == null { return .{} }
+        family := <<(cast(*u16)socket)
+        result: IP
+        if family == IPv4 {
+            result.count = 4
+            for index: 0..3 { result.bytes[index] = socket[4 + index] }
+        } else if family == IPv6 {
+            result.count = 16
+            for index: 0..15 { result.bytes[index] = socket[8 + index] }
+        }
+        return result
+    }
+
+    #scope_file
+    ContainsIP :: (network: Subnet, ip: []u8) -> bool {
+        if ip.count != network.address.count { return false }
+        for byte, index: ip {
+            if (byte & network.mask[index]) != (network.address.bytes[index] & network.mask[index]) { return false }
+        }
+        return true
+    }
+
+    Attached :: (child: Subnet, interfaces: *InterfaceAddress) -> bool {
+        current := interfaces
+        while current != null {
+            ip := SocketIP(current.address)
+            mask := SocketIP(current.netmask)
+            if ip.count == child.address.count && mask.count == ip.count &&
+                Contains(.{address = ip, mask = mask.bytes}, child) { return true }
+            current = current.next
+        }
+        return false
+    }
+
+    #scope_export
+    ParseIP :: (raw: string) -> IP {
+        input: [46]u8
+        result: IP
+        if raw == "" || !c_string.CopyCString(raw, input[:]) { return .{} }
+        if ParseAddress(IPv4, *input[0], *result.bytes[0]) == 1 {
+            result.count = 4
+        } else if ParseAddress(IPv6, *input[0], *result.bytes[0]) == 1 {
+            result.count = 16
+        }
+        return result
+    }
+
+    PrivateNetwork :: (raw: string) -> Subnet {
+        cidr := wire.Cut(raw, #char "/")
+        if !cidr.found || cidr.after.count == 0 { return .{} }
+        for digit: cidr.after {
+            if digit < #char "0" || digit > #char "9" { return .{} }
+        }
+        bits, consumed := numbers.IntegerPrefix(cidr.after)
+        ip := ParseIP(cidr.before)
+        if ip.count == 0 || consumed != cidr.after.count || bits < 0 || bits > ip.count * 8 { return .{} }
+        result: Subnet = .{address = ip}
+        for index: 0..ip.count - 1 {
+            remaining := bits - index * 8
+            if remaining >= 8 { result.mask[index] = 255 }
+            else if remaining > 0 { result.mask[index] = cast(u8)(cast(u32)255 << cast(u32)(8 - remaining)) }
+            result.address.bytes[index] = ip.bytes[index] & result.mask[index]
+        }
+        if !address_rules.IsLocalRange(result.address.bytes[:ip.count], result.mask[:ip.count]) { return .{} }
+        return result
+    }
+
+    Contains :: (parent: Subnet, child: Subnet) -> bool {
+        count := child.address.count
+        return count > 0 && count == parent.address.count &&
+            address_rules.MaskContains(parent.mask[:count], child.mask[:count]) && ContainsIP(parent, child.address.bytes[:count])
+    }
+
+    AddNetwork :: (scope: *Scope, network: Subnet) -> bool {
+        return VecPush(scope.networks, network)
+    }
+
+    Covers :: (scope: *Scope, required: *Scope) -> bool {
+        candidates := VecSlice(scope.networks, 0, scope.networks.count)
+        for child: VecSlice(required.networks, 0, required.networks.count) {
+            found := false
+            for parent: candidates {
+                if Contains(parent, child) {
+                    found = true
+                    break
+                }
+            }
+            if !found { return false }
+        }
+        return true
+    }
+
+    Parse :: (scope: *Scope, lanOnly: bool, rawNetworks: string) -> string {
+        scope.lanOnly = lanOnly
+        if !lanOnly { return "" }
+        remaining := rawNetworks
+        while true {
+            entry := wire.Cut(remaining, #char ",")
+            network := PrivateNetwork(wire.TrimSpace(entry.before))
+            if network.address.count == 0 { return MissingLANConfig }
+            if !AddNetwork(scope, network) { return "could not store the Mesh LAN networks" }
+            if !entry.found { break }
+            remaining = entry.after
+        }
+        interfaces: *InterfaceAddress = null
+        if InterfaceAddresses(*interfaces) != 0 { return "could not enumerate local network interfaces" }
+        defer FreeInterfaceAddresses(interfaces)
+        for network: VecSlice(scope.networks, 0, scope.networks.count) {
+            if !Attached(network, interfaces) { return "LAN network is not within a connected local subnet" }
+        }
+        return ""
+    }
+
+    AllowsIP :: (scope: *Scope, bytes: []u8) -> bool {
+        if !scope.lanOnly { return true }
+        classification := address_rules.Classify(bytes)
+        if classification == .Loopback { return true }
+        if classification == .Other { return false }
+        ip := bytes
+        if bytes.count == 16 && bytes[10] == 255 && bytes[11] == 255 {
+            mapped := true
+            for byte: bytes[:10] { if byte != 0 { mapped = false } }
+            if mapped { ip = bytes[12:] }
+        }
+        for network: VecSlice(scope.networks, 0, scope.networks.count) {
+            if ContainsIP(network, ip) { return true }
+        }
+        return false
+    }
+}

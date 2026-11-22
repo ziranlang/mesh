@@ -1,0 +1,101 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    app_network :: #import "app_network_native";
+    imports :: #import "mesh_import_native";
+    auth :: #import "node_auth_native";
+    calendar :: #import "std/date_time_linux";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    network :: #import "network_scope_native";
+    response :: #import "sync_response_native";
+    policy :: #import "mesh_policy_native";
+    reply :: #import "http_json_native";
+    sqlite :: #import "sqlite/SQLite";
+    transport :: #import "http_server_native";
+    #import "std/vec"
+
+    Path :: "/api/v1/node/mesh/import";
+
+    #scope_file
+    Failure :: "mesh import failed";
+
+    Result :: struct {
+        status: u32
+        error: string
+        root: s32
+        usedBytes: s64
+        limit: s64
+    }
+
+    Apply :: (settings: accounts.Configuration, connection: *void, scope: *network.Scope, token: string,
+        approvalKey: []u8, body: []u8, output: *json.JsonDocument) -> Result {
+        database := settings.database
+        if app_network.StoredAllowed(scope, database) != "" {
+            return .{status = 403, error = "app manifests forbid this node network scope"}
+        }
+        now := calendar.UnixMilliseconds()
+        authorized := auth.Authorize(database, connection, Path, body, token, scope.lanOnly, now / 1000)
+        if authorized.status != 0 { return .{status = authorized.status, error = authorized.error} }
+        input: json.JsonDocument
+        keys: [1]string = .["policy"]
+        kinds: [1]json.JsonKind = .[.Object]
+        nodes: [1]s32
+        if !json.JsonRead(*input, TextView(body)) || !fields.Read(*input, input.root, keys[:], kinds[:], nodes[:]) {
+            return .{status = 400, error = "invalid mesh import request"}
+        }
+        filters: json.JsonDocument
+        selected := policy.Policy(*filters, *input, nodes[0])
+        if selected < 0 { return .{status = 400, error = "invalid mesh import request"} }
+        if !policy.ValidInbound(*filters, selected) { return .{status = 400, error = "explicit mesh policy required"} }
+        permission := auth.CheckPolicy(database, authorized.nodeID, *filters, selected, false)
+        if permission.status != 0 { return .{status = permission.status, error = permission.error} }
+        batch := imports.Read(*input, input.root)
+        if !batch.valid { return .{status = 400, error = "invalid mesh import request"} }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return .{status = 500, error = Failure} }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        applied := imports.ApplyTx(settings, scope, approvalKey, *filters, selected, *input, batch, now)
+        if applied.status != 0 {
+            return .{status = applied.status, error = applied.error, usedBytes = applied.usedBytes, limit = applied.limit}
+        }
+        root := json.JsonNewObject(output)
+        if !fields.SetString(output, root, "status", "ok") ||
+            !json.JsonSet(output, root, "records", json.JsonNewInteger(output, batch.count)) ||
+            !json.JsonSet(output, root, "applied", json.JsonNewInteger(output, applied.applied)) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{status = 500, error = Failure}
+        }
+        return .{status = 200, root = root}
+    }
+
+    #scope_export
+    Handle :: (access: *accounts.AccountAccess, scope: *network.Scope, token: string, approvalKey: []u8,
+        connection: *void, method: string, body: []u8, overflow: bool) -> s32 {
+        if method != "POST" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        settings := access.configuration
+        zstd := settings.zstdResponses
+        received: reply.Body
+        decoded := reply.Decode(connection, body, overflow, settings.maximumBodyBytes, settings.zstdRequests, *received)
+        if decoded.status != 0 { return reply.ErrorReply(connection, method, decoded.status, decoded.error, zstd) }
+        source := ifx decoded.decoded then VecSlice(received.scratch, 0, decoded.length) else body
+        document: json.JsonDocument
+        if !mutex.Lock(*access.databaseLock) { return reply.ErrorReply(connection, method, 503, Failure, zstd) }
+        imported := Apply(settings, connection, scope, token, approvalKey, source, *document)
+        mutex.Unlock(*access.databaseLock)
+        if imported.status == 200 { return reply.Reply(connection, method, 200, *document, imported.root, zstd) }
+        if imported.limit > 0 {
+            failure: json.JsonDocument
+            root := json.JsonNewObject(*failure)
+            if !fields.SetString(*failure, root, "error", imported.error) ||
+                !response.Storage(*failure, root, imported.usedBytes, imported.limit) { return 0 }
+            return reply.Reply(connection, method, imported.status, *failure, root, zstd)
+        }
+        return reply.ErrorReply(connection, method, imported.status, imported.error, zstd)
+    }
+}

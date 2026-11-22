@@ -1,0 +1,424 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    #scope_file
+    Tables :: #string SQL
+CREATE TABLE IF NOT EXISTS server_lumi_link_codes (
+    code TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    expires INTEGER NOT NULL,
+    consumed_at INTEGER NOT NULL DEFAULT 0,
+    telegram_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS server_lumi_telegram (
+    account_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    telegram_id INTEGER NOT NULL UNIQUE,
+    linked_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_lumi_updates (
+    id INTEGER PRIMARY KEY,
+    account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    text TEXT NOT NULL,
+    choice INTEGER NOT NULL DEFAULT 0,
+    done INTEGER NOT NULL DEFAULT 0,
+    executor TEXT NOT NULL DEFAULT '',
+    done_at INTEGER NOT NULL DEFAULT 0,
+    telegram_chat_id INTEGER NOT NULL DEFAULT 0,
+    telegram_message_id INTEGER NOT NULL DEFAULT 0,
+    telegram_reply_id INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS server_lumi_deliveries (
+    account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    PRIMARY KEY(account_id,id)
+);
+SQL;
+
+    Upgrade :: struct {
+        table: string
+        column: string
+        ddl: string
+    }
+
+    Upgrades :: () -> [7]Upgrade {
+        migrations: [7]Upgrade = .[
+            .{table = "server_lumi_link_codes", column = "consumed_at", ddl = "ALTER TABLE server_lumi_link_codes ADD COLUMN consumed_at INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_lumi_link_codes", column = "telegram_id", ddl = "ALTER TABLE server_lumi_link_codes ADD COLUMN telegram_id INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_lumi_updates", column = "done_at", ddl = "ALTER TABLE server_lumi_updates ADD COLUMN done_at INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_lumi_updates", column = "telegram_chat_id", ddl = "ALTER TABLE server_lumi_updates ADD COLUMN telegram_chat_id INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_lumi_updates", column = "telegram_message_id", ddl = "ALTER TABLE server_lumi_updates ADD COLUMN telegram_message_id INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_lumi_updates", column = "telegram_reply_id", ddl = "ALTER TABLE server_lumi_updates ADD COLUMN telegram_reply_id INTEGER NOT NULL DEFAULT 0"},
+            .{table = "server_app_feedback", column = "owner_delivered", ddl = "ALTER TABLE server_app_feedback ADD COLUMN owner_delivered INTEGER NOT NULL DEFAULT 0"}
+        ]
+        return migrations
+    }
+
+    ForgetReport :: #string SQL
+CREATE TRIGGER IF NOT EXISTS server_lumi_forget_report AFTER DELETE ON server_app_feedback
+BEGIN
+    DELETE FROM server_lumi_updates WHERE kind='feedback'
+        AND (CASE WHEN json_valid(text) THEN json_extract(text,'$.account_id') END)=OLD.account_id
+        AND (CASE WHEN json_valid(text) THEN json_extract(text,'$.report_id') END)=OLD.id;
+END;
+SQL;
+
+    AcknowledgeReport :: #string SQL
+UPDATE server_app_feedback SET owner_delivered=1 WHERE owner_delivered=0 AND EXISTS(
+    SELECT 1 FROM server_lumi_updates u WHERE u.account_id=?1 AND u.id=?2 AND u.executor=?3 AND u.kind='feedback'
+        AND (CASE WHEN json_valid(u.text) THEN json_extract(u.text,'$.account_id') END)=server_app_feedback.account_id
+        AND (CASE WHEN json_valid(u.text) THEN json_extract(u.text,'$.report_id') END)=server_app_feedback.id
+)
+SQL;
+
+    MarkAcknowledgedReports :: #string SQL
+UPDATE server_app_feedback SET owner_delivered=1 WHERE owner_delivered=0 AND EXISTS(
+    SELECT 1 FROM server_lumi_updates u WHERE u.done=1 AND u.kind='feedback'
+        AND (CASE WHEN json_valid(u.text) THEN json_extract(u.text,'$.account_id') END)=server_app_feedback.account_id
+        AND (CASE WHEN json_valid(u.text) THEN json_extract(u.text,'$.report_id') END)=server_app_feedback.id
+)
+SQL;
+
+    DeleteOrphanedReports :: #string SQL
+DELETE FROM server_lumi_updates WHERE kind='feedback' AND NOT EXISTS(
+    SELECT 1 FROM server_app_feedback f
+    WHERE f.account_id=(CASE WHEN json_valid(server_lumi_updates.text) THEN json_extract(server_lumi_updates.text,'$.account_id') END)
+      AND f.id=(CASE WHEN json_valid(server_lumi_updates.text) THEN json_extract(server_lumi_updates.text,'$.report_id') END)
+)
+SQL;
+
+    CopyReports :: #string SQL
+INSERT OR IGNORE INTO server_lumi_updates(id,account_id,kind,text)
+SELECT -rowid,?1,'feedback',json_object('title',title,'message',message,'account_id',account_id,'report_id',id)
+FROM server_app_feedback WHERE app_id='inbe' AND owner_delivered=0
+SQL;
+
+    ClaimUpdate :: #string SQL
+UPDATE server_lumi_updates SET executor=?2 WHERE account_id=?1 AND done=0
+    AND id=(SELECT id FROM server_lumi_updates WHERE account_id=?1 AND done=0 ORDER BY id LIMIT 1)
+    AND (executor='' OR executor=?2)
+RETURNING id,kind,text,choice,(kind='message' AND telegram_chat_id=?3 AND telegram_chat_id>0 AND telegram_message_id>0)
+SQL;
+
+    ClaimReply :: #string SQL
+UPDATE server_lumi_updates SET done=1,done_at=?4,text=''
+WHERE account_id=?1 AND id=?2 AND executor=?3 AND done=0
+  AND kind='message' AND telegram_message_id>0 AND EXISTS(
+      SELECT 1 FROM server_lumi_telegram
+      WHERE account_id=?1 AND telegram_id=server_lumi_updates.telegram_chat_id)
+RETURNING telegram_chat_id,telegram_message_id
+SQL;
+
+    ReadReply :: #string SQL
+SELECT telegram_reply_id FROM server_lumi_updates
+WHERE account_id=?1 AND id=?2 AND executor=?3 AND done=1
+  AND kind='message' AND telegram_message_id>0 AND EXISTS(
+      SELECT 1 FROM server_lumi_telegram
+      WHERE account_id=?1 AND telegram_id=server_lumi_updates.telegram_chat_id)
+SQL;
+
+    #scope_export
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    Ensure :: (database: *void) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer Rollback(database)
+        if sqlite.SqliteExecText(database, Tables) != sqlite.SQLITE_OK {
+            return false
+        }
+        migrations := Upgrades()
+        for migration: migrations {
+            args: [2]sql.Argument = .[sql.TextArg(migration.table), sql.TextArg(migration.column)]
+            column := sql.ReadInteger(database, "SELECT 1 FROM pragma_table_info(?1) WHERE name=?2", args[:])
+            if column.status != sqlite.SQLITE_OK ||
+                (!column.found && sqlite.SqliteExecText(database, migration.ddl) != sqlite.SQLITE_OK) {
+                return false
+            }
+        }
+        return sqlite.SqliteExecText(database, ForgetReport) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Prune :: (database: *void, now: s64) -> bool {
+        empty: [0]sql.Argument
+        tables := sql.ReadInteger(database,
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_lumi_updates')", empty[:])
+        if tables.status != sqlite.SQLITE_OK || !tables.found {
+            return false
+        }
+        if tables.value == 0 {
+            return true
+        }
+        if !Ensure(database) || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer Rollback(database)
+        handled: [1]sql.Argument = .[sql.IntArg(now - 86400)]
+        expired: [1]sql.Argument = .[sql.IntArg(now)]
+        return sql.Execute(database, MarkAcknowledgedReports, empty[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, "DELETE FROM server_lumi_updates WHERE done=1 AND (kind='feedback' OR done_at<?1)", handled[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, DeleteOrphanedReports, empty[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, "DELETE FROM server_lumi_link_codes WHERE expires<=?1", expired[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Issue :: (database: *void, account: string, code: string, now: s64) -> bool {
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(code), sql.IntArg(now + 600)]
+        return sql.Execute(database, "INSERT INTO server_lumi_link_codes(code,account_id,expires) VALUES(?2,?1,?3)", args[:]) == sqlite.SQLITE_OK
+    }
+
+    LinkClaim :: struct {
+        account: Text
+        expires: s64
+        consumed: s64
+        found: bool
+        ok: bool
+    }
+
+    #scope_file
+    ReadLink :: (database: *void, args: []sql.Argument) -> LinkClaim {
+        query := sql.Prepare(database, "SELECT account_id,expires,consumed_at FROM server_lumi_link_codes WHERE code=?1", args)
+        if query.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(query.value)
+        status := sqlite.SqliteStep(query.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        result: LinkClaim
+        result.account = TextCopy(sql.ColumnText(query.value, 0))
+        result.expires = sqlite.SqliteColumnInt64(query.value, 1)
+        result.consumed = sqlite.SqliteColumnInt64(query.value, 2)
+        result.found = true
+        result.ok = true
+        return result
+    }
+
+    #scope_export
+    // An empty result denotes a store failure. Rejected bindings roll back the code claim.
+    Consume :: (database: *void, code: string, sender: s64, now: s64) -> string {
+        if code.count != 32 || sender <= 0 || now <= 0 {
+            return "invalid"
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return ""
+        }
+        defer Rollback(database)
+        args: [4]sql.Argument = .[sql.TextArg(code), sql.IntArg(sender), sql.IntArg(now), sql.TextArg("")]
+        claimed := sql.Execute(database,
+            "UPDATE server_lumi_link_codes SET consumed_at=?3,telegram_id=?2 WHERE code=?1 AND expires>?3 AND consumed_at=0", args[:3])
+        if claimed != sqlite.SQLITE_OK {
+            return ""
+        }
+        changed := sqlite.SqliteChanges(database)
+        link := ReadLink(database, args[:1])
+        if !link.ok {
+            return ""
+        }
+        if !link.found {
+            return "invalid"
+        }
+        if changed != 1 {
+            if link.consumed > 0 {
+                return "reused"
+            }
+            if link.expires <= now {
+                return "expired"
+            }
+            return "invalid"
+        }
+        args[3] = sql.TextArg(TextView(link.account))
+        conflicts := sql.ReadInteger(database,
+            "SELECT COUNT(*) FROM server_lumi_telegram WHERE (account_id=?4 AND telegram_id<>?2) OR (telegram_id=?2 AND account_id<>?4)", args[:])
+        if conflicts.status != sqlite.SQLITE_OK || !conflicts.found {
+            return ""
+        }
+        if conflicts.value != 0 {
+            return "conflicting_account"
+        }
+        bound := sql.Execute(database,
+            "INSERT INTO server_lumi_telegram(account_id,telegram_id,linked_at) VALUES(?4,?2,?3) ON CONFLICT(account_id) DO UPDATE SET telegram_id=excluded.telegram_id WHERE server_lumi_telegram.telegram_id=excluded.telegram_id", args[:])
+        if bound != sqlite.SQLITE_OK {
+            return ""
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return "conflicting_account"
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return ""
+        }
+        return "connected"
+    }
+
+    Unlink :: (database: *void, account: string, now: s64) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer Rollback(database)
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.IntArg(now)]
+        if sql.Execute(database, "DELETE FROM server_lumi_telegram WHERE account_id=?1", args[:1]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, "UPDATE server_authorization_grants SET revoked_at=?2 WHERE account_id=?1 AND revoked_at=0 AND request_id IN (SELECT request_id FROM server_authorization_requests WHERE bot_id>0)", args[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, "UPDATE server_authorization_requests SET status='cancelled' WHERE account_id=?1 AND bot_id>0 AND status IN ('pending','claimed')", args[:1]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, "UPDATE server_lumi_link_codes SET expires=?2 WHERE account_id=?1 AND consumed_at=0 AND expires>?2", args[:]) != sqlite.SQLITE_OK {
+            return false
+        }
+        return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Binding :: struct {
+        destination: s64
+        linkedAt: s64
+        ok: bool
+    }
+
+    Linked :: (database: *void, account: string) -> Binding {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        statement := sql.Prepare(database, "SELECT telegram_id,linked_at FROM server_lumi_telegram WHERE account_id=?1", args[:])
+        if statement.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        return .{destination = sqlite.SqliteColumnInt64(statement.value, 0),
+            linkedAt = sqlite.SqliteColumnInt64(statement.value, 1), ok = true}
+    }
+
+    AccountFor :: (database: *void, sender: s64) -> Text {
+        args: [1]sql.Argument = .[sql.IntArg(sender)]
+        statement := sql.Prepare(database, "SELECT account_id FROM server_lumi_telegram WHERE telegram_id=?1", args[:])
+        if statement.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(statement.value)
+        if sqlite.SqliteStep(statement.value) != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        return TextCopy(sql.ColumnText(statement.value, 0))
+    }
+
+    PollUpdate :: struct {
+        id: s64
+        kind: Text
+        text: Text
+        choice: s64
+        canReply: bool
+        ok: bool
+    }
+
+    GatherReports :: (database: *void, account: string) -> bool {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        return sql.Execute(database, CopyReports, args[:]) == sqlite.SQLITE_OK
+    }
+
+    Poll :: (database: *void, account: string, client: string, destination: s64) -> PollUpdate {
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(client), sql.IntArg(destination)]
+        statement := sql.Prepare(database, ClaimUpdate, args[:])
+        if statement.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        result: PollUpdate
+        result.id = sqlite.SqliteColumnInt64(statement.value, 0)
+        result.kind = TextCopy(sql.ColumnText(statement.value, 1))
+        result.text = TextCopy(sql.ColumnText(statement.value, 2))
+        result.choice = sqlite.SqliteColumnInt64(statement.value, 3)
+        result.canReply = sqlite.SqliteColumnInt64(statement.value, 4) != 0
+        result.ok = sqlite.SqliteStep(statement.value) == sqlite.SQLITE_DONE
+        return result
+    }
+
+    Ack :: (database: *void, account: string, id: s64, client: string, now: s64) -> bool {
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.IntArg(id), sql.TextArg(client), sql.IntArg(now)]
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer Rollback(database)
+        return sql.Execute(database, AcknowledgeReport, args[:3]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, "UPDATE server_lumi_updates SET done=1,done_at=?4,text='' WHERE account_id=?1 AND id=?2 AND executor=?3 AND done=0", args[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    ReplyClaim :: struct {
+        destination: s64
+        original: s64
+        delivered: s64
+        found: bool
+        ok: bool
+    }
+
+    #scope_file
+    ClaimPrivateReply :: (database: *void, args: []sql.Argument) -> ReplyClaim {
+        statement := sql.Prepare(database, ClaimReply, args)
+        if statement.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{ok = true}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        destination := sqlite.SqliteColumnInt64(statement.value, 0)
+        original := sqlite.SqliteColumnInt64(statement.value, 1)
+        if sqlite.SqliteStep(statement.value) != sqlite.SQLITE_DONE {
+            return .{}
+        }
+        return .{destination = destination, original = original, found = true, ok = true}
+    }
+
+    #scope_export
+    PrepareReply :: (database: *void, account: string, id: s64, client: string, now: s64) -> ReplyClaim {
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.IntArg(id), sql.TextArg(client), sql.IntArg(now)]
+        claim := ClaimPrivateReply(database, args[:])
+        if !claim.ok || claim.found {
+            return claim
+        }
+        receipt := sql.ReadInteger(database, ReadReply, args[:3])
+        return .{found = receipt.found, delivered = receipt.value, ok = receipt.status == sqlite.SQLITE_OK}
+    }
+
+    SaveReply :: (database: *void, account: string, id: s64, client: string, now: s64, delivered: s64) -> bool {
+        args: [5]sql.Argument = .[sql.TextArg(account), sql.IntArg(id), sql.TextArg(client), sql.IntArg(now), sql.IntArg(delivered)]
+        return sql.Execute(database, "UPDATE server_lumi_updates SET telegram_reply_id=?5 WHERE account_id=?1 AND id=?2 AND executor=?3 AND done_at=?4", args[:]) == sqlite.SQLITE_OK
+    }
+
+    Queue :: (database: *void, account: string, id: s64, sender: s64, kind: string, text: string, choice: s64, original: s64) -> s32 {
+        args: [7]sql.Argument = .[sql.IntArg(id), sql.IntArg(sender), sql.TextArg(kind), sql.TextArg(text),
+            sql.IntArg(choice), sql.IntArg(original), sql.TextArg(account)]
+        // Require the binding observed during dispatch. A concurrent unlink
+        // or relink must not move an in-flight update to another account.
+        stored := sql.Execute(database,
+            "INSERT OR IGNORE INTO server_lumi_updates(id,account_id,kind,text,choice,telegram_chat_id,telegram_message_id) SELECT ?1,account_id,?3,?4,?5,?2,?6 FROM server_lumi_telegram WHERE telegram_id=?2 AND account_id=?7", args[:])
+        if stored != sqlite.SQLITE_OK {
+            return -1
+        }
+        return sqlite.SqliteChanges(database)
+    }
+}

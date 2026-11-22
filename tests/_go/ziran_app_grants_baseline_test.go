@@ -193,7 +193,8 @@ SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,
 FROM server_encrypted_records
 WHERE user_id_hash=?1 AND collection LIKE ?2 ESCAPE '\'
 ORDER BY collection,id`
-		args[1] = Scope_LikePatternForCollectionPrefix(collectionPrefix)
+		base := strings.TrimSuffix(collectionPrefix, ".*")
+		args[1] = strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(base) + ".%"
 	}
 	rows, err := s.Database.QueryContext(ctx, query, args...)
 	if err != nil {

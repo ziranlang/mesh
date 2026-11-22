@@ -1,0 +1,77 @@
+#if TARGET == .C && OS == .LINUX {
+    transport :: #import "http_server_native";
+    addresses :: #import "network_address";
+    limits :: #import "server_limits";
+    wire :: #import "wire_text";
+    c_string :: #import "std/c_string";
+    memory :: #import "std/byte_text_linux";
+    text :: #import "std/text_tools";
+
+    ClientAddress :: struct {
+        bytes: [46]u8
+        count: s64
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    AddressFamilyIPv4 :: 2;
+    AddressFamilyIPv6 :: 10;
+    ParseIP :: (family: s32, input: *u8, output: *u8) -> s32 #foreign c "inet_pton";
+    FormatIP :: (family: s32, input: *u8, output: *u8, length: u32) -> *u8 #foreign c "inet_ntop";
+
+    Normalize :: (input: []u8) -> ClientAddress {
+        if input.count == 16 && input[10] == 255 && input[11] == 255 {
+            mapped := true
+            for byte: input[:10] { if byte != 0 { mapped = false } }
+            if mapped { return Normalize(input[12:]) }
+        }
+        if input.count != 4 && input.count != 16 { return .{} }
+        output: ClientAddress
+        family: s32 = ifx input.count == 4 then AddressFamilyIPv4 else AddressFamilyIPv6
+        pointer := FormatIP(family, *input[0], *output.bytes[0], cast(u32)output.bytes.count)
+        if pointer != null { output.count = memory.TextFromCString(pointer).count }
+        return output
+    }
+
+    Parse :: (address: string) -> ClientAddress {
+        trimmed := wire.TrimSpace(address)
+        input: [46]u8
+        output: [16]u8
+        if trimmed == "" || !c_string.CopyCString(trimmed, input[:]) { return .{} }
+        if ParseIP(AddressFamilyIPv4, *input[0], *output[0]) == 1 { return Normalize(output[:4]) }
+        if ParseIP(AddressFamilyIPv6, *input[0], *output[0]) == 1 { return Normalize(output[:]) }
+        return .{}
+    }
+
+    #scope_export
+    // Only a connection from loopback may choose its client address via
+    // proxy headers. The final forwarded entry is the connecting peer.
+    Resolve :: (peer: transport.PeerAddress, cloudflare: string, forwarded: string) -> ClientAddress {
+        if peer.count == 4 || peer.count == 16 {
+            bytes := peer.bytes[:peer.count]
+            if addresses.Classify(bytes) == .Loopback {
+                candidate := Parse(cloudflare)
+                if candidate.count != 0 { return candidate }
+                last := Parse(forwarded[text.TextFindLast(forwarded, ",") + 1:])
+                if last.count != 0 { return last }
+            }
+            return Normalize(bytes)
+        }
+        result: ClientAddress
+        for byte, index: "unknown" { result.bytes[index] = byte }
+        result.count = 7
+        return result
+    }
+
+    FromRequest :: (connection: *void) -> ClientAddress {
+        peer := transport.RemoteAddress(connection)
+        if peer.count == 0 || addresses.Classify(peer.bytes[:peer.count]) != .Loopback {
+            return Resolve(peer, "", "")
+        }
+        cloudflare := transport.Header(connection, "CF-Connecting-IP")
+        forwarded: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "X-Forwarded-For", forwarded[:])
+        if count < 0 { return Resolve(peer, cloudflare, "") }
+        return Resolve(peer, cloudflare, TextView(forwarded[:count]))
+    }
+}

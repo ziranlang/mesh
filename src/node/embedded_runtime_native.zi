@@ -1,0 +1,205 @@
+#if TARGET == .C && OS == .LINUX {
+    server :: #import "embedded_server_native";
+    profile :: #import "embedded_profile_native";
+    transport :: #import "peer_http_native";
+    files :: #import "std/file_linux";
+    directories :: #import "std/file_tree_linux";
+    mutex :: #import "std/mutex_linux";
+    c_string :: #import "std/c_string";
+    strings :: #import "std/byte_text_linux";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    canonical :: #import "canonical_json_native";
+    binary :: #import "binary_codec";
+    text :: #import "std/text_tools";
+    #import "std/vec"
+
+    #scope_file
+    c :: #system_library "c";
+    RunOnce :: #type () -> void #c_call;
+    Once :: (status: *s32, setup: RunOnce) -> s32 #foreign c "pthread_once";
+    Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+    Free :: (pointer: *void) #foreign c "free";
+    BoundedLength :: (text: *u8, maximum: usize) -> usize #foreign c "strnlen";
+
+    BodyLimit :: 1048576;
+    CapacityLimit :: 2097152;
+    TargetLimit :: 65535;
+
+    Node :: struct {
+        root: [4096]u8
+        handle: s64
+        references: s64
+        host: *server.EmbeddedServer
+        lease: files.FileHandle
+        next: *Node
+    }
+
+    once: s32;
+    registry: mutex.Mutex;
+    nodes: *Node;
+    nextHandle: s64;
+
+    Initialize :: () { unused mutex.Open(*registry) }
+
+    Lock :: () -> bool { return Once(*once, Initialize) == 0 && mutex.Lock(*registry) }
+
+    Lookup :: (handle: s64) -> *Node {
+        node := nodes
+        while node != null && node.handle != handle { node = node.next }
+        return node
+    }
+
+    Start :: (path: string) -> s64 {
+        name: Text = profile.Profile(path)
+        root := TextView(name)
+        if root == "" { return 0 }
+        existing := nodes
+        while existing != null {
+            if strings.TextFromCString(*existing.root[0]) == root {
+                if existing.references == 9223372036854775807 || !server.ResumeEmbedded(existing.host) { return 0 }
+                existing.references += 1
+                return existing.handle
+            }
+            existing = existing.next
+        }
+        if nextHandle == 9223372036854775807 { return 0 }
+        directory := directories.OpenDirectoryHandle(root)
+        if !directory.valid { return 0 }
+        defer files.CloseFile(directory)
+        lease := profile.Lease(directory, root)
+        if !lease.valid { return 0 }
+        created := cast(*Node)Allocate(1, size_of(Node))
+        ready := false
+        openedTransport := false
+        defer {
+            if !ready {
+                if openedTransport { transport.Close() }
+                unused files.CloseFile(lease)
+                Free(cast(*void)created)
+            }
+        }
+        if created == null || !c_string.CopyCString(root, created.root[:]) { return 0 }
+        if nodes == null {
+            openedTransport = transport.Open()
+            if !openedTransport { return 0 }
+        }
+        created.host = server.OpenEmbedded(directory, root)
+        if created.host == null { return 0 }
+        nextHandle += 1
+        created.handle = nextHandle
+        created.references = 1
+        created.lease = lease
+        created.next = nodes
+        nodes = created
+        ready = true
+        return nextHandle
+    }
+
+    ValidateMethod :: (method: string) -> bool {
+        for byte, index: method {
+            if byte < 33 || byte > 126 || text.TextContains("()<>@,;:\\\"/[]?={}", method[index:index + 1]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    ValidateTarget :: (target: string) -> s64 {
+        if target.count == 0 || target[0] != #char "/" || text.TextContains(target, "://") { return -1 }
+        query := false
+        for byte, index: target {
+            if byte == #char "#" { return index }
+            if byte <= 32 || byte == 127 { return -1 }
+            if byte == #char "?" { query = true }
+            if !query && byte == #char "%" &&
+                (index + 2 >= target.count || !binary.IsHex(target[index + 1:index + 3])) {
+                return -1
+            }
+        }
+        return target.count
+    }
+
+    Reply :: (response: *transport.Response, output: *u8, capacity: s32) -> s32 {
+        // Serialize into owned storage before touching the caller's buffer.
+        body := strings.TextFromBytes(VecSlice(response.bytes, 0, response.bytes.count))
+        status: [24]u8
+        encoded: Vec(u8)
+        if !BuilderAppend(encoded, "{\"status\":") || !BuilderAppend(encoded, numbers.FormatInteger(cast(s64)response.status, status[:])) ||
+            !BuilderAppend(encoded, ",\"body\":") { return 0 }
+        document: json.JsonDocument
+        root := ifx json.JsonRead(*document, body) then document.root else json.JsonNewStringCopy(*document, body)
+        if root < 0 || !canonical.Encode(*document, root, *encoded) || !VecPush(encoded, #char "}") ||
+            encoded.count >= capacity { return 0 }
+        for index: 0..encoded.count - 1 { output[index] = encoded[index] }
+        output[encoded.count] = 0
+        return cast(s32)encoded.count
+    }
+
+    #scope_export
+    #program_export "NodeStart"
+    NodeStart :: (root: *u8) -> s64 {
+        if root == null || BoundedLength(root, 4096) >= 4096 || !Lock() { return 0 }
+        defer mutex.Unlock(*registry)
+        return Start(strings.TextFromCString(root))
+    }
+
+    #program_export "NodeStop"
+    NodeStop :: (handle: s64) -> s32 {
+        if !Lock() { return 0 }
+        defer mutex.Unlock(*registry)
+        link := *nodes
+        node := <<link
+        while node != null && node.handle != handle {
+            link = *node.next
+            node = <<link
+        }
+        if node == null { return 0 }
+        node.references -= 1
+        if node.references == 0 {
+            server.CloseEmbedded(node.host)
+            unused files.CloseFile(node.lease)
+            <<link = node.next
+            Free(cast(*void)node)
+            if nodes == null { transport.Close() }
+        }
+        return 1
+    }
+
+    #program_export "NodeSuspend"
+    NodeSuspend :: (handle: s64) -> s32 {
+        if !Lock() { return 0 }
+        defer mutex.Unlock(*registry)
+        node := Lookup(handle)
+        if node == null { return 0 }
+        server.SuspendEmbedded(node.host)
+        return 1
+    }
+
+    #program_export "NodeResume"
+    NodeResume :: (handle: s64) -> s32 {
+        if !Lock() { return 0 }
+        defer mutex.Unlock(*registry)
+        node := Lookup(handle)
+        return ifx node != null && server.ResumeEmbedded(node.host) then 1 else 0
+    }
+
+    #program_export "NodeRequest"
+    NodeRequest :: (handle: s64, method: *u8, target: *u8, body: *u8, output: *u8, capacity: s32) -> s32 {
+        if method == null || target == null || output == null || capacity < 1 || capacity > CapacityLimit ||
+            BoundedLength(method, 256) >= 256 || BoundedLength(target, TargetLimit + 1) > TargetLimit ||
+            (body != null && BoundedLength(body, BodyLimit + 1) > BodyLimit) { return 0 }
+        route := strings.TextFromCString(target)
+        length := ValidateTarget(route)
+        givenMethod := strings.TextFromCString(method)
+        if length < 1 || !ValidateMethod(givenMethod) || !Lock() { return 0 }
+        defer mutex.Unlock(*registry)
+        node := Lookup(handle)
+        if node == null { return 0 }
+        verb := ifx givenMethod == "" then "GET" else givenMethod
+        data := ifx body == null then "" else strings.TextFromCString(body)
+        response: transport.Response
+        if !server.RequestEmbedded(node.host, verb, route[:length], data, BodyLimit, *response) { return 0 }
+        return Reply(*response, output, capacity)
+    }
+}

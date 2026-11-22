@@ -1,0 +1,311 @@
+#if TARGET == .C && OS == .LINUX {
+    dates :: #import "app_manifest_rules";
+    binary :: #import "binary_codec";
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    network :: #import "network_scope_native";
+    protocol :: #import "protocol";
+    scopes :: #import "scope";
+    wire :: #import "wire_text";
+    json :: #import "std/json_document";
+
+    #scope_file
+    InvalidAppJSON :: "invalid json";
+    AppAllocation :: "app registration unavailable";
+
+    SetText :: (document: *json.JsonDocument, object: s32, key: string, value: string) -> bool {
+        return json.JsonSet(document, object, key, json.JsonNewStringCopy(document, value))
+    }
+
+    OptionalText :: (document: *json.JsonDocument, object: s32, key: string, value: string) -> bool {
+        return value == "" || SetText(document, object, key, value)
+    }
+
+    OptionalInteger :: (document: *json.JsonDocument, object: s32, key: string, value: s64) -> bool {
+        return value == 0 || json.JsonSet(document, object, key, json.JsonNewInteger(document, value))
+    }
+
+    Collection :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32, appID: string, signed: bool) -> string {
+        names: [6]string = .["app_id", "collection_prefix", "visibility", "schema_version", "description", "created_at"]
+        kinds: [6]json.JsonKind = .[.String, .String, .String, .Number, .String, .String]
+        values: [6]s32
+        if !fields.Read(input, node, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+        rawName: Text = json.JsonString(input, values[1])
+        rawVisibility: Text = json.JsonString(input, values[2])
+        prefix := wire.TrimSpace(TextView(rawName))
+        visibility := wire.TrimSpace(TextView(rawVisibility))
+        version := fields.Number(input, values[3])
+        if !signed && version < 0 { return "invalid schema_version" }
+        collection: protocol.AppCollection = .{AppID = appID, CollectionPrefix = prefix, Visibility = visibility}
+        if !scopes.ValidCollectionPrefix(prefix) || !scopes.ValidAppVisibility(visibility) || !scopes.AppOwnsDeclaredScope(appID, collection) {
+            return "invalid app collection"
+        }
+        object := json.JsonNewObject(output)
+        rawDescription: Text = json.JsonString(input, values[4])
+        createdAt: Text = json.JsonString(input, values[5])
+        if !SetText(output, object, "app_id", appID) || !SetText(output, object, "collection_prefix", prefix) ||
+            !SetText(output, object, "visibility", visibility) || !OptionalInteger(output, object, "schema_version", version) ||
+            !OptionalText(output, object, "description", wire.TrimSpace(TextView(rawDescription))) ||
+            !OptionalText(output, object, "created_at", TextView(createdAt)) || !json.JsonAppend(output, array, object) {
+            return AppAllocation
+        }
+        return ""
+    }
+
+    Capability :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32) -> string {
+        if json.JsonKindOf(input, node) != .String && json.JsonKindOf(input, node) != .Null { return InvalidAppJSON }
+        raw: Text = json.JsonString(input, node)
+        value := wire.TrimSpace(TextView(raw))
+        if !identity.ValidNamespace(value) { return "invalid capability" }
+        return ifx json.JsonAppend(output, array, json.JsonNewStringCopy(output, value)) then "" else AppAllocation
+    }
+
+    Declared :: (document: *json.JsonDocument, array: s32, name: string) -> bool {
+        row := json.JsonFirst(document, array)
+        while row >= 0 {
+            if json.JsonIs(document, json.JsonMember(document, row, "collection_prefix"), name) { return true }
+            row = json.JsonNext(document, row)
+        }
+        return false
+    }
+
+    Feature :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32, collections: s32) -> string {
+        names: [4]string = .["id", "collections", "requires_signed_tx", "description"]
+        kinds: [4]json.JsonKind = .[.String, .Array, .True, .String]
+        values: [4]s32
+        if !fields.Read(input, node, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+        raw: Text = json.JsonString(input, values[0])
+        id := wire.TrimSpace(TextView(raw))
+        if !identity.ValidNamespace(id) || (values[1] >= 0 && json.JsonCount(input, values[1]) > 16) { return "invalid app feature" }
+        object := json.JsonNewObject(output)
+        if !SetText(output, object, "id", id) { return AppAllocation }
+        item := json.JsonFirst(input, values[1])
+        if item >= 0 {
+            list := json.JsonNewArray(output)
+            while item >= 0 {
+                kind := json.JsonKindOf(input, item)
+                if kind != .String && kind != .Null { return InvalidAppJSON }
+                rawName: Text = json.JsonString(input, item)
+                name := wire.TrimSpace(TextView(rawName))
+                if !Declared(output, collections, name) { return "invalid app feature collection" }
+                if !json.JsonAppend(output, list, json.JsonNewStringCopy(output, name)) { return AppAllocation }
+                item = json.JsonNext(input, item)
+            }
+            if !json.JsonSet(output, object, "collections", list) { return AppAllocation }
+        }
+        if json.JsonKindOf(input, values[2]) == .True && !json.JsonSet(output, object, "requires_signed_tx", json.JsonNewBool(output, true)) {
+            return AppAllocation
+        }
+        rawDescription: Text = json.JsonString(input, values[3])
+        description := wire.TrimSpace(TextView(rawDescription))
+        if description != "" && !SetText(output, object, "description", description) { return AppAllocation }
+        return ifx json.JsonAppend(output, array, object) then "" else AppAllocation
+    }
+
+    Legacy :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32) -> string {
+        names: [4]string = .["name", "version", "status", "valid_until"]
+        kinds: [4]json.JsonKind = .[.String, .Number, .String, .String]
+        values: [4]s32
+        if !fields.Read(input, node, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+        rawName: Text = json.JsonString(input, values[0])
+        rawStatus: Text = json.JsonString(input, values[2])
+        rawDate: Text = json.JsonString(input, values[3])
+        name := wire.TrimSpace(TextView(rawName))
+        status := wire.TrimSpace(TextView(rawStatus))
+        date := wire.TrimSpace(TextView(rawDate))
+        version := fields.Number(input, values[1])
+        if !identity.ValidNamespace(name) || version < 0 || !scopes.ValidLegacyProtocolStatus(status) || !dates.ValidDate(date) {
+            return "invalid legacy protocol"
+        }
+        object := json.JsonNewObject(output)
+        if !SetText(output, object, "name", name) ||
+            (version != 0 && !json.JsonSet(output, object, "version", json.JsonNewInteger(output, version))) ||
+            !SetText(output, object, "status", status) || !SetText(output, object, "valid_until", date) ||
+            !json.JsonAppend(output, array, object) {
+            return AppAllocation
+        }
+        return ""
+    }
+
+    Policy :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32, now: s64, signed: bool) -> string {
+        names: [4]string = .["asset_id", "permission", "status", "legacy_unsigned_until"]
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .Number]
+        values: [4]s32
+        if !fields.Read(input, node, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+        rawAsset: Text = json.JsonString(input, values[0])
+        rawPermission: Text = json.JsonString(input, values[1])
+        rawStatus: Text = json.JsonString(input, values[2])
+        asset := wire.TrimSpace(TextView(rawAsset))
+        permission := wire.TrimSpace(TextView(rawPermission))
+        status := wire.TrimSpace(TextView(rawStatus))
+        if status == "" { status = "active" }
+        expiry := fields.Number(input, values[3])
+        if asset == "" || !scopes.ValidTokenPolicyPermission(permission) { return "invalid token policy" }
+        if status != "active" && status != "suspended" {
+            return ifx signed then "invalid token policy status" else "invalid token policy"
+        }
+        if expiry < 0 || (expiry > now && expiry - now > 31536000) {
+            return ifx signed then "invalid legacy_unsigned_until" else "invalid token policy"
+        }
+        object := json.JsonNewObject(output)
+        if !SetText(output, object, "asset_id", asset) || !SetText(output, object, "permission", permission) ||
+            !SetText(output, object, "status", status) || !OptionalInteger(output, object, "legacy_unsigned_until", expiry) ||
+            !json.JsonAppend(output, array, object) {
+            return AppAllocation
+        }
+        return ""
+    }
+
+    Key :: (input: *json.JsonDocument, node: s32, output: *json.JsonDocument, array: s32) -> string {
+        names: [7]string = .["key_id", "algorithm", "public_key", "purpose", "status", "expires_at", "created_at"]
+        kinds: [7]json.JsonKind = .[.String, .String, .String, .String, .String, .Number, .String]
+        values: [7]s32
+        if !fields.Read(input, node, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+        rawID: Text = json.JsonString(input, values[0])
+        rawAlgorithm: Text = json.JsonString(input, values[1])
+        rawPublic: Text = json.JsonString(input, values[2])
+        id := wire.TrimSpace(TextView(rawID))
+        algorithm := wire.TrimSpace(TextView(rawAlgorithm))
+        public := wire.TrimSpace(TextView(rawPublic))
+        if !identity.ValidClientID(id) || !wire.MatchesToken(algorithm, "ed25519") { return "invalid app key" }
+        decoded := binary.DecodeBinaryField(public)
+        if decoded.error != "" || decoded.value.count != 32 { return "invalid app public key" }
+        rawPurpose: Text = json.JsonString(input, values[3])
+        rawStatus: Text = json.JsonString(input, values[4])
+        createdAt: Text = json.JsonString(input, values[6])
+        status := wire.TrimSpace(TextView(rawStatus))
+        if status != "" && status != "active" && status != "suspended" { return "invalid app key status" }
+        object := json.JsonNewObject(output)
+        if !SetText(output, object, "key_id", id) || !SetText(output, object, "algorithm", algorithm) ||
+            !SetText(output, object, "public_key", public) ||
+            !OptionalText(output, object, "purpose", wire.TrimSpace(TextView(rawPurpose))) ||
+            !OptionalText(output, object, "status", status) ||
+            !OptionalInteger(output, object, "expires_at", fields.Number(input, values[5])) ||
+            !OptionalText(output, object, "created_at", TextView(createdAt)) || !json.JsonAppend(output, array, object) {
+            return AppAllocation
+        }
+        return ""
+    }
+
+    LANRestrictions :: (input: *json.JsonDocument, values: []s32, output: *json.JsonDocument, root: s32) -> string {
+        expiry := fields.Number(input, values[0])
+        if !OptionalInteger(output, root, "expires_at", expiry) { return AppAllocation }
+        rawNode: Text = json.JsonString(input, values[3])
+        nodeID := wire.TrimSpace(TextView(rawNode))
+        count := json.JsonCount(input, values[2])
+        if json.JsonKindOf(input, values[1]) != .True {
+            return ifx count == 0 && nodeID == "" then "" else "LAN restrictions require lan_only"
+        }
+        if count == 0 { return "LAN-only manifests require explicit private LAN networks" }
+        array := json.JsonNewArray(output)
+        node := json.JsonFirst(input, values[2])
+        while node >= 0 {
+            kind := json.JsonKindOf(input, node)
+            if kind != .Null && kind != .String { return InvalidAppJSON }
+            raw: Text = json.JsonString(input, node)
+            cidr := wire.TrimSpace(TextView(raw))
+            if network.PrivateNetwork(cidr).address.count == 0 { return "LAN-only manifests require explicit private LAN networks" }
+            if !json.JsonAppend(output, array, json.JsonNewStringCopy(output, cidr)) { return AppAllocation }
+            node = json.JsonNext(input, node)
+        }
+        if nodeID != "" && !identity.ValidUserID(nodeID) { return "invalid registration_node_id" }
+        if !json.JsonSet(output, root, "lan_only", json.JsonNewBool(output, true)) ||
+            !json.JsonSet(output, root, "lan_networks", array) || !OptionalText(output, root, "registration_node_id", nodeID) {
+            return AppAllocation
+        }
+        return ""
+    }
+
+    #scope_export
+    Read :: (input: *json.JsonDocument, inputRoot: s32, output: *json.JsonDocument, root: s32, now: s64, signed: bool) -> string {
+        names: [23]string = .["app_id", "display_name", "description", "homepage_url", "source_url", "public_key",
+            "status", "app_schema_version", "min_supported_client_version", "current_client_version", "compatibility_until",
+            "collections", "capabilities", "features", "legacy_protocols", "token_policies",
+            "manifest_version", "manifest_sequence", "expires_at", "lan_only", "lan_networks", "registration_node_id", "keys"]
+        kinds: [23]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String, .Number,
+            .String, .String, .String, .Array, .Array, .Array, .Array, .Array, .Number, .Number, .Number, .True, .Array, .String, .Array]
+        values: [23]s32
+        if signed {
+            names[5] = "" // The manifest has keys, while the admin registration can supply public_key.
+            if !fields.Read(input, inputRoot, names[:], kinds[:], values[:]) { return InvalidAppJSON }
+            if fields.Number(input, values[16]) != 1 { return "unsupported manifest_version" }
+            sequence := fields.Number(input, values[17])
+            if sequence < 0 { return "invalid manifest_sequence" }
+            if !json.JsonSet(output, root, "manifest_version", json.JsonNewInteger(output, 1)) ||
+                !OptionalInteger(output, root, "manifest_sequence", sequence) { return AppAllocation }
+        } else if !fields.Read(input, inputRoot, names[:16], kinds[:16], values[:16]) {
+            return InvalidAppJSON
+        }
+        idText: Text = json.JsonString(input, values[0])
+        appID := wire.TrimSpace(TextView(idText))
+        if !identity.ValidNamespace(appID) { return "invalid app_id" }
+        if !SetText(output, root, "app_id", appID) { return AppAllocation }
+        for index: 1..6 {
+            if index == 5 && signed { continue }
+            raw: Text = json.JsonString(input, values[index])
+            normalized := wire.TrimSpace(TextView(raw))
+            if index == 1 && (normalized == "" || normalized.count > 80) { return "invalid display_name" }
+            if index == 6 {
+                if normalized == "" { normalized = "active" }
+                if normalized != "active" && normalized != "suspended" { return "invalid status" }
+            }
+            if !OptionalText(output, root, names[index], normalized) { return AppAllocation }
+        }
+        if signed {
+            problem := LANRestrictions(input, values[18:22], output, root)
+            if problem != "" { return problem }
+            keyCount := json.JsonCount(input, values[22])
+            if keyCount == 0 || keyCount > 16 { return "invalid app keys" }
+        }
+        version := fields.Number(input, values[7])
+        if version < 0 || version > 65535 { return "invalid app_schema_version" }
+        if !OptionalInteger(output, root, "app_schema_version", version) { return AppAllocation }
+        for index: 8..10 {
+            raw: Text = json.JsonString(input, values[index])
+            normalized := wire.TrimSpace(TextView(raw))
+            if index == 10 && normalized != "" && !dates.ValidDate(normalized) { return "invalid compatibility_until" }
+            if !OptionalText(output, root, names[index], normalized) { return AppAllocation }
+        }
+        caps: [5]s64 = .[64, 64, 128, 64, 64]
+        for cap, index: caps {
+            if json.JsonCount(input, values[11 + index]) > cap {
+                return ifx signed then "too many manifest fields" else "too many app fields"
+            }
+        }
+        if signed {
+            keys := json.JsonNewArray(output)
+            node := json.JsonFirst(input, values[22])
+            while node >= 0 {
+                problem := Key(input, node, output, keys)
+                if problem != "" { return problem }
+                node = json.JsonNext(input, node)
+            }
+            if !json.JsonSet(output, root, "keys", keys) { return AppAllocation }
+        }
+        collections: s32 = -1
+        for index: 0..4 {
+            source := values[11 + index]
+            if source < 0 { continue }
+            array := json.JsonNewArray(output)
+            if index == 0 { collections = array }
+            node := json.JsonFirst(input, source)
+            if node < 0 && signed { continue }
+            while node >= 0 {
+                problem: string
+                if index == 0 { problem = Collection(input, node, output, array, appID, signed) }
+                else if index == 1 { problem = Capability(input, node, output, array) }
+                else if index == 2 { problem = Feature(input, node, output, array, collections) }
+                else if index == 3 { problem = Legacy(input, node, output, array) }
+                else { problem = Policy(input, node, output, array, now, signed) }
+                if problem != "" { return problem }
+                node = json.JsonNext(input, node)
+            }
+            if !json.JsonSet(output, root, names[11 + index], array) { return AppAllocation }
+        }
+        if signed {
+            expiry := fields.Number(input, values[18])
+            if expiry > 0 && now > expiry { return "manifest expired" }
+        }
+        return ""
+    }
+}

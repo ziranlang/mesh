@@ -1,0 +1,39 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    statements :: #import "sqlite_statement_native";
+    state :: #import "account_state_native";
+    credentials :: #import "account_signature_native";
+    sessions :: #import "auth_sessions_native";
+    clients :: #import "sync_client_queries";
+    identity :: #import "identity";
+
+    #scope_file
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    #scope_export
+    // A restored account must be loaded before completing its login. Commit
+    // the account, client association and session before returning the bearer.
+    Complete :: (database: *void, auth: credentials.Authentication, secret: []u8, clientID: string,
+        issuedAt: s64, expiresAt: s64, now: string) -> sessions.IssuedSession {
+        if !auth.authenticated || !identity.ValidClientID(clientID) { return .{error = "invalid login"} }
+        if database == null { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        userID := TextView(auth.userID[:])
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        defer RollbackIfActive(database)
+        status = state.RegisterTx(database, userID, auth.publicKey[:], now)
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        arguments: [3]statements.Argument = .[statements.TextArg(userID), statements.TextArg(clientID), statements.TextArg(now)]
+        status = statements.Execute(database, clients.RecordLogin, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        issued := sessions.Issue(database, secret, userID, clientID, issuedAt, expiresAt, now)
+        if issued.error != "" || issued.databaseError != sqlite.SQLITE_OK {
+            return .{error = issued.error, databaseError = issued.databaseError}
+        }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        return issued
+    }
+}

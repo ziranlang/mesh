@@ -1,0 +1,197 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    utf8 :: #import "std/utf8";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Draft :: struct {
+        root: s32
+        items: s32
+        count: s64
+        validList: bool
+    }
+
+    #scope_file
+    SetDecodedText :: (target: *json.JsonDocument, node: s32, key: string, source: *json.JsonDocument,
+        field: s32, optional: bool = false) -> bool {
+        text: Text = json.JsonString(source, field)
+        value := TextView(text)
+        if optional && value == "" {
+            return true
+        }
+        if utf8.Valid(value) {
+            return fields.SetString(target, node, key, value)
+        }
+        clean: Vec(u8)
+        size := value.count * 3
+        if !VecResizeBounded(clean, size, size) {
+            return false
+        }
+        decoded := utf8.Copy(VecSlice(text.bytes, 0, text.bytes.count), VecSlice(clean, 0, clean.count))
+        return decoded.complete && fields.SetString(target, node, key, TextView(VecSlice(clean, 0, decoded.count)))
+    }
+
+    Int32Value :: (source: *json.JsonDocument, field: s32) -> bool {
+        value := fields.Number(source, field)
+        return value >= -2147483648 && value <= 2147483647
+    }
+
+    Item :: (source: *json.JsonDocument, field: s32, target: *json.JsonDocument) -> s32 {
+        keys: [4]string = .["id", "title", "comment", "done"]
+        types: [4]json.JsonKind = .[.String, .String, .String, .Number]
+        values: [4]s32
+        if !fields.Read(source, field, keys[:], types[:], values[:]) || !Int32Value(source, values[3]) {
+            return -1
+        }
+        item := json.JsonNewObject(target)
+        for key, index: keys[:3] {
+            if !SetDecodedText(target, item, key, source, values[index]) {
+                return -1
+            }
+        }
+        if !json.JsonSet(target, item, "done", json.JsonNewInteger(target, fields.Number(source, values[3]))) {
+            return -1
+        }
+        return item
+    }
+
+    ValidItem :: (document: *json.JsonDocument, node: s32) -> bool {
+        id: Text = fields.StringField(document, node, "id")
+        title: Text = fields.StringField(document, node, "title")
+        comment: Text = fields.StringField(document, node, "comment")
+        done := fields.Number(document, json.JsonMember(document, node, "done"))
+        return identity.ValidResourceID(TextView(id)) && TextView(id).count <= 36 && TextView(title).count <= 127 &&
+            wire.TrimSpace(TextView(title)) != "" && TextView(comment).count <= 511 && (done == 0 || done == 1)
+    }
+
+    ValidItems :: (document: *json.JsonDocument, items: s32, count: s64) -> bool {
+        if count > 256 {
+            return false
+        }
+        current := json.JsonFirst(document, items)
+        while current >= 0 {
+            if !ValidItem(document, current) {
+                return false
+            }
+            id: Text = fields.StringField(document, current, "id")
+            previous := json.JsonFirst(document, items)
+            while previous != current {
+                previousID: Text = fields.StringField(document, previous, "id")
+                if TextView(previousID) == TextView(id) {
+                    return false
+                }
+                previous = json.JsonNext(document, previous)
+            }
+            current = json.JsonNext(document, current)
+        }
+        return true
+    }
+
+    #scope_export
+    Items :: (source: *json.JsonDocument, field: s32, target: *json.JsonDocument) -> s32 {
+        kind := json.JsonKindOf(source, field)
+        if kind == .Missing || kind == .Null {
+            return json.JsonNewNull(target)
+        }
+        if kind != .Array {
+            return -1
+        }
+        items := json.JsonNewArray(target)
+        item := json.JsonFirst(source, field)
+        while item >= 0 {
+            if !json.JsonAppend(target, items, Item(source, item, target)) {
+                return -1
+            }
+            item = json.JsonNext(source, item)
+        }
+        return items
+    }
+
+    // Render the typed Go wire shape before hashing so existing command
+    // receipts remain valid across the server migration.
+    Decode :: (source: *json.JsonDocument, target: *json.JsonDocument) -> Draft {
+        bad: Draft = .{root = -1, items = -1}
+        keys: [6]string = .["request_id", "action", "target", "invitation_id", "access", "list"]
+        types: [6]json.JsonKind = .[.String, .String, .String, .String, .String, .Object]
+        values: [6]s32
+        if !fields.Read(source, source.root, keys[:], types[:], values[:]) {
+            return bad
+        }
+        listKeys: [8]string = .["id", "owner", "alias", "title", "revision", "deleted", "items", "access"]
+        listTypes: [8]json.JsonKind = .[.String, .String, .String, .String, .Number, .Number, .Array, .String]
+        listValues: [8]s32
+        if !fields.Read(source, values[5], listKeys[:], listTypes[:], listValues[:]) || !Int32Value(source, listValues[5]) {
+            return bad
+        }
+        root := json.JsonNewObject(target)
+        list := json.JsonNewObject(target)
+        for key, index: keys[:5] {
+            if !SetDecodedText(target, root, key, source, values[index], index == 4) {
+                return bad
+            }
+        }
+        for key, index: listKeys[:4] {
+            if !SetDecodedText(target, list, key, source, listValues[index]) {
+                return bad
+            }
+        }
+        for index: 4..5 {
+            if !json.JsonSet(target, list, listKeys[index], json.JsonNewInteger(target, fields.Number(source, listValues[index]))) {
+                return bad
+            }
+        }
+        items := Items(source, listValues[6], target)
+        if !json.JsonSet(target, list, "items", items) || !SetDecodedText(target, list, "access", source, listValues[7], true) ||
+            !json.JsonSet(target, root, "list", list) {
+            return bad
+        }
+        count: s64 = 0
+        item := json.JsonFirst(target, items)
+        while item >= 0 {
+            count += 1
+            item = json.JsonNext(target, item)
+        }
+        id: Text = fields.StringField(target, list, "id")
+        title: Text = fields.StringField(target, list, "title")
+        valid := identity.ValidResourceID(TextView(id)) && TextView(id).count <= 36 && TextView(title).count <= 127 &&
+            wire.TrimSpace(TextView(title)) != "" && ValidItems(target, items, count)
+        return .{root = root, items = items, count = count, validList = valid}
+    }
+
+    WriteGo :: (document: *json.JsonDocument, node: s32, output: *Vec(u8)) -> bool {
+        raw: Vec(u8)
+        if !json.JsonWriteInto(*raw, document, node, json.JsonCompactStyle(false)) {
+            return false
+        }
+        source := TextView(VecSlice(raw, 0, raw.count))
+        start: s64 = 0
+        at: s64 = 0
+        while at < source.count {
+            escape := ""
+            width: s64 = 1
+            byte := source[at]
+            if byte == #char "<" {
+                escape = "\\u003c"
+            } else if byte == #char ">" {
+                escape = "\\u003e"
+            } else if byte == #char "&" {
+                escape = "\\u0026"
+            } else if byte == 0xe2 && at + 2 < source.count && source[at + 1] == 0x80 {
+                if source[at + 2] == 0xa8 || source[at + 2] == 0xa9 {
+                    escape = ifx source[at + 2] == 0xa8 then "\\u2028" else "\\u2029"
+                    width = 3
+                }
+            }
+            if escape != "" {
+                if !BuilderAppend(<<output, source[start:at]) || !BuilderAppend(<<output, escape) {
+                    return false
+                }
+                start = at + width
+            }
+            at += width
+        }
+        return BuilderAppend(<<output, source[start:])
+    }
+}

@@ -1,0 +1,101 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    queries :: #import "friend_read_queries";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    AddText :: (document: *json.JsonDocument, row: s32, key: string, value: string, optional: bool = false) -> bool {
+        return (optional && value == "") || json.JsonSet(document, row, key, json.JsonNewStringCopy(document, value))
+    }
+
+    Snapshot :: (document: *json.JsonDocument, into: s32, kind: string, root: s32, now: string) -> bool {
+        entry := json.JsonNewObject(document)
+        return AddText(document, entry, "kind", kind) && AddText(document, entry, "updated_at", now) &&
+            json.JsonSet(document, entry, "json", root) && json.JsonAppend(document, into, entry)
+    }
+
+    #scope_export
+    RequestRow :: (statement: *void, document: *json.JsonDocument) -> s32 {
+        fields: [8]string = .["id", "requester_user_id_hash", "requester_alias", "target_user_id_hash", "target_alias",
+            "status", "created_at", "updated_at"]
+        request := json.JsonNewObject(document)
+        for field, index: fields {
+            if !AddText(document, request, field, sql.ColumnText(statement, cast(s32)index), index == 2 || index == 4) {
+                return -1
+            }
+        }
+        return request
+    }
+
+    #scope_file
+    Friends :: (database: *void, arguments: []sql.Argument, document: *json.JsonDocument, root: s32) -> bool {
+        selected := sql.Prepare(database, queries.CurrentFriendsSQL, arguments)
+        if selected.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(selected.value)
+        while true {
+            step := sqlite.SqliteStep(selected.value)
+            if step == sqlite.SQLITE_DONE { return true }
+            if step != sqlite.SQLITE_ROW { return false }
+            friend := json.JsonNewObject(document)
+            icon := sqlite.SqliteColumnInt64(selected.value, 2)
+            if !AddText(document, friend, "user_id_hash", sql.ColumnText(selected.value, 0)) ||
+                !AddText(document, friend, "alias", sql.ColumnText(selected.value, 1), true) ||
+                (icon != 0 && !json.JsonSet(document, friend, "profile_icon", json.JsonNewInteger(document, icon))) ||
+                !AddText(document, friend, "created_at", sql.ColumnText(selected.value, 3)) ||
+                !json.JsonAppend(document, root, friend) { return false }
+        }
+        return false
+    }
+
+    Pending :: (database: *void, user: string, incoming: bool, document: *json.JsonDocument, root: s32) -> bool {
+        condition := ifx incoming then "fr.target_user_id_hash=?1" else "fr.requester_user_id_hash=?1"
+        query: Vec(u8)
+        if !BuilderAppend(query, queries.FriendRequestFieldsSQL) || !BuilderAppend(query, "\nWHERE ") ||
+            !BuilderAppend(query, condition) || !BuilderAppend(query, " AND fr.status='pending'\nORDER BY fr.updated_at DESC") { return false }
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        selected := sql.Prepare(database, TextView(VecSlice(query, 0, query.count)), arguments[:])
+        if selected.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(selected.value)
+        while true {
+            step := sqlite.SqliteStep(selected.value)
+            if step == sqlite.SQLITE_DONE { return true }
+            if step != sqlite.SQLITE_ROW { return false }
+            if !json.JsonAppend(document, root, RequestRow(selected.value, document)) { return false }
+        }
+        return false
+    }
+
+    #scope_export
+    FriendList :: (database: *void, user: string, document: *json.JsonDocument) -> s32 {
+        friends := json.JsonNewObject(document)
+        list := json.JsonNewArray(document)
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        if !Friends(database, arguments[:], document, list) || !json.JsonSet(document, friends, "friends", list) {
+            return -1
+        }
+        return friends
+    }
+
+    RequestList :: (database: *void, user: string, document: *json.JsonDocument) -> s32 {
+        requests := json.JsonNewObject(document)
+        incoming := json.JsonNewArray(document)
+        outgoing := json.JsonNewArray(document)
+        if !Pending(database, user, true, document, incoming) || !Pending(database, user, false, document, outgoing) ||
+            !json.JsonSet(document, requests, "incoming", incoming) || !json.JsonSet(document, requests, "outgoing", outgoing) {
+            return -1
+        }
+        return requests
+    }
+
+    Build :: (database: *void, user: string, now: string, document: *json.JsonDocument) -> s32 {
+        snapshots := json.JsonNewArray(document)
+        friends := FriendList(database, user, document)
+        requests := RequestList(database, user, document)
+        if !Snapshot(document, snapshots, "friends.list", friends, now) || !Snapshot(document, snapshots, "friends.requests", requests, now) {
+            return -1
+        }
+        return snapshots
+    }
+}

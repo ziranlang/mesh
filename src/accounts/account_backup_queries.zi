@@ -1,0 +1,15 @@
+ReadBackupSecretSQL :: "SELECT secret FROM server_account_backup_secret WHERE id=1";
+CreateBackupSecretSQL :: "INSERT OR IGNORE INTO server_account_backup_secret(id,secret) VALUES(1,?1)";
+ReadBackupSaltSQL :: "SELECT salt FROM server_account_backups WHERE user_id_hash=?1";
+ReadBackupStatusSQL :: "SELECT updated_at FROM server_account_backups WHERE user_id_hash=?1";
+ChargeBackupAttemptSQL :: "UPDATE server_account_backups SET failed_attempts=failed_attempts+1 WHERE user_id_hash=?1 AND locked_until<=?2";
+ReadBackupAttemptSQL :: "SELECT backup,verifier,failed_attempts,locked_until FROM server_account_backups WHERE user_id_hash=?1";
+ClearBackupAttemptSQL :: "UPDATE server_account_backups SET failed_attempts=0,locked_until=0 WHERE user_id_hash=?1";
+LockBackupAttemptSQL :: "UPDATE server_account_backups SET locked_until=?2 WHERE user_id_hash=?1";
+RemoveBackupSQL :: "DELETE FROM server_account_backups WHERE user_id_hash=?1 RETURNING failed_attempts,locked_until";
+StoreBackupSQL :: #string SQL_END
+INSERT INTO server_account_backups(user_id_hash,backup,salt,verifier,failed_attempts,locked_until,updated_at)
+SELECT ?1,?2,?3,?4,0,0,?5 WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?1)
+ON CONFLICT(user_id_hash) DO UPDATE SET backup=excluded.backup,salt=excluded.salt,verifier=excluded.verifier,
+failed_attempts=0,locked_until=0,updated_at=excluded.updated_at
+SQL_END;

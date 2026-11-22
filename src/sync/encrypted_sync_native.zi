@@ -1,0 +1,341 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    output :: #import "sync_response_native";
+    accounts :: #import "account_state_native";
+    storage :: #import "storage_allowance_native";
+    quota :: #import "storage_usage_rules";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    payloads :: #import "encrypted_payload_queries";
+    clients :: #import "sync_client_queries";
+    audit :: #import "sync_audit_queries";
+    friends :: #import "friend_snapshots_native";
+    notifications :: #import "sync_hub_native";
+    rates :: #import "rate_limit_native";
+    identity :: #import "identity";
+    protocol :: #import "protocol";
+    wire :: #import "wire_text";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    calendar :: #import "std/date_time_linux";
+    timer :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    VersionCeiling :: 9223372036854775807;
+    EmptyApplied :: "{\"meditation_logs\":0,\"habits\":0,\"habit_days\":0,\"sessions\":0,\"social_cache\":0}";
+
+    Query :: struct {
+        user: string
+        client: string
+        since: s64
+        limit: s64
+        bytes: []u8
+        now: time.TimestampValue
+    }
+
+    Result :: struct {
+        status: u32
+        message: string
+        serverVersion: s64
+        usedBytes: s64
+        storageLimit: s64
+    }
+
+    DecimalHeader :: (value: string, fallback: s64) -> s64 {
+        if value == "" {
+            return fallback
+        }
+        negative := value[0] == #char "-"
+        digits := ifx negative then value[1:] else wire.TrimPrefix(value, "+")
+        if digits == "" {
+            return -1
+        }
+        result: s64 = 0
+        for digit: digits {
+            part := cast(s64)digit - 48
+            if part < 0 || part > 9 || result > (VersionCeiling - part) / 10 {
+                return -1
+            }
+            result = result * 10 + part
+        }
+        return ifx negative && result != 0 then -1 else result
+    }
+
+    Alias :: (connection: *void, current: string, legacy: string) -> string {
+        value := wire.TrimSpace(http.Header(connection, current))
+        return ifx value != "" then value else wire.TrimSpace(http.Header(connection, legacy))
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    AttachPayloads :: (database: *void, request: Query, document: *json.JsonDocument, root: s32) -> bool {
+        limited := request.limit > 0 && request.limit < VersionCeiling
+        query: Vec(u8)
+        if !BuilderAppend(query, payloads.Since) || (limited && !BuilderAppend(query, " LIMIT ?3")) {
+            return false
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(request.user), sql.IntArg(request.since), sql.IntArg(0)]
+        count: s64 = 2
+        if limited {
+            arguments[2] = sql.IntArg(request.limit + 1)
+            count = 3
+        }
+        rows := sql.Prepare(database, TextView(VecSlice(query, 0, query.count)), arguments[:count])
+        if rows.status != sqlite.SQLITE_OK {
+            return false
+        }
+        defer sqlite.SqliteFinalize(rows.value)
+        array := json.JsonNewArray(document)
+        if array < 0 {
+            return false
+        }
+        cursor: s64 = 0
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                break
+            }
+            if status != sqlite.SQLITE_ROW {
+                return false
+            }
+            if limited && json.JsonCount(document, array) == request.limit {
+                if !output.BooleanField(document, root, "encrypted_payloads_truncated", true) ||
+                    (cursor != 0 && !output.IntegerField(document, root, "encrypted_payloads_next_since_version", cursor)) {
+                    return false
+                }
+                break
+            }
+            payload := output.AttachEncryptedPayload(document, rows.value)
+            if payload < 0 || !json.JsonAppend(document, array, payload) {
+                return false
+            }
+            cursor = sqlite.SqliteColumnInt64(rows.value, 4)
+        }
+        return json.JsonCount(document, array) == 0 || json.JsonSet(document, root, "encrypted_payloads", array)
+    }
+
+    AttachMetadata :: (settings: access.Configuration, document: *json.JsonDocument, root: s32,
+        request: Query, auditTime: string, version: s64) -> bool {
+        database := settings.database
+        arguments: [1]sql.Argument = .[sql.TextArg(request.user)]
+        profile := sql.Prepare(database, "SELECT COALESCE(alias,''),profile_icon FROM server_users WHERE user_id_hash=?1", arguments[:])
+        if profile.status != sqlite.SQLITE_OK {
+            return false
+        }
+        defer sqlite.SqliteFinalize(profile.value)
+        if sqlite.SqliteStep(profile.value) != sqlite.SQLITE_ROW ||
+            !output.TextIfPresent(document, root, "account_alias", sql.ColumnText(profile.value, 0)) {
+            return false
+        }
+        icon := sqlite.SqliteColumnInt64(profile.value, 1)
+        if icon != 0 && !output.IntegerField(document, root, "profile_icon", icon) {
+            return false
+        }
+        social := friends.Build(database, request.user, auditTime, document)
+        changes := json.JsonNewObject(document)
+        applied := json.JsonNewObject(document)
+        sections: [4]string = .["meditation_logs", "habits", "habit_days", "sessions"]
+        for key: sections {
+            if !json.JsonSet(document, changes, key, json.JsonNewArray(document)) || !output.IntegerField(document, applied, key, 0) {
+                return false
+            }
+        }
+        return social >= 0 && json.JsonSet(document, changes, "social_cache", social) &&
+            output.IntegerField(document, applied, "social_cache", 0) &&
+            json.JsonSet(document, root, "changes", changes) && json.JsonSet(document, root, "applied", applied) &&
+            output.TextField(document, root, "status", "ok") && output.TextField(document, root, "transition_mode", "encrypted_payload") &&
+            output.IntegerField(document, root, "protocol_version", protocol.LatestProtocol) &&
+            output.IntegerField(document, root, "min_supported_protocol", protocol.MinSupportedProtocol) &&
+            output.IntegerField(document, root, "server_latest_protocol", protocol.LatestProtocol) &&
+            output.IntegerField(document, root, "server_version", version) && output.IntegerField(document, root, "server_clock", version) &&
+            output.BooleanField(document, root, "changes_complete", true) && output.BooleanField(document, root, "full_snapshot_required", false) &&
+            output.BooleanField(document, root, "legacy_write_required", false) && output.AttachCapabilities(document, root, settings.zstdRequests)
+    }
+
+    Store :: (settings: access.Configuration, request: Query, auditTime: string,
+        document: *json.JsonDocument, root: s32) -> Result {
+        failure: Result = .{status = 500, message = "encrypted sync failed"}
+        database := settings.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return failure
+        }
+        defer RollbackIfActive(database)
+        user: [1]sql.Argument = .[sql.TextArg(request.user)]
+        if settings.encryptedPayloadAccountLimit > 0 {
+            used := sql.ReadInteger(database, payloads.Bytes, user[:])
+            if used.status != sqlite.SQLITE_OK {
+                return failure
+            }
+            if !quota.RoomForPacking(used.value, settings.encryptedPayloadAccountLimit, request.bytes.count) {
+                return .{status = 413, message = "encrypted payload quota exceeded"}
+            }
+        }
+        allowance := storage.Allowance(database, request.user, request.now.seconds, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if allowance.status != sqlite.SQLITE_OK {
+            return .{status = 500, message = "storage unavailable"}
+        }
+        if allowance.value > 0 {
+            used := sql.ReadInteger(database, quota.UsageSQL, user[:])
+            if used.status != sqlite.SQLITE_OK {
+                return failure
+            }
+            if !quota.RoomForPacking(used.value, allowance.value, request.bytes.count + request.client.count) {
+                return .{status = 413, message = "account storage limit reached", storageLimit = allowance.value, usedBytes = used.value}
+            }
+        }
+        touched := accounts.Touch(database, request.user, auditTime)
+        if touched == sqlite.SQLITE_DONE {
+            return .{status = 404, message = "sync account not found"}
+        }
+        if touched != sqlite.SQLITE_OK {
+            return failure
+        }
+        version := accounts.NextVersion(database, request.user)
+        if version.status != sqlite.SQLITE_OK {
+            return failure
+        }
+        arguments: [5]sql.Argument = .[sql.TextArg(request.user), sql.TextArg(request.client), sql.TextArg(TextView(request.bytes)),
+            sql.IntArg(version.value), sql.TextArg(auditTime)]
+        if sql.Execute(database, payloads.Insert, arguments[:]) != sqlite.SQLITE_OK {
+            return failure
+        }
+        if settings.encryptedPayloadRetentionSeconds > 0 {
+            cutoff := request.now
+            cutoff.seconds -= settings.encryptedPayloadRetentionSeconds
+            buffer: [31]u8
+            size := format.UTC(cutoff, buffer[:])
+            if size == 0 {
+                return failure
+            }
+            prune: [2]sql.Argument = .[user[0], sql.TextArg(TextView(buffer[:size]))]
+            if sql.Execute(database, payloads.PruneBefore, prune[:]) != sqlite.SQLITE_OK {
+                return failure
+            }
+        }
+        if !AttachPayloads(database, request, document, root) || !AttachMetadata(settings, document, root, request, auditTime, version.value) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return failure
+        }
+        tracked: [7]sql.Argument = .[user[0], sql.TextArg(request.client), sql.TextArg(auditTime), sql.IntArg(request.since),
+            sql.IntArg(version.value), sql.IntArg(protocol.LatestProtocol), sql.IntArg(version.value)]
+        unused sql.Execute(database, clients.RecordSync, tracked[:])
+        event: [13]sql.Argument = .[user[0], sql.TextArg(request.client), sql.TextArg(""), sql.IntArg(protocol.LatestProtocol),
+            sql.IntArg(request.since), sql.IntArg(request.since), sql.IntArg(version.value), sql.TextArg(EmptyApplied), sql.IntArg(0),
+            sql.IntArg(0), sql.TextArg(""), sql.IntArg(1), sql.IntArg(request.bytes.count)]
+        unused sql.Execute(database, audit.InsertSyncAuditSQL, event[:])
+        return .{serverVersion = version.value}
+    }
+
+    #scope_export
+    IsEnvelope :: (document: *json.JsonDocument) -> bool {
+        if json.JsonKindOf(document, document.root) != .Object {
+            return false
+        }
+        version: s64 = 0
+        nonce := false
+        ciphertext := false
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            key := TextView(name)
+            kind := json.JsonKindOf(document, node)
+            if kind != .Null {
+                if wire.MatchesToken(key, "v") {
+                    value, valid := json.JsonInteger(document, node)
+                    if !valid { return false }
+                    version = value
+                } else if wire.MatchesToken(key, "nonce") || wire.MatchesToken(key, "ciphertext") {
+                    if kind != .String { return false }
+                    field: Text = json.JsonString(document, node)
+                    present := wire.TrimSpace(TextView(field)) != ""
+                    if wire.MatchesToken(key, "nonce") { nonce = present } else { ciphertext = present }
+                }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return (version == 1 || version == 2) && nonce && ciphertext
+    }
+
+    Handle :: (service: *access.AccountAccess, hub: *notifications.Hub, connection: *void, bytes: []u8) -> s32 {
+        settings := service.configuration
+        zstd := settings.zstdResponses
+        header := auth.UserHeader(connection)
+        user: [64]u8
+        if header.value == "" {
+            return replies.ErrorReply(connection, "POST", 400, "missing X-Mesh-User", zstd)
+        }
+        if !identity.NormalizeUserID(header.value, user[:]) {
+            text := "invalid X-Mesh-User"
+            if header.name == "X-Ksync-User" { text = "invalid X-Ksync-User" }
+            if header.name == "X-Inbe-User" { text = "invalid X-Inbe-User" }
+            return replies.ErrorReply(connection, "POST", 400, text, zstd)
+        }
+        milliseconds := calendar.UnixMilliseconds()
+        now: time.TimestampValue = .{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = milliseconds >= 0}
+        buffer: [31]u8
+        size := format.UTC(now, buffer[:])
+        if size == 0 || !mutex.Lock(*service.databaseLock) {
+            return replies.ErrorReply(connection, "POST", 500, "encrypted sync failed", zstd)
+        }
+        defer mutex.Unlock(*service.databaseLock)
+        auditTime := TextView(buffer[:size])
+        checked := auth.Authenticate(settings.database, connection, settings.secret, now.seconds, auditTime, false)
+        if checked.status != 0 {
+            return replies.ErrorReply(connection, "POST", checked.status, checked.message, zstd)
+        }
+        account := TextView(user[:])
+        bucket: Vec(u8)
+        if !BuilderAppend(bucket, "sync:user:") || !BuilderAppend(bucket, account) {
+            return replies.ErrorReply(connection, "POST", 500, "encrypted sync failed", zstd)
+        }
+        if !rates.Allow(*service.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 300, 60000, timer.MonotonicMilliseconds()) {
+            return replies.ErrorReply(connection, "POST", 429, "rate limit exceeded", zstd)
+        }
+        request: Query = .{user = account, client = Alias(connection, "X-Mesh-Client", "X-Ksync-Client"), bytes = bytes, now = now}
+        if request.client != "" && !identity.ValidClientID(request.client) {
+            return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Client", zstd)
+        }
+        request.since = DecimalHeader(Alias(connection, "X-Mesh-Since-Version", "X-Ksync-Since-Version"), 0)
+        if request.since < 0 {
+            return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Since-Version", zstd)
+        }
+        limit := Alias(connection, "X-Mesh-Limit", "X-Ksync-Limit")
+        request.limit = DecimalHeader(limit, settings.encryptedPayloadMaxReturn)
+        if request.limit < 0 || (limit != "" && request.limit == 0) {
+            return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Limit", zstd)
+        }
+        if settings.encryptedPayloadMaxReturn > 0 && request.limit > settings.encryptedPayloadMaxReturn {
+            request.limit = settings.encryptedPayloadMaxReturn
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        result := Store(settings, request, auditTime, *document, root)
+        if result.storageLimit > 0 {
+            error: json.JsonDocument
+            response := json.JsonNewObject(*error)
+            if !output.TextField(*error, response, "error", result.message) ||
+                !output.TextField(*error, response, "code", "storage_full") ||
+                !output.Storage(*error, response, result.usedBytes, result.storageLimit) {
+                return 0
+            }
+            return replies.Reply(connection, "POST", result.status, *error, response, zstd)
+        }
+        if result.status != 0 {
+            return replies.ErrorReply(connection, "POST", result.status, result.message, zstd)
+        }
+        if hub != null {
+            notifications.Publish(hub, account, result.serverVersion)
+        }
+        return replies.Reply(connection, "POST", 200, *document, root, zstd)
+    }
+}

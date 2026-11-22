@@ -1,0 +1,287 @@
+#if TARGET == .C && OS == .LINUX {
+    wire :: #import "wire_text";
+    bytes :: #import "std/byte_text_linux";
+    networks :: #import "network_scope_native";
+    address :: #import "network_address";
+    random :: #import "std/random_linux";
+    sha :: #import "crypto/sha256";
+    signing :: #import "token_signing_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Wallet :: struct {
+        url: string
+        username: string
+        password: string
+    }
+
+    StopCheck :: #type (context: *void) -> bool;
+    Cancellation :: struct {
+        stopping: StopCheck
+        context: *void
+    }
+
+    // JsonRead borrows keys and values directly from the response body.
+    Reply :: struct {
+        body: Vec(u8)
+        document: json.JsonDocument
+    }
+
+    #scope_file
+    curl :: #system_library "curl";
+    NewURL :: () -> *void #foreign curl "curl_url";
+    FreeURL :: (value: *void) #foreign curl "curl_url_cleanup";
+    SetURL :: (value: *void, part: s32, field: *u8, flags: u32) -> s32 #foreign curl "curl_url_set";
+    GetURL :: (value: *void, part: s32, field: **u8, flags: u32) -> s32 #foreign curl "curl_url_get";
+    FreePart :: (field: *void) #foreign curl "curl_free";
+    Easy :: () -> *void #foreign curl "curl_easy_init";
+    Cleanup :: (transfer: *void) #foreign curl "curl_easy_cleanup";
+    Option :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_setopt";
+    Perform :: (transfer: *void) -> s32 #foreign curl "curl_easy_perform";
+    Info :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_getinfo";
+    AddHeader :: (list: *void, value: *u8) -> *void #foreign curl "curl_slist_append";
+    FreeHeaders :: (list: *void) #foreign curl "curl_slist_free_all";
+
+    // Stable URL parts, options and info values from libcurl.
+    URLPart :: 0;
+    SchemePart :: 1;
+    HostPart :: 5;
+    PathPart :: 7;
+    QueryPart :: 8;
+    URLHandle :: 10282;
+    PostFields :: 10015;
+    PostSize :: 60;
+    HeaderList :: 10023;
+    Timeout :: 13;
+    NoSignal :: 99;
+    Proxy :: 10004;
+    HTTPAuth :: 107;
+    Username :: 10173;
+    Password :: 10174;
+    WriteCallback :: 20011;
+    WriteData :: 10001;
+    HeaderCallback :: 20079;
+    HeaderData :: 10029;
+    ProgressCallback :: 20219;
+    ProgressData :: 10057;
+    NoProgress :: 43;
+    ResponseCode :: 2097154;
+    MaximumBody :: 1048576;
+    MaximumHeader :: 16384;
+
+    Digest :: struct {
+        realm: [MaximumHeader]u8
+        nonce: [MaximumHeader]u8
+        realmLength: s64
+        nonceLength: s64
+    }
+    Response :: struct {
+        body: Vec(u8)
+        digest: Digest
+        status: isize
+    }
+    Callback :: #type (data: *u8, size: usize, count: usize, context: *void) -> usize #c_call;
+    ProgressHandler :: #type (context: *void, d: s64, dn: s64, u: s64, un: s64) -> s32 #c_call;
+
+    SafeCredential :: (value: string) -> bool {
+        for byte: value {
+            if byte < 32 || byte == 127 || byte == 34 || byte == 92 { return false }
+        }
+        return true
+    }
+
+    Part :: (url: *void, field: s32) -> Text {
+        value: *u8
+        if GetURL(url, field, *value, 0) != 0 { return .{} }
+        defer FreePart(cast(*void)value)
+        return TextCopy(bytes.TextFromCString(value))
+    }
+
+    Configure :: (wallet: Wallet, url: *void) -> string {
+        raw := wire.TrimSpace(wallet.url)
+        if raw == "" { return "monero rpc url required" }
+        if (wallet.username == "") != (wallet.password == "") { return "monero rpc credentials incomplete" }
+        if !SafeCredential(wallet.username) || !SafeCredential(wallet.password) { return "monero rpc credentials invalid" }
+        prefix := wire.Cut(raw, #char ":")
+        if !prefix.found { return "monero rpc url invalid" }
+        for byte: raw {
+            if byte <= 32 || byte == 127 { return "monero rpc url invalid" }
+        }
+        target: Vec(u8)
+        if !BuilderAppend(target, raw) || !BuilderAppend(target, "/json_rpc") || !VecPush(target, cast(u8)0) ||
+            SetURL(url, URLPart, *target[0], 0) != 0 { return "monero rpc url invalid" }
+        scheme: Text = Part(url, SchemePart)
+        host: Text = Part(url, HostPart)
+        if TextView(scheme) == "https" && TextView(host) != "" { return "" }
+        name := TextView(host)
+        if name.count >= 2 && name[0] == #char "[" && name[name.count - 1] == #char "]" {
+            name = name[1:name.count - 1]
+        }
+        ip := networks.ParseIP(name)
+        if TextView(scheme) != "http" || address.Classify(ip.bytes[:ip.count]) != .Loopback {
+            return "monero rpc transport invalid"
+        }
+        return ""
+    }
+
+    HeaderValue :: (raw: string, name: string) -> string {
+        remaining := raw
+        while remaining != "" {
+            pair := wire.Cut(remaining, #char ",")
+            remaining = pair.after
+            field := wire.Cut(wire.TrimSpace(pair.before), #char "=")
+            if !field.found || field.before != name { continue }
+            value := wire.TrimSpace(field.after)
+            if value.count >= 2 && value[0] == 34 && value[value.count - 1] == 34 { return value[1:value.count - 1] }
+            return value
+        }
+        return ""
+    }
+
+    ReadHeader :: (data: *u8, size: usize, count: usize, context: *void) -> usize {
+        if size != 1 || count > MaximumHeader { return 0 }
+        value := TextView(bytes.BytesFromPointer(data, cast(u64)count))
+        field := wire.Cut(value, #char ":")
+        if !field.found || !wire.MatchesToken(field.before, "www-authenticate") { return count }
+        challenge := wire.TrimSpace(field.after)
+        if challenge.count < 7 || !wire.MatchesToken(challenge[:7], "digest ") { return count }
+        fields := challenge[7:]
+        if HeaderValue(fields, "algorithm") != "SHA-256" { return count }
+        realm := HeaderValue(fields, "realm")
+        nonce := HeaderValue(fields, "nonce")
+        qop := HeaderValue(fields, "qop")
+        if realm != "" && nonce != "" && (qop == "" || qop == "auth") && SafeCredential(realm) && SafeCredential(nonce) {
+            response := cast(*Response)context
+            if response.digest.nonceLength == 0 {
+                for byte, index: realm { response.digest.realm[index] = byte }
+                for byte, index: nonce { response.digest.nonce[index] = byte }
+                response.digest.realmLength = realm.count
+                response.digest.nonceLength = nonce.count
+            }
+        }
+        return count
+    }
+
+    ReadBody :: (data: *u8, size: usize, count: usize, context: *void) -> usize {
+        response := cast(*Response)context
+        if size != 1 || count > cast(usize)(MaximumBody - response.body.count) { return 0 }
+        start := response.body.count
+        if !VecResizeBounded(response.body, start + cast(s64)count, MaximumBody) { return 0 }
+        for byte, index: bytes.BytesFromPointer(data, cast(u64)count) { response.body[start + index] = byte }
+        return count
+    }
+
+    Progress :: (context: *void, d: s64, dn: s64, u: s64, un: s64) -> s32 {
+        return ifx Cancelled(<<cast(*Cancellation)context) then 1 else 0
+    }
+
+    DigestHeader :: (wallet: Wallet, url: *void, digest: Digest) -> Text {
+        path: Text = Part(url, PathPart)
+        query: Text = Part(url, QueryPart)
+        target: Vec(u8)
+        if !BuilderAppend(target, TextView(path)) ||
+            (TextView(query) != "" && (!BuilderAppend(target, "?") || !BuilderAppend(target, TextView(query)))) { return .{} }
+        uri := TextView(VecSlice(target, 0, target.count))
+        realm := TextView(digest.realm[:digest.realmLength])
+        nonce := TextView(digest.nonce[:digest.nonceLength])
+        randomBytes: [16]u8
+        client: [33]u8
+        if !random.FillSecure(randomBytes[:]) || sha.BytesToHex(*randomBytes[0], randomBytes.count, *client[0], client.count) != 1 { return .{} }
+        cnonce := TextView(client[:32])
+        preimage: Vec(u8)
+        first: [65]u8
+        second: [65]u8
+        proof: [65]u8
+        BuilderPrint(*preimage, "%:%:%", wallet.username, realm, wallet.password)
+        if !signing.HashHex(TextView(VecSlice(preimage, 0, preimage.count)), first[:]) { return .{} }
+        VecClear(preimage)
+        BuilderPrint(*preimage, "POST:%", uri)
+        if !signing.HashHex(TextView(VecSlice(preimage, 0, preimage.count)), second[:]) { return .{} }
+        VecClear(preimage)
+        BuilderPrint(*preimage, "%:%:00000001:%:auth:%", TextView(first[:64]), nonce, cnonce, TextView(second[:64]))
+        if !signing.HashHex(TextView(VecSlice(preimage, 0, preimage.count)), proof[:]) { return .{} }
+        header: Vec(u8)
+        BuilderPrint(*header, "Authorization: Digest username=\"%\",realm=\"%\",nonce=\"%\",uri=\"%\",algorithm=SHA-256,qop=auth,nc=00000001,cnonce=\"%\",response=\"%\"",
+            wallet.username, realm, nonce, uri, cnonce, TextView(proof[:64]))
+        return BuilderFinish(header)
+    }
+
+    Transfer :: (wallet: Wallet, url: *void, payload: []u8, authorization: string, cancel: Cancellation, output: *Response) -> bool {
+        transfer := Easy()
+        if transfer == null { return false }
+        defer Cleanup(transfer)
+        content: Vec(u8)
+        if !BuilderAppend(content, "Content-Type: application/json") || !VecPush(content, cast(u8)0) { return false }
+        basicHeaders := AddHeader(null, *content[0])
+        if basicHeaders == null { return false }
+        defer FreeHeaders(basicHeaders)
+        if authorization != "" {
+            encoded: Vec(u8)
+            if !BuilderAppend(encoded, authorization) || !VecPush(encoded, cast(u8)0) || AddHeader(basicHeaders, *encoded[0]) == null { return false }
+        } else if wallet.username != "" {
+            user: Vec(u8)
+            secret: Vec(u8)
+            if !BuilderAppend(user, wallet.username) || !VecPush(user, cast(u8)0) || !BuilderAppend(secret, wallet.password) ||
+                !VecPush(secret, cast(u8)0) || Option(transfer, HTTPAuth, cast(isize)1) != 0 ||
+                Option(transfer, Username, *user[0]) != 0 || Option(transfer, Password, *secret[0]) != 0 { return false }
+        }
+        receive: Callback = ReadBody
+        headers: Callback = ReadHeader
+        progress: ProgressHandler = Progress
+        cancellation := cancel
+        noProxy: [1]u8
+        if Option(transfer, URLHandle, url) != 0 || Option(transfer, HeaderList, basicHeaders) != 0 ||
+            Option(transfer, PostFields, *payload[0]) != 0 || Option(transfer, PostSize, cast(isize)payload.count) != 0 ||
+            Option(transfer, Timeout, cast(isize)15) != 0 || Option(transfer, NoSignal, cast(isize)1) != 0 ||
+            Option(transfer, Proxy, *noProxy[0]) != 0 || Option(transfer, WriteCallback, receive) != 0 ||
+            Option(transfer, WriteData, output) != 0 || Option(transfer, HeaderCallback, headers) != 0 ||
+            Option(transfer, HeaderData, output) != 0 || Option(transfer, NoProgress, cast(isize)0) != 0 ||
+            Option(transfer, ProgressCallback, progress) != 0 || Option(transfer, ProgressData, *cancellation) != 0 { return false }
+        VecClear(output.body)
+        output.digest.nonceLength = 0
+        output.digest.realmLength = 0
+        return Perform(transfer) == 0 && !Cancelled(cancel) && Info(transfer, ResponseCode, *output.status) == 0
+    }
+
+    #scope_export
+    Cancelled :: (cancel: Cancellation) -> bool { return cancel.stopping != null && cancel.stopping(cancel.context) }
+
+    ConfigurationError :: (wallet: Wallet) -> string {
+        url := NewURL()
+        if url == null { return "monero rpc unavailable" }
+        defer FreeURL(url)
+        return Configure(wallet, url)
+    }
+
+    Request :: (wallet: Wallet, method: string, parameters: *json.JsonDocument, node: s32, cancel: Cancellation,
+        output: *Reply) -> s32 {
+        if Cancelled(cancel) { return -1 }
+        url := NewURL()
+        if url == null { return -1 }
+        defer FreeURL(url)
+        if Configure(wallet, url) != "" { return -1 }
+        request: json.JsonDocument
+        root := json.JsonNewObject(*request)
+        if !json.JsonSet(*request, root, "jsonrpc", json.JsonNewString(*request, "2.0")) ||
+            !json.JsonSet(*request, root, "id", json.JsonNewString(*request, "0")) ||
+            !json.JsonSet(*request, root, "method", json.JsonNewString(*request, method)) ||
+            !json.JsonSet(*request, root, "params", json.JsonCopy(*request, parameters, node)) { return -1 }
+        payload: Vec(u8)
+        if !json.JsonWriteInto(*payload, *request, root, json.JsonCompactStyle(false)) { return -1 }
+        body := VecSlice(payload, 0, payload.count)
+        response: Response
+        if !Transfer(wallet, url, body, "", cancel, *response) { return -1 }
+        if response.status == 401 && wallet.username != "" && response.digest.nonceLength > 0 {
+            authorization: Text = DigestHeader(wallet, url, response.digest)
+            if TextView(authorization) == "" || !Transfer(wallet, url, body, TextView(authorization), cancel, *response) { return -1 }
+        }
+        if response.status < 200 || response.status >= 300 { return -1 }
+        VecSwap(output.body, response.body)
+        document := *output.document
+        if !json.JsonRead(document, TextView(VecSlice(output.body, 0, output.body.count))) { return -1 }
+        problem := json.JsonMember(document, document.root, "error")
+        if problem >= 0 && json.JsonKindOf(document, problem) != .Null { return -1 }
+        result := json.JsonMember(document, document.root, "result")
+        return ifx json.JsonKindOf(document, result) == .Object then result else -1
+    }
+}

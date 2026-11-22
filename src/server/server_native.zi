@@ -1,0 +1,892 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    holds :: #import "account_hold_native";
+    passkeys :: #import "account_passkey_native";
+    backups :: #import "account_backup_native";
+    decoys :: #import "account_backup_decoy_native";
+    registry :: #import "app_registry_native";
+    registrations :: #import "app_registration_http_native";
+    app_network :: #import "app_network_native";
+    network :: #import "network_scope_native";
+    node_identity :: #import "node_identity_native";
+    trust_peers :: #import "trust_peers_native";
+    pairing :: #import "pairing_http_native";
+    peer_http :: #import "peer_http_native";
+    namespace :: #import "name_http_native";
+    mesh_export :: #import "mesh_export_http_native";
+    mesh_import :: #import "mesh_import_http_native";
+    mesh_pull :: #import "mesh_pull_native";
+    peer_settings :: #import "mesh_peer_settings_native";
+    bundles :: #import "bundle_http_native";
+    blobs :: #import "blob_http_native";
+    blob_store :: #import "blob_store_native";
+    packages :: #import "package_http_native";
+    publications :: #import "publication_http_native";
+    social :: #import "social_http_native";
+    feedback :: #import "feedback_http_native";
+    chat :: #import "chat_http_native";
+    lumi :: #import "lumi_developer_native";
+    lumi_telegram :: #import "lumi_telegram_native";
+    telegram_entry :: #import "telegram_account_entry_native";
+    telegram_menu :: #import "telegram_account_menu_native";
+    google :: #import "account_google_http_native";
+    lists :: #import "shared_lists_http_native";
+    tokens :: #import "token_http_native";
+    aliases :: #import "alias_http_native";
+    token_issuer :: #import "token_issuer_native";
+    token_rewards :: #import "token_rewards_http_native";
+    reward_campaign :: #import "token_reward_native";
+    reward_cli :: #import "reward_cli_native";
+    entitlement_rules :: #import "entitlement_rules_native";
+    entitlements :: #import "entitlements_http_native";
+    authorizations :: #import "authorization_http_native";
+    delegated :: #import "delegated_sync_native";
+    docs :: #import "docs_native";
+    grants :: #import "app_grant_http_native";
+    links :: #import "device_link_native";
+    records :: #import "record_sync_http_native";
+    diagnostics :: #import "sync_diagnostics_native";
+    sockets :: #import "sync_ws_native";
+    notifications :: #import "sync_hub_native";
+    http :: #import "http_server_native";
+    auth :: #import "http_auth_native";
+    http_metrics :: #import "http_metrics_native";
+    http_policy :: #import "http_policy_native";
+    limiting :: #import "rate_limit_native";
+    rates :: #import "exchange_rate_native";
+    reward_migration :: #import "reward_migration_http_native";
+    game_evidence :: #import "game_evidence_http_native";
+    stars :: #import "telegram_stars_native";
+    lumi_store :: #import "lumi_telegram_store_native";
+    monero :: #import "monero_http_native";
+    monero_wallet :: #import "monero_wallet_native";
+    monero_worker :: #import "monero_worker_native";
+    play :: #import "google_play_http_native";
+    play_provider :: #import "google_play_provider_native";
+    http_json :: #import "http_json_native";
+    listener :: #import "listen_native";
+    uploads :: #import "http_upload_native";
+    operational :: #import "operational_native";
+    inspect :: #import "inspect_cli_native";
+    build_version :: #import "version";
+    discovery :: #import "discovery_native";
+    sqlite :: #import "sqlite/SQLite";
+    schema :: #import "sqlite_schema";
+    startup :: #import "store_startup_native";
+    signatures :: #import "ml_dsa44_native";
+    oqs :: #import "oqs/Oqs";
+    wire :: #import "wire_text";
+    binary :: #import "binary_codec";
+    environment :: #import "std/environment_linux";
+    files :: #import "std/file_linux";
+    file_tree :: #import "std/file_tree_linux";
+    mutex :: #import "std/mutex_linux";
+    calendar :: #import "std/date_time_linux";
+    linux :: #import "std/socket_linux";
+    numbers :: #import "std/number_text";
+    strings :: #import "std/byte_text_linux";
+    random :: #import "std/random_linux";
+    stdio :: #import "std/stdio_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    c :: #system_library "c";
+    TimeSpec :: struct {
+        seconds: isize
+        nanoseconds: isize
+    }
+    EmptySignals :: (mask: *void) -> s32 #foreign c "sigemptyset";
+    AddSignal :: (mask: *void, signal: s32) -> s32 #foreign c "sigaddset";
+    BlockSignals :: (how: s32, mask: *void, previous: *void) -> s32 #foreign c "pthread_sigmask";
+    WaitSignal :: (mask: *void, information: *void, timeout: *TimeSpec) -> s32 #foreign c "sigtimedwait";
+    Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+    Free :: (pointer: *void) #foreign c "free";
+
+    SignalInterrupt :: 2;
+    SignalTerminate :: 15;
+    MaskBlock :: 0;
+    Timeout :: 11;
+    Interrupted :: 4;
+
+    #scope_export
+    State :: struct {
+        accounts: accounts.AccountAccess
+        notificationHub: notifications.Hub
+        deviceLinks: links.Store
+        backupDecoys: decoys.Decoys
+        networkScope: network.Scope
+        localNode: node_identity.Identity
+        registration: registrations.Authorization
+        pairingConfiguration: pairing.Settings
+        knownPeers: json.JsonDocument
+        counters: http_metrics.Counters
+        feedbackToken: string
+        chat: chat.Configuration
+        lumi: lumi.Configuration
+        lumiTelegram: lumi_telegram.Configuration
+        google: google.State
+        tokens: tokens.State
+        entitlements: entitlement_rules.Configuration
+        exchangeRates: rates.ExchangeRateState
+        telegramStars: stars.State
+        moneroPurchases: monero.State
+        moneroReconciler: monero_worker.Worker
+        playPurchases: play.PlayState
+        playVerifier: bool
+        giftsEnabled: bool
+        premiumAliasesEnabled: bool
+        meshToken: string
+        meshBatch: s64
+        persistentSecret: bool
+        issuerPublic: []u8
+    }
+
+    #scope_file
+    Request :: struct {
+        upload: uploads.Upload
+        socket: sockets.UpgradeRequest
+        counters: http_metrics.Request
+    }
+
+    IntegerSetting :: struct {
+        value: s64
+        valid: bool
+    }
+
+    Integer :: (key: string, fallback: s64, allowNonpositive: bool = false) -> IntegerSetting {
+        raw := environment.EnvironmentText(key)
+        if raw == "" {
+            return .{value = fallback, valid = true}
+        }
+        value, count := numbers.IntegerPrefix(raw)
+        if count == 0 || count != raw.count {
+            return .{}
+        }
+        return .{value = ifx value > 0 || allowNonpositive then value else fallback, valid = true}
+    }
+
+    Enabled :: (key: string, fallback: bool) -> bool {
+        value := environment.EnvironmentText(key)
+        if value == "1" || wire.MatchesToken(value, "true") {
+            return true
+        }
+        if value == "0" || wire.MatchesToken(value, "false") {
+            return false
+        }
+        return fallback
+    }
+
+    FlagSetting :: (key: string, fallback: bool) -> bool {
+        value := wire.TrimSpace(environment.EnvironmentText(key))
+        if value == "" { return fallback }
+        return value == "1" || wire.MatchesToken(value, "true") || wire.MatchesToken(value, "yes") || wire.MatchesToken(value, "on")
+    }
+
+    Setting :: (key: string, fallback: string) -> string {
+        value := environment.EnvironmentText(key)
+        return ifx value != "" then value else fallback
+    }
+
+    SecretSetting :: (key: string, fileKey: string, scratch: []u8) -> string {
+        value := environment.EnvironmentText(key)
+        if value != "" {
+            return value
+        }
+        path := wire.TrimSpace(environment.EnvironmentText(fileKey))
+        if path == "" {
+            return ""
+        }
+        if file_tree.PathStatus(path).kind != .File {
+            unused stdio.PrintError("could not read Mesh token file\n")
+            return ""
+        }
+        opened := files.OpenRead(path)
+        if !opened.valid {
+            unused stdio.PrintError("could not read Mesh token file\n")
+            return ""
+        }
+        defer files.CloseFile(opened)
+        size := files.FileSize(opened)
+        if size < 0 || size > scratch.count || files.ReadAt(opened, scratch[:size], 0) != size {
+            unused stdio.PrintError("could not read Mesh token file\n")
+            return ""
+        }
+        return wire.TrimSpace(TextView(scratch[:size]))
+    }
+
+    StopSignals :: (mask: *void) -> bool {
+        return EmptySignals(mask) == 0 && AddSignal(mask, SignalInterrupt) == 0 &&
+            AddSignal(mask, SignalTerminate) == 0 && BlockSignals(MaskBlock, mask, null) == 0
+    }
+
+    #scope_export
+    Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+        completed := cast(*Request)(<<request)
+        if completed == null {
+            return
+        }
+        state := cast(*State)context
+        http_metrics.Finish(*state.counters, completed.counters, http.ResponseStatus(connection))
+        sockets.Complete(*completed.socket)
+        VecFree(completed.upload.bytes)
+        Free(cast(*void)completed)
+        <<request = null
+    }
+
+    Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+        version: *u8, upload: *u8, size: *usize, request: **void) -> s32 {
+        if <<request == null {
+            created := cast(*Request)Allocate(1, size_of(Request))
+            if created == null { return 0 }
+            created.counters = http_metrics.Begin(strings.TextFromCString(method), strings.TextFromCString(path))
+            <<request = cast(*void)created
+            return 1
+        }
+        state := cast(*State)context
+        empty: [0]u8
+        if state.networkScope.lanOnly {
+            peer := http.RemoteAddress(connection)
+            if !network.AllowsIP(*state.networkScope, peer.bytes[:peer.count]) {
+                <<size = 0
+                return http.Write(connection, 403, "", empty[:])
+            }
+        }
+        route := strings.TextFromCString(path)
+        verb := strings.TextFromCString(method)
+        if http.HeaderTooLarge(connection) {
+            <<size = 0
+            return http.Write(connection, 431, "", empty[:])
+        }
+        if http_policy.IsPreflight(verb) {
+            if <<size > 0 {
+                <<size = 0
+                return 1
+            }
+            return http.Write(connection, http_policy.PreflightStatus, "", empty[:])
+        }
+        isSync := route == "/api/v1/sync"
+        deviceLink := links.Handles(route)
+        blob := blobs.Handles(route)
+        passkey := passkeys.Handles(route)
+        backup := backups.Handles(route)
+        registration := registrations.Handles(route, verb)
+        nodePairing := pairing.Handles(route)
+        nodeName := namespace.Handles(route)
+        peerExport := route == mesh_export.Path
+        peerImport := route == mesh_import.Path
+        current := cast(*Request)(<<request)
+        body := *current.upload
+        if <<size > 0 {
+            if deviceLink && verb == "POST" {
+                uploads.Append(body, upload, <<size, links.RequestLimit)
+            } else if backup && verb == "POST" {
+                uploads.Append(body, upload, <<size, backups.RequestBytes(route))
+            } else if passkey && verb == "POST" {
+                uploads.Append(body, upload, <<size, passkeys.RequestBytes(route))
+            } else if blob && verb == "PUT" {
+                uploads.Append(body, upload, <<size, blobs.MaxBlobBytes)
+            } else if feedback.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, feedback.BodyLimit(route))
+            } else if publications.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, publications.MaxRequestBytes)
+            } else if chat.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, chat.BodyLimit(route))
+            } else if google.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, google.MaxRequestBytes)
+            } else if lists.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, lists.RequestLimit)
+            } else if lumi.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, lumi.RequestLimit)
+            } else if lumi_telegram.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, lumi_telegram.BodyLimit(route))
+            } else if telegram_entry.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, telegram_entry.BodyLimit(route))
+            } else if stars.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, stars.BodyLimit(route))
+            } else if token_rewards.ReadsBody(route, verb) || entitlements.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, 1024)
+            } else if reward_migration.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, reward_migration.BodyLimit)
+            } else if game_evidence.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, game_evidence.BodyLimit)
+            } else if aliases.ReadsBody(route, verb) {
+                maximum := state.accounts.configuration.maximumBodyBytes
+                uploads.Append(body, upload, <<size, ifx route == "/api/v1/account/alias/purchase" && maximum > 2048 then 2048 else maximum)
+            } else if authorizations.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, authorizations.BodyLimit(route))
+            } else if delegated.ReadsBody(route, verb) {
+                maximum := state.accounts.configuration.maximumBodyBytes
+                uploads.Append(body, upload, <<size, ifx maximum < 1048576 then maximum else 1048576)
+            } else if registration || ((isSync || nodePairing || nodeName || peerExport || peerImport) && verb == "POST") ||
+                accounts.ReadsBody(route, verb) || grants.ReadsBody(route, verb) || social.ReadsBody(route, verb) ||
+                tokens.ReadsBody(route, verb) || monero.ReadsBody(route, verb) || play.ReadsBody(route, verb) {
+                uploads.Append(body, upload, <<size, state.accounts.configuration.maximumBodyBytes)
+            }
+            <<size = 0
+            return 1
+        }
+        if route == "/api/v1/rates" {
+            return rates.Handle(*state.exchangeRates, connection, verb, state.entitlements.moneroAtomicAmount,
+                state.entitlements.moneroTokenUnits)
+        }
+        if docs.Handles(route) {
+            settings := state.accounts.configuration
+            if route != "/" || (verb != "GET" && verb != "HEAD") {
+                return docs.Handle(connection, verb, route, settings.zstdResponses)
+            }
+            if !mutex.Lock(*state.accounts.databaseLock) {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            defer mutex.Unlock(*state.accounts.databaseLock)
+            return docs.HandleWithStats(connection, verb, route, settings.zstdResponses, settings.database, settings.path)
+        }
+        if feedback.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return feedback.Handle(*state.accounts, connection, verb, route, state.feedbackToken,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if chat.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return chat.Handle(*state.accounts, connection, verb, route, state.chat,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if google.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return google.Handle(*state.google, *state.accounts, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if lists.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return lists.HandleWithHub(*state.accounts, *state.notificationHub, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if lumi.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return lumi.Handle(*state.accounts, connection, verb, route, state.lumi,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if lumi_telegram.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return lumi_telegram.Handle(*state.accounts, connection, verb, route, state.lumiTelegram,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if stars.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return stars.Handle(*state.telegramStars, *state.accounts, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow, state.lumiTelegram.bot, state.registration.adminToken)
+        }
+        if monero.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return monero.Handle(*state.moneroPurchases, *state.tokens, *state.accounts, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if play.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return play.Handle(*state.playPurchases, *state.tokens, *state.accounts, connection, verb,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if tokens.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return tokens.Handle(*state.tokens, *state.accounts, state.registration.adminToken, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if token_rewards.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return token_rewards.Handle(*state.tokens.signer, *state.accounts, state.giftsEnabled, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if reward_migration.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return reward_migration.Handle(*state.accounts, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if game_evidence.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return game_evidence.Handle(*state.accounts, state.registration.adminToken, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if entitlements.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return entitlements.Handle(*state.accounts, state.entitlements, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if aliases.Handles(route) {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return aliases.Handle(*state.accounts, *state.tokens.signer, state.premiumAliasesEnabled, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if authorizations.Handles(route) || delegated.Handles(route) || telegram_entry.Handles(route) || sockets.HandlesDelegated(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            bytes := VecSlice(body.bytes, 0, body.bytes.count)
+            identity := state.localNode.id
+            nodeID := TextView(identity[:64])
+            audience := state.pairingConfiguration.baseURL
+            if sockets.HandlesDelegated(route) {
+                return sockets.HandleDelegated(*state.accounts, *state.notificationHub, *current.socket, connection, verb, nodeID, audience)
+            }
+            if delegated.Handles(route) {
+                return delegated.Handle(*state.accounts, connection, verb, route, bytes, body.overflow,
+                    nodeID, audience, http.RequestTarget(connection))
+            }
+            if telegram_entry.Handles(route) {
+                return telegram_entry.Handle(*state.accounts, connection, verb, route, bytes, body.overflow,
+                    nodeID, audience, state.lumiTelegram.bot.token)
+            }
+            return authorizations.Handle(*state.accounts, connection, verb, route, bytes, body.overflow,
+                nodeID, audience, state.lumiTelegram.bot.token)
+        }
+        if publications.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return publications.Handle(*state.accounts, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if social.Handles(route) {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            return social.HandleWithHub(*state.accounts, *state.notificationHub, connection, verb, route,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if route == "/api/v1/sync/ws" {
+            return sockets.Handle(*state.accounts, *state.notificationHub, *current.socket, connection, verb)
+        }
+        if route == diagnostics.Path {
+            return diagnostics.Handle(*state.accounts, connection, verb)
+        }
+        appGrant := grants.Handles(route)
+        if accounts.Handles(route) || isSync || appGrant || deviceLink {
+            if body.unavailable {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            bytes := VecSlice(body.bytes, 0, body.bytes.count)
+            if isSync {
+                return records.Handle(*state.accounts, *state.notificationHub, connection, verb, route, bytes, body.overflow)
+            }
+            if deviceLink {
+                settings := state.accounts.configuration
+                return links.Handle(*state.deviceLinks, connection, verb, route, bytes, body.overflow,
+                    settings.zstdRequests, settings.zstdResponses)
+            }
+            if appGrant {
+                return grants.Handle(*state.accounts, connection, verb, route, bytes, body.overflow)
+            }
+            return accounts.Handle(*state.accounts, connection, verb, route, bytes, body.overflow)
+        }
+        if backup {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return backups.Handle(*state.accounts, connection, *state.backupDecoys, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if passkey {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return passkeys.Handle(*state.accounts, connection, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if blob {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return blobs.Handle(*state.accounts, connection, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if bundles.Handles(route) {
+            return bundles.Handle(*state.accounts, connection, verb, route)
+        }
+        if packages.Handles(route) {
+            return packages.Handle(*state.accounts, connection, verb, route, state.issuerPublic)
+        }
+        if registration {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return registrations.Register(*state.accounts, connection, verb, route, state.registration,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if route == trust_peers.Path {
+            if !mutex.Lock(*state.accounts.databaseLock) { return http.Write(connection, 503, "", empty[:]) }
+            defer mutex.Unlock(*state.accounts.databaseLock)
+            return trust_peers.List(connection, verb, state.accounts.configuration.database, state.registration.adminToken)
+        }
+        if nodePairing {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return pairing.Handle(*state.accounts, connection, verb, route, state.pairingConfiguration,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if nodeName {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return namespace.Handle(*state.accounts, connection, verb, route, state.registration.adminToken,
+                VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if peerExport {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return mesh_export.Handle(*state.accounts, *state.networkScope, state.meshToken, state.meshBatch,
+                connection, verb, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if peerImport {
+            if body.unavailable { return http.Write(connection, 503, "", empty[:]) }
+            return mesh_import.Handle(*state.accounts, *state.networkScope, state.meshToken, state.registration.approvalKey,
+                connection, verb, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+        }
+        if registry.Handles(route) {
+            if !mutex.Lock(*state.accounts.databaseLock) {
+                return http.Write(connection, 503, "", empty[:])
+            }
+            defer mutex.Unlock(*state.accounts.databaseLock)
+            return registry.Handle(state.accounts.configuration.database, connection, verb, route)
+        }
+        if route != "/readyz" && route != "/healthz" && route != "/api/v1/node" && route != "/metrics" {
+            return http.Write(connection, 404, "", empty[:])
+        }
+        if verb != "GET" && verb != "HEAD" {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            return http.WriteWithHeaders(connection, 405, "", empty[:], headers[:])
+        }
+        if route == "/healthz" {
+            return operational.Health(connection)
+        }
+        if route == "/metrics" && state.registration.adminToken != "" && !auth.AdminMatches(connection, state.registration.adminToken) {
+            return http_json.ErrorReply(connection, verb, 401, "admin token required", state.accounts.configuration.zstdResponses)
+        }
+        if !mutex.Lock(*state.accounts.databaseLock) {
+            return http.Write(connection, 503, "", empty[:])
+        }
+        defer mutex.Unlock(*state.accounts.databaseLock)
+        if route == "/metrics" {
+            settings := state.accounts.configuration
+            return operational.Metrics(connection, settings.database, settings.path,
+                notifications.Stats(*state.notificationHub), *state.counters, limiting.Rejected(*state.accounts.limiter))
+        }
+        if route == "/api/v1/node" {
+            configuration := state.accounts.configuration
+            node := state.pairingConfiguration
+            return operational.Node(connection, verb, configuration.database, configuration.path, *state.localNode,
+                node.displayName, node.baseURL, *state.knownPeers, notifications.Stats(*state.notificationHub),
+                state.premiumAliasesEnabled, state.playVerifier, configuration.zstdRequests, configuration.zstdResponses)
+        }
+        return operational.Ready(connection, state.accounts.configuration.database, .{
+            persistentTokenSecret = state.persistentSecret, verifierAvailable = true,
+            issuerStatus = token_issuer.Status(*state.tokens.signer)})
+    }
+
+    #scope_file
+    Fail :: (message: string) -> s32 {
+        unused stdio.PrintError(message)
+        return 1
+    }
+
+    FailLine :: (message: string) -> s32 {
+        unused stdio.PrintError(message)
+        unused stdio.PrintError("\n")
+        return 1
+    }
+
+    ReadSecret :: (encoded: string) -> binary.BinaryBytes {
+        if encoded == "" {
+            return .{}
+        }
+        return binary.DecodeBinaryField(encoded)
+    }
+
+    Stop :: (daemon: *void, hub: *notifications.Hub) {
+        notifications.Stop(hub)
+        http.Stop(daemon)
+    }
+
+    PurgeFiles :: (access: *accounts.AccountAccess, trashDays: s64) {
+        if !mutex.Lock(*access.databaseLock) {
+            return
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        settings := access.configuration
+        now := calendar.UnixMilliseconds() / 1000
+        purged := holds.Purge(settings.database, settings.path, now)
+        if purged.databaseError != sqlite.SQLITE_OK || purged.error != "" {
+            unused stdio.PrintError("could not purge expired account holds\n")
+        }
+        if !blob_store.Purge(settings.database, settings.path, now, trashDays) {
+            unused stdio.PrintError("could not purge expired trashed blobs\n")
+        }
+    }
+
+    Run :: (access: *accounts.AccountAccess, mask: *void, trashDays: s64) -> s32 {
+        timeout: TimeSpec = .{seconds = 3600}
+        while true {
+            signal := WaitSignal(mask, null, *timeout)
+            if signal == SignalInterrupt || signal == SignalTerminate {
+                return 0
+            }
+            error := linux.LinuxErrno()
+            if error == Timeout {
+                PurgeFiles(access, trashDays)
+                unused lumi_telegram.Prune(access, calendar.UnixMilliseconds() / 1000)
+            } else if error != Interrupted {
+                return Fail("could not wait for termination\n")
+            }
+        }
+        return 0
+    }
+
+    Serve :: () -> s32 {
+        endpoint := listener.ParseEndpoint(Setting("MESH_ADDR", "127.0.0.1:8080"))
+        if !endpoint.valid { return Fail("invalid MESH_ADDR\n") }
+        state: State
+        networkProblem := network.Parse(*state.networkScope, Enabled("MESH_LAN_ONLY", false),
+            environment.EnvironmentText("MESH_LAN_NETWORKS"))
+        if networkProblem != "" { return FailLine(networkProblem) }
+        if !listener.AllowsBind(endpoint, *state.networkScope) {
+            return Fail("LAN-only nodes require explicit private LAN networks and a local bind address\n")
+        }
+        path := Setting("MESH_DB", "daochi.db")
+        maximum := Integer("MESH_MAX_BODY_BYTES", 1048576)
+        storage := Integer("MESH_ACCOUNT_STORAGE_LIMIT_BYTES", 0)
+        lifetime := Integer("MESH_TOKEN_TTL_SECONDS", 3600)
+        challenge := Integer("MESH_CHALLENGE_TTL_SECONDS", 60)
+        payloadLimit := Integer("MESH_ENCRYPTED_PAYLOAD_MAX_ACCOUNT_BYTES", 0)
+        payloadPage := Integer("MESH_ENCRYPTED_PAYLOAD_MAX_RETURN", 0)
+        payloadDays := Integer("MESH_ENCRYPTED_PAYLOAD_RETENTION_DAYS", 0)
+        trashDays := Integer("MESH_TRASH_PURGE_DAYS", 30, true)
+        chatDaily := Integer("MESH_CHAT_DAILY_LIMIT", 20, true)
+        chatGlobal := Integer("MESH_CHAT_GLOBAL_DAILY_LIMIT", 1000, true)
+        lumiGroup := Integer("MESH_LUMI_GROUP_ID", 0, true)
+        moneroAmount := Integer("MONERO_RATE_ATOMIC_AMOUNT", 0, true)
+        moneroUnits := Integer("MONERO_RATE_TOKEN_UNITS", 0, true)
+        trialUntil := Integer("MESH_UNLOCK_TRIAL_UNTIL", 0, true)
+        islandLaunch := Integer("MESH_SHOVEY_ISLAND_LAUNCH_AT", 0, true)
+        if !maximum.valid || !storage.valid || !lifetime.valid || !challenge.valid ||
+            !payloadLimit.valid || !payloadPage.valid || !payloadDays.valid || payloadDays.value > 106751 ||
+            !trashDays.valid || trashDays.value > 106751 || !chatDaily.valid || !chatGlobal.valid || !lumiGroup.valid ||
+            !moneroAmount.valid || !moneroUnits.valid || !trialUntil.valid || !islandLaunch.valid {
+            return Fail("invalid Mesh server numeric setting\n")
+        }
+        secretText := environment.EnvironmentText("MESH_TOKEN_SECRET_HEX")
+        if secretText.count % 2 != 0 || !binary.IsHex(secretText) {
+            return Fail("invalid MESH_TOKEN_SECRET_HEX\n")
+        }
+        decoded := ReadSecret(secretText)
+        defer oqs.Cleanse(VecSlice(decoded.value, 0, decoded.value.count))
+        if decoded.error != "" {
+            return Fail("invalid MESH_TOKEN_SECRET_HEX\n")
+        }
+        temporary: [32]u8
+        defer oqs.Cleanse(temporary[:])
+        secret := VecSlice(decoded.value, 0, decoded.value.count)
+        persistent := secret.count >= 32
+        if !persistent {
+            if !Enabled("MESH_ALLOW_EPHEMERAL_TOKEN_SECRET", false) {
+                return Fail("MESH_TOKEN_SECRET_HEX must contain at least 32 bytes\n")
+            }
+            if !random.FillSecure(temporary[:]) {
+                return Fail("could not generate the ephemeral token secret\n")
+            }
+            secret = temporary[:]
+        }
+        mask: [16]u64 // Linux sigset_t
+        if !StopSignals(cast(*void)(*mask[0])) {
+            return Fail("could not initialize termination signals\n")
+        }
+        opened := schema.OpenCore(path)
+        if opened.status != sqlite.SQLITE_OK {
+            return Fail("could not open the Mesh database\n")
+        }
+        database := opened.database
+        defer sqlite.SqliteClose(database)
+        if startup.InitializeFeatures(database) != sqlite.SQLITE_OK || !lumi_store.Ensure(database) {
+            return Fail("could not initialize the Mesh database\n")
+        }
+        manifestProblem := app_network.StoredAllowed(*state.networkScope, database)
+        if manifestProblem != "" { return FailLine(manifestProblem) }
+        defer oqs.Cleanse(state.localNode.seed[:])
+        if !node_identity.Load(path, *state.localNode) { return Fail("could not load the Mesh node identity\n") }
+        issuer := node_identity.HexSetting("MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX", "MESH_TOKEN_ISSUER_PUBLIC_KEY_HEX_FILE")
+        approvalKey := node_identity.HexSetting("MESH_NODE_REGISTRY_PUBLIC_KEY_HEX", "MESH_NODE_REGISTRY_PUBLIC_KEY_HEX_FILE")
+        state.persistentSecret = persistent
+        state.registration = .{adminToken = environment.EnvironmentText("MESH_ADMIN_TOKEN"),
+            approvalKey = VecSlice(approvalKey.value, 0, approvalKey.value.count),
+            nodeID = TextView(state.localNode.id[:64]), scope = *state.networkScope}
+        feedbackSecret: [4096]u8
+        defer oqs.Cleanse(feedbackSecret[:])
+        state.feedbackToken = SecretSetting("MESH_FEEDBACK_TOKEN", "MESH_FEEDBACK_TOKEN_FILE", feedbackSecret[:])
+        if state.feedbackToken == "" {
+            state.feedbackToken = SecretSetting("MESH_ADMIN_TOKEN", "MESH_ADMIN_TOKEN_FILE", feedbackSecret[:])
+        }
+        chatSecret: [4096]u8
+        defer oqs.Cleanse(chatSecret[:])
+        state.chat = .{apiKey = SecretSetting("MESH_CHAT_API_KEY", "MESH_CHAT_API_KEY_FILE", chatSecret[:]),
+            endpoint = environment.EnvironmentText("MESH_CHAT_ENDPOINT"), model = Setting("MESH_CHAT_MODEL", "glm-4.7-flash"),
+            dailyLimit = chatDaily.value, globalDailyLimit = chatGlobal.value}
+        lumiSecret: [4096]u8
+        defer oqs.Cleanse(lumiSecret[:])
+        state.lumi = .{ownerID = environment.EnvironmentText("MESH_LUMI_OWNER_ID"),
+            developerToken = SecretSetting("MESH_LUMI_DEVELOPER_TOKEN", "MESH_LUMI_DEVELOPER_TOKEN_FILE", lumiSecret[:])}
+        botSecret: [4096]u8
+        webhookSecret: [4096]u8
+        defer oqs.Cleanse(botSecret[:])
+        defer oqs.Cleanse(webhookSecret[:])
+        state.pairingConfiguration = .{admin = state.registration.adminToken, baseURL = Setting("MESH_BASE_URL", "https://api.example.com"),
+            displayName = Setting("MESH_NODE_NAME", "Mesh Node"), local = *state.localNode, scope = *state.networkScope}
+        state.lumiTelegram = .{bot = .{token = SecretSetting("MESH_LUMI_BOT_TOKEN", "MESH_LUMI_BOT_TOKEN_FILE", botSecret[:])},
+            webhookSecret = SecretSetting("MESH_LUMI_WEBHOOK_SECRET", "MESH_LUMI_WEBHOOK_SECRET_FILE", webhookSecret[:]),
+            ownerID = state.lumi.ownerID, canvasURL = Setting("MESH_LUMI_CANVAS_URL", lumi_telegram.DefaultCanvasURL),
+            groupID = lumiGroup.value, chatSettings = state.chat,
+            accountsEnabled = FlagSetting("MESH_TELEGRAM_ACCOUNTS_ENABLED", false), entryMenu = telegram_menu.Send,
+            entryNode = state.registration.nodeID, entryAudience = state.pairingConfiguration.baseURL,
+            payment = stars.Webhook, paymentContext = cast(*void)(*state.telegramStars)}
+        if !peer_settings.Read(environment.EnvironmentText("MESH_KNOWN_NODES"), *state.knownPeers) {
+            return Fail("could not load configured Mesh peers\n")
+        }
+        state.meshToken = environment.EnvironmentText("MESH_NODE_SYNC_TOKEN")
+        state.meshBatch = Integer("MESH_NODE_SYNC_BATCH_LIMIT", 500).value
+        state.issuerPublic = VecSlice(issuer.value, 0, issuer.value.count)
+        issuerPrivate := node_identity.HexSetting("MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX", "MESH_TOKEN_ISSUER_PRIVATE_KEY_HEX_FILE")
+        privateKey := VecSlice(issuerPrivate.value, 0, issuerPrivate.value.count)
+        directPurchases := FlagSetting("MESH_TOKEN_DIRECT_PURCHASES_ENABLED", false)
+        tokenReady := tokens.Open(*state.tokens, environment.EnvironmentText("MESH_TOKEN_PRODUCTS"), directPurchases, state.issuerPublic, privateKey)
+        oqs.Cleanse(privateKey)
+        if !tokenReady { return Fail("could not initialize Mesh tokens\n") }
+        defer tokens.Close(*state.tokens)
+        if !stars.Open(*state.telegramStars, *state.tokens, environment.EnvironmentText("MESH_TELEGRAM_STARS_APPS"),
+            environment.EnvironmentText("MESH_TELEGRAM_STARS_PRICES"), state.registration.nodeID,
+            state.pairingConfiguration.baseURL, state.lumiTelegram.accountsEnabled, state.lumiTelegram.webhookSecret != "") {
+            return Fail("could not initialize Mesh Telegram Stars\n")
+        }
+        state.giftsEnabled = FlagSetting("MESH_DEW_GIFTS_ENABLED", false)
+        state.premiumAliasesEnabled = FlagSetting("MESH_PREMIUM_ALIASES_ENABLED", false)
+        storagePlans := FlagSetting("MESH_STORAGE_PLANS_ENABLED", false)
+        state.entitlements = .{signer = *state.tokens.signer, storagePlansEnabled = storagePlans,
+            moneroAtomicAmount = moneroAmount.value, moneroTokenUnits = moneroUnits.value,
+            trialUntil = trialUntil.value, islandLaunchAt = islandLaunch.value}
+        walletURL := Setting("MONERO_WALLET_RPC_URL", "")
+        walletNetwork := Setting("MONERO_NETWORK", "mainnet")
+        entitlementError := entitlements.ConfigurationError(state.entitlements, persistent, directPurchases, walletURL, walletNetwork)
+        if entitlementError != "" { return FailLine(entitlementError) }
+        settlement := reward_campaign.SettleCampaign(database, *state.tokens.signer)
+        if settlement.error != "" {
+            unused stdio.PrintError("could not settle Mesh campaign rewards\n")
+        }
+        settings: accounts.Configuration = .{database = database, path = path, secret = secret,
+            challengeSeconds = challenge.value, tokenSeconds = lifetime.value, maximumBodyBytes = maximum.value,
+            accountStorageLimit = storage.value, storagePlansEnabled = storagePlans,
+            encryptedPayloadAccountLimit = payloadLimit.value, encryptedPayloadMaxReturn = payloadPage.value,
+            encryptedPayloadRetentionSeconds = payloadDays.value * 86400,
+            zstdRequests = Enabled("MESH_HTTP_ZSTD_REQUESTS", true), zstdResponses = Enabled("MESH_HTTP_ZSTD_RESPONSES", true),
+            verify = signatures.Verify}
+        if !accounts.Open(*state.accounts, settings) {
+            return Fail("could not initialize Mesh authentication\n")
+        }
+        defer accounts.Close(*state.accounts)
+        defer decoys.Close(*state.backupDecoys)
+        if !links.Open(*state.deviceLinks) {
+            return Fail("could not initialize Mesh device links\n")
+        }
+        defer links.Close(*state.deviceLinks)
+        PurgeFiles(*state.accounts, trashDays.value)
+        unused lumi_telegram.Prune(*state.accounts, calendar.UnixMilliseconds() / 1000)
+        if !notifications.Open(*state.notificationHub) {
+            return Fail("could not initialize Mesh sync notifications\n")
+        }
+        defer notifications.Close(*state.notificationHub)
+        if !peer_http.Open() { return Fail("could not initialize the Mesh peer HTTP client\n") }
+        defer peer_http.Close()
+        rateInterval := Integer("MESH_XMR_RATE_REFRESH_INTERVAL_SECONDS", 600)
+        rateUpstreams: [3]string = .[environment.EnvironmentText("MESH_XMR_COINGECKO_URL"),
+            environment.EnvironmentText("MESH_XMR_KRAKEN_URL"), environment.EnvironmentText("MESH_XMR_COINPAPRIKA_URL")]
+        if !rateInterval.valid || !rates.Open(*state.exchangeRates, .{database = database,
+            databaseLock = *state.accounts.databaseLock, enabled = FlagSetting("MESH_XMR_RATE_REFRESH_ENABLED", true),
+            intervalSeconds = rateInterval.value, upstreams = rateUpstreams}) {
+            return Fail("could not initialize Mesh exchange rates\n")
+        }
+        defer rates.Close(*state.exchangeRates)
+        playSettings := play.FromEnvironment()
+        state.playVerifier = play_provider.Configured(*playSettings.credentials)
+        if !mutex.Lock(*state.accounts.databaseLock) { return Fail("could not lock Mesh storage for Google Play\n") }
+        playReady := play.Open(*state.playPurchases, *state.accounts, *state.tokens, *playSettings)
+        unused mutex.Unlock(*state.accounts.databaseLock)
+        defer play.Close(*state.playPurchases)
+        if !playReady { return Fail("could not initialize Mesh Google Play purchases\n") }
+        walletPassword: [4096]u8
+        defer oqs.Cleanse(walletPassword[:])
+        walletConfiguration: monero_wallet.Configuration = .{wallet = .{url = walletURL,
+                username = Setting("MONERO_WALLET_RPC_USER", ""),
+                password = SecretSetting("MONERO_WALLET_RPC_PASSWORD", "MONERO_WALLET_RPC_PASSWORD_FILE", walletPassword[:])},
+            signer = *state.tokens.signer, directPurchases = directPurchases, network = walletNetwork,
+            rateAtomic = moneroAmount.value, rateTokens = moneroUnits.value,
+            minimumAtomic = Integer("MONERO_MINIMUM_ATOMIC_AMOUNT", 1).value,
+            confirmations = Integer("MONERO_CONFIRMATIONS_REQUIRED", 10).value}
+        reconcileInterval := Integer("MESH_MONERO_RECONCILE_SECONDS", 60)
+        if !reconcileInterval.valid || reconcileInterval.value > 2147483 ||
+            !monero_worker.Open(*state.moneroReconciler, *state.accounts, walletConfiguration, *state.exchangeRates,
+                cast(s32)(reconcileInterval.value * 1000)) {
+            return Fail("could not start Mesh Monero reconciliation\n")
+        }
+        defer monero_worker.Close(*state.moneroReconciler)
+        if !monero.Open(*state.moneroPurchases, walletConfiguration, monero_worker.Cancellation(*state.moneroReconciler)) {
+            return Fail("could not initialize Mesh Monero purchases\n")
+        }
+        defer monero.Close(*state.moneroPurchases)
+        if !google.Open(*state.google, environment.EnvironmentText("MESH_GOOGLE_SIGNIN_CLIENT_IDS"),
+            environment.EnvironmentText("MESH_GOOGLE_SIGNIN_TEST_CERTIFICATES_URL")) {
+            return Fail("could not initialize Mesh Google sign-in\n")
+        }
+        defer google.Close(*state.google)
+        if !http_metrics.Open(*state.counters) { return Fail("could not initialize Mesh HTTP metrics\n") }
+        defer http_metrics.Close(*state.counters)
+        daemon := listener.Bind(endpoint, 1024, cast(*void)(*state), Dispatch, Completed)
+        if daemon == null {
+            return Fail("could not listen on MESH_ADDR\n")
+        }
+        defer Stop(daemon, *state.notificationHub)
+        defer rates.Stop(*state.exchangeRates)
+        defer play.Stop(*state.playPurchases)
+        defer monero_worker.Stop(*state.moneroReconciler)
+        advertiser: discovery.Worker
+        discoveryProblem := discovery.Start(*advertiser, FlagSetting("MESH_LAN_DISCOVERY", true), endpoint.port,
+            state.pairingConfiguration.displayName, TextView(state.localNode.id[:64]))
+        defer discovery.Stop(*advertiser)
+        if discoveryProblem != "" {
+            unused stdio.PrintError(discoveryProblem)
+            unused stdio.PrintError("\n")
+        }
+        pulls: mesh_pull.Worker
+        interval := Integer("MESH_NODE_SYNC_INTERVAL_SECONDS", 0).value
+        replication: mesh_pull.Configuration = .{access = *state.accounts, scope = *state.networkScope, local = *state.localNode,
+            approvalKey = state.registration.approvalKey, configured = *state.knownPeers,
+            token = state.meshToken, batch = state.meshBatch, interval = interval}
+        if !mesh_pull.Start(*pulls, replication) { return Fail("could not start Mesh peer synchronization\n") }
+        defer mesh_pull.Stop(*pulls)
+        port: [24]u8
+        if !stdio.WriteOutput(numbers.FormatInteger(cast(s64)http.BoundPort(daemon), port[:])) ||
+            !stdio.WriteOutput("\n") { return Fail("could not report the Mesh listener\n") }
+        return Run(*state.accounts, cast(*void)(*mask[0]), trashDays.value)
+    }
+
+    Usage :: "usage: mesh [serve | inspect [options] [command] | reward-dew REWARD ACCOUNT DEW | --version]\n";
+
+    #scope_export
+    Main :: (argc: s32, argv: **u8) -> s32 {
+        if argc <= 1 { return Serve() }
+        command := strings.TextFromCString(argv[1])
+        if command == "inspect" { return inspect.Run(argc, argv) }
+        if command == "reward-dew" { return reward_cli.Run(argc, argv, Setting("MESH_DB", "daochi.db")) }
+        if command == "serve" {
+            if argc != 2 { return Fail("usage: mesh serve\n") }
+            return Serve()
+        }
+        if argc == 2 && (command == "--help" || command == "-h" || command == "help") {
+            return ifx stdio.WriteOutput(Usage) then 0 else 1
+        }
+        if argc == 2 && (command == "--version" || command == "version") {
+            written := stdio.WriteOutput("mesh ") && stdio.WriteOutput(build_version.BuildVersion) && stdio.WriteOutput("\n")
+            return ifx written then 0 else 1
+        }
+        unused stdio.PrintError("unknown Mesh command\n")
+        return Fail(Usage)
+    }
+}

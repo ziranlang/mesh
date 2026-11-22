@@ -1,0 +1,103 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    blob :: #import "blob_files_native";
+    queries :: #import "blob_queries";
+    rules :: #import "blob_rules";
+    identity :: #import "identity";
+
+    Deletion :: enum { Deleted; FileError; DatabaseError; }
+
+    Delete :: (database: *void, opened: blob.Directory, hash: string, query: string,
+        arguments: []sql.Argument, conditional: bool) -> Deletion {
+        if !opened.handle.valid && opened.status != blob.Missing { return .FileError }
+        if sql.Execute(database, query, arguments) != sqlite.SQLITE_OK { return .DatabaseError }
+        if opened.handle.valid && (!conditional || sqlite.SqliteChanges(database) != 0) {
+            status: s32
+            file := tree.OpenChildRegularFile(opened.handle, hash, *status)
+            if file.valid {
+                unused files.CloseFile(file)
+                name: Text = blob.TemporaryName(".delete-")
+                temporary := TextView(name)
+                if temporary == "" || !tree.RenameChild(opened.handle, hash, temporary) { return .FileError }
+                if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+                    unused tree.RenameChild(opened.handle, temporary, hash)
+                    return .DatabaseError
+                }
+                unused tree.RemoveChildFile(opened.handle, temporary, true)
+                return .Deleted
+            }
+            if status != blob.Missing { return .FileError }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return .DatabaseError }
+        return .Deleted
+    }
+
+    #scope_file
+    Due :: struct {
+        row: s64
+        user: [64]u8
+        app: [64]u8
+        appLength: s64
+        hash: [64]u8
+        status: s32
+        found: bool
+        valid: bool
+    }
+
+    NextDue :: (database: *void, cutoff: s64, previous: s64) -> Due {
+        arguments: [2]sql.Argument = .[sql.IntArg(cutoff), sql.IntArg(previous)]
+        rows := sql.Prepare(database, "SELECT rowid,user_id_hash,app_id,hash FROM server_blobs WHERE trashed_at<>0 AND trashed_at<=?1 AND rowid>?2 ORDER BY rowid LIMIT 1", arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return .{status = rows.status} }
+        defer sqlite.SqliteFinalize(rows.value)
+        step := sqlite.SqliteStep(rows.value)
+        if step == sqlite.SQLITE_DONE { return .{} }
+        if step != sqlite.SQLITE_ROW { return .{status = step} }
+        result: Due = .{found = true, row = sqlite.SqliteColumnInt64(rows.value, 0)}
+        user := sql.ColumnText(rows.value, 1)
+        app := sql.ColumnText(rows.value, 2)
+        hash := sql.ColumnText(rows.value, 3)
+        if !identity.ValidUserID(user) || !identity.ValidNamespace(app) || !rules.ValidHash(hash) { return result }
+        for byte, index: user { result.user[index] = byte }
+        for byte, index: app { result.app[index] = byte }
+        for byte, index: hash { result.hash[index] = byte }
+        result.appLength = app.count
+        result.valid = true
+        return result
+    }
+
+    RemoveExpired :: (database: *void, path: string, user: string, app: string, hash: string, cutoff: s64) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        directory := blob.Open(path, user, app, false)
+        arguments: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(app), sql.TextArg(hash), sql.IntArg(cutoff)]
+        if directory.handle.valid {
+            defer files.CloseFile(directory.handle)
+            return Delete(database, directory, hash, queries.ForgetTrashedSQL, arguments[:], true) == .Deleted
+        }
+        return Delete(database, directory, hash, queries.ForgetTrashedSQL, arguments[:], true) == .Deleted
+    }
+
+    #scope_export
+    // Scan by row ID so old/corrupt paths cannot cause an unbounded batch or an
+    // endless retry. The caller holds the same database lock as blob mutations.
+    Purge :: (database: *void, path: string, now: s64, trashDays: s64) -> bool {
+        if trashDays <= 0 { return true }
+        cutoff := now - trashDays * 86400
+        previous: s64 = -9223372036854775807 - 1
+        success := true
+        while true {
+            entry := NextDue(database, cutoff, previous)
+            if entry.status != sqlite.SQLITE_OK { return false }
+            if !entry.found { return success }
+            if entry.valid && !RemoveExpired(database, path, TextView(entry.user[:]),
+                TextView(entry.app[:entry.appLength]), TextView(entry.hash[:]), cutoff) { success = false }
+            previous = entry.row
+        }
+        return success
+    }
+}

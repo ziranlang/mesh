@@ -1,0 +1,70 @@
+#import "std/go_types"
+ctx :: #import "std/context_go";
+clock :: #import "std/time_go";
+io :: #import "std/io_go";
+middleware :: #import "middleware";
+limits :: #import "server_limits";
+go_http :: #system_library "go:net/http";
+go_net :: #system_library "go:net";
+go_log :: #system_library "go:log";
+go_os :: #system_library "go:os";
+builtin :: #system_library "go:builtin";
+
+HTTPServer :: #type #foreign go_http "Server";
+Listener :: #type #foreign go_net "Listener";
+
+#scope_file
+Logger :: #type #foreign go_log "Logger";
+Allocate :: () -> *HTTPServer #foreign builtin "new";
+SetAddress :: (server: *HTTPServer, address: string) #go_field #foreign go_http "(*Server).Addr";
+SetHandler :: (server: *HTTPServer, handler: middleware.Handler) #go_field #foreign go_http "(*Server).Handler";
+SetReadHeaderTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).ReadHeaderTimeout";
+SetReadTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).ReadTimeout";
+SetWriteTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).WriteTimeout";
+SetIdleTimeout :: (server: *HTTPServer, duration: clock.Duration) #go_field #foreign go_http "(*Server).IdleTimeout";
+SetMaxHeaderBytes :: (server: *HTTPServer, size: isize) #go_field #foreign go_http "(*Server).MaxHeaderBytes";
+SetErrorLog :: (server: *HTTPServer, logger: *Logger) #go_field #foreign go_http "(*Server).ErrorLog";
+StandardError :: () -> io.Writer #go_field #foreign go_os "Stderr";
+StandardLogFlags :: () -> isize #go_field #foreign go_log "LstdFlags";
+NewLogger :: (writer: io.Writer, prefix: string, flags: isize) -> *Logger #foreign go_log "New";
+Millisecond :: 1000000;
+ListenNative :: (server: *HTTPServer) -> Error #foreign go_http "(*Server).ListenAndServe";
+ShutdownNative :: (server: *HTTPServer, context: ctx.Context) -> Error #foreign go_http "(*Server).Shutdown";
+ServeNative :: (server: *HTTPServer, listener: Listener) -> Error #foreign go_http "(*Server).Serve";
+CloseNative :: (server: *HTTPServer) -> Error #foreign go_http "(*Server).Close";
+ClosedError :: () -> Error #go_field #foreign go_http "ErrServerClosed";
+
+#scope_export
+Listen :: (server: *HTTPServer) -> Error {
+    return ListenNative(server)
+}
+
+Shutdown :: (server: *HTTPServer, context: ctx.Context) -> Error {
+    return ShutdownNative(server, context)
+}
+
+Serve :: (server: *HTTPServer, listener: Listener) -> Error {
+    return ServeNative(server, listener)
+}
+
+Close :: (server: *HTTPServer) -> Error {
+    return CloseNative(server)
+}
+
+Closed :: () -> Error {
+    return ClosedError()
+}
+
+New :: (address: string, handler: middleware.Handler) -> *HTTPServer {
+    server := Allocate()
+    SetAddress(server, address)
+    SetHandler(server, handler)
+    SetReadHeaderTimeout(server, cast(clock.Duration)(limits.HeaderTimeoutMilliseconds * Millisecond))
+    SetReadTimeout(server, cast(clock.Duration)(limits.ReadTimeoutMilliseconds * Millisecond))
+    SetWriteTimeout(server, cast(clock.Duration)(limits.WriteTimeoutMilliseconds * Millisecond))
+    SetIdleTimeout(server, cast(clock.Duration)(limits.IdleTimeoutMilliseconds * Millisecond))
+    // Mesh headers are small. Bound the bytes a request can retain in keys.
+    SetMaxHeaderBytes(server, cast(isize)limits.MaxHeaderBytes)
+    SetErrorLog(server, NewLogger(StandardError(), "http: ", StandardLogFlags()))
+    return server
+}

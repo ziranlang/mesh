@@ -1,0 +1,528 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    environment :: #import "std/environment_linux";
+    files :: #import "std/file_linux";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    mutex :: #import "std/mutex_linux";
+    provider :: #import "google_play_provider_native";
+    registry :: #import "app_registry_queries";
+    response :: #import "http_json_native";
+    signed :: #import "signed_tx_native";
+    signing :: #import "token_signing_native";
+    sockets :: #import "std/socket_linux";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    store :: #import "google_play_store_native";
+    thread :: #import "std/thread_linux";
+    tokens :: #import "token_http_native";
+    wire :: #import "wire_text";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    Configuration :: struct {
+        credentials: provider.PlayCredentials
+        packageNames: Text
+        packageApps: Text
+        intervalMilliseconds: s32
+    }
+
+    PlayState :: struct {
+        configuration: Configuration
+        access: *accounts.AccountAccess
+        tokens: *tokens.State
+        worker: thread.Thread
+        stopFD: s32
+    }
+
+    #scope_file
+    Route :: "/api/v1/tokens/purchases/google/verify";
+    c :: #system_library "c";
+    mhd :: #system_library "microhttpd";
+    ConnectionInfo :: (connection: *void, kind: s32, arguments: ..any) -> *void #foreign mhd "MHD_get_connection_info";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (fds: *sockets.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+    WakeFlags :: 0x80800;
+    ConnectionFD :: 6;
+    ReadHangup :: 8192;
+    SocketErrors :: 56;
+    MaximumCredentialBytes :: 1048576;
+
+    HTTPResult :: struct {
+        status: u32
+        message: string
+    }
+
+    Request :: struct {
+        app: Text
+        packageName: Text
+        productID: Text
+        token: Text
+        error: string
+    }
+
+    Connection :: struct {
+        state: *PlayState
+        fd: s32
+    }
+
+    Pending :: struct {
+        packageName: Text
+        productID: Text
+        token: Text
+    }
+
+    Setting :: (key: string, fileKey: string) -> Text {
+        raw := wire.TrimSpace(environment.EnvironmentText(key))
+        if raw != "" { return TextCopy(raw) }
+        path := wire.TrimSpace(environment.EnvironmentText(fileKey))
+        if path == "" { return .{} }
+        opened := files.OpenRead(path)
+        if !opened.valid { return .{} }
+        defer files.CloseFile(opened)
+        length := files.FileSize(opened)
+        data: Vec(u8)
+        if length <= 0 || !VecResizeBounded(data, length, MaximumCredentialBytes) { return .{} }
+        buffer := VecSlice(data, 0, length)
+        if files.ReadAt(opened, buffer, 0) != length { return .{} }
+        return TextCopy(wire.TrimSpace(TextView(buffer)))
+    }
+
+    PackageApp :: (configured: string, packageName: string) -> string {
+        remaining := configured
+        mapped := ""
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            remaining = item.after
+            pair := wire.Cut(wire.TrimSpace(item.before), #char "=")
+            app := wire.TrimSpace(pair.after)
+            if pair.found && app != "" && !wire.Cut(app, #char "=").found && wire.TrimSpace(pair.before) == packageName { mapped = app }
+        }
+        if mapped != "" { return mapped }
+        if packageName == "xyz.waozi.inbe" || packageName == "net.waozi.inbe" { return "inbe" }
+        if packageName == "xyz.waozi.shovey" { return "shovey" }
+        if packageName == "xyz.waozi.wurm" { return "wurm" }
+        return ""
+    }
+
+    Allowed :: (configuration: *Configuration, packageName: string) -> bool {
+        remaining := TextView(configuration.packageNames)
+        restricted := false
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            remaining = item.after
+            name := wire.TrimSpace(item.before)
+            if name == packageName { return true }
+            if name != "" { restricted = true }
+        }
+        return !restricted
+    }
+
+    ProductUnits :: (state: *tokens.State, productID: string) -> s64 {
+        configured: json.JsonDocument
+        if !json.JsonRead(*configured, TextView(VecSlice(state.products, 0, state.products.count))) { return 0 }
+        list := json.JsonMember(*configured, configured.root, "products")
+        row := json.JsonFirst(*configured, list)
+        while row >= 0 {
+            name: Text = json.JsonString(*configured, json.JsonMember(*configured, row, "product_id"))
+            if TextView(name) == productID {
+                units, ok := json.JsonInteger(*configured, json.JsonMember(*configured, row, "token_units"))
+                return ifx ok then units else 0
+            }
+            row = json.JsonNext(*configured, row)
+        }
+        return 0
+    }
+
+    TrimmedField :: (document: *json.JsonDocument, name: string) -> Text {
+        field: Text = json.JsonString(document, json.JsonMember(document, document.root, name))
+        return TextCopy(wire.TrimSpace(TextView(field)))
+    }
+
+    Read :: (document: *json.JsonDocument, raw: []u8) -> Request {
+        if !json.JsonRead(document, TextView(raw)) { return .{error = "invalid json"} }
+        kind := json.JsonKindOf(document, document.root)
+        if kind != .Object && kind != .Null { return .{error = "invalid json"} }
+        names: [4]string = .["app_id", "package_name", "product_id", "purchase_token"]
+        for name: names {
+            actual := json.JsonKindOf(document, json.JsonMember(document, document.root, name))
+            if actual != .Null && actual != .Missing && actual != .String { return .{error = "invalid json"} }
+        }
+        app: Text = TrimmedField(document, "app_id")
+        if !identity.ValidNamespace(TextView(app)) { return .{error = "invalid app_id"} }
+        packageName: Text = TrimmedField(document, "package_name")
+        productID: Text = TrimmedField(document, "product_id")
+        token: Text = TrimmedField(document, "purchase_token")
+        if TextView(packageName) == "" || TextView(productID) == "" || TextView(token) == "" { return .{error = "purchase fields required"} }
+        return .{app = app, packageName = packageName, productID = productID, token = token}
+    }
+
+    Authorize :: (access: *accounts.AccountAccess, connection: *void, purchase: store.Purchase, raw: []u8, now: s64) -> HTTPResult {
+        database := access.configuration.database
+        args: [2]sql.Argument = .[sql.TextArg(purchase.app), sql.TextArg(ledger.AssetID)]
+        exists := sql.ReadInteger(database, registry.ActiveAppSQL, args[:1])
+        if !exists.found { return .{status = 500, message = "token purchase failed"} }
+        if exists.value == 0 { return .{status = 400, message = "unknown app_id"} }
+        header := wire.TrimSpace(http.Header(connection, "X-Mesh-Tx"))
+        if header != "" {
+            verified := signed.VerifyTx(database, access.configuration.verify, header, purchase.account, purchase.app,
+                "POST", Route, raw, now, purchase.at)
+            if verified.status != 0 { return .{status = verified.status, message = verified.message} }
+            if verified.databaseError != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        }
+        policy := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM token_app_permissions WHERE app_id=?1)", args[:1])
+        if !policy.found { return .{status = 500, message = "authentication failed"} }
+        if policy.value == 0 { return .{} }
+        permission := sql.ReadInteger(database,
+            "SELECT legacy_unsigned_until FROM token_app_permissions WHERE app_id=?1 AND asset_id=?2 AND permission='purchase' AND status='active'", args[:])
+        if permission.status != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        if !permission.found { return .{status = 403, message = "app token permission denied"} }
+        if header == "" && (permission.value == 0 || now > permission.value) { return .{status = 401, message = "signed transaction required"} }
+        return .{}
+    }
+
+    Stopping :: (context: *void) -> bool {
+        state := cast(*PlayState)context
+        if state.stopFD < 0 { return false }
+        descriptor: sockets.LinuxPollFd = .{fd = state.stopFD, events = 1}
+        return Poll(*descriptor, 1, 0) > 0
+    }
+
+    Disconnected :: (context: *void) -> bool {
+        request := cast(*Connection)context
+        if Stopping(cast(*void)request.state) { return true }
+        if request.fd < 0 { return false }
+        descriptor: sockets.LinuxPollFd = .{fd = request.fd, events = ReadHangup}
+        return Poll(*descriptor, 1, 0) > 0 && (descriptor.revents & (ReadHangup | SocketErrors)) != 0
+    }
+
+    Preflight :: (state: *PlayState, connection: *void, purchase: *store.Purchase, raw: []u8, now: s64) -> HTTPResult {
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return .{status = 500, message = "authentication failed"} }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        defer writes.Rollback(database)
+        return Authorize(access, connection, <<purchase, raw, now)
+    }
+
+    // Both authorization checks run without any provider transport holding the database lock.
+    Verify :: (state: *PlayState, connection: *void, purchase: store.Purchase, raw: []u8,
+        inspected: *provider.PlayInspection, cancel: provider.PlayCancellation, receipt: *Text) -> HTTPResult {
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return .{status = 500, message = "token credit failed"} }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        failure: HTTPResult = .{status = 500, message = "token credit failed"}
+        if provider.Cancelled(cancel) || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return failure }
+        defer writes.Rollback(database)
+        now := calendar.UnixMilliseconds() / 1000
+        actor := auth.Authenticate(database, connection, access.configuration.secret, now, "", false)
+        if actor.status != 0 { return .{status = actor.status, message = actor.message} }
+        if TextView(actor.userID[:]) != purchase.account { return .{status = 401, message = "authentication failed"} }
+        if sqlite.SqliteExecText(database, "SAVEPOINT play_authorization") != sqlite.SQLITE_OK { return failure }
+        reserved := Authorize(access, connection, purchase, raw, now)
+        if reserved.status != 0 { return reserved }
+        // Unclaimed purchases may be retried with the same signed request.
+        guarded := store.Process(database, *state.tokens.signer, purchase, inspected)
+        if !guarded.ok || provider.Cancelled(cancel) { return failure }
+        if guarded.missingBinding {
+            if sqlite.SqliteExecText(database, "ROLLBACK TO play_authorization") != sqlite.SQLITE_OK ||
+                sqlite.SqliteExecText(database, "RELEASE play_authorization") != sqlite.SQLITE_OK { return failure }
+            recorded := store.Process(database, *state.tokens.signer, purchase, inspected)
+            if !recorded.ok || !recorded.missingBinding || provider.Cancelled(cancel) ||
+                sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return failure }
+            return .{status = 409, message = "google purchase account binding required"}
+        }
+        if sqlite.SqliteExecText(database, "RELEASE play_authorization") != sqlite.SQLITE_OK || provider.Cancelled(cancel) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return failure }
+        VecSwap(receipt.bytes, guarded.receipt.bytes)
+        return .{}
+    }
+
+    Bearer :: (access: *accounts.AccountAccess, connection: *void, now: s64) -> auth.BearerAuthentication {
+        if !mutex.Lock(*access.databaseLock) { return .{status = 500, message = "authentication failed"} }
+        defer mutex.Unlock(*access.databaseLock)
+        return auth.Authenticate(access.configuration.database, connection, access.configuration.secret, now, "", false)
+    }
+
+    ReplyPurchase :: (access: *accounts.AccountAccess, connection: *void, account: string, id: string) -> s32 {
+        compressed := access.configuration.zstdResponses
+        if !mutex.Lock(*access.databaseLock) { return response.ErrorReply(connection, "POST", 500, "token balance failed", compressed) }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        balance := ledger.Balance(database, account)
+        document: json.JsonDocument
+        receipt := ledger.Receipt(database, id, *document)
+        root := json.JsonNewObject(*document)
+        if !balance.found || receipt.status != 200 || !ledger.PutText(*document, root, "status", "ok") ||
+            !ledger.PutInt(*document, root, "balance", balance.value) || !json.JsonSet(*document, root, "receipt", receipt.node) {
+            return response.ErrorReply(connection, "POST", 500, "token balance failed", compressed)
+        }
+        return response.Reply(connection, "POST", 200, *document, root, compressed)
+    }
+
+    RetryConsume :: (state: *PlayState, product: provider.PlayProduct, cancel: provider.PlayCancellation) {
+        if provider.Cancelled(cancel) { return }
+        access := state.access
+        database := access.configuration.database
+        if !mutex.Lock(*access.databaseLock) { return }
+        current := store.Load(database, product.token)
+        mutex.Unlock(*access.databaseLock)
+        if current.failed || !current.found || TextView(current.state) != "consume_pending" { return }
+        credentials := *state.configuration.credentials
+        inspected := provider.Inspect(credentials, product, cancel)
+        if inspected.status != 0 || !inspected.purchased { return }
+        if !inspected.consumed && !provider.Consume(credentials, product, cancel) {
+            verified := provider.Inspect(credentials, product, cancel)
+            if verified.status != 0 || !verified.purchased || !verified.consumed { return }
+        }
+        if provider.Cancelled(cancel) || !mutex.Lock(*access.databaseLock) { return }
+        defer mutex.Unlock(*access.databaseLock)
+        unused store.MarkConsumed(database, product.token)
+    }
+
+    RefreshSnapshot :: (state: *PlayState, product: provider.PlayProduct, cancel: provider.PlayCancellation) -> bool {
+        inspected := provider.Inspect(*state.configuration.credentials, product, cancel)
+        if inspected.status != 0 || provider.Cancelled(cancel) { return false }
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := signing.Now()
+        stamp: [31]u8
+        at := signing.WireTime(now, false, stamp[:])
+        if at == "" || provider.Cancelled(cancel) || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        millis := now.seconds * 1000 + cast(s64)now.nanoseconds / 1000000
+        return store.RefreshSnapshot(database, *state.tokens.signer, product, *inspected, at, millis) && !provider.Cancelled(cancel) &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    VoidNeedsSnapshot :: (state: *PlayState, packageName: string, token: string, event: *provider.PlayVoid) -> store.Lifecycle {
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if !store.WatchVoid(database, packageName, token, event) { return .{} }
+        return store.Load(database, token)
+    }
+
+    ApplyVoid :: (state: *PlayState, packageName: string, event: *provider.PlayVoid, cancel: provider.PlayCancellation) {
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := signing.Now()
+        stamp: [31]u8
+        at := signing.WireTime(now, false, stamp[:])
+        if at == "" || provider.Cancelled(cancel) || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return }
+        defer writes.Rollback(database)
+        if store.ApplyVoid(database, *state.tokens.signer, packageName, event, at) && !provider.Cancelled(cancel) {
+            unused sqlite.SqliteExecText(database, "COMMIT")
+        }
+    }
+
+    ReconcileRefunds :: (state: *PlayState, packageName: string, cancel: provider.PlayCancellation) {
+        if !state.tokens.signer.signing { return }
+        since := calendar.UnixMilliseconds() - 2592000000
+        batch := provider.VoidedPurchases(*state.configuration.credentials, packageName, since, cancel)
+        for index: 0..batch.events.count - 1 {
+            if provider.Cancelled(cancel) { return }
+            event := provider.VoidAt(*batch, index)
+            token := TextView(event.token)
+            current := VoidNeedsSnapshot(state, packageName, token, *event)
+            if current.found && !RefreshSnapshot(state, .{packageName = packageName, productID = TextView(current.productID), token = token}, cancel) { continue }
+            ApplyVoid(state, packageName, *event, cancel)
+        }
+    }
+
+    KnownPackages :: (state: *PlayState) -> Vec(Text) {
+        result: Vec(Text)
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        args: []sql.Argument
+        row := sql.Prepare(access.configuration.database,
+            "SELECT DISTINCT package_name FROM google_play_purchase_lifecycle WHERE provider='google_play' AND state IN ('consume_pending','consumed') ORDER BY package_name", args)
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        while sqlite.SqliteStep(row.value) == sqlite.SQLITE_ROW {
+            packageName: Text = TextCopy(sql.ColumnText(row.value, 0))
+            if !VecPush(result, packageName) { return .{} }
+        }
+        return result
+    }
+
+    TouchSnapshotWatch :: (state: *PlayState, token: string) -> bool {
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        args: [2]sql.Argument = .[sql.TextArg(token), sql.IntArg(calendar.UnixMilliseconds())]
+        return sql.Execute(access.configuration.database, "UPDATE google_play_snapshot_watch SET last_attempt=?2 WHERE purchase_token=?1", args[:]) == sqlite.SQLITE_OK
+    }
+
+    PendingProducts :: (state: *PlayState, query: string) -> Vec(Pending) {
+        result: Vec(Pending)
+        access := state.access
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        args: []sql.Argument
+        row := sql.Prepare(access.configuration.database, query, args)
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        while sqlite.SqliteStep(row.value) == sqlite.SQLITE_ROW {
+            entry: Pending = .{packageName = TextCopy(sql.ColumnText(row.value, 0)),
+                productID = TextCopy(sql.ColumnText(row.value, 1)), token = TextCopy(sql.ColumnText(row.value, 2))}
+            if !VecPush(result, entry) { break }
+        }
+        return result
+    }
+
+    Reconcile :: (state: *PlayState, cancel: provider.PlayCancellation) {
+        if !state.tokens.signer.signing { return }
+        pending := PendingProducts(state, "SELECT package_name,product_id,purchase_token FROM google_play_purchase_lifecycle WHERE provider='google_play' AND state='consume_pending' ORDER BY created_at,purchase_token LIMIT 100")
+        for index: 0..pending.count - 1 {
+            if provider.Cancelled(cancel) { return }
+            entry := *pending[index]
+            RetryConsume(state, .{packageName = TextView(entry.packageName), productID = TextView(entry.productID), token = TextView(entry.token)}, cancel)
+        }
+        packages := KnownPackages(state)
+        for index: 0..packages.count - 1 {
+            if provider.Cancelled(cancel) { return }
+            ReconcileRefunds(state, TextView(packages[index]), cancel)
+        }
+        watched := PendingProducts(state, "SELECT g.package_name,g.product_id,g.purchase_token FROM google_play_snapshot_watch w JOIN google_play_purchase_lifecycle g ON g.purchase_token=w.purchase_token WHERE g.provider='google_play' AND g.state IN ('consume_pending','consumed') ORDER BY w.last_attempt,w.purchase_token LIMIT 25")
+        for index: 0..watched.count - 1 {
+            if provider.Cancelled(cancel) { return }
+            entry := *watched[index]
+            token := TextView(entry.token)
+            if TouchSnapshotWatch(state, token) {
+                unused RefreshSnapshot(state, .{packageName = TextView(entry.packageName), productID = TextView(entry.productID), token = token}, cancel)
+            }
+        }
+    }
+
+    Run :: (context: *void) {
+        state := cast(*PlayState)context
+        cancel: provider.PlayCancellation = .{check = Stopping, context = context}
+        while !Stopping(context) {
+            Reconcile(state, cancel)
+            descriptor: sockets.LinuxPollFd = .{fd = state.stopFD, events = 1}
+            if Poll(*descriptor, 1, state.configuration.intervalMilliseconds) > 0 { return }
+        }
+    }
+
+    #scope_export
+    FromEnvironment :: () -> Configuration {
+        return .{credentials = .{serviceAccount = Setting("MESH_GOOGLE_SERVICE_ACCOUNT_JSON", "MESH_GOOGLE_SERVICE_ACCOUNT_JSON_FILE"),
+            oauthClient = Setting("MESH_GOOGLE_OAUTH_CLIENT_JSON", "MESH_GOOGLE_OAUTH_CLIENT_JSON_FILE"),
+            refreshToken = Setting("MESH_GOOGLE_OAUTH_REFRESH_TOKEN", "MESH_GOOGLE_OAUTH_REFRESH_TOKEN_FILE")},
+            packageNames = TextCopy(environment.EnvironmentText("MESH_GOOGLE_PACKAGE_NAMES")),
+            packageApps = TextCopy(environment.EnvironmentText("MESH_GOOGLE_PACKAGE_APPS")), intervalMilliseconds = 60000}
+    }
+
+    Open :: (state: *PlayState, access: *accounts.AccountAccess, tokenState: *tokens.State, configuration: *Configuration) -> bool {
+        VecSwap(state.configuration.credentials.serviceAccount.bytes, configuration.credentials.serviceAccount.bytes)
+        VecSwap(state.configuration.credentials.oauthClient.bytes, configuration.credentials.oauthClient.bytes)
+        VecSwap(state.configuration.credentials.refreshToken.bytes, configuration.credentials.refreshToken.bytes)
+        VecSwap(state.configuration.credentials.loopbackBase.bytes, configuration.credentials.loopbackBase.bytes)
+        VecSwap(state.configuration.packageNames.bytes, configuration.packageNames.bytes)
+        VecSwap(state.configuration.packageApps.bytes, configuration.packageApps.bytes)
+        state.configuration.intervalMilliseconds = configuration.intervalMilliseconds
+        state.access = access
+        state.tokens = tokenState
+        state.stopFD = -1
+        if !store.Ensure(access.configuration.database) { return false }
+        if !provider.Configured(*state.configuration.credentials) { return true }
+        state.stopFD = EventFD(0, WakeFlags)
+        if state.stopFD < 0 { return false }
+        if configuration.intervalMilliseconds <= 0 || thread.ThreadStart(*state.worker, Run, cast(*void)state) { return true }
+        unused CloseFD(state.stopFD)
+        state.stopFD = -1
+        return false
+    }
+
+    Stop :: (state: *PlayState) {
+        if state.stopFD < 0 { return }
+        unused Signal(state.stopFD, 1)
+        if thread.ThreadRunning(*state.worker) { thread.ThreadWait(*state.worker) }
+    }
+
+    // Close follows the HTTP listener drain so its cancellation descriptor stays valid.
+    Close :: (state: *PlayState) {
+        if state.stopFD >= 0 {
+            Stop(state)
+            unused CloseFD(state.stopFD)
+            state.stopFD = -1
+        }
+        VecFree(state.configuration.credentials.serviceAccount.bytes)
+        VecFree(state.configuration.credentials.oauthClient.bytes)
+        VecFree(state.configuration.credentials.refreshToken.bytes)
+        VecFree(state.configuration.credentials.loopbackBase.bytes)
+        VecFree(state.configuration.packageNames.bytes)
+        VecFree(state.configuration.packageApps.bytes)
+    }
+
+    Handles :: (route: string) -> bool { return route == Route }
+
+    ReadsBody :: (route: string, verb: string) -> bool { return Handles(route) && verb == "POST" }
+
+    Handle :: (state: *PlayState, tokenState: *tokens.State, access: *accounts.AccountAccess,
+        connection: *void, verb: string, raw: []u8, overflow: bool) -> s32 {
+        if verb != "POST" {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        compressed := access.configuration.zstdResponses
+        now := signing.Now()
+        if !now.valid { return response.ErrorReply(connection, verb, 500, "token clock unavailable", compressed) }
+        actor := Bearer(access, connection, now.seconds)
+        if actor.status != 0 { return response.ErrorReply(connection, verb, actor.status, actor.message, compressed) }
+        limit := access.configuration.maximumBodyBytes
+        decoded: response.Body
+        loaded := response.Decode(connection, raw, overflow || raw.count > limit, limit, access.configuration.zstdRequests, *decoded)
+        if loaded.status != 0 { return response.ErrorReply(connection, verb, 400, loaded.error, compressed) }
+        body := ifx loaded.decoded then VecSlice(decoded.scratch, 0, loaded.length) else raw
+        document: json.JsonDocument
+        request := Read(*document, body)
+        if request.error != "" { return response.ErrorReply(connection, verb, 400, request.error, compressed) }
+        if !tokenState.signer.signing { return response.ErrorReply(connection, verb, 503, "token issuer unavailable", compressed) }
+        app := TextView(request.app)
+        product: provider.PlayProduct = .{packageName = TextView(request.packageName),
+            productID = TextView(request.productID), token = TextView(request.token)}
+        if PackageApp(TextView(state.configuration.packageApps), product.packageName) != app { return response.ErrorReply(connection, verb, 400, "package app mismatch", compressed) }
+        units := ProductUnits(tokenState, product.productID)
+        if units <= 0 { return response.ErrorReply(connection, verb, 400, "unknown product_id", compressed) }
+        stamp: [31]u8
+        at := signing.WireTime(now, false, stamp[:])
+        purchase: store.Purchase = .{product = product, app = app, account = TextView(actor.userID[:]), at = at,
+            millis = now.seconds * 1000 + cast(s64)now.nanoseconds / 1000000}
+        permitted := Preflight(state, connection, *purchase, body, now.seconds)
+        if permitted.status != 0 { return response.ErrorReply(connection, verb, permitted.status, permitted.message, compressed) }
+        if !Allowed(*state.configuration, product.packageName) { return response.ErrorReply(connection, verb, 400, "package not allowed", compressed) }
+        socket := cast(*s32)ConnectionInfo(connection, ConnectionFD)
+        client: Connection = .{state = state, fd = ifx socket == null then -1 else <<socket}
+        cancel: provider.PlayCancellation = .{check = Disconnected, context = cast(*void)*client}
+        ReconcileRefunds(state, product.packageName, cancel)
+        inspected := provider.Inspect(*state.configuration.credentials, product, cancel)
+        if inspected.status != 0 { return response.ErrorReply(connection, verb, inspected.status, inspected.error, compressed) }
+        if inspected.quantity < 1 || units > 9223372036854775807 / inspected.quantity {
+            return response.ErrorReply(connection, verb, 400, "invalid google purchase quantity", compressed)
+        }
+        purchase.amount = units * inspected.quantity
+        purchase.millis = calendar.UnixMilliseconds()
+        receipt: Text
+        credited := Verify(state, connection, purchase, body, *inspected, cancel, *receipt)
+        if credited.status != 0 { return response.ErrorReply(connection, verb, credited.status, credited.message, compressed) }
+        RetryConsume(state, product, cancel)
+        return ReplyPurchase(access, connection, purchase.account, TextView(receipt))
+    }
+}

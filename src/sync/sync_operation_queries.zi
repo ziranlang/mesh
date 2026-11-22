@@ -1,0 +1,2 @@
+OperationExists :: "SELECT EXISTS(SELECT 1 FROM server_sync_ops WHERE user_id_hash=?1 AND op_id=?2)";
+InsertOperation :: "\nINSERT INTO server_sync_ops(user_id_hash,op_id,client_id,seq,entity_type,entity_id,local_date,op_type,payload_json,created_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)";

@@ -1,0 +1,185 @@
+#if TARGET == .C {
+    sqlite :: #import "sqlite/SQLite";
+    core :: #import "schema_sql";
+    features :: #import "schema_features";
+    history :: #import "schema_history";
+    #import "std/vec"
+
+    OpenResult :: struct {
+        database: *void
+        status: s32
+    }
+
+    #scope_file
+    ReadOnlyFlag :: 0x1; // SQLITE_OPEN_READONLY
+
+    ExecList :: (database: *void, statements: []string) -> s32 {
+        for statement: statements {
+            status := sqlite.SqliteExecText(database, statement)
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    ColumnMissing :: (database: *void, table: string, column: string) -> IntegerResult {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, core.ColumnLookup, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteFinalize(statement)
+        status = sqlite.SqliteBindTextString(statement, 1, table, cast(s32)table.count)
+        if status == sqlite.SQLITE_OK {
+            status = sqlite.SqliteBindTextString(statement, 2, column, cast(s32)column.count)
+        }
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        status = sqlite.SqliteStep(statement)
+        if status == sqlite.SQLITE_DONE { return .{value = 1} }
+        if status == sqlite.SQLITE_ROW { return .{} }
+        return .{status = status}
+    }
+
+    AddColumn :: (database: *void, table: string, name: string, ddl: string) -> s32 {
+        missing := ColumnMissing(database, table, name)
+        if missing.status != sqlite.SQLITE_OK || missing.value == 0 { return missing.status }
+        return sqlite.SqliteExecText(database, ddl)
+    }
+
+    MeditationKey :: (database: *void) -> s32 {
+        key := QueryInteger(database, core.MeditationKeyReady)
+        if key.status != sqlite.SQLITE_OK || key.value == 1 { return key.status }
+        status := sqlite.SqliteExecText(database, core.MeditationUpgrade)
+        if status != sqlite.SQLITE_OK {
+            if !sqlite.SqliteGetAutocommit(database) {
+                unused sqlite.SqliteExecText(database, core.MeditationRollback)
+            } else {
+                unused sqlite.SqliteExecText(database, "PRAGMA foreign_keys=ON")
+            }
+        }
+        return status
+    }
+
+    SocialCache :: (database: *void) -> s32 {
+        exists := QueryInteger(database, core.SocialExists)
+        if exists.status != sqlite.SQLITE_OK || exists.value == 0 { return exists.status }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, core.SocialUpgrade)
+        if status == sqlite.SQLITE_OK {
+            status = sqlite.SqliteExecText(database, "COMMIT")
+        }
+        if status != sqlite.SQLITE_OK && !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+        return status
+    }
+
+    DuplicateColumn :: (database: *void, status: s32) -> bool {
+        // SQLITE_ERROR is the code for duplicate columns as well as invalid SQL.
+        if status != 1 { return false }
+        message := sqlite.SqliteErrorMessage(database)
+        prefix := "duplicate column name:"
+        index: s64 = 0
+        while index < prefix.count {
+            if message[index] != prefix[index] { return false }
+            index += 1
+        }
+        return true
+    }
+
+    #scope_export
+    IntegerResult :: struct {
+        value: s32
+        status: s32
+    }
+
+    QueryInteger :: (database: *void, query: string) -> IntegerResult {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, query, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteFinalize(statement)
+        status = sqlite.SqliteStep(statement)
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        return .{value = sqlite.SqliteColumnInt(statement, 0)}
+    }
+
+    #scope_export
+    // Apply the shared table, trigger, index, and column migrations. Callers
+    // perform the feature-specific data migrations and seeds after this step.
+    Initialize :: (database: *void) -> s32 {
+        if database == null || !sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        status := sqlite.SqliteExecText(database, core.Pragmas)
+        if status != sqlite.SQLITE_OK { return status }
+        tables := core.Tables()
+        status = ExecList(database, tables[:])
+        if status != sqlite.SQLITE_OK { return status }
+        triggers := history.Build()
+        if triggers.count == 0 { return sqlite.SQLITE_NOMEM }
+        statements := features.Statements(TextView(VecSlice(triggers, 0, triggers.count)))
+        status = ExecList(database, statements[:])
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, core.BackfillMesh)
+        if status != sqlite.SQLITE_OK { return status }
+        status = AddColumn(database, "server_mesh_changes", "op", core.MeshOperationColumn)
+        if status != sqlite.SQLITE_OK { return status }
+        status = AddColumn(database, "server_mesh_changes", "deleted_at", core.MeshDeletionColumn)
+        if status != sqlite.SQLITE_OK { return status }
+        status = MeditationKey(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = SocialCache(database)
+        if status != sqlite.SQLITE_OK { return status }
+        upgrades := core.Upgrades()
+        for statement: upgrades {
+            status = sqlite.SqliteExecText(database, statement)
+            if status != sqlite.SQLITE_OK && !DuplicateColumn(database, status) { return status }
+        }
+        status = sqlite.SqliteExecText(database, core.AliasIndex)
+        if status != sqlite.SQLITE_OK { return status }
+        indexes := core.Indexes()
+        status = ExecList(database, indexes[:])
+        if status != sqlite.SQLITE_OK { return status }
+        status = AddColumn(database, "server_storage_plans", "size", core.StoragePlanSize)
+        if status != sqlite.SQLITE_OK { return status }
+        return AddColumn(database, "server_storage_purchases", "size", core.StoragePurchaseSize)
+    }
+
+    #scope_file
+    OpenConnection :: (path: string, flags: s32) -> OpenResult {
+        if path.count == 0 { return .{status = sqlite.SQLITE_MISUSE} }
+        for byte: path {
+            if byte == 0 { return .{status = sqlite.SQLITE_MISUSE} }
+        }
+        database: *void = null
+        status := sqlite.SqliteOpenText(path, *database, flags | sqlite.SQLITE_OPEN_FULLMUTEX)
+        if status == sqlite.SQLITE_OK { status = sqlite.SqliteBusyTimeout(database, 5000) }
+        if status == sqlite.SQLITE_OK {
+            status = sqlite.SqliteExecText(database,
+                "PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON; PRAGMA synchronous=NORMAL; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32000; PRAGMA mmap_size=268435456")
+        }
+        if status != sqlite.SQLITE_OK {
+            if database != null { unused sqlite.SqliteClose(database) }
+            return .{status = status}
+        }
+        return .{database = database}
+    }
+
+    #scope_export
+    OpenCore :: (path: string) -> OpenResult {
+        opened := OpenConnection(path, sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE)
+        if opened.status != sqlite.SQLITE_OK { return opened }
+        status := Initialize(opened.database)
+        if status != sqlite.SQLITE_OK {
+            unused sqlite.SqliteClose(opened.database)
+            return .{status = status}
+        }
+        return opened
+    }
+
+    // Open a request-owned connection to an already initialized store. The
+    // caller can hold exclusive use across transactions and closes the handle.
+    OpenExisting :: (path: string) -> OpenResult {
+        return OpenConnection(path, sqlite.SQLITE_OPEN_READWRITE)
+    }
+
+    OpenReadOnly :: (path: string) -> OpenResult {
+        return OpenConnection(path, ReadOnlyFlag)
+    }
+}

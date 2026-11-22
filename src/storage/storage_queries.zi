@@ -1,0 +1,16 @@
+#import "std/vec"
+
+QuickCheck :: "PRAGMA quick_check";
+Migrated :: "\nSELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='server_users')";
+UserFilter :: "WHERE user_id_hash=?1";
+
+CountQuery :: (table: string, where: string) -> Vec(u8) {
+    query: Vec(u8)
+    if !BuilderAppend(query, "SELECT COUNT(*) FROM ") || !BuilderAppend(query, table) {
+        return .{}
+    }
+    if where != "" && (!BuilderAppend(query, " ") || !BuilderAppend(query, where)) {
+        return .{}
+    }
+    return query
+}

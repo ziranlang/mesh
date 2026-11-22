@@ -12,7 +12,7 @@ import (
 
 func authorizationPaginationRecord(t *testing.T, fixture *authorizationFixture, record EncryptedRecord) {
 	t.Helper()
-	if !EncryptedRecord_ValidForProtocol(record, 6) {
+	if !RecordValidation_ValidForProtocol(record, 6) {
 		t.Fatal("pagination fixture does not satisfy the owner record grammar")
 	}
 	transaction, err := fixture.store.Database.BeginTx(t.Context(), nil)

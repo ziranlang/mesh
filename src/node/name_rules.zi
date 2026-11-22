@@ -1,0 +1,8 @@
+Valid :: (name: string) -> bool {
+    if name.count == 0 || name.count > 63 { return false }
+    for byte, index: name {
+        if (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) { continue }
+        if byte != 45 || index == 0 || index == name.count - 1 { return false }
+    }
+    return true
+}

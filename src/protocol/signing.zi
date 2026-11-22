@@ -1,3 +1,6 @@
+wire :: #import "account_signing_message";
+text :: #import "std/text_go";
+#import "std/vec"
 go_sha256 :: #system_library "crypto/sha256";
 go_hex :: #system_library "encoding/hex";
 go_strings :: #system_library "go:strings";
@@ -13,8 +16,8 @@ CanonicalMessage :: (nonce: []u8, method: string, path: string, payload: []u8) -
 
 CanonicalMessageWithContext :: (context: string, nonce: []u8, method: string, path: string, payload: []u8) -> string {
     sum: [32]u8 = Sum256(payload)
-    parts: [6]string = .[context, Upper(method), path, EncodeHex(sum[:]), EncodeHex(nonce), ""]
-    return Join(parts[:], "\n")
+    message := wire.Canonical(context, nonce, Upper(method), path, sum)
+    return text.FromBytes(VecSlice(message, 0, message.count))
 }
 
 SHA256Hex :: (value: []u8) -> string {

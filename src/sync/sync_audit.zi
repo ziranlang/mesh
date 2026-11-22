@@ -1,6 +1,7 @@
 #import "std/go_types"
 #import "protocol"
 #import "sync_types"
+queries :: #import "sync_audit_queries";
 sql :: #import "std/sql_go";
 ctx :: #import "std/context_go";
 json :: #import "std/json_go";
@@ -42,7 +43,7 @@ Record :: (database: *sql.Database, context: ctx.Context, entry: SyncAuditEntry)
         entry.SinceServerVersion, entry.ClientClock, entry.ServerVersion,
         text.FromBytes(encoded.value), entry.RemoteOps, BoolInt(entry.FullSnapshotRequired),
         entry.SnapshotReason, BoolInt(entry.EncryptedPayload), entry.EncryptedPayloadBytes]
-    written := sql.Exec(database, context, "\nINSERT INTO server_sync_audit(\n\tuser_id_hash,client_id,app_id,protocol_version,since_server_version,client_clock,\n\tserver_version,applied_json,remote_ops,full_snapshot_required,snapshot_reason,\n\tencrypted_payload,encrypted_payload_bytes)\nVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", arguments[:])
+    written := sql.Exec(database, context, queries.InsertSyncAuditSQL, arguments[:])
     return written.error
 }
 
@@ -52,7 +53,7 @@ Recent :: (database: *sql.Database, context: ctx.Context, userID: string, limit:
         limit = cast(isize)10
     }
     arguments: [2]Any = .[userID, limit]
-    queried := sql.Query(database, context, "\nSELECT id,user_id_hash,client_id,app_id,protocol_version,since_server_version,client_clock,\n       server_version,applied_json,remote_ops,full_snapshot_required,snapshot_reason,\n       encrypted_payload,encrypted_payload_bytes,created_at\nFROM server_sync_audit\nWHERE user_id_hash=?1\nORDER BY id DESC\nLIMIT ?2", arguments[:])
+    queried := sql.Query(database, context, queries.RecentSQL, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result

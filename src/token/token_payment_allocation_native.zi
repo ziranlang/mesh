@@ -1,0 +1,104 @@
+#if TARGET == .C && OS == .LINUX {
+    identity :: #import "identity";
+    ledger :: #import "token_ledger_native";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    NativeGoogleLedgerProvider :: "google_play";
+    NativeStarsLedgerProvider :: "telegram_stars";
+
+    #scope_file
+    GoogleOriginSQL :: "SELECT 1 FROM token_google_origins WHERE payment_id=?1 AND account_id=?2 AND app_id=?3 AND amount=?4";
+
+    OriginalPurchaseSQL :: #string SQL
+SELECT credit.ledger_seq,credit.amount_delta FROM token_ledger AS credit
+JOIN token_processed_payments AS paid ON paid.receipt_id=credit.receipt_id AND paid.provider=credit.source_type
+ AND paid.provider_payment_id=credit.source_ref AND paid.account_id=credit.account_id AND paid.amount=credit.amount_delta
+ AND paid.asset_id=credit.asset_id
+WHERE credit.receipt_id=?1 AND credit.account_id=?2 AND credit.app_id=?3 AND credit.source_ref=?4
+ AND credit.source_type=?7 AND credit.event_type='credit' AND credit.amount_delta>0
+ AND credit.asset_id=?5 AND credit.issuer_id=?6
+SQL;
+
+    RefundedUnitsSQL :: #string SQL
+SELECT COALESCE(-SUM(amount_delta),0) AS refunded FROM token_ledger
+WHERE account_id=?2 AND asset_id=?3 AND source_ref=?4 AND source_type=?5 AND event_type='debit' AND receipt_id<>?1
+HAVING typeof(refunded)='integer'
+SQL;
+
+    DebitPaymentLotSQL :: #string SQL
+UPDATE token_allocations SET remaining=remaining-?6
+WHERE receipt_id=?1 AND source_receipt_id=?1 AND account_id=?2 AND app_id=?3 AND provider_payment_id=?4
+ AND source_type=?8 AND asset_id=?5 AND issued=?7 AND typeof(remaining)='integer' AND remaining>=?6-?7
+SQL;
+
+    PaymentPurchase :: struct {
+        sequence: s64
+        units: s64
+    }
+
+    OriginalPurchase :: (database: *void, arguments: []sql.Argument) -> PaymentPurchase {
+        query := sql.Prepare(database, OriginalPurchaseSQL, arguments)
+        if query.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(query.value)
+        if sqlite.SqliteStep(query.value) != sqlite.SQLITE_ROW || sqlite.SqliteColumnType(query.value, 0) != sqlite.SQLITE_INTEGER ||
+            sqlite.SqliteColumnType(query.value, 1) != sqlite.SQLITE_INTEGER {
+            return .{}
+        }
+        return .{sequence = sqlite.SqliteColumnInt64(query.value, 0), units = sqlite.SqliteColumnInt64(query.value, 1)}
+    }
+
+    #scope_export
+    OriginatingLot :: (source: string) -> bool {
+        return source == NativeGoogleLedgerProvider || source == NativeStarsLedgerProvider
+    }
+
+    // Server integration calls this only after validating the provider proof
+    // and mapping the package to a title from server configuration.
+    Bind :: (database: *void, paymentID: string, account: string, packageName: string, app: string, units: s64) -> string {
+        if sqlite.SqliteGetAutocommit(database) || paymentID == "" || !identity.ValidUserID(account) || packageName == "" || !identity.ValidNamespace(app) || units <= 0 {
+            return "verified Google origin required"
+        }
+        arguments: [5]sql.Argument = .[sql.TextArg(paymentID), sql.TextArg(account), sql.TextArg(packageName), sql.TextArg(app), sql.IntArg(units)]
+        if sql.Execute(database, "INSERT INTO token_google_origins(payment_id,account_id,package_name,app_id,amount) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(payment_id) DO NOTHING", arguments[:]) != sqlite.SQLITE_OK {
+            return "Google origin binding failed"
+        }
+        existing := sql.ReadInteger(database, "SELECT 1 FROM token_google_origins WHERE payment_id=?1 AND account_id=?2 AND package_name=?3 AND app_id=?4 AND amount=?5", arguments[:])
+        if !existing.found { return "Google origin binding collision" }
+        return ""
+    }
+
+    Bound :: (database: *void, paymentID: string, account: string, app: string, units: s64) -> bool {
+        arguments: [4]sql.Argument = .[sql.TextArg(paymentID), sql.TextArg(account), sql.TextArg(app), sql.IntArg(units)]
+        binding := sql.ReadInteger(database, GoogleOriginSQL, arguments[:])
+        return binding.found
+    }
+
+    // Applies a debit after its signed receipt is written in the same
+    // transaction. A modern purchase's own lot carries its refund deficit.
+    Refund :: (database: *void, refund: signing.Event, original: string, debit: string, cutoff: s64) -> bool {
+        purchaseArguments: [7]sql.Argument = .[sql.TextArg(original), sql.TextArg(refund.account), sql.TextArg(refund.app),
+            sql.TextArg(refund.reference), sql.TextArg(ledger.AssetID), sql.TextArg(ledger.IssuerID), sql.TextArg(refund.source)]
+        purchase := OriginalPurchase(database, purchaseArguments[:])
+        if purchase.sequence <= 0 || purchase.units <= 0 { return false }
+        priorArguments: [5]sql.Argument = .[sql.TextArg(debit), purchaseArguments[1], purchaseArguments[4], purchaseArguments[3], purchaseArguments[6]]
+        prior := sql.ReadInteger(database, RefundedUnitsSQL, priorArguments[:])
+        units := -refund.amount
+        if !prior.found || prior.value < 0 || prior.value > purchase.units || units > purchase.units - prior.value { return false }
+        source := ""
+        if purchase.sequence > cutoff {
+            title := ""
+            if refund.source == NativeGoogleLedgerProvider {
+                if !Bound(database, refund.reference, refund.account, refund.app, purchase.units) { return false }
+                title = refund.app
+            }
+            arguments: [8]sql.Argument = .[purchaseArguments[0], purchaseArguments[1], sql.TextArg(title),
+                purchaseArguments[3], purchaseArguments[4], sql.IntArg(units), sql.IntArg(purchase.units), purchaseArguments[6]]
+            if sql.Execute(database, DebitPaymentLotSQL, arguments[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return false }
+            source = original
+        }
+        audit: [3]sql.Argument = .[sql.TextArg(debit), sql.TextArg(source), sql.IntArg(units)]
+        return sql.Execute(database, "INSERT INTO token_allocation_debits(debit_receipt_id,credit_receipt_id,units) VALUES(?1,?2,?3)", audit[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+}

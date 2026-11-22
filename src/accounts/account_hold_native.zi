@@ -1,0 +1,433 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    statements :: #import "sqlite_statement_native";
+    queries :: #import "account_hold_queries";
+    account_queries :: #import "account_state_queries";
+    accounts :: #import "account_state_native";
+    identity :: #import "identity";
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    fragments :: #import "sql_fragments";
+    #import "std/vec"
+
+    RestoredAccount :: struct {
+        restored: bool
+        databaseError: s32
+        error: string
+        cleanupError: string
+    }
+
+    DeletedAccount :: struct {
+        databaseError: s32
+        error: string
+    }
+
+    PurgedHolds :: struct {
+        databaseError: s32
+        error: string
+    }
+
+    #scope_file
+    HeldOwner :: "SELECT COUNT(*)=1 AND MIN(user_id_hash)=?1 FROM held.server_users";
+    // Discovery uses only live schema names. Double quotes in a name are
+    // escaped when inserting it into the statement as an identifier.
+    RestoreTable :: "INSERT OR IGNORE INTO main.\"$table\"($columns) SELECT $columns FROM held.\"$table\" AS item WHERE $condition";
+    CopyUsers :: "CREATE TABLE held.server_users AS SELECT * FROM main.server_users WHERE user_id_hash=?1";
+    CopyTable :: "CREATE TABLE held.\"$table\" AS SELECT * FROM main.\"$table\" AS item WHERE $condition";
+    AccountHoldRetentionSeconds :: 2592000;
+
+    Path :: (databasePath: string, directorySuffix: string, userID: string, suffix: string) -> Vec(u8) {
+        result: Vec(u8)
+        if !BuilderAppend(result, databasePath) || !BuilderAppend(result, directorySuffix) ||
+            !BuilderAppend(result, userID) || !BuilderAppend(result, suffix) { return .{} }
+        return result
+    }
+
+    ReadText :: (database: *void, query: string, table: []statements.Argument, output: *Vec(u8)) -> s32 {
+        read := statements.Prepare(database, query, table)
+        if read.status != sqlite.SQLITE_OK { return read.status }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status != sqlite.SQLITE_ROW { return status }
+        if !BuilderAppend(<<output, statements.ColumnText(read.value, 0)) { return sqlite.SQLITE_NOMEM }
+        return sqlite.SQLITE_OK
+    }
+
+    CopyAccountTable :: (database: *void, table: string, owner: []statements.Argument) -> s32 {
+        if table == "server_users" {
+            return statements.Execute(database, CopyUsers, owner)
+        }
+        tableArg: [1]statements.Argument = .[statements.TextArg(table)]
+        condition: Vec(u8)
+        status := ReadText(database, queries.HoldCondition, tableArg[:], *condition)
+        if status != sqlite.SQLITE_OK || condition.count == 0 {
+            return status
+        }
+        quoted := fragments.Replace(table, "\"", "\"\"")
+        if quoted.count == 0 {
+            return sqlite.SQLITE_NOMEM
+        }
+        values: [2]fragments.Replacement = .[
+            .{marker = "$table", value = TextView(VecSlice(quoted, 0, quoted.count))},
+            .{marker = "$condition", value = TextView(VecSlice(condition, 0, condition.count))}]
+        command: Vec(u8)
+        if !fragments.Append(*command, CopyTable, values[:]) {
+            return sqlite.SQLITE_NOMEM
+        }
+        return sqlite.SqliteExecText(database, TextView(VecSlice(command, 0, command.count)))
+    }
+
+    SnapshotRows :: (database: *void, owner: []statements.Argument) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        defer RollbackIfActive(database)
+        noArguments: []statements.Argument
+        tables := statements.Prepare(database, queries.HeldTables, noArguments)
+        if tables.status != sqlite.SQLITE_OK {
+            return tables.status
+        }
+        defer sqlite.SqliteFinalize(tables.value)
+        while true {
+            step := sqlite.SqliteStep(tables.value)
+            if step == sqlite.SQLITE_DONE {
+                break
+            }
+            if step != sqlite.SQLITE_ROW {
+                return step
+            }
+            status = CopyAccountTable(database, statements.ColumnText(tables.value, 0), owner)
+            if status != sqlite.SQLITE_OK {
+                return status
+            }
+        }
+        checked := statements.ReadInteger(database, HeldOwner, owner)
+        if checked.status != sqlite.SQLITE_OK || checked.value != 1 {
+            return ifx checked.status != sqlite.SQLITE_OK then checked.status else sqlite.SQLITE_DONE
+        }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    Snapshot :: (database: *void, path: string, owner: []statements.Argument) -> s32 {
+        arguments: [1]statements.Argument = .[statements.TextArg(path)]
+        attached := statements.Execute(database, queries.Attach, arguments[:])
+        if attached != sqlite.SQLITE_OK {
+            return attached
+        }
+        copied := SnapshotRows(database, owner)
+        detached := sqlite.SqliteExecText(database, queries.Detach)
+        return ifx copied == sqlite.SQLITE_OK then detached else copied
+    }
+
+    FileMove :: struct {
+        source: string
+        target: string
+        kind: tree.PathKind
+        optional: bool
+        moved: bool
+    }
+
+    Relocate :: (move: *FileMove) -> bool {
+        status := tree.PathQuery(move.source, false)
+        if move.optional && status.missing {
+            return true
+        }
+        if !status.valid || status.info.kind != move.kind || !files.RenameNoReplace(move.source, move.target) {
+            return false
+        }
+        move.moved = true
+        return true
+    }
+
+    UndoMoves :: (moves: []FileMove) -> bool {
+        ok := true
+        index := moves.count
+        while index > 0 {
+            index -= 1
+            move := moves[index]
+            if move.moved && !files.RenameNoReplace(move.target, move.source) {
+                ok = false
+            }
+        }
+        return ok
+    }
+
+    CommitDeletion :: (database: *void, userID: string, now: s64) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        defer RollbackIfActive(database)
+        status = accounts.DeleteTx(database, userID)
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        recorded: [3]statements.Argument = .[statements.TextArg(userID), statements.IntArg(now), statements.IntArg(now + AccountHoldRetentionSeconds)]
+        status = statements.Execute(database, queries.HoldRecord, recorded[:])
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    DueAccount :: struct {
+        id: [64]u8
+        found: bool
+        status: s32
+        error: string
+    }
+
+    NextDue :: (database: *void, now: s64) -> DueAccount {
+        arguments: [1]statements.Argument = .[statements.IntArg(now)]
+        prepared := statements.Prepare(database, queries.DueHold, arguments[:])
+        if prepared.status != sqlite.SQLITE_OK {
+            return .{status = prepared.status}
+        }
+        defer sqlite.SqliteFinalize(prepared.value)
+        step := sqlite.SqliteStep(prepared.value)
+        if step == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if step != sqlite.SQLITE_ROW {
+            return .{status = step}
+        }
+        id := statements.ColumnText(prepared.value, 0)
+        if !identity.ValidUserID(id) {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        account: [64]u8
+        for byte, index: id {
+            account[index] = byte
+        }
+        return .{found = true, id = account}
+    }
+
+    PurgeNext :: (database: *void, databasePath: string, now: s64) -> DueAccount {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        defer RollbackIfActive(database)
+        due := NextDue(database, now)
+        if due.status != sqlite.SQLITE_OK || !due.found {
+            return due
+        }
+        account := TextView(due.id[:])
+        file := Path(databasePath, ".held/", account, ".db")
+        blobs := Path(databasePath, ".held/", account, ".blobs")
+        if file.count == 0 || blobs.count == 0 {
+            return .{status = sqlite.SQLITE_NOMEM}
+        }
+        name := TextView(VecSlice(file, 0, file.count))
+        if (!files.RemoveFile(name) && !tree.PathQuery(name, false).missing) ||
+            !tree.RemoveTree(TextView(VecSlice(blobs, 0, blobs.count))) {
+            return .{error = "cannot remove expired hold files"}
+        }
+        arguments: [2]statements.Argument = .[statements.TextArg(account), statements.IntArg(now)]
+        status = statements.Execute(database, queries.ReleaseDueHold, arguments[:])
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        return .{found = status == sqlite.SQLITE_OK, status = status}
+    }
+
+    RestoreOne :: (database: *void, table: string) -> s32 {
+        tableArg: [1]statements.Argument = .[statements.TextArg(table)]
+        present := statements.ReadInteger(database, queries.HeldTable, tableArg[:])
+        if present.status != sqlite.SQLITE_OK || present.value == 0 { return present.status }
+        columns: Vec(u8)
+        status := ReadText(database, queries.RestoreColumns, tableArg[:], *columns)
+        if status != sqlite.SQLITE_OK || columns.count == 0 { return status }
+        condition: Vec(u8)
+        status = ReadText(database, queries.RestoreCondition, tableArg[:], *condition)
+        if status != sqlite.SQLITE_OK { return status }
+        if condition.count == 0 && !BuilderAppend(condition, "1") { return sqlite.SQLITE_NOMEM }
+        quoted := fragments.Replace(table, "\"", "\"\"")
+        if quoted.count == 0 { return sqlite.SQLITE_NOMEM }
+        command: Vec(u8)
+        values: [3]fragments.Replacement = .[
+            .{marker = "$table", value = TextView(VecSlice(quoted, 0, quoted.count))},
+            .{marker = "$columns", value = TextView(VecSlice(columns, 0, columns.count))},
+            .{marker = "$condition", value = TextView(VecSlice(condition, 0, condition.count))}]
+        if !fragments.Append(*command, RestoreTable, values[:]) { return sqlite.SQLITE_NOMEM }
+        return sqlite.SqliteExecText(database, TextView(VecSlice(command, 0, command.count)))
+    }
+
+    CopyHeldRows :: (database: *void) -> s32 {
+        noArguments: []statements.Argument
+        tables := statements.Prepare(database, queries.HeldTables, noArguments)
+        if tables.status != sqlite.SQLITE_OK { return tables.status }
+        defer sqlite.SqliteFinalize(tables.value)
+        while true {
+            stepped := sqlite.SqliteStep(tables.value)
+            if stepped == sqlite.SQLITE_DONE { return sqlite.SQLITE_OK }
+            if stepped != sqlite.SQLITE_ROW { return stepped }
+            status := RestoreOne(database, statements.ColumnText(tables.value, 0))
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    RestoreRows :: (database: *void, owner: []statements.Argument) -> RestoredAccount {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        defer RollbackIfActive(database)
+        checked := statements.ReadInteger(database, HeldOwner, owner)
+        if checked.status != sqlite.SQLITE_OK { return .{databaseError = checked.status} }
+        if checked.value != 1 { return .{error = "held database has an invalid owner"} }
+        status = sqlite.SqliteExecText(database, queries.AliasTaken)
+        if status == sqlite.SQLITE_OK { status = CopyHeldRows(database) }
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        back := statements.ReadInteger(database, queries.AccountExists, owner)
+        if back.status != sqlite.SQLITE_OK { return .{databaseError = back.status} }
+        if back.value == 0 { return .{error = "held account did not come back"} }
+        status = statements.Execute(database, queries.ReleaseHold, owner)
+        if status == sqlite.SQLITE_OK { status = statements.Execute(database, account_queries.ClearTombstone, owner) }
+        if status == sqlite.SQLITE_OK { status = sqlite.SqliteExecText(database, "COMMIT") }
+        return .{restored = status == sqlite.SQLITE_OK, databaseError = status}
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    Cleanup :: (heldFile: string, heldBlobs: string, liveBlobs: string) -> string {
+        inspected := tree.PathQuery(heldBlobs, false)
+        if !inspected.missing && (!inspected.valid || inspected.info.kind != .Directory ||
+            !files.RenameNoReplace(heldBlobs, liveBlobs)) { return "restore account blobs failed" }
+        if !files.RemoveFile(heldFile) && !tree.PathQuery(heldFile, false).missing { return "remove restored hold failed" }
+        return ""
+    }
+
+    #scope_export
+    // Remove expired hold files while preserving the live account tombstone.
+    Purge :: (database: *void, databasePath: string, now: s64) -> PurgedHolds {
+        if database == null || !sqlite.SqliteGetAutocommit(database) || now < 0 {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        if databasePath == "" {
+            return .{}
+        }
+        folder := Path(databasePath, ".held", "", "")
+        if folder.count == 0 {
+            return .{databaseError = sqlite.SQLITE_NOMEM}
+        }
+        inspected := tree.PathQuery(TextView(VecSlice(folder, 0, folder.count)), false)
+        if !inspected.missing && (!inspected.valid || inspected.info.kind != .Directory) {
+            return .{error = "invalid account hold directory"}
+        }
+        while true {
+            purged := PurgeNext(database, databasePath, now)
+            if !purged.found {
+                return .{databaseError = purged.status, error = purged.error}
+            }
+        }
+        return .{}
+    }
+
+    // The caller owns the connection and the account's paths. First create
+    // a complete snapshot, then move the files and commit live deletion.
+    Delete :: (database: *void, databasePath: string, userID: string, now: s64) -> DeletedAccount {
+        if database == null || !sqlite.SqliteGetAutocommit(database) || !identity.ValidUserID(userID) ||
+            now < 0 || now > 9223372036852183807 {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        if databasePath == "" {
+            return .{databaseError = accounts.Delete(database, userID)}
+        }
+        folder := Path(databasePath, ".held", "", "")
+        heldFile := Path(databasePath, ".held/", userID, ".db")
+        heldBlobs := Path(databasePath, ".held/", userID, ".blobs")
+        liveBlobs := Path(databasePath, ".blobs/", userID, "")
+        if folder.count == 0 || heldFile.count == 0 || heldBlobs.count == 0 || liveBlobs.count == 0 {
+            return .{databaseError = sqlite.SQLITE_NOMEM}
+        }
+        directory := TextView(VecSlice(folder, 0, folder.count))
+        existing := tree.PathQuery(directory, false)
+        if existing.missing && !files.CreatePrivateDirectory(directory) {
+            return .{error = "cannot create account hold directory"}
+        }
+        if !existing.missing && (!existing.valid || existing.info.kind != .Directory) {
+            return .{error = "invalid account hold directory"}
+        }
+        temporary: Text = tree.CreateTemporaryDirectory(directory, "hold-")
+        staging := TextView(temporary)
+        if staging == "" {
+            return .{error = "cannot stage account hold"}
+        }
+        clean := true
+        defer {
+            if clean {
+                unused tree.RemoveTree(staging)
+            }
+        }
+        snapshot: Text = tree.JoinPath(staging, "snapshot.db")
+        previousFile: Text = tree.JoinPath(staging, "previous.db")
+        previousBlobs: Text = tree.JoinPath(staging, "previous.blobs")
+        if TextView(snapshot) == "" || TextView(previousFile) == "" || TextView(previousBlobs) == "" {
+            return .{databaseError = sqlite.SQLITE_NOMEM}
+        }
+        owner: [1]statements.Argument = .[statements.TextArg(userID)]
+        status := Snapshot(database, TextView(snapshot), owner[:])
+        if status != sqlite.SQLITE_OK {
+            return .{databaseError = status}
+        }
+        file := TextView(VecSlice(heldFile, 0, heldFile.count))
+        blobs := TextView(VecSlice(heldBlobs, 0, heldBlobs.count))
+        live := TextView(VecSlice(liveBlobs, 0, liveBlobs.count))
+        moves: [4]FileMove = .[
+            .{source = file, target = TextView(previousFile), kind = .File, optional = true},
+            .{source = blobs, target = TextView(previousBlobs), kind = .Directory, optional = true},
+            .{source = TextView(snapshot), target = file, kind = .File},
+            .{source = live, target = blobs, kind = .Directory, optional = true}]
+        for index: 0..3 {
+            if !Relocate(*moves[index]) {
+                clean = UndoMoves(moves[:])
+                return .{error = "cannot move account hold files"}
+            }
+        }
+        status = CommitDeletion(database, userID, now)
+        if status != sqlite.SQLITE_OK {
+            clean = UndoMoves(moves[:])
+        }
+        return .{databaseError = status}
+    }
+
+    // Call after proof verification and before registering a fresh account.
+    // The connection and hold path are exclusively owned for the operation.
+    Restore :: (database: *void, databasePath: string, userID: string) -> RestoredAccount {
+        if !identity.ValidUserID(userID) || databasePath == "" { return .{} }
+        if database == null || !sqlite.SqliteGetAutocommit(database) { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        owner: [1]statements.Argument = .[statements.TextArg(userID)]
+        held := statements.ReadInteger(database, queries.HoldExists, owner[:])
+        if held.status != sqlite.SQLITE_OK || held.value == 0 { return .{databaseError = held.status} }
+        live := statements.ReadInteger(database, queries.AccountExists, owner[:])
+        if live.status != sqlite.SQLITE_OK || live.value != 0 { return .{databaseError = live.status} }
+        file := Path(databasePath, ".held/", userID, ".db")
+        heldBlobs := Path(databasePath, ".held/", userID, ".blobs")
+        liveBlobs := Path(databasePath, ".blobs/", userID, "")
+        if file.count == 0 || heldBlobs.count == 0 || liveBlobs.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
+        name := TextView(VecSlice(file, 0, file.count))
+        inspected := tree.PathQuery(name, false)
+        if inspected.missing { return .{databaseError = statements.Execute(database, queries.ReleaseHold, owner[:])} }
+        if !inspected.valid || inspected.info.kind != .File { return .{error = "cannot open held account"} }
+        arguments: [1]statements.Argument = .[statements.TextArg(name)]
+        status := statements.Execute(database, queries.Attach, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        result := RestoreRows(database, owner[:])
+        detached := sqlite.SqliteExecText(database, queries.Detach)
+        if result.databaseError == sqlite.SQLITE_OK { result.databaseError = detached }
+        if result.restored && detached == sqlite.SQLITE_OK {
+            result.cleanupError = Cleanup(name, TextView(VecSlice(heldBlobs, 0, heldBlobs.count)), TextView(VecSlice(liveBlobs, 0, liveBlobs.count)))
+        }
+        return result
+    }
+
+    HeldUntil :: (database: *void, userID: string) -> statements.IntegerResult {
+        if database == null { return .{status = sqlite.SQLITE_MISUSE} }
+        owner: [1]statements.Argument = .[statements.TextArg(userID)]
+        return statements.ReadInteger(database, queries.HeldUntil, owner[:])
+    }
+}

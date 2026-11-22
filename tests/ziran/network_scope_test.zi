@@ -1,0 +1,51 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+network :: #import "network_scope";
+ctx :: #import "std/context_go";
+clock :: #import "std/time_go";
+http :: #import "std/http_go";
+io :: #import "std/io_go";
+errors :: #import "std/errors_go";
+go_http :: #system_library "go:net/http";
+go_httptest :: #system_library "go:net/http/httptest";
+go_strings :: #system_library "go:strings";
+
+#scope_file
+TestServer :: #type #foreign go_httptest "Server";
+NewServer :: (handler: network.NetworkHandler) -> *TestServer #foreign go_httptest;
+CloseServer :: (server: *TestServer) #go_defer #foreign go_httptest "(*Server).Close";
+ServerURL :: (server: *TestServer) -> string #go_field #foreign go_httptest "(*Server).URL";
+Redirect :: (destination: string, status: isize) -> network.NetworkHandler #foreign go_http "RedirectHandler";
+Contains :: (text: string, fragment: string) -> bool #foreign go_strings;
+
+Get :: (test: *testing.Test, client: *http.Client, target: string) -> http.ResponseResult {
+    body: io.Reader
+    request := http.NewRequest(ctx.Background(), "GET", target, body)
+    if request.error != null {
+        arguments: [1]Any = .[request.error]
+        testing.Fatalf(test, "build request: %v", arguments[:])
+    }
+    response := http.Do(client, request.value)
+    if response.error == null {
+        unused io.Close(http.ResponseBody(response.value))
+    }
+    return response
+}
+
+#scope_export
+#program_export "TestScopedNetworkTransport"
+ScopedNetworkTransport :: (test: *testing.Test) {
+    server := NewServer(Redirect("/next", cast(isize)307))
+    CloseServer(server)
+    client := network.Client(.{LANOnly = true}, cast(clock.Duration)2000000000)
+    local := Get(test, client, ServerURL(server))
+    if local.error != null || http.StatusCode(local.value) != 307 {
+        arguments: [2]Any = .[local.value, local.error]
+        testing.Fatalf(test, "loopback redirect: response %v, error %v", arguments[:])
+    }
+    outside := Get(test, client, "http://[::]:1/")
+    if outside.error == null || !Contains(errors.Message(outside.error), "peer is outside the node LAN") {
+        arguments: [1]Any = .[outside.error]
+        testing.Fatalf(test, "unspecified IPv6 address must be rejected by LAN policy, got %v", arguments[:])
+    }
+}

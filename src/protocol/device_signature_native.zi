@@ -1,0 +1,54 @@
+#if TARGET == .C && OS == .LINUX {
+    #scope_file
+    crypto :: #system_library "crypto";
+    PublicKey :: (context: *void, keyType: *u8, properties: *u8, bytes: *u8, count: usize) -> *void #foreign crypto "EVP_PKEY_new_raw_public_key_ex";
+    PrivateKey :: (context: *void, keyType: *u8, properties: *u8, bytes: *u8, count: usize) -> *void #foreign crypto "EVP_PKEY_new_raw_private_key_ex";
+    PublicBytes :: (key: *void, bytes: *u8, count: *usize) -> s32 #foreign crypto "EVP_PKEY_get_raw_public_key";
+    FreeKey :: (key: *void) #foreign crypto "EVP_PKEY_free";
+    NewContext :: () -> *void #foreign crypto "EVP_MD_CTX_new";
+    FreeContext :: (context: *void) #foreign crypto "EVP_MD_CTX_free";
+    VerifyInit :: (context: *void, keyContext: **void, digest: *void, engine: *void, key: *void) -> s32 #foreign crypto "EVP_DigestVerifyInit";
+    VerifyMessage :: (context: *void, signature: *u8, signatureBytes: usize, message: *u8, messageBytes: usize) -> s32 #foreign crypto "EVP_DigestVerify";
+    SignInit :: (context: *void, keyContext: **void, digest: *void, engine: *void, key: *void) -> s32 #foreign crypto "EVP_DigestSignInit";
+    SignMessage :: (context: *void, signature: *u8, signatureBytes: *usize, message: *u8, messageBytes: usize) -> s32 #foreign crypto "EVP_DigestSign";
+
+    #scope_export
+    DerivePublic :: (seed: []u8, output: []u8) -> bool {
+        if seed.count != 32 || output.count != 32 { return false }
+        keyType: [8]u8 = .[69, 68, 50, 53, 53, 49, 57, 0] // ED25519
+        key := PrivateKey(null, *keyType[0], null, *seed[0], 32)
+        if key == null { return false }
+        defer FreeKey(key)
+        written: usize = 32
+        return PublicBytes(key, *output[0], *written) == 1 && written == 32
+    }
+
+    Sign :: (seed: []u8, message: []u8, signature: []u8) -> bool {
+        if seed.count != 32 || signature.count != 64 { return false }
+        keyType: [8]u8 = .[69, 68, 50, 53, 53, 49, 57, 0] // ED25519
+        key := PrivateKey(null, *keyType[0], null, *seed[0], 32)
+        if key == null { return false }
+        defer FreeKey(key)
+        context := NewContext()
+        if context == null { return false }
+        defer FreeContext(context)
+        if SignInit(context, null, null, null, key) != 1 { return false }
+        messagePointer := ifx message.count > 0 then *message[0] else null
+        count: usize = 64
+        return SignMessage(context, *signature[0], *count, messagePointer, cast(usize)message.count) == 1 && count == 64
+    }
+
+    Verify :: (publicKey: []u8, message: []u8, signature: []u8) -> bool {
+        if publicKey.count != 32 || signature.count != 64 { return false }
+        keyType: [8]u8 = .[69, 68, 50, 53, 53, 49, 57, 0] // ED25519
+        key := PublicKey(null, *keyType[0], null, *publicKey[0], cast(usize)publicKey.count)
+        if key == null { return false }
+        defer FreeKey(key)
+        context := NewContext()
+        if context == null { return false }
+        defer FreeContext(context)
+        if VerifyInit(context, null, null, null, key) != 1 { return false }
+        messagePointer := ifx message.count > 0 then *message[0] else null
+        return VerifyMessage(context, *signature[0], cast(usize)signature.count, messagePointer, cast(usize)message.count) == 1
+    }
+}

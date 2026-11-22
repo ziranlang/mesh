@@ -1,0 +1,99 @@
+#if TARGET == .C && OS == .LINUX {
+    sessions :: #import "auth_sessions_native";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    secure :: #import "std/constant_time";
+    addresses :: #import "network_address";
+    sqlite :: #import "sqlite/SQLite";
+
+    BearerAuthentication :: struct {
+        userID: [64]u8
+        bootstrap: bool
+        status: u32
+        message: string
+    }
+
+    OperatorAuthentication :: struct {
+        status: u32
+        problem: string
+    }
+
+    UserHeaderValue :: struct {
+        name: string
+        value: string
+    }
+
+    UserHeader :: (connection: *void) -> UserHeaderValue {
+        names: [3]string = .["X-Mesh-User", "X-Ksync-User", "X-Inbe-User"]
+        for name: names {
+            value := wire.TrimSpace(transport.Header(connection, name))
+            if value != "" { return .{name = name, value = value} }
+        }
+        return .{}
+    }
+
+    Bearer :: (connection: *void) -> string {
+        authorization := wire.TrimSpace(transport.Header(connection, "Authorization"))
+        token := wire.TrimPrefix(authorization, "Bearer ")
+        if token.count == authorization.count { return "" }
+        return wire.TrimSpace(token)
+    }
+
+    AdminMatches :: (connection: *void, expected: string) -> bool {
+        provided := wire.TrimSpace(transport.Header(connection, "X-Mesh-Admin"))
+        if provided == "" { provided = wire.TrimSpace(transport.Header(connection, "X-Ksync-Admin")) }
+        return secure.ConstantTimeTextEqual(provided, expected)
+    }
+
+    LocalOperator :: (connection: *void, expected: string) -> OperatorAuthentication {
+        if expected != "" {
+            if AdminMatches(connection, expected) { return .{} }
+            return .{status = 401, problem = "admin token required"}
+        }
+        failure: OperatorAuthentication = .{status = 403, problem = "administration requires loopback access or MESH_ADMIN_TOKEN"}
+        peer := transport.RemoteAddress(connection)
+        if addresses.Classify(peer.bytes[:peer.count]) != .Loopback { return failure }
+        proxies: [8]string = .["X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
+            "Forwarded", "CF-Connecting-IP", "True-Client-IP", "Via"]
+        for header: proxies {
+            if transport.Header(connection, header) != "" { return failure }
+        }
+        return .{}
+    }
+
+    #scope_file
+    HeaderMatches :: (header: string, userID: [64]u8) -> bool {
+        if header.count != userID.count { return false }
+        for index: 0..63 {
+            byte := header[index]
+            if byte >= #char "A" && byte <= #char "F" { byte += #char "a" - #char "A" }
+            if byte != userID[index] { return false }
+        }
+        return true
+    }
+
+    #scope_export
+    // The caller owns the database connection for the duration of this request.
+    Authenticate :: (database: *void, connection: *void, secret: []u8,
+        now: s64, createdAt: string, allowBootstrap: bool) -> BearerAuthentication {
+        bearer := Bearer(connection)
+        if bearer == "" {
+            return .{status = 401, message = "bearer token required"}
+        }
+        authorized := sessions.Authorize(database, secret, bearer, "", now, createdAt, allowBootstrap)
+        if authorized.databaseError != sqlite.SQLITE_OK {
+            return .{status = 500, message = "authentication failed"}
+        }
+        if authorized.accountMissing {
+            return .{status = 401, message = "sync account not found"}
+        }
+        if !authorized.active {
+            return .{status = 401, message = "invalid bearer token"}
+        }
+        expected := UserHeader(connection).value
+        if expected != "" && !HeaderMatches(expected, authorized.userID) {
+            return .{status = 401, message = "token user mismatch"}
+        }
+        return .{userID = authorized.userID, bootstrap = authorized.bootstrap}
+    }
+}

@@ -13,6 +13,7 @@ auth :: #import "http_auth";
 body :: #import "http_body";
 response :: #import "response";
 strict :: #import "strict_json";
+schema :: #import "reward_migration_schema";
 http :: #import "std/http_go";
 sha :: #system_library "go:crypto/sha256";
 hex :: #system_library "go:encoding/hex";
@@ -103,7 +104,7 @@ ReadEnvelope :: (account: string, ciphertext: string, envelope: *MigrationEnvelo
 #scope_export
 Ensure :: (database: *sql.Database, context: ctx.Context) -> Error {
     empty: [0]Any
-    created := sql.Exec(database, context, Schema, empty[:])
+    created := sql.Exec(database, context, schema.Schema, empty[:])
     if created.error != null {
         return created.error
     }
@@ -120,7 +121,7 @@ Freeze :: (database: *sql.Database, context: ctx.Context) -> Error {
     transaction := started.value
     RollbackAtReturn(transaction)
     empty: [0]Any
-    marker := sql.ExecTx(transaction, context, InsertMarker, empty[:])
+    marker := sql.ExecTx(transaction, context, schema.InsertMarker, empty[:])
     if marker.error != null {
         return marker.error
     }
@@ -129,7 +130,7 @@ Freeze :: (database: *sql.Database, context: ctx.Context) -> Error {
         return affected.error
     }
     if affected.value == 1 {
-        copied := sql.ExecTx(transaction, context, FreezeRecords, empty[:])
+        copied := sql.ExecTx(transaction, context, schema.FreezeRecords, empty[:])
         if copied.error != null {
             return copied.error
         }
@@ -265,19 +266,6 @@ Handle :: (accounts: service.Accounts, writer: http.ResponseWriter, request: *ht
 }
 
 #scope_file
-Schema :: #string SQL
-CREATE TABLE IF NOT EXISTS game_legacy_migration (id INTEGER PRIMARY KEY CHECK(id=1));
-CREATE TABLE IF NOT EXISTS game_legacy_snapshots (
- account_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- ciphertext TEXT NOT NULL, server_version INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS game_legacy_progress (
- account_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- unlocked INTEGER NOT NULL, completed TEXT NOT NULL, snapshot TEXT NOT NULL, migrated_at INTEGER NOT NULL
-);
-SQL
-InsertMarker :: "INSERT INTO game_legacy_migration(id) VALUES(1) ON CONFLICT DO NOTHING";
-FreezeRecords :: "INSERT INTO game_legacy_snapshots(account_id,ciphertext,server_version) SELECT user_id_hash,ciphertext,server_version FROM server_encrypted_records WHERE collection='private.entity.v1.game-progress' AND id='fd65a3d7ac3d5ceb2d4d96cc5224a740' AND key_id='entity-v1' AND deleted_at=0 AND ciphertext<>'' ON CONFLICT DO NOTHING";
 ReadFrozen :: "SELECT ciphertext FROM game_legacy_snapshots WHERE account_id=?1";
 ReadMigrated :: "SELECT COUNT(*) FROM game_legacy_progress WHERE account_id=?1";
 InsertProgress :: "INSERT INTO game_legacy_progress(account_id,unlocked,completed,snapshot,migrated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";

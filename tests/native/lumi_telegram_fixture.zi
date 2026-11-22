@@ -1,0 +1,181 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    authorization :: #import "authorization_http_native";
+    calendar :: #import "std/date_time_linux";
+    environment :: #import "std/environment_linux";
+    http :: #import "http_server_native";
+    lumi :: #import "lumi_telegram_native";
+    numbers :: #import "std/number_text";
+    schema :: #import "sqlite_schema";
+    signatures :: #import "ml_dsa44_native";
+    sqlite :: #import "sqlite/SQLite";
+    stdio :: #import "std/stdio_linux";
+    strings :: #import "std/byte_text_linux";
+    entry :: #import "telegram_account_entry_native";
+    entryMenu :: #import "telegram_account_menu_native";
+    stars :: #import "telegram_stars_native";
+    tokens :: #import "token_http_native";
+    transfer :: #import "peer_http_native";
+    uploads :: #import "http_upload_native";
+    #import "std/vec"
+
+    #scope_file
+    c :: #system_library "c";
+    EmptySignals :: (mask: *void) -> s32 #foreign c "sigemptyset";
+    AddSignal :: (mask: *void, signal: s32) -> s32 #foreign c "sigaddset";
+    BlockSignals :: (how: s32, mask: *void, previous: *void) -> s32 #foreign c "pthread_sigmask";
+    WaitSignal :: (mask: *void, signal: *s32) -> s32 #foreign c "sigwait";
+
+    NodeID :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    State :: struct {
+        accounts: accounts.AccountAccess
+        settings: lumi.Configuration
+        tokens: tokens.State
+        stars: stars.State
+        admin: string
+    }
+
+    Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+        version: *u8, incoming: *u8, size: *usize, slot: **void) -> s32 {
+        if <<slot == null {
+            <<slot = cast(*void)uploads.New()
+            return ifx <<slot != null then 1 else 0
+        }
+        state := cast(*State)context
+        upload := cast(*uploads.Upload)(<<slot)
+        route := strings.TextFromCString(path)
+        verb := strings.TextFromCString(method)
+        if <<size > 0 {
+            if lumi.ReadsBody(route, verb) {
+                uploads.Append(upload, incoming, <<size, lumi.BodyLimit(route))
+            } else if entry.ReadsBody(route, verb) {
+                uploads.Append(upload, incoming, <<size, entry.BodyLimit(route))
+            } else if stars.ReadsBody(route, verb) {
+                uploads.Append(upload, incoming, <<size, stars.BodyLimit(route))
+            } else if authorization.ReadsBody(route, verb) {
+                uploads.Append(upload, incoming, <<size, authorization.BodyLimit(route))
+            } else if accounts.ReadsBody(route, verb) {
+                uploads.Append(upload, incoming, <<size, state.accounts.configuration.maximumBodyBytes)
+            }
+            <<size = 0
+            return 1
+        }
+        empty: [0]u8
+        if upload.unavailable {
+            return http.Write(connection, 503, "", empty[:])
+        }
+        body := VecSlice(upload.bytes, 0, upload.bytes.count)
+        if lumi.Handles(route) {
+            return lumi.Handle(*state.accounts, connection, verb, route, state.settings, body, upload.overflow)
+        }
+        if entry.Handles(route) {
+            return entry.Handle(*state.accounts, connection, verb, route, body, upload.overflow,
+                state.settings.entryNode, state.settings.entryAudience, state.settings.bot.token)
+        }
+        if stars.Handles(route) {
+            return stars.Handle(*state.stars, *state.accounts, connection, verb, route, body, upload.overflow, state.settings.bot, state.admin)
+        }
+        if authorization.Handles(route) {
+            return authorization.Handle(*state.accounts, connection, verb, route, body, upload.overflow,
+                state.settings.entryNode, state.settings.entryAudience, state.settings.bot.token)
+        }
+        if accounts.Handles(route) {
+            return accounts.Handle(*state.accounts, connection, verb, route, body, upload.overflow)
+        }
+        return http.Write(connection, 404, "", empty[:])
+    }
+
+    Completed :: (context: *void, connection: *void, slot: **void, reason: s32) {
+        uploads.Delete(cast(*uploads.Upload)(<<slot))
+        <<slot = null
+    }
+
+    LoopbackEndpoint :: (setting: string) -> Text {
+        portText := environment.EnvironmentText(setting)
+        port, consumed := numbers.IntegerPrefix(portText)
+        if consumed != portText.count || port <= 0 || port > 65535 {
+            return .{}
+        }
+        bytes: [5]u8
+        result: Vec(u8)
+        if !BuilderAppend(result, "http://127.0.0.1:") || !BuilderAppend(result, numbers.FormatInteger(port, bytes[:])) {
+            return .{}
+        }
+        return TextCopy(TextView(VecSlice(result, 0, result.count)))
+    }
+
+    #scope_export
+    Main :: () -> s32 {
+        signals: [16]u64
+        mask := cast(*void)(*signals[0])
+        if EmptySignals(mask) != 0 || AddSignal(mask, 2) != 0 || AddSignal(mask, 15) != 0 || BlockSignals(0, mask, null) != 0 {
+            return 1
+        }
+        path := environment.EnvironmentText("MESH_DB")
+        if path == "" {
+            return 1
+        }
+        opened := schema.OpenCore(path)
+        if opened.status != sqlite.SQLITE_OK {
+            return 1
+        }
+        defer sqlite.SqliteClose(opened.database)
+        secret: [32]u8
+        state: State
+        accountSettings: accounts.Configuration = .{database = opened.database, path = path, secret = secret[:],
+            challengeSeconds = 60, tokenSeconds = 3600, maximumBodyBytes = 8192, zstdRequests = true, zstdResponses = true,
+            verify = signatures.Verify}
+        if !accounts.Open(*state.accounts, accountSettings) {
+            return 1
+        }
+        defer accounts.Close(*state.accounts)
+        if !lumi.Prune(*state.accounts, calendar.UnixMilliseconds() / 1000) || !transfer.Open() {
+            return 1
+        }
+        defer transfer.Close()
+        botEndpoint: Text = LoopbackEndpoint("MESH_LUMI_FIXTURE_TELEGRAM_PORT")
+        modelEndpoint: Text = LoopbackEndpoint("MESH_LUMI_FIXTURE_MODEL_PORT")
+        token := environment.EnvironmentText("MESH_LUMI_BOT_TOKEN")
+        if token != "" && TextView(botEndpoint) == "" {
+            return 1
+        }
+        group, consumed := numbers.IntegerPrefix(environment.EnvironmentText("MESH_LUMI_GROUP_ID"))
+        modelKey := ifx TextView(modelEndpoint) != "" then "fixture-model-key" else ""
+        state.settings = .{bot = .{token = token, endpoint = TextView(botEndpoint)},
+            webhookSecret = environment.EnvironmentText("MESH_LUMI_WEBHOOK_SECRET"),
+            ownerID = environment.EnvironmentText("MESH_LUMI_OWNER_ID"),
+            canvasURL = environment.EnvironmentText("MESH_LUMI_CANVAS_URL"), groupID = ifx consumed > 0 then group else 0,
+            accountsEnabled = environment.EnvironmentText("MESH_TELEGRAM_ACCOUNTS_ENABLED") == "1",
+            entryMenu = entryMenu.Send, entryNode = NodeID, entryAudience = environment.EnvironmentText("MESH_BASE_URL"),
+            chatSettings = .{apiKey = modelKey, endpoint = TextView(modelEndpoint), model = "glm-5.3-flash",
+                dailyLimit = 2, globalDailyLimit = 2}}
+        seed: [32]u8
+        seed[0] = 17
+        public: [0]u8
+        if !tokens.Open(*state.tokens, environment.EnvironmentText("MESH_TOKEN_PRODUCTS"), false, public[:], seed[:]) {
+            return 1
+        }
+        defer tokens.Close(*state.tokens)
+        if !stars.Open(*state.stars, *state.tokens, environment.EnvironmentText("MESH_TELEGRAM_STARS_APPS"),
+            environment.EnvironmentText("MESH_TELEGRAM_STARS_PRICES"), NodeID, state.settings.entryAudience,
+            state.settings.accountsEnabled, state.settings.webhookSecret != "") {
+            return 1
+        }
+        state.admin = environment.EnvironmentText("MESH_ADMIN_TOKEN")
+        state.settings.payment = stars.Webhook
+        state.settings.paymentContext = cast(*void)(*state.stars)
+        address: [4]u8 = .[127, 0, 0, 1]
+        daemon := http.Start(address, 0, 32, cast(*void)(*state), Dispatch, Completed)
+        if daemon == null {
+            return 1
+        }
+        defer http.Stop(daemon)
+        port: [5]u8
+        if !stdio.WriteOutput(numbers.FormatInteger(cast(s64)http.BoundPort(daemon), port[:])) || !stdio.WriteOutput("\n") {
+            return 1
+        }
+        signal: s32
+        return ifx WaitSignal(mask, *signal) == 0 then 0 else 1
+    }
+}

@@ -1,0 +1,33 @@
+#if TARGET == .C {
+    sqlite :: #import "sqlite/SQLite";
+    queries :: #import "storage_queries";
+
+    #scope_file
+    FirstRow :: (database: *void, query: string) -> *void {
+        statement: *void = null
+        prepared := sqlite.SqlitePrepareText(database, query, -1, *statement, null)
+        if prepared == sqlite.SQLITE_OK && statement != null && sqlite.SqliteStep(statement) == sqlite.SQLITE_ROW {
+            return statement
+        }
+        if statement != null { sqlite.SqliteFinalize(statement) }
+        return null
+    }
+
+    IntegrityOK :: (database: *void) -> bool {
+        statement := FirstRow(database, queries.QuickCheck)
+        if statement == null { return false }
+        defer sqlite.SqliteFinalize(statement)
+        text := sqlite.SqliteColumnText(statement, 0)
+        return text != null && sqlite.SqliteColumnBytes(statement, 0) == 2 &&
+            text[0] == #char "o" && text[1] == #char "k"
+    }
+
+    #scope_export
+    Health :: (database: *void) -> bool {
+        if database == null || !IntegrityOK(database) { return false }
+        statement := FirstRow(database, queries.Migrated)
+        if statement == null { return false }
+        defer sqlite.SqliteFinalize(statement)
+        return sqlite.SqliteColumnInt(statement, 0) != 0
+    }
+}

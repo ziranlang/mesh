@@ -1,0 +1,331 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    accountKeys :: #import "account_keys_native";
+    signatures :: #import "account_signature_native";
+    binary :: #import "binary_codec";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    scopeRules :: #import "scope";
+    sha :: #import "crypto/sha256";
+    random :: #import "std/random_linux";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Failure :: struct {
+        status: u32
+        message: string
+    }
+
+    GrantScope :: struct {
+        collection: Text
+        visibility: Text
+        read: bool
+        write: bool
+        keyID: Text
+        envelope: Text
+    }
+
+    Grant :: struct {
+        version: s64
+        account: Text
+        id: Text
+        request: Text
+        app: Text
+        client: Text
+        node: Text
+        audience: Text
+        signingKey: Text
+        encryptionKey: Text
+        issuedAt: s64
+        notBefore: s64
+        expiresAt: s64
+        nonce: Text
+        botID: s64
+        telegramID: s64
+        telegramStars: bool
+        scopes: Vec(GrantScope)
+        signature: Text
+        valid: bool
+    }
+
+    ActiveResult :: struct {
+        grant: Grant
+        failure: Failure
+    }
+
+    ReadFields :: (document: *json.JsonDocument, root: s32, names: []string, kinds: []json.JsonKind, found: []s32) -> bool {
+        for index: 0..found.count - 1 { found[index] = -1 }
+        kind := json.JsonKindOf(document, root)
+        if kind == .Null || kind == .Missing { return true }
+        if kind != .Object { return false }
+        member := json.JsonFirst(document, root)
+        while member >= 0 {
+            key: Text = json.JsonKey(document, member)
+            index: s64 = 0
+            while index < names.count && names[index] != TextView(key) { index += 1 }
+            if index == names.count || found[index] >= 0 { return false }
+            actual := json.JsonKindOf(document, member)
+            wanted := kinds[index]
+            if actual != .Null && actual != wanted && !(wanted == .True && actual == .False) { return false }
+            if actual == .Number {
+                value, valid := json.JsonInteger(document, member)
+                unused value
+                if !valid { return false }
+            }
+            found[index] = member
+            member = json.JsonNext(document, member)
+        }
+        return true
+    }
+
+    Integer :: (document: *json.JsonDocument, node: s32) -> s64 {
+        value, valid := json.JsonInteger(document, node)
+        return ifx valid then value else 0
+    }
+
+    PutText :: (document: *json.JsonDocument, root: s32, name: string, value: string) -> bool {
+        return json.JsonSet(document, root, name, json.JsonNewStringCopy(document, value))
+    }
+
+    PutInt :: (document: *json.JsonDocument, root: s32, name: string, value: s64) -> bool {
+        return json.JsonSet(document, root, name, json.JsonNewInteger(document, value))
+    }
+
+    PutBool :: (document: *json.JsonDocument, root: s32, name: string, value: bool) -> bool {
+        return json.JsonSet(document, root, name, json.JsonNewBool(document, value))
+    }
+
+    HexID :: (value: string, length: s64) -> bool {
+        if value.count != length { return false }
+        for byte: value {
+            if !(byte >= #char "0" && byte <= #char "9") && !(byte >= #char "a" && byte <= #char "f") { return false }
+        }
+        return true
+    }
+
+    Digest :: (value: string, encoded: []u8) -> bool {
+        digest := sha.Sha256Of(value)
+        return sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) == 1
+    }
+
+    Nonce :: (encoded: []u8) -> bool {
+        bytes: [16]u8
+        return encoded.count >= 33 && random.FillSecure(bytes[:]) &&
+            sha.BytesToHex(*bytes[0], bytes.count, *encoded[0], encoded.count) == 1
+    }
+
+    AppendLines :: (output: *Vec(u8), values: []string) -> bool {
+        for value: values {
+            if !BuilderAppend(<<output, value) || !BuilderAppend(<<output, "\n") { return false }
+        }
+        return true
+    }
+
+    ReadScopes :: (document: *json.JsonDocument, array: s32, scopes: *Vec(GrantScope), approved: bool) -> bool {
+        names: [6]string = .["collection", "read", "write", "visibility", "key_id", "key_envelope"]
+        kinds: [6]json.JsonKind = .[.String, .True, .True, .String, .String, .String]
+        item := json.JsonFirst(document, array)
+        limit := ifx approved then 6 else 3
+        while item >= 0 {
+            fields: [6]s32
+            if scopes.count >= 16 || !ReadFields(document, item, names[:limit], kinds[:limit], fields[:limit]) { return false }
+            scope: GrantScope = .{collection = json.JsonString(document, fields[0]),
+                read = json.JsonKindOf(document, fields[1]) == .True, write = json.JsonKindOf(document, fields[2]) == .True}
+            if approved {
+                scope.visibility = json.JsonString(document, fields[3])
+                scope.keyID = json.JsonString(document, fields[4])
+                scope.envelope = json.JsonString(document, fields[5])
+            }
+            if !VecPush(<<scopes, scope) { return false }
+            item = json.JsonNext(document, item)
+        }
+        return true
+    }
+
+    ScopeJSON :: (document: *json.JsonDocument, scopes: []GrantScope, approved: bool) -> s32 {
+        array := json.JsonNewArray(document)
+        for *scope: scopes {
+            item := json.JsonNewObject(document)
+            if !PutText(document, item, "collection", TextView(scope.collection)) ||
+                !PutBool(document, item, "read", scope.read) || !PutBool(document, item, "write", scope.write) { return -1 }
+            if approved && (!PutText(document, item, "visibility", TextView(scope.visibility)) ||
+                !PutText(document, item, "key_id", TextView(scope.keyID)) ||
+                !PutText(document, item, "key_envelope", TextView(scope.envelope))) { return -1 }
+            if !json.JsonAppend(document, array, item) { return -1 }
+        }
+        return array
+    }
+
+    ReadGrant :: (document: *json.JsonDocument) -> Grant {
+        names: [19]string = .["version", "account_id", "grant_id", "request_id", "app_id", "client_id", "node_id", "audience",
+            "signing_key", "encryption_key", "issued_at", "not_before", "expires_at", "nonce", "bot_id", "telegram_id", "telegram_stars",
+            "scopes", "signature"]
+        kinds: [19]json.JsonKind = .[.Number, .String, .String, .String, .String, .String, .String, .String, .String, .String,
+            .Number, .Number, .Number, .String, .Number, .Number, .True, .Array, .String]
+        field: [19]s32
+        if !ReadFields(document, document.root, names[:], kinds[:], field[:]) { return .{} }
+        result: Grant = .{version = Integer(document, field[0]), account = json.JsonString(document, field[1]),
+            id = json.JsonString(document, field[2]), request = json.JsonString(document, field[3]), app = json.JsonString(document, field[4]),
+            client = json.JsonString(document, field[5]), node = json.JsonString(document, field[6]), audience = json.JsonString(document, field[7]),
+            signingKey = json.JsonString(document, field[8]), encryptionKey = json.JsonString(document, field[9]),
+            issuedAt = Integer(document, field[10]), notBefore = Integer(document, field[11]), expiresAt = Integer(document, field[12]),
+            nonce = json.JsonString(document, field[13]), botID = Integer(document, field[14]), telegramID = Integer(document, field[15]),
+            telegramStars = json.JsonKindOf(document, field[16]) == .True, signature = json.JsonString(document, field[18])}
+        result.valid = ReadScopes(document, field[17], *result.scopes, true)
+        return result
+    }
+
+    GrantJSON :: (document: *json.JsonDocument, grant: *Grant) -> s32 {
+        root := json.JsonNewObject(document)
+        names: [11]string = .["account_id", "grant_id", "request_id", "app_id", "client_id", "node_id", "audience", "signing_key", "encryption_key", "nonce", "signature"]
+        values: [11]string = .[TextView(grant.account), TextView(grant.id), TextView(grant.request), TextView(grant.app),
+            TextView(grant.client), TextView(grant.node), TextView(grant.audience), TextView(grant.signingKey),
+            TextView(grant.encryptionKey), TextView(grant.nonce), TextView(grant.signature)]
+        for name, index: names {
+            if !PutText(document, root, name, values[index]) { return -1 }
+        }
+        return ifx PutInt(document, root, "version", grant.version) && PutInt(document, root, "issued_at", grant.issuedAt) &&
+            PutInt(document, root, "not_before", grant.notBefore) && PutInt(document, root, "expires_at", grant.expiresAt) &&
+            PutInt(document, root, "bot_id", grant.botID) && PutInt(document, root, "telegram_id", grant.telegramID) &&
+            (!grant.telegramStars || PutBool(document, root, "telegram_stars", true)) &&
+            json.JsonSet(document, root, "scopes", ScopeJSON(document, VecSlice(grant.scopes, 0, grant.scopes.count), true)) then root else -1
+    }
+
+    ScopesValid :: (scopes: []GrantScope, app: string, approved: bool) -> bool {
+        if scopes.count < 1 || scopes.count > 16 { return false }
+        previous := ""
+        for *scope: scopes {
+            collection := TextView(scope.collection)
+            if collection.count > 64 || !identity.ValidEncryptedHierarchyCollection(collection) ||
+                collection != wire.TrimSpace(collection) || wire.TrimPrefix(collection, "account.").count != collection.count ||
+                (app == "inbe" && wire.TrimPrefix(collection, "private.inbe.v1.").count != collection.count) ||
+                (!scope.read && !scope.write) { return false }
+            index: s64 = 0
+            while index < previous.count && index < collection.count && previous[index] == collection[index] { index += 1 }
+            if index == collection.count || (index < previous.count && previous[index] > collection[index]) { return false }
+            previous = collection
+            if approved {
+                visibility := TextView(scope.visibility)
+                envelope := TextView(scope.envelope)
+                if (visibility != "private" && visibility != "shared" && visibility != "friends" && visibility != "public") ||
+                    !identity.ValidClientID(TextView(scope.keyID)) || envelope.count < 1 || envelope.count > 16384 { return false }
+            }
+        }
+        return true
+    }
+
+    GrantMessage :: (grant: *Grant, output: *Vec(u8)) -> bool {
+        digits: [6][24]u8
+        fields: [18]string = .["daochi-authorization-v1", "1", TextView(grant.account), TextView(grant.id), TextView(grant.request),
+            TextView(grant.app), TextView(grant.client), TextView(grant.node), TextView(grant.audience), TextView(grant.signingKey), TextView(grant.encryptionKey),
+            numbers.FormatInteger(grant.issuedAt, digits[0][:]), numbers.FormatInteger(grant.notBefore, digits[1][:]),
+            numbers.FormatInteger(grant.expiresAt, digits[2][:]), TextView(grant.nonce), numbers.FormatInteger(grant.botID, digits[3][:]),
+            numbers.FormatInteger(grant.telegramID, digits[4][:]), numbers.FormatInteger(grant.scopes.count, digits[5][:])]
+        if !AppendLines(output, fields[:]) { return false }
+        for *scope: grant.scopes {
+            hash: [65]u8
+            if !Digest(TextView(scope.envelope), hash[:]) { return false }
+            values: [6]string = .[TextView(scope.collection), TextView(scope.visibility), ifx scope.read then "read" else "",
+                ifx scope.write then "write" else "", TextView(scope.keyID), TextView(hash[:64])]
+            if !AppendLines(output, values[:]) { return false }
+        }
+        return !grant.telegramStars || BuilderAppend(<<output, "telegram-stars-purchases\n")
+    }
+
+    VerifyGrant :: (database: *void, verify: signatures.VerifySignature, grant: *Grant, account: string,
+        node: string, audience: string, now: s64) -> Failure {
+        app := TextView(grant.app)
+        if !grant.valid || grant.version != 1 || !identity.ValidUserID(account) || account != TextView(grant.account) ||
+            !HexID(TextView(grant.id), 32) || !HexID(TextView(grant.request), 32) || !identity.ValidNamespace(app) ||
+            !HexID(TextView(grant.client), 64) || !HexID(node, 64) || node != TextView(grant.node) ||
+            audience == "" || audience != TextView(grant.audience) || !HexID(TextView(grant.signingKey), 64) ||
+            !HexID(TextView(grant.encryptionKey), 2368) || !HexID(TextView(grant.nonce), 32) ||
+            grant.issuedAt < now - 300 || grant.issuedAt > now || grant.notBefore < grant.issuedAt || grant.notBefore > now ||
+            grant.expiresAt <= now || grant.expiresAt > grant.issuedAt + 2592000 ||
+            grant.botID < 0 || grant.telegramID < 0 || ((grant.botID == 0) != (grant.telegramID == 0)) ||
+            (grant.telegramStars && grant.botID == 0) || !ScopesValid(VecSlice(grant.scopes, 0, grant.scopes.count), app, true) {
+            return .{status = 400, message = "invalid authorization grant"}
+        }
+        owner := accountKeys.Read(database, account)
+        if owner.status != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        signature := TextView(grant.signature)
+        if !owner.found || owner.count != owner.bytes.count || !HexID(signature, 4840) || verify == null {
+            return .{status = 401, message = "owner authorization rejected"}
+        }
+        proof := binary.DecodeBinaryField(signature)
+        message: Vec(u8)
+        if proof.error != "" || !GrantMessage(grant, *message) ||
+            !verify(owner.bytes[:], VecSlice(message, 0, message.count), VecSlice(proof.value, 0, proof.value.count)) {
+            return .{status = 401, message = "owner authorization rejected"}
+        }
+        args: [1]sql.Argument = .[sql.TextArg(app)]
+        for *scope: grant.scopes {
+            rows := sql.Prepare(database, "SELECT collection_prefix FROM server_app_collections WHERE app_id=?1", args[:])
+            if rows.status != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+            defer sqlite.SqliteFinalize(rows.value)
+            while true {
+                step := sqlite.SqliteStep(rows.value)
+                if step == sqlite.SQLITE_DONE { return .{status = 403, message = "collection is not registered for app"} }
+                if step != sqlite.SQLITE_ROW { return .{status = 500, message = "authentication failed"} }
+                if scopeRules.CollectionMatchesPrefix(TextView(scope.collection), sql.ColumnText(rows.value, 0)) { break }
+            }
+        }
+        return .{}
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    ActiveGrant :: (database: *void, id: string, node: string, audience: string, now: s64) -> ActiveResult {
+        inactive: Failure = .{status = 401, message = "authorization inactive on this node"}
+        if sqlite.SqliteGetAutocommit(database) { return .{failure = inactive} }
+        arguments: [4]sql.Argument = .[sql.TextArg(id), sql.TextArg(node), sql.TextArg(audience), sql.IntArg(now)]
+        selected := sql.Prepare(database, #string QUERY_END
+SELECT g.grant_json FROM server_authorization_grants g JOIN server_apps a ON a.app_id=g.app_id
+WHERE g.grant_id=?1 AND g.node_id=?2 AND g.audience=?3 AND g.revoked_at=0 AND g.not_before<=?4 AND g.expires_at>?4
+AND a.status='active' AND NOT EXISTS(SELECT 1 FROM server_app_manifests m WHERE m.app_id=a.app_id AND (m.status<>'active' OR (m.expires_at>0 AND m.expires_at<=?4)))
+QUERY_END, arguments[:])
+        if selected.status != sqlite.SQLITE_OK { return .{failure = inactive} }
+        defer sqlite.SqliteFinalize(selected.value)
+        document: json.JsonDocument
+        if sqlite.SqliteStep(selected.value) != sqlite.SQLITE_ROW || !json.JsonRead(*document, sql.ColumnText(selected.value, 0)) {
+            return .{failure = inactive}
+        }
+        grant := ReadGrant(*document)
+        if !grant.valid || grant.scopes.count < 1 { return .{failure = inactive} }
+        {
+            registration: [2]sql.Argument = .[sql.TextArg(TextView(grant.account)), sql.TextArg(TextView(grant.client))]
+            client := sql.ReadInteger(database, "SELECT COUNT(*) FROM server_clients WHERE user_id_hash=?1 AND client_id=?2 AND protocol_version=6", registration[:])
+            if client.status != sqlite.SQLITE_OK || client.value != 1 { return .{failure = .{status = 401, message = "delegate client is not registered"}} }
+        }
+        for *scope: grant.scopes {
+            collection: [1]sql.Argument = .[sql.TextArg(TextView(scope.collection))]
+            row := sql.Prepare(database, #string QUERY_END
+WITH matches AS (SELECT app_id,visibility,length(rtrim(collection_prefix,'*')) AS specificity FROM server_app_collections
+WHERE collection_prefix=?1 OR (substr(collection_prefix,-1)='*' AND substr(?1,1,length(collection_prefix)-1)=substr(collection_prefix,1,length(collection_prefix)-1))),
+best AS (SELECT * FROM matches WHERE specificity=(SELECT MAX(specificity) FROM matches))
+SELECT app_id,visibility,(SELECT COUNT(*) FROM best) FROM best LIMIT 1
+QUERY_END, collection[:])
+            changed: Failure = .{status = 403, message = "app collection visibility changed"}
+            if row.status != sqlite.SQLITE_OK { return .{failure = changed} }
+            defer sqlite.SqliteFinalize(row.value)
+            if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW || sql.ColumnText(row.value, 0) != TextView(grant.app) ||
+                sql.ColumnText(row.value, 1) != TextView(scope.visibility) || sqlite.SqliteColumnInt64(row.value, 2) != 1 {
+                return .{failure = changed}
+            }
+        }
+        if grant.telegramID > 0 && !TelegramBound(database, TextView(grant.account), grant.telegramID) {
+            return .{failure = .{status = 401, message = "Telegram authorization disconnected"}}
+        }
+        return .{grant = grant}
+    }
+
+    TelegramBound :: (database: *void, account: string, telegramID: s64) -> bool {
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.IntArg(telegramID)]
+        connected := sql.ReadInteger(database, "SELECT COUNT(*) FROM server_lumi_telegram WHERE account_id=?1 AND telegram_id=?2", args[:])
+        return connected.status == sqlite.SQLITE_OK && connected.value == 1
+    }
+}

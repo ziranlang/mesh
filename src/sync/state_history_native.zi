@@ -1,0 +1,26 @@
+#if TARGET == .C && OS == .LINUX {
+    queries :: #import "state_history_queries";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    Record :: (database: *void, user: string, version: s64, digest: string) -> s32 {
+        if version <= 0 || digest == "" {
+            return sqlite.SQLITE_OK
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(version), sql.TextArg(digest)]
+        status := sql.Execute(database, queries.RecordSQL, arguments[:])
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        bounds: [2]sql.Argument = .[arguments[0], sql.IntArg(queries.HistoryLimit)]
+        return sql.Execute(database, queries.PruneSQL, bounds[:])
+    }
+
+    Matches :: (database: *void, user: string, version: s64, digest: string) -> sql.IntegerResult {
+        if version <= 0 || digest == "" {
+            return .{}
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(version), sql.TextArg(digest)]
+        return sql.ReadInteger(database, queries.MatchSQL, arguments[:])
+    }
+}

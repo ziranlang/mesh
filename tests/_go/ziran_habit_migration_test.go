@@ -99,6 +99,34 @@ func TestZiranHabitAccountMigrationAgainstBaseline(t *testing.T) {
 	}
 }
 
+func TestZiranHabitMigrationPreservesCanonicalOrphan(t *testing.T) {
+	store := applicationFixture(t)
+	user := lifecycleAccounts[0]
+	const id = "12345678-1234-4567-89ab-000000000099"
+	lifecycleExecute(t, store, `INSERT INTO server_habit_days(user_id_hash,habit_id,local_date,completed,count,updated_at,server_version)
+		VALUES(?1,?2,20261001,1,2,?3,9)`, user, id, lifecycleFixtureTime)
+	before := AccountState_CurrentVersion(store.Database, t.Context(), user)
+	if before.Error != nil {
+		t.Fatal(before.Error)
+	}
+	for range 2 {
+		if err := HabitMigration_Account(store.Database, t.Context(), user); err != nil {
+			t.Fatal(err)
+		}
+		var count, version int
+		err := store.Database.QueryRowContext(t.Context(), `SELECT d.count,h.server_version
+			FROM server_habits h JOIN server_habit_days d ON h.user_id_hash=d.user_id_hash AND h.id=d.habit_id
+			WHERE h.user_id_hash=?1 AND h.id=?2 AND d.local_date=20261001 AND d.completed=1`, user, id).Scan(&count, &version)
+		if err != nil || count != 2 || version != 9 {
+			t.Fatalf("recovered habit or day changed: count=%d version=%d err=%v", count, version, err)
+		}
+		after := AccountState_CurrentVersion(store.Database, t.Context(), user)
+		if after.Error != nil || after.Value != before.Value+1 {
+			t.Fatalf("migration must advance the version once: before=%+v after=%+v", before, after)
+		}
+	}
+}
+
 func migrationInTransaction(t *testing.T, store *Store, call func(*sql.Tx) MigrationResult) MigrationResult {
 	t.Helper()
 	transaction, err := store.Database.BeginTx(t.Context(), nil)

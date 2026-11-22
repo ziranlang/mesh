@@ -1,0 +1,40 @@
+// The released date grammar is Go's date-only layout: four ASCII year digits,
+// two month/day digits, and the Gregorian calendar (including year zero).
+ValidDate :: (value: string) -> bool {
+    if value.count != 10 || value[4] != cast(u8)45 || value[7] != cast(u8)45 {
+        return false
+    }
+    index: s64 = 0
+    while index < 10 {
+        if index != 4 && index != 7 {
+            if value[index] < cast(u8)48 || value[index] > cast(u8)57 {
+                return false
+            }
+        }
+        index += 1
+    }
+    year: s64 = 0
+    index = 0
+    while index < 4 {
+        year = year * 10 + cast(s64)value[index] - 48
+        index += 1
+    }
+    month: s64 = (cast(s64)value[5] - 48) * 10 + cast(s64)value[6] - 48
+    day: s64 = (cast(s64)value[8] - 48) * 10 + cast(s64)value[9] - 48
+    if month < 1 || month > 12 || day < 1 {
+        return false
+    }
+    days: s64 = 31
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        days = 30
+    }
+    if month == 2 {
+        days = 28
+        if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) {
+            days = 29
+        }
+    }
+    return day <= days
+}
+AppManifestContext :: "daochi-app-manifest-v1";
+AppApprovalContext :: "daochi-app-approval-v1";

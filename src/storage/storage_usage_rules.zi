@@ -1,0 +1,14 @@
+UsageSQL :: "SELECT COALESCE((SELECT used_bytes FROM server_storage_usage WHERE user_id_hash=?1),0)";
+
+// A write may not grow an account past a positive limit. Writes that keep or
+// shrink usage still apply, so an account above its limit can free space.
+Exceeds :: (before: s64, after: s64, limit: s64) -> bool {
+    if limit <= 0 {
+        return false
+    }
+    return after > limit && after > before
+}
+
+RoomForPacking :: (used: s64, limit: s64, additional: s64) -> bool {
+    return used <= limit && additional <= limit - used
+}

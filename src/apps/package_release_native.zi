@@ -1,0 +1,230 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    delivery :: #import "package_delivery_native";
+    stored :: #import "package_files_native";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    ReleaseFields :: () -> [12]string {
+        names: [12]string = .["app_id", "sequence", "version", "runtime", "host_api", "module_api", "data_schema",
+            "key_id", "artifacts", "dependencies", "signature", "channel"]
+        return names
+    }
+
+    ArtifactFields :: () -> [3]string {
+        names: [3]string = .["variant", "sha256", "size"]
+        return names
+    }
+    DependencyFields :: () -> [4]string {
+        names: [4]string = .["app_id", "version", "sha256", "size"]
+        return names
+    }
+
+    ReadArtifact :: (document: *json.JsonDocument, node: s32, members: []s32) -> bool {
+        names := ArtifactFields()
+        kinds: [3]json.JsonKind = .[.String, .String, .Number]
+        return fields.Read(document, node, names[:], kinds[:], members)
+    }
+
+    ReadDependency :: (document: *json.JsonDocument, node: s32, members: []s32) -> bool {
+        names := DependencyFields()
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .Number]
+        return fields.Read(document, node, names[:], kinds[:], members)
+    }
+
+    #scope_export
+    Release :: struct {
+        nodes: [12]s32
+        sequence: s64
+        host: s64
+        module: s64
+        schema: s64
+        message: Vec(u8)
+        valid: bool
+    }
+
+    #scope_file
+    PartValid :: (part: string) -> bool {
+        if part.count == 0 || part.count > 9 || (part.count > 1 && part[0] == #char "0") { return false }
+        for byte: part {
+            if byte < #char "0" || byte > #char "9" { return false }
+        }
+        return true
+    }
+
+    VersionValid :: (version: string) -> bool {
+        major := wire.Cut(version, #char ".")
+        minor := wire.Cut(major.after, #char ".")
+        return major.found && minor.found && PartValid(major.before) && PartValid(minor.before) && PartValid(minor.after)
+    }
+
+    Ordered :: (previous: string, next: string) -> bool {
+        for byte, index: previous {
+            if index >= next.count { return false }
+            if byte != next[index] { return byte < next[index] }
+        }
+        return previous.count < next.count
+    }
+
+    Artifacts :: (document: *json.JsonDocument, parent: s32, message: *Vec(u8)) -> bool {
+        count := json.JsonCount(document, parent)
+        if count < 1 || count > 2 || !delivery.AppendNumber(message, count) { return false }
+        node := json.JsonFirst(document, parent)
+        for index: 0..count - 1 {
+            members: [3]s32
+            if !ReadArtifact(document, node, members[:]) { return false }
+            variant: Text = json.JsonString(document, members[0])
+            hash: Text = json.JsonString(document, members[1])
+            size := fields.Number(document, members[2])
+            expected := ifx index == 0 then "module" else "standalone"
+            if TextView(variant) != expected || !stored.LowerHash(TextView(hash)) || size < 8 ||
+                !delivery.AppendLine(message, TextView(variant)) || !delivery.AppendLine(message, TextView(hash)) ||
+                !delivery.AppendNumber(message, size) { return false }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    Dependencies :: (document: *json.JsonDocument, parent: s32, app: string, message: *Vec(u8)) -> bool {
+        count := json.JsonCount(document, parent)
+        if count > 64 || !delivery.AppendNumber(message, count) { return false }
+        node := json.JsonFirst(document, parent)
+        previous: [64]u8
+        previousCount: s64 = 0
+        while node >= 0 {
+            members: [4]s32
+            if !ReadDependency(document, node, members[:]) { return false }
+            id: Text = json.JsonString(document, members[0])
+            version: Text = json.JsonString(document, members[1])
+            hash: Text = json.JsonString(document, members[2])
+            size := fields.Number(document, members[3])
+            name := TextView(id)
+            if !identity.ValidNamespace(name) || name == app || name.count > previous.count ||
+                !Ordered(TextView(previous[:previousCount]), name) || !VersionValid(TextView(version)) ||
+                !stored.LowerHash(TextView(hash)) || size < 8 || !delivery.AppendLine(message, name) ||
+                !delivery.AppendLine(message, TextView(version)) || !delivery.AppendLine(message, TextView(hash)) ||
+                !delivery.AppendNumber(message, size) { return false }
+            for byte, index: name { previous[index] = byte }
+            previousCount = name.count
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    #scope_export
+    Parse :: (document: *json.JsonDocument, root: s32, app: string) -> Release {
+        result: Release
+        names := ReleaseFields()
+        kinds: [12]json.JsonKind = .[.String, .Number, .String, .String, .Number, .Number, .Number,
+            .String, .Array, .Array, .String, .String]
+        if !fields.Read(document, root, names[:], kinds[:], result.nodes[:]) { return .{} }
+        id: Text = json.JsonString(document, result.nodes[0])
+        version: Text = json.JsonString(document, result.nodes[2])
+        runtime: Text = json.JsonString(document, result.nodes[3])
+        key: Text = json.JsonString(document, result.nodes[7])
+        channel: Text = json.JsonString(document, result.nodes[11])
+        result.sequence = fields.Number(document, result.nodes[1])
+        result.host = fields.Number(document, result.nodes[4])
+        result.module = fields.Number(document, result.nodes[5])
+        result.schema = fields.Number(document, result.nodes[6])
+        if TextView(id) != app || result.sequence <= 0 || result.host <= 0 || result.module <= 0 || result.schema < 0 ||
+            !VersionValid(TextView(version)) || TextView(runtime) != "kryon-app-v1" || !identity.ValidNamespace(TextView(key)) ||
+            (TextView(channel) != "" && TextView(channel) != "beta") { return .{} }
+        if !delivery.AppendLine(*result.message, "daochi-zib-release-v2") || !delivery.AppendLine(*result.message, app) ||
+            !delivery.AppendNumber(*result.message, result.sequence) || !delivery.AppendLine(*result.message, TextView(version)) ||
+            !delivery.AppendLine(*result.message, TextView(runtime)) || !delivery.AppendNumber(*result.message, result.host) ||
+            !delivery.AppendNumber(*result.message, result.module) || !delivery.AppendNumber(*result.message, result.schema) ||
+            !delivery.AppendLine(*result.message, TextView(key)) || !Artifacts(document, result.nodes[8], *result.message) ||
+            !Dependencies(document, result.nodes[9], app, *result.message) { return .{} }
+        result.valid = true
+        return result
+    }
+
+    Trusted :: (access: *accounts.AccountAccess, document: *json.JsonDocument, release: *Release, app: string, now: s64) -> bool {
+        key: Text = json.JsonString(document, release.nodes[7])
+        proof: Text = json.JsonString(document, release.nodes[10])
+        return delivery.Trusted(access, app, TextView(key), TextView(proof), VecSlice(release.message, 0, release.message.count), now)
+    }
+
+    ModuleHash :: (document: *json.JsonDocument, release: *Release) -> Text {
+        members: [3]s32
+        if !ReadArtifact(document, json.JsonFirst(document, release.nodes[8]), members[:]) {
+            return .{}
+        }
+        return json.JsonString(document, members[1])
+    }
+
+    ArtifactSize :: (document: *json.JsonDocument, release: *Release, hash: string) -> s64 {
+        node := json.JsonFirst(document, release.nodes[8])
+        while node >= 0 {
+            members: [3]s32
+            if !ReadArtifact(document, node, members[:]) { return 0 }
+            candidate: Text = json.JsonString(document, members[1])
+            if TextView(candidate) == hash { return fields.Number(document, members[2]) }
+            node = json.JsonNext(document, node)
+        }
+        return 0
+    }
+
+    Project :: (target: *json.JsonDocument, document: *json.JsonDocument, release: *Release) -> s32 {
+        root := json.JsonNewObject(target)
+        names := ReleaseFields()
+        for key, index: names {
+            node := release.nodes[index]
+            if index == 11 {
+                channel: Text = json.JsonString(document, node)
+                if TextView(channel) == "" { continue }
+            }
+            child: s32 = -1
+            if index == 8 || (index == 9 && node >= 0) {
+                child = json.JsonNewArray(target)
+                row := json.JsonFirst(document, node)
+                while row >= 0 {
+                    entry := json.JsonNewObject(target)
+                    if index == 8 {
+                        members: [3]s32
+                        if !ReadArtifact(document, row, members[:]) { return -1 }
+                        artifactNames := ArtifactFields()
+                        for name, member: artifactNames {
+                            if !json.JsonSet(target, entry, name, json.JsonCopy(target, document, members[member])) { return -1 }
+                        }
+                    } else {
+                        members: [4]s32
+                        if !ReadDependency(document, row, members[:]) { return -1 }
+                        dependencyNames := DependencyFields()
+                        for name, member: dependencyNames {
+                            if !json.JsonSet(target, entry, name, json.JsonCopy(target, document, members[member])) { return -1 }
+                        }
+                    }
+                    if !json.JsonAppend(target, child, entry) { return -1 }
+                    row = json.JsonNext(document, row)
+                }
+            } else if node >= 0 {
+                child = json.JsonCopy(target, document, node)
+            } else if index == 6 {
+                child = json.JsonNewInteger(target, 0)
+            } else if index == 9 {
+                child = json.JsonNewNull(target)
+            }
+            if child < 0 || !json.JsonSet(target, root, key, child) { return -1 }
+        }
+        return root
+    }
+
+    SameWasmRelease :: (document: *json.JsonDocument, release: *Release, wasm: *json.JsonDocument, variant: *Release) -> bool {
+        if release.sequence != variant.sequence || release.host != variant.host || release.module != variant.module ||
+            release.schema != variant.schema || json.JsonCount(wasm, variant.nodes[8]) != 1 ||
+            json.JsonCount(document, release.nodes[9]) != 0 || json.JsonCount(wasm, variant.nodes[9]) != 0 { return false }
+        stringFields: [3]s64 = .[2, 7, 11]
+        for index: stringFields {
+            original: Text = json.JsonString(document, release.nodes[index])
+            alternate: Text = json.JsonString(wasm, variant.nodes[index])
+            if TextView(original) != TextView(alternate) { return false }
+        }
+        return true
+    }
+}

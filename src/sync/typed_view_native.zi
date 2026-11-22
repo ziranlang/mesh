@@ -1,0 +1,122 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+    queries :: #import "sync_view_queries";
+    output :: #import "sync_response_native";
+    bytes :: #import "std/byte_text_linux";
+
+    #scope_file
+    Kind :: enum { Habits; Days; Sessions; Meditations; CleanDays; Rounds; }
+
+    Section :: struct {
+        key: string
+        query: string
+        kind: Kind
+    }
+
+    Row :: (document: *json.JsonDocument, result: s32, statement: *void, kind: Kind) -> bool {
+        columns := sqlite.SqliteColumnCount(statement)
+        completed := false
+        column: s32 = 0
+        while column < columns {
+            name := bytes.TextFromCString(sqlite.SqliteColumnName(statement, column))
+            field := ifx kind == .CleanDays && name == "name" then "habit_name" else name
+            stored := sqlite.SqliteColumnType(statement, column)
+            fieldValue: s32 = -1
+            if stored == sqlite.SQLITE_INTEGER {
+                value := sqlite.SqliteColumnInt64(statement, column)
+                if field == "completed" {
+                    completed = value != 0
+                    fieldValue = json.JsonNewBool(document, completed)
+                } else if field != "server_version" && (kind != .Meditations || field != "duration_seconds" || value != 0) {
+                    if field == "count" && completed && value <= 0 { value = 1 }
+                    fieldValue = json.JsonNewInteger(document, value)
+                } else {
+                    column += 1
+                    continue
+                }
+            } else if stored == sqlite.SQLITE_TEXT || stored == sqlite.SQLITE_BLOB {
+                value := sql.ColumnText(statement, column)
+                if kind == .Meditations && field == "completed_at" && value == "" {
+                    column += 1
+                    continue
+                }
+                fieldValue = json.JsonNewStringCopy(document, value)
+            }
+            if field == "" || fieldValue < 0 || !json.JsonSetCopy(document, result, field, fieldValue) {
+                return false
+            }
+            column += 1
+        }
+        return true
+    }
+
+    // The parent's row is pinned while its rounds are read from a second
+    // statement on the same connection and snapshot.
+    Rounds :: (database: *void, document: *json.JsonDocument, item: s32, user: string, session: string) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(session)]
+        rows := sql.Prepare(database, queries.SessionRounds, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        rounds := json.JsonNewArray(document)
+        if rounds < 0 { return false }
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                return json.JsonCount(document, rounds) == 0 || json.JsonSet(document, item, "rounds", rounds)
+            }
+            if status != sqlite.SQLITE_ROW { return false }
+            round := json.JsonNewObject(document)
+            if !Row(document, round, rows.value, .Rounds) || !json.JsonAppend(document, rounds, round) { return false }
+        }
+        return false
+    }
+
+    Read :: (database: *void, document: *json.JsonDocument, array: s32, section: Section, arguments: []sql.Argument) -> bool {
+        rows := sql.Prepare(database, section.query, arguments)
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { return true }
+            if status != sqlite.SQLITE_ROW { return false }
+            item := json.JsonNewObject(document)
+            if !Row(document, item, rows.value, section.kind) ||
+                (section.kind == .Sessions && !Rounds(database, document, item, arguments[0].text, sql.ColumnText(rows.value, 0))) ||
+                !json.JsonAppend(document, array, item) { return false }
+        }
+        return false
+    }
+
+    #scope_export
+    // Provide either the legacy changes after a version or the full typed
+    // data projection. Both routes use the same SQL as the released server.
+    Attach :: (database: *void, user: string, since: s64, clean: bool, include: bool,
+        document: *json.JsonDocument, root: s32, counts: *json.JsonDocument, summary: s32) -> bool {
+        changes: [4]Section = .[
+            .{key = "habits", query = queries.HabitsSince, kind = .Habits},
+            .{key = "habit_days", query = queries.HabitDaysSince, kind = .Days},
+            .{key = "sessions", query = queries.SessionsSince, kind = .Sessions},
+            .{key = "meditation_logs", query = queries.MeditationsSince, kind = .Meditations},
+        ]
+        if clean {
+            changes[0].query = queries.CleanHabits
+            changes[1].query = queries.CleanHabitDays
+            changes[1].kind = .CleanDays
+            changes[2].query = queries.CleanSessions
+            changes[3].query = queries.CleanMeditations
+        }
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(since)]
+        size: s64 = ifx clean then 1 else 2
+        for section: changes {
+            array := json.JsonNewArray(document)
+            if array < 0 || (include && !Read(database, document, array, section, arguments[:size])) ||
+                !json.JsonSet(document, root, section.key, array) ||
+                (counts != null && !output.IntegerField(counts, summary, section.key, cast(s64)json.JsonCount(document, array))) {
+                return false
+            }
+        }
+        return true
+    }
+}

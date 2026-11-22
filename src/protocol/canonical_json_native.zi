@@ -1,0 +1,36 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_export
+    // The released protocol signs encoding/json's compact struct encoding,
+    // including its five HTML-safe escapes when serializing string values.
+    Encode :: (document: *json.JsonDocument, root: s32, output: *Vec(u8)) -> bool {
+        raw: Text = json.JsonWrite(document, root, json.JsonCompactStyle(false))
+        source := TextView(raw)
+        if source == "" || !VecReserve(<<output, source.count) { return false }
+        begin: s64 = 0
+        index: s64 = 0
+        while index < source.count {
+            escape: string
+            advance: s64 = 1
+            byte := source[index]
+            if byte == #char "<" { escape = "\\u003c" }
+            else if byte == #char ">" { escape = "\\u003e" }
+            else if byte == #char "&" { escape = "\\u0026" }
+            else if byte == 226 && index + 2 < source.count && source[index + 1] == 128 {
+                last := source[index + 2]
+                if last == 168 || last == 169 {
+                    escape = ifx last == 168 then "\\u2028" else "\\u2029"
+                    advance = 3
+                }
+            }
+            if escape != "" {
+                if !BuilderAppend(<<output, source[begin:index]) || !BuilderAppend(<<output, escape) { return false }
+                begin = index + advance
+            }
+            index += advance
+        }
+        return BuilderAppend(<<output, source[begin:])
+    }
+}

@@ -1,0 +1,116 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    state :: #import "account_state_native";
+    protocol :: #import "protocol";
+    validation :: #import "record_validation";
+    queries :: #import "record_write_queries";
+    quota :: #import "storage_usage_rules";
+    timestamp :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+
+    RecordWriteResult :: struct {
+        applied: s64
+        usedBytes: s64
+        storageFull: bool
+        invalidRecord: bool
+        status: s32
+    }
+
+    #scope_file
+    MinimumTimestamp :: "0001-01-01T00:00:00.000000000Z";
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    SavePacking :: (database: *void, user: string, record: protocol.EncryptedRecord, limit: s64) -> s32 {
+        if record.PackedCiphertext == "" { return sqlite.SQLITE_OK }
+        packed: [10]sql.Argument = .[sql.TextArg(user), sql.TextArg(record.Collection), sql.TextArg(record.ID),
+            sql.TextArg(record.PackedNonce), sql.TextArg(record.PackedCiphertext), sql.TextArg(record.Nonce),
+            sql.TextArg(record.Ciphertext), sql.TextArg(record.ContentHash), sql.TextArg(record.KeyID),
+            sql.IntArg(cast(s64)record.SchemaVersion)]
+        if limit > 0 {
+            usage := sql.ReadInteger(database, quota.UsageSQL, packed[:1])
+            if usage.status != sqlite.SQLITE_OK { return usage.status }
+            additional := record.PackedNonce.count + record.PackedCiphertext.count
+            // An optional copy must leave room for the authoritative write.
+            if !quota.RoomForPacking(usage.value, limit, additional) { return sqlite.SQLITE_OK }
+        }
+        return sql.Execute(database, queries.SavePacking, packed[:])
+    }
+
+    #scope_export
+    Write :: (database: *void, user: string, record: protocol.EncryptedRecord, limit: s64,
+        latest: timestamp.TimestampValue, cutoff: string) -> RecordWriteResult {
+        updated := timestamp.Parse(record.UpdatedAt)
+        if updated.valid && timestamp.Before(latest, updated) { updated = latest }
+        storage: [31]u8
+        length := format.UTC(updated, storage[:])
+        when := ifx length == 0 then MinimumTimestamp else TextView(storage[:length])
+        version := state.NextVersion(database, user)
+        if version.status != sqlite.SQLITE_OK { return .{status = version.status} }
+        arguments: [14]sql.Argument = .[sql.TextArg(user), sql.TextArg(record.Collection), sql.TextArg(record.ID),
+            sql.TextArg(record.KeyID), sql.TextArg(record.Nonce), sql.TextArg(record.Ciphertext), sql.TextArg(when),
+            sql.IntArg(record.DeletedAt), sql.TextArg(record.ContentHash), sql.IntArg(cast(s64)record.SchemaVersion),
+            sql.TextArg(record.ParentID), sql.IntArg(version.value), sql.TextArg(cutoff), sql.IntArg(record.FreeBytes)]
+        status := sql.Execute(database, queries.Upsert, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        applied := cast(s64)sqlite.SqliteChanges(database)
+        status = SavePacking(database, user, record, limit)
+        return .{applied = applied, status = status}
+    }
+
+    // The caller must authorize the account and app. Apply the batch on the
+    // same transaction that reserved its nonce, and roll back on any failure.
+    ApplyTx :: (database: *void, user: string, records: []protocol.EncryptedRecord, version: isize,
+        now: timestamp.TimestampValue, limit: s64) -> RecordWriteResult {
+        if database == null || sqlite.SqliteGetAutocommit(database) { return .{status = sqlite.SQLITE_MISUSE} }
+        for record: records {
+            if !validation.ValidForProtocol(record, version) { return .{invalidRecord = true} }
+        }
+        current: [31]u8
+        currentLength := format.UTC(now, current[:])
+        if currentLength == 0 { return .{status = sqlite.SQLITE_MISUSE} }
+        latest := now
+        latest.seconds += 300
+        cutoff: [31]u8
+        cutoffLength := format.UTC(latest, cutoff[:])
+        if cutoffLength == 0 { return .{status = sqlite.SQLITE_MISUSE} }
+        status := state.Touch(database, user, TextView(current[:currentLength]))
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        before: s64 = 0
+        if limit > 0 {
+            measured := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+            if measured.status != sqlite.SQLITE_OK { return .{status = measured.status} }
+            before = measured.value
+        }
+        result: RecordWriteResult
+        for record: records {
+            written := Write(database, user, record, limit, latest, TextView(cutoff[:cutoffLength]))
+            if written.status != sqlite.SQLITE_OK { return .{status = written.status} }
+            result.applied += written.applied
+        }
+        if limit > 0 {
+            measured := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+            if measured.status != sqlite.SQLITE_OK { return .{status = measured.status} }
+            if quota.Exceeds(before, measured.value, limit) { return .{storageFull = true, usedBytes = before} }
+            result.usedBytes = measured.value
+        }
+        return result
+    }
+
+    Apply :: (database: *void, user: string, records: []protocol.EncryptedRecord, version: isize,
+        now: timestamp.TimestampValue, limit: s64) -> RecordWriteResult {
+        if database == null { return .{status = sqlite.SQLITE_MISUSE} }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer RollbackIfActive(database)
+        result := ApplyTx(database, user, records, version, now, limit)
+        if result.status != sqlite.SQLITE_OK || result.invalidRecord || result.storageFull { return result }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        return result
+    }
+}

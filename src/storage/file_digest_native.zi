@@ -1,0 +1,27 @@
+#if TARGET == .C && OS == .LINUX {
+    files :: #import "std/file_linux";
+    sha :: #import "crypto/sha256";
+    #import "std/vec"
+
+    // Stream a checksum in bounded space. The open handle pins the verified
+    // inode across an atomic replacement of the release file.
+    Matches :: (file: files.FileHandle, size: s64, hash: string) -> bool {
+        if !file.valid || files.FileSize(file) != size { return false }
+        digest: sha.Sha256Context
+        sha.Sha256Initialize(*digest)
+        buffer: [65536]u8
+        offset: s64 = 0
+        while offset < size {
+            left := size - offset
+            count := ifx left < buffer.count then left else buffer.count
+            read := files.ReadAt(file, buffer[:count], offset)
+            if read <= 0 { return false }
+            sha.Sha256UpdateText(*digest, TextView(buffer[:read]))
+            offset += read
+        }
+        raw: [32]u8
+        hex: [65]u8
+        sha.Sha256Finish(*digest, *raw[0])
+        return files.FileSize(file) == size && sha.BytesToHex(*raw[0], 32, *hex[0], hex.count) == 1 && TextView(hex[:64]) == hash
+    }
+}

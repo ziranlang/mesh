@@ -1,0 +1,87 @@
+#if TARGET == .C && OS == .LINUX {
+    queries :: #import "shared_lists_queries";
+    codec :: #import "shared_lists_json_native";
+    fields :: #import "sync_json_fields";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+
+    #scope_file
+    List :: (document: *json.JsonDocument, row: *void) -> s32 {
+        result := json.JsonNewObject(document)
+        names: [4]string = .["id", "owner", "alias", "title"]
+        for name, index: names {
+            if !fields.SetString(document, result, name, sql.ColumnText(row, cast(s32)index)) {
+                return -1
+            }
+        }
+        source: json.JsonDocument
+        deleted := sqlite.SqliteColumnInt64(row, 6)
+        revision := sqlite.SqliteColumnInt64(row, 4)
+        if !json.JsonRead(*source, sql.ColumnText(row, 5)) || deleted < -2147483648 || deleted > 2147483647 ||
+            !json.JsonSet(document, result, "revision", json.JsonNewInteger(document, revision)) ||
+            !json.JsonSet(document, result, "deleted", json.JsonNewInteger(document, deleted)) ||
+            !json.JsonSet(document, result, "items", codec.Items(*source, source.root, document)) {
+            return -1
+        }
+        access := sql.ColumnText(row, 7)
+        if access != "" && !fields.SetString(document, result, "access", access) {
+            return -1
+        }
+        return result
+    }
+
+    Invitation :: (document: *json.JsonDocument, row: *void) -> s32 {
+        result := json.JsonNewObject(document)
+        names: [9]string = .["id", "list_id", "title", "owner", "alias", "target", "target_alias", "status", "access"]
+        for name, index: names {
+            value := sql.ColumnText(row, cast(s32)index)
+            if index == 8 && value == "" {
+                continue
+            }
+            if !fields.SetString(document, result, name, value) {
+                return -1
+            }
+        }
+        return result
+    }
+
+    Rows :: (database: *void, user: string, document: *json.JsonDocument, readingLists: bool) -> s32 {
+        args: [1]sql.Argument = .[sql.TextArg(user)]
+        query := ifx readingLists then queries.Lists else queries.Invitations
+        prepared := sql.Prepare(database, query, args[:])
+        if prepared.status != sqlite.SQLITE_OK {
+            return -1
+        }
+        defer sqlite.SqliteFinalize(prepared.value)
+        array := json.JsonNewArray(document)
+        step := sqlite.SqliteStep(prepared.value)
+        while step == sqlite.SQLITE_ROW {
+            row := ifx readingLists then List(document, prepared.value) else Invitation(document, prepared.value)
+            if !json.JsonAppend(document, array, row) {
+                return -1
+            }
+            step = sqlite.SqliteStep(prepared.value)
+        }
+        return ifx step == sqlite.SQLITE_DONE then array else -1
+    }
+
+    #scope_export
+    Snapshot :: (database: *void, user: string, document: *json.JsonDocument) -> s32 {
+        if sqlite.SqliteExecText(database, "BEGIN") != sqlite.SQLITE_OK {
+            return -1
+        }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) {
+                unused sqlite.SqliteExecText(database, "ROLLBACK")
+            }
+        }
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "lists", Rows(database, user, document, true)) ||
+            !json.JsonSet(document, root, "invitations", Rows(database, user, document, false)) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return -1
+        }
+        return root
+    }
+}

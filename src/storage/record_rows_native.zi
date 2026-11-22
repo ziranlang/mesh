@@ -1,0 +1,36 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    protocol :: #import "protocol";
+    json :: #import "std/json_document";
+
+    #scope_file
+    AddText :: (target: *json.JsonDocument, row: s32, field: string, value: string, required: bool = false) -> bool {
+        return (!required && value == "") || json.JsonSet(target, row, field, json.JsonNewStringCopy(target, value))
+    }
+
+    AddInteger :: (target: *json.JsonDocument, row: s32, field: string, value: s64) -> bool {
+        return value == 0 || json.JsonSet(target, row, field, json.JsonNewInteger(target, value))
+    }
+
+    #scope_export
+    Append :: (target: *json.JsonDocument, array: s32, item: protocol.EncryptedRecord) -> bool {
+        row := json.JsonNewObject(target)
+        return AddText(target, row, "collection", item.Collection, true) &&
+            AddText(target, row, "id", item.ID, true) && AddText(target, row, "key_id", item.KeyID) &&
+            AddText(target, row, "nonce", item.Nonce) && AddText(target, row, "ciphertext", item.Ciphertext) &&
+            AddText(target, row, "updated_at", item.UpdatedAt, true) && AddInteger(target, row, "deleted_at", item.DeletedAt) &&
+            AddText(target, row, "content_hash", item.ContentHash) && AddInteger(target, row, "schema_version", cast(s64)item.SchemaVersion) &&
+            AddText(target, row, "parent_id", item.ParentID) && AddInteger(target, row, "free_bytes", item.FreeBytes) &&
+            json.JsonAppend(target, array, row)
+    }
+
+    Read :: (statement: *void, freeBytesColumn: s32) -> protocol.EncryptedRecord {
+        return .{Collection = sql.ColumnText(statement, 0), ID = sql.ColumnText(statement, 1),
+            KeyID = sql.ColumnText(statement, 2), Nonce = sql.ColumnText(statement, 3),
+            Ciphertext = sql.ColumnText(statement, 4), UpdatedAt = sql.ColumnText(statement, 5),
+            DeletedAt = sqlite.SqliteColumnInt64(statement, 6), ContentHash = sql.ColumnText(statement, 7),
+            SchemaVersion = cast(isize)sqlite.SqliteColumnInt64(statement, 8), ParentID = sql.ColumnText(statement, 9),
+            FreeBytes = sqlite.SqliteColumnInt64(statement, freeBytesColumn)}
+    }
+}

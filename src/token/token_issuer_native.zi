@@ -1,0 +1,75 @@
+#if TARGET == .C && OS == .LINUX {
+    signatures :: #import "device_signature_native";
+    secure :: #import "std/constant_time";
+    oqs :: #import "oqs/Oqs";
+    sha :: #import "crypto/sha256";
+    #import "std/vec"
+
+    Issuer :: struct {
+        seed: [32]u8
+        publicHex: Vec(u8)
+        signing: bool
+        readable: bool
+    }
+
+    Open :: (issuer: *Issuer, publicKey: []u8, privateKey: []u8) -> bool {
+        derived: [32]u8
+        publicBytes := publicKey
+        if privateKey.count == 32 || privateKey.count == 64 {
+            if !signatures.DerivePublic(privateKey[:32], derived[:]) ||
+                (privateKey.count == 64 && !secure.ConstantTimeEqual(derived[:], privateKey[32:])) ||
+                (publicKey.count != 0 && !secure.ConstantTimeEqual(derived[:], publicKey)) {
+                return false
+            }
+            if publicKey.count == 0 {
+                publicBytes = derived[:]
+            }
+        }
+        hex: Vec(u8)
+        if publicBytes.count > 0 {
+            size := publicBytes.count * 2 + 1
+            if !VecResizeBounded(hex, size, size) || sha.BytesToHex(*publicBytes[0], publicBytes.count, *VecSlice(hex, 0, size)[0], size) != 1 {
+                return false
+            }
+        }
+        VecSwap(issuer.publicHex, hex)
+        issuer.readable = publicBytes.count == 32
+        issuer.signing = privateKey.count == 32 || privateKey.count == 64
+        if issuer.signing {
+            for byte, index: privateKey[:32] {
+                issuer.seed[index] = byte
+            }
+        }
+        return true
+    }
+
+    Close :: (issuer: *Issuer) {
+        oqs.Cleanse(issuer.seed[:])
+        VecFree(issuer.publicHex)
+        issuer.signing = false
+        issuer.readable = false
+    }
+
+    Status :: (issuer: *Issuer) -> string {
+        if issuer.signing {
+            return "ok"
+        }
+        if issuer.readable {
+            return "read_only"
+        }
+        return "disabled"
+    }
+
+    PublicHex :: (issuer: *Issuer) -> string {
+        if issuer.publicHex.count == 0 {
+            return ""
+        }
+        return TextView(VecSlice(issuer.publicHex, 0, issuer.publicHex.count - 1))
+    }
+
+    SignHex :: (issuer: *Issuer, message: []u8, target: []u8) -> bool {
+        signature: [64]u8
+        return issuer.signing && target.count >= 129 && signatures.Sign(issuer.seed[:], message, signature[:]) &&
+            sha.BytesToHex(*signature[0], signature.count, *target[0], target.count) == 1
+    }
+}

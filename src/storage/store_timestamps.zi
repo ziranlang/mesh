@@ -2,35 +2,13 @@
 #import "timestamp"
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
+schema :: #import "timestamp_schema";
 go_sql :: #system_library "go:database/sql";
 go_format :: #system_library "go:fmt";
 go_log :: #system_library "go:log/slog";
 builtin :: #system_library "go:builtin";
 
-// Bump this version when another stored-timestamp rewrite is required.
-TimestampSchemaVersion :: 1;
-
 #scope_file
-TimestampColumn :: struct {
-    table: string
-    column: string
-}
-canonicalTimestampColumns: [14]TimestampColumn = .[
-    TimestampColumn.{table = "server_habits", column = "updated_at"},
-    TimestampColumn.{table = "server_habit_days", column = "updated_at"},
-    TimestampColumn.{table = "server_sessions", column = "updated_at"},
-    TimestampColumn.{table = "server_sessions", column = "started_at"},
-    TimestampColumn.{table = "server_meditation_logs", column = "completed_at"},
-    TimestampColumn.{table = "server_encrypted_records", column = "updated_at"},
-    TimestampColumn.{table = "server_social_snapshots", column = "updated_at"},
-    TimestampColumn.{table = "server_sync_ops", column = "created_at"},
-    TimestampColumn.{table = "server_users", column = "created_at"},
-    TimestampColumn.{table = "server_users", column = "last_seen_at"},
-    TimestampColumn.{table = "server_clients", column = "last_seen_at"},
-    TimestampColumn.{table = "server_clients", column = "last_login_at"},
-    TimestampColumn.{table = "server_clients", column = "last_sync_at"},
-    TimestampColumn.{table = "server_encrypted_payloads", column = "created_at"}
-];
 TransactionResult :: struct {
     value: *sql.Transaction
     error: Error
@@ -60,7 +38,6 @@ ScanRow :: (rows: *sql.Rows, rowid: *s64, value: *sql.NullString) -> Error #fore
 ExecText :: (transaction: *sql.Transaction, context: ctx.Context, query: string) -> ExecResult #go_results #foreign go_sql "(*Tx).ExecContext";
 ExecRewrite :: (transaction: *sql.Transaction, context: ctx.Context, query: string, rowid: s64, value: string) -> ExecResult #go_results #foreign go_sql "(*Tx).ExecContext";
 FormatQuery :: (format: string, first: string, second: string) -> string #foreign go_format "Sprintf";
-FormatVersion :: (format: string, value: isize) -> string #foreign go_format "Sprintf";
 ColumnError :: (format: string, table: string, column: string, error: Error) -> Error #foreign go_format "Errorf";
 LogRewritten :: (message: string, label: string, count: isize) #foreign go_log "Info";
 AllocatePending :: (count: isize) -> []PendingRewrite #foreign builtin "make";
@@ -124,12 +101,12 @@ CanonicalizeColumn :: (context: ctx.Context, transaction: *sql.Transaction, tabl
 // Rewrite every known column atomically, then advance the stored schema version.
 Canonicalize :: (database: *sql.Database, context: ctx.Context) -> Error {
     version: isize
-    row := QueryVersion(database, context, "PRAGMA user_version")
+    row := QueryVersion(database, context, schema.VersionQuery)
     error := ScanVersion(row, *version)
     if error != null {
         return error
     }
-    if version >= TimestampSchemaVersion {
+    if version >= schema.TimestampSchemaVersion {
         return null
     }
     begun := Begin(database, context, null)
@@ -139,15 +116,14 @@ Canonicalize :: (database: *sql.Database, context: ctx.Context) -> Error {
     transaction := begun.value
     RollbackAtReturn(transaction)
     rewritten: isize = 0
-    for target: canonicalTimestampColumns {
+    for target: schema.Columns {
         result := CanonicalizeColumn(context, transaction, target.table, target.column)
         if result.error != null {
             return ColumnError("canonicalize %s.%s: %w", target.table, target.column, result.error)
         }
         rewritten += result.count
     }
-    query := FormatVersion("PRAGMA user_version=%d", cast(isize)TimestampSchemaVersion)
-    updated := ExecText(transaction, context, query)
+    updated := ExecText(transaction, context, schema.AdvanceVersion)
     if updated.error != null {
         return updated.error
     }

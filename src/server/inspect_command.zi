@@ -1,0 +1,30 @@
+InspectAction :: enum {
+    Summary
+    Users
+    User
+    Doctor
+    Unknown
+}
+
+InspectCommand :: struct {
+    action: InspectAction
+    user: string
+    name: string
+    usage: string
+}
+
+Parse :: (arguments: []string) -> InspectCommand {
+    if arguments.count == 0 { return .{action = .Summary} }
+    name := arguments[0]
+    if name == "summary" { return .{action = .Summary} }
+    if name == "users" { return .{action = .Users} }
+    if name == "user" {
+        if arguments.count != 2 { return .{action = .User, usage = "usage: mesh inspect user <user_id_hash>"} }
+        return .{action = .User, user = arguments[1]}
+    }
+    if name == "doctor" {
+        if arguments.count != 2 { return .{action = .Doctor, usage = "usage: mesh inspect doctor <user_id_hash>"} }
+        return .{action = .Doctor, user = arguments[1]}
+    }
+    return .{action = .Unknown, name = name}
+}

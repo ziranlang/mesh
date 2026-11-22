@@ -2,6 +2,7 @@
 package main
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"os"
@@ -35,6 +36,7 @@ type response struct {
 	Available    bool
 	Verified     bool
 	Signature    []byte
+	Message      []byte `json:",omitempty"`
 	PublicKey    []byte
 	PrivateKey   []byte
 	Error        string
@@ -65,6 +67,21 @@ func main() {
 			output.Signature, err = signWithPrivateKey(input.Message, input.PrivateKey)
 		case "keypair":
 			output.PublicKey, output.PrivateKey, err = generateMLDSA44Keypair()
+		case "device-keypair":
+			output.PublicKey, output.PrivateKey, err = ed25519.GenerateKey(nil)
+		case "device-sign":
+			if len(input.PrivateKey) != ed25519.PrivateKeySize {
+				err = errors.New("invalid fixture device key")
+			} else {
+				output.Signature = ed25519.Sign(input.PrivateKey, input.Message)
+			}
+		case "app-manifest-sign":
+			output.Message, err = json.Marshal(json.RawMessage(input.Message))
+			if err == nil && len(input.PrivateKey) == ed25519.PrivateKeySize {
+				output.Signature = ed25519.Sign(input.PrivateKey, append([]byte("daochi-app-manifest-v1\n"), output.Message...))
+			} else if err == nil {
+				err = errors.New("invalid fixture device key")
+			}
 		default:
 			panic("unknown provider operation")
 		}

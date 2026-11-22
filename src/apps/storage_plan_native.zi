@@ -1,0 +1,120 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "entitlement_rules_native";
+    ledger :: #import "token_ledger_native";
+    quota :: #import "storage_usage_rules";
+    allowance :: #import "storage_allowance_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    Sizes: [2]string = .["1gb", "5gb"];
+    ReadPlan :: "SELECT period,size,expires_at FROM server_storage_plans WHERE user_id=?1";
+    ReadPurchase :: "SELECT CASE WHEN period=?3 AND size=?4 THEN 1 ELSE 0 END FROM server_storage_purchases WHERE user_id=?1 AND request_id=?2";
+
+    Plan :: struct {
+        period: Vec(u8)
+        size: Vec(u8)
+        expires: s64
+        ok: bool
+    }
+
+    Load :: (database: *void, user: string) -> Plan {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        statement := sql.Prepare(database, ReadPlan, arguments[:])
+        if statement.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(statement.value)
+        state := sqlite.SqliteStep(statement.value)
+        if state == sqlite.SQLITE_DONE { return .{ok = true} }
+        if state != sqlite.SQLITE_ROW || sqlite.SqliteColumnType(statement.value, 2) != sqlite.SQLITE_INTEGER { return .{} }
+        plan: Plan
+        plan.expires = sqlite.SqliteColumnInt64(statement.value, 2)
+        plan.ok = BuilderAppend(plan.period, sql.ColumnText(statement.value, 0)) &&
+            BuilderAppend(plan.size, sql.ColumnText(statement.value, 1))
+        return plan
+    }
+
+    OfferPrices :: (configuration: rules.Configuration, size: string, document: *json.JsonDocument, node: s32) -> bool {
+        monthly := rules.Price(size, "monthly")
+        yearly := rules.Price(size, "yearly")
+        atomicMonthly := rules.MoneroPrice(monthly, configuration.moneroAtomicAmount, configuration.moneroTokenUnits)
+        atomicYearly := rules.MoneroPrice(yearly, configuration.moneroAtomicAmount, configuration.moneroTokenUnits)
+        quoted := atomicMonthly > 0 && atomicYearly > 0
+        return ledger.PutInt(document, node, "monthly_units", monthly) && ledger.PutInt(document, node, "yearly_units", yearly) &&
+            ledger.PutInt(document, node, "monthly_xmr_atomic_units", ifx quoted then atomicMonthly else 0) &&
+            ledger.PutInt(document, node, "yearly_xmr_atomic_units", ifx quoted then atomicYearly else 0)
+    }
+
+    #scope_export
+    Status :: (database: *void, configuration: rules.Configuration, user: string, now: s64, free: s64,
+        document: *json.JsonDocument) -> rules.Result {
+        plan := Load(database, user)
+        balance := ledger.Balance(database, user)
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        usage := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+        limit := allowance.Allowance(database, user, now, free, true)
+        unavailable := rules.Failure(503, "storage balance unavailable")
+        if !plan.ok || !balance.found || !usage.found || !limit.found { return unavailable }
+        value := json.JsonNewObject(document)
+        if !ledger.PutText(document, value, "period", TextView(VecSlice(plan.period, 0, plan.period.count))) ||
+            !ledger.PutText(document, value, "size", TextView(VecSlice(plan.size, 0, plan.size.count))) ||
+            !ledger.PutInt(document, value, "expires_at", plan.expires) || !ledger.PutInt(document, value, "limit_bytes", limit.value) ||
+            !ledger.PutInt(document, value, "balance", balance.value) { return unavailable }
+        offers := json.JsonNewArray(document)
+        for size: Sizes {
+            offer := json.JsonNewObject(document)
+            if !ledger.PutText(document, offer, "size", size) || !ledger.PutInt(document, offer, "limit_bytes", rules.SizeBytes(size)) ||
+                !OfferPrices(configuration, size, document, offer) || !json.JsonAppend(document, offers, offer) { return unavailable }
+        }
+        root := json.JsonNewObject(document)
+        if !ledger.PutText(document, root, "account_id", user) || !ledger.PutText(document, root, "asset_id", ledger.AssetID) ||
+            !json.JsonSet(document, root, "enabled", json.JsonNewBool(document, rules.Enabled(configuration))) ||
+            !json.JsonSet(document, root, "plan", value) || !ledger.PutInt(document, root, "used_bytes", usage.value) ||
+            !ledger.PutInt(document, root, "free_bytes", free) || !ledger.PutInt(document, root, "units_per_dew", rules.UnitsPerDew) ||
+            !OfferPrices(configuration, "1gb", document, root) || !json.JsonSet(document, root, "plans", offers) { return unavailable }
+        return .{status = 200, node = root}
+    }
+
+    // Status is assembled in the same SQLite transaction as the debit and
+    // renewal, so a failure cannot leave a debit without its paid time.
+    Purchase :: (database: *void, configuration: rules.Configuration, user: string, size: string, period: string,
+        key: string, now: s64, at: string, free: s64, document: *json.JsonDocument) -> rules.Result {
+        unavailable := rules.Failure(503, "storage upgrade unavailable")
+        match: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(key), sql.TextArg(period), sql.TextArg(size)]
+        previous := sql.ReadInteger(database, ReadPurchase, match[:])
+        if previous.status != sqlite.SQLITE_OK { return unavailable }
+        if previous.found {
+            if previous.value == 0 { return rules.Failure(409, "storage request id reused") }
+            return Status(database, configuration, user, now, free, document)
+        }
+        plan := Load(database, user)
+        if !plan.ok { return unavailable }
+        bounds := rules.Failure(400, "storage expiry out of range")
+        start := now
+        if plan.expires > now {
+            if plan.expires > rules.MaximumExpiry { return bounds }
+            current := TextView(VecSlice(plan.size, 0, plan.size.count))
+            if rules.SizeBytes(current) == 0 { current = "1gb" }
+            start = ifx current == size then plan.expires else now + rules.ConvertedSeconds(plan.expires - now, current, size)
+        }
+        months: s32 = ifx period == "yearly" then 12 else 1
+        expiry := rules.AddMonths(start, months, true)
+        if expiry <= start || expiry > rules.MaximumExpiry { return bounds }
+        debit: json.JsonDocument
+        purchased := rules.Debit(database, configuration.signer, .{account = user, app = "inbe", kind = "debit",
+            source = "storage", reference = key, amount = -rules.Price(size, period)}, at, key, *debit)
+        if purchased.status == 402 { return rules.Failure(402, "not enough Dew") }
+        if purchased.status != 200 { return unavailable }
+        receiptText: Text = rules.TextField(*debit, purchased.node, "receipt_id")
+        receipt := TextView(receiptText)
+        if receipt == "" { return unavailable }
+        planArguments: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(period), sql.IntArg(expiry), sql.TextArg(size)]
+        saved := sql.Execute(database, "INSERT INTO server_storage_plans(user_id,period,expires_at,size) VALUES(?1,?2,?3,?4) ON CONFLICT(user_id) DO UPDATE SET period=excluded.period,expires_at=excluded.expires_at,size=excluded.size", planArguments[:])
+        if saved != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return unavailable }
+        purchaseArguments: [6]sql.Argument = .[sql.TextArg(user), sql.TextArg(key), sql.TextArg(period), sql.IntArg(expiry), sql.TextArg(receipt), sql.TextArg(size)]
+        saved = sql.Execute(database, "INSERT INTO server_storage_purchases(user_id,request_id,period,expires_at,receipt_id,size) VALUES(?1,?2,?3,?4,?5,?6)", purchaseArguments[:])
+        if saved != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return unavailable }
+        return Status(database, configuration, user, now, free, document)
+    }
+}

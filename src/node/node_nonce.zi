@@ -1,3 +1,4 @@
+schema :: #import "trust_schema";
 #import "std/go_types"
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
@@ -28,12 +29,19 @@ Consume :: (database: *sql.Database, context: ctx.Context, nodeID: string, nonce
     }
     transaction := begun.value
     RollbackAtReturn(transaction)
-    deleted := DeleteExpired(transaction, context, "DELETE FROM node_request_nonces WHERE expires_at<?1", clock.Unix(clock.Now()))
+    deleted := DeleteExpired(transaction, context, schema.ExpireNoncesSQL, clock.Unix(clock.Now()))
     if deleted.error != null {
         return deleted.error
     }
-    inserted := Insert(transaction, context, "INSERT INTO node_request_nonces(node_id,nonce,expires_at) VALUES(?1,?2,?3)", nodeID, nonce, expiresAt)
+    inserted := Insert(transaction, context, schema.InsertNonceSQL, nodeID, nonce, expiresAt)
     if inserted.error != null {
+        return errors.New("node request replayed")
+    }
+    changed := sql.RowsAffected(inserted.value)
+    if changed.error != null {
+        return changed.error
+    }
+    if changed.value != 1 {
         return errors.New("node request replayed")
     }
     return sql.Commit(transaction)

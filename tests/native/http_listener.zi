@@ -1,0 +1,194 @@
+transport :: #import "http_server_native";
+websocket :: #import "websocket_native";
+operations :: #import "operational_native";
+addresses :: #import "client_address_native";
+account :: #import "account_access_native";
+record_http :: #import "record_sync_http_native";
+notifications :: #import "sync_hub_native";
+uploads :: #import "http_upload_native";
+ml_dsa44 :: #import "ml_dsa44_native";
+auth :: #import "http_auth_native";
+auth_queries :: #import "auth_session_queries";
+environment :: #import "std/environment_linux";
+text :: #import "std/byte_text_linux";
+clock :: #import "std/timer";
+sqlite :: #import "sqlite/SQLite";
+schema :: #import "sqlite_schema";
+startup :: #import "store_startup_native";
+#import "std/vec"
+
+#scope_file
+c :: #system_library "c";
+GetChar :: () -> s32 #foreign c "getchar";
+Flush :: (stream: *void) -> s32 #foreign c "fflush";
+
+ListenerState :: struct {
+    database: *void
+    path: string
+    account: account.AccountAccess
+}
+
+Credentials :: #string CREDENTIALS_END
+INSERT INTO server_users(user_id_hash, public_key, created_at) VALUES
+ ('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', x'01', '1970-01-01 00:01:40');
+INSERT INTO server_auth_sessions(token_hash, user_id_hash, session_id, issued_at, expires_at, created_at) VALUES
+ ('1beca3a85196adc17bf5355832d234063cb4a1e5d0058f05628b56ce14a9f9ea',
+  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  '1111111111111111111111111111111111111111111111111111111111111111', 100, 200, '1970-01-01 00:01:40');
+INSERT INTO server_auth_settings(name, value) VALUES
+ ('legacy_v1_started', '1970-01-01 00:01:41'), ('legacy_v1_deadline', '1970-01-01 00:03:30');
+INSERT INTO server_account_tombstones(user_id_hash) VALUES
+ ('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee');
+CREDENTIALS_END;
+
+AuthenticationReply :: (connection: *void, path: string, allowBootstrap: bool) -> s32 {
+    opened := schema.OpenExisting(path)
+    if opened.status != sqlite.SQLITE_OK { return 0 }
+    defer sqlite.SqliteClose(opened.database)
+    secret: [32]u8
+    outcome := auth.Authenticate(opened.database, connection, secret[:],
+        200, "1970-01-01T00:03:20.000000000Z", allowBootstrap)
+    body: Vec(u8)
+    status := outcome.status
+    if status != 0 {
+        if !BuilderAppend(body, "{\"error\":\"") || !BuilderAppend(body, outcome.message) ||
+            !BuilderAppend(body, "\"}\n") { return 0 }
+    } else {
+        status = 200
+        bootstrap := ifx outcome.bootstrap then "true" else "false"
+        if !BuilderAppend(body, "{\"user\":\"") || !BuilderAppend(body, TextView(outcome.userID[:])) ||
+            !BuilderAppend(body, "\",\"bootstrap\":") || !BuilderAppend(body, bootstrap) ||
+            !BuilderAppend(body, "}\n") { return 0 }
+    }
+    return transport.Write(connection, status, "application/json", VecSlice(body, 0, body.count))
+}
+
+Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+    uploads.Delete(cast(*uploads.Upload)(<<request))
+    <<request = null
+}
+
+Upgrade :: (context: *void, connection: *void, request: *void, buffered: *u8,
+    count: usize, fd: s32, upgrade: *void) {
+    defer transport.CloseUpgrade(upgrade)
+    now := clock.MonotonicMilliseconds()
+    stream := websocket.Open(fd, buffered, count, now + 1000, now + 1000)
+    frame := websocket.ReadClientFrame(*stream)
+    if frame.error != "" || frame.closed || frame.opcode != 1 {
+        return
+    }
+    payload := frame.payload
+    unused websocket.WriteFrame(*stream, 1, VecSlice(payload, 0, payload.count))
+}
+
+Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+    version: *u8, upload: *u8, size: *usize, request: **void) -> s32 {
+    if <<request == null {
+        <<request = cast(*void)uploads.New()
+        return ifx <<request == null then 0 else 1
+    }
+    state := cast(*ListenerState)context
+    body := cast(*uploads.Upload)(<<request)
+    route := text.TextFromCString(path)
+    verb := text.TextFromCString(method)
+    if <<size > 0 {
+        if (route == "/api/v1/sync" && verb == "POST") || account.ReadsBody(route, verb) {
+            uploads.Append(body, upload, <<size, state.account.configuration.maximumBodyBytes)
+        }
+        <<size = 0
+        return 1
+    }
+    empty: [0]u8
+    if transport.HeaderTooLarge(connection) {
+        return transport.Write(connection, 431, "", empty[:])
+    }
+    if account.Handles(route) {
+        if body.unavailable { return transport.Write(connection, 503, "", empty[:]) }
+        return account.Handle(*state.account, connection, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+    }
+    if route == "/api/v1/sync" && verb == "POST" {
+        if body.unavailable { return transport.Write(connection, 503, "", empty[:]) }
+        hub: *notifications.Hub = null
+        return record_http.Handle(*state.account, hub, connection, verb, route, VecSlice(body.bytes, 0, body.bytes.count), body.overflow)
+    }
+    if route == "/healthz" || route == "/readyz" {
+        if verb != "GET" && verb != "HEAD" {
+            return transport.Write(connection, 405, "", empty[:])
+        }
+        if route == "/healthz" {
+            return operations.Health(connection)
+        }
+        return operations.Ready(connection, state.database, .{verifierAvailable = true, issuerStatus = "disabled"})
+    }
+    if route == "/client" {
+        address := addresses.FromRequest(connection)
+        body: Vec(u8)
+        if !BuilderAppend(body, TextView(address.bytes[:address.count])) || !BuilderAppend(body, "\n") ||
+            !BuilderAppend(body, transport.QueryArgument(connection, "value")) { return 0 }
+        return transport.Write(connection, 200, "text/plain", VecSlice(body, 0, body.count))
+    }
+    if route == "/target" {
+        body: Vec(u8)
+        if !BuilderAppend(body, transport.RequestTarget(connection)) { return 0 }
+        return transport.Write(connection, 200, "text/plain", VecSlice(body, 0, body.count))
+    }
+    if route == "/account" || route == "/api/v1/sync" {
+        return AuthenticationReply(connection, state.path, route == "/api/v1/sync")
+    }
+    if route != "/socket" {
+        return transport.Write(connection, 404, "", empty[:])
+    }
+    if verb != "GET" {
+        return transport.Write(connection, 405, "", empty[:])
+    }
+    return websocket.Accept(connection, context, Upgrade)
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    path := environment.EnvironmentText("MESH_TEST_HTTP_DATABASE")
+    if path == "" { return 1 }
+    outside := transport.PeerAddress.{count = 4}
+    outside.bytes[0] = 192
+    outside.bytes[1] = 0
+    outside.bytes[2] = 2
+    outside.bytes[3] = 73
+    resolved := addresses.Resolve(outside, "127.0.0.1", "2001:db8::3")
+    if TextView(resolved.bytes[:resolved.count]) != "192.0.2.73" { return 6 }
+    opened := schema.OpenCore(path)
+    if opened.status != sqlite.SQLITE_OK { return 2 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if startup.InitializeFeatures(database) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, auth_queries.Schema) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, Credentials) != sqlite.SQLITE_OK { return 5 }
+    state := ListenerState.{database = database, path = path}
+    secret: [32]u8
+    settings: account.Configuration = .{database = database, path = path, secret = secret[:], challengeSeconds = 60,
+        tokenSeconds = 3600, maximumBodyBytes = 8192, accountStorageLimit = 1000, zstdRequests = true, zstdResponses = true, verify = ml_dsa44.Verify}
+    if !account.Open(*state.account, settings) { return 7 }
+    defer account.Close(*state.account)
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    ipv6: [16]u8
+    ipv6[15] = 1
+    context := cast(*void)(*state)
+    daemon: *void = null
+    if environment.EnvironmentText("MESH_TEST_HTTP_IPV6") == "1" {
+        daemon = transport.StartIPv6(ipv6, 0, 0, 8, context, Dispatch, Completed)
+    } else {
+        daemon = transport.Start(loopback, 0, 8, context, Dispatch, Completed)
+    }
+    if daemon == null {
+        return 3
+    }
+    defer transport.Stop(daemon)
+    port := transport.BoundPort(daemon)
+    if port == 0 {
+        return 4
+    }
+    print("%\n", port)
+    Flush(null)
+    GetChar()
+    return 0
+}

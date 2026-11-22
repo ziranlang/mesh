@@ -1,0 +1,102 @@
+account :: #import "account_access_native";
+curl :: #import "peer_http_native";
+environment :: #import "std/environment_linux";
+ml_dsa44 :: #import "ml_dsa44_native";
+play :: #import "google_play_http_native";
+schema :: #import "sqlite_schema";
+sqlite :: #import "sqlite/SQLite";
+startup :: #import "store_startup_native";
+text :: #import "std/byte_text_linux";
+tokens :: #import "token_http_native";
+transport :: #import "http_server_native";
+uploads :: #import "http_upload_native";
+#import "std/vec"
+
+#scope_file
+c :: #system_library "c";
+Flush :: (stream: *void) -> s32 #foreign c "fflush";
+GetChar :: () -> s32 #foreign c "getchar";
+Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+Free :: (value: *void) #foreign c "free";
+
+Fixture :: struct {
+    account: account.AccountAccess
+    play: play.PlayState
+    tokens: tokens.State
+}
+
+Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+    upload := cast(*uploads.Upload)(<<request)
+    if upload == null { return }
+    VecFree(upload.bytes)
+    Free(cast(*void)upload)
+    <<request = null
+}
+
+Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+    version: *u8, chunk: *u8, size: *usize, request: **void) -> s32 {
+    upload := cast(*uploads.Upload)(<<request)
+    if upload == null {
+        upload = cast(*uploads.Upload)Allocate(1, size_of(uploads.Upload))
+        if upload == null { return 0 }
+        <<request = cast(*void)upload
+        return 1
+    }
+    fixture := cast(*Fixture)context
+    route := text.TextFromCString(path)
+    verb := text.TextFromCString(method)
+    if <<size > 0 {
+        if play.ReadsBody(route, verb) { uploads.Append(upload, chunk, <<size, fixture.account.configuration.maximumBodyBytes) }
+        <<size = 0
+        return 1
+    }
+    if play.Handles(route) {
+        return play.Handle(*fixture.play, *fixture.tokens, *fixture.account, connection, verb,
+            VecSlice(upload.bytes, 0, upload.bytes.count), upload.overflow || upload.unavailable)
+    }
+    empty: []u8
+    return transport.Write(connection, 404, "", empty)
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    path := environment.EnvironmentText("MESH_TEST_HTTP_DATABASE")
+    origin := environment.EnvironmentText("MESH_TEST_PLAY_ORIGIN")
+    if path == "" || origin == "" { return 1 }
+    opened := schema.OpenCore(path)
+    if opened.status != sqlite.SQLITE_OK { return 2 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if startup.InitializeFeatures(database) != sqlite.SQLITE_OK { return 3 }
+    fixture: Fixture
+    secret: [32]u8
+    settings: account.Configuration = .{database = database, path = path, secret = secret[:], challengeSeconds = 60,
+        tokenSeconds = 3600, maximumBodyBytes = 1048576, zstdRequests = true, zstdResponses = true, verify = ml_dsa44.Verify}
+    if !account.Open(*fixture.account, settings) { return 4 }
+    defer account.Close(*fixture.account)
+    noKey: []u8
+    private: [32]u8 = .[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
+    if !tokens.Open(*fixture.tokens, "sku:17,other:23,overflow:9223372036854775807", false, noKey, private[:]) { return 5 }
+    defer tokens.Close(*fixture.tokens)
+    if !curl.Open() { return 6 }
+    defer curl.Close()
+    configuration: play.Configuration = .{credentials = .{loopbackBase = TextCopy(origin),
+        oauthClient = TextCopy(environment.EnvironmentText("MESH_TEST_PLAY_OAUTH")),
+        refreshToken = TextCopy(environment.EnvironmentText("MESH_TEST_PLAY_REFRESH")),
+        serviceAccount = TextCopy(environment.EnvironmentText("MESH_TEST_PLAY_SERVICE"))},
+        packageNames = TextCopy(environment.EnvironmentText("MESH_TEST_PLAY_PACKAGES")),
+        packageApps = TextCopy(environment.EnvironmentText("MESH_TEST_PLAY_APPS"))}
+    if environment.EnvironmentText("MESH_TEST_PLAY_RETRY") == "1" { configuration.intervalMilliseconds = 100 }
+    if !play.Open(*fixture.play, *fixture.account, *fixture.tokens, *configuration) { return 7 }
+    defer play.Close(*fixture.play)
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    daemon := transport.Start(loopback, 0, 8, cast(*void)*fixture, Dispatch, Completed)
+    if daemon == null { return 8 }
+    defer transport.Stop(daemon)
+    defer play.Stop(*fixture.play)
+    print("%\n", transport.BoundPort(daemon))
+    unused Flush(null)
+    unused GetChar()
+    return 0
+}

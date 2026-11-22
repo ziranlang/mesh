@@ -1,3 +1,4 @@
+trust_schema :: #import "trust_schema";
 #import "std/go_types"
 #import "protocol"
 #import "mesh_types"
@@ -9,6 +10,7 @@ cursor :: #import "mesh_cursor";
 scope :: #import "collection_scope";
 policy :: #import "mesh_policy";
 record :: #import "encrypted_record";
+validation :: #import "record_validation";
 account :: #import "account_state";
 plans :: #import "storage_plan";
 storage :: #import "account_storage";
@@ -208,7 +210,7 @@ ExportEncryptedRecords :: (database: *sql.Database, context: ctx.Context, meshPo
     if result.error != null {
         return result
     }
-    queried := QueryExport(database, context, ExportSQL, decoded.value.Seq)
+    queried := QueryExport(database, context, trust_schema.ExportRecordsSQL, decoded.value.Seq)
     result.error = queried.error
     if result.error != null {
         return result
@@ -386,7 +388,7 @@ ImportEncryptedBatch :: (database: *sql.Database, context: ctx.Context, meshPoli
         if result.error != null {
             return result
         }
-        if !record.ValidForProtocol(item.Record, 5) {
+        if !validation.ValidForProtocol(item.Record, 5) {
             result.error = errors.New("invalid mesh encrypted record")
             return result
         }
@@ -568,17 +570,6 @@ UpsertRecord :: (transaction: *sql.Transaction, context: ctx.Context, userID: st
 }
 
 #scope_file
-ExportSQL :: #string SQL_END
-SELECT e.seq,e.op,e.user_id_hash,e.collection,e.record_id,e.deleted_at,
-       r.id,r.key_id,r.nonce,r.ciphertext,r.updated_at,r.deleted_at,
-       r.content_hash,r.schema_version,r.parent_id,r.free_bytes,u.public_key,u.created_at,u.last_seen_at
-FROM server_mesh_changes e
-LEFT JOIN server_encrypted_records r
-  ON e.op!='delete' AND r.user_id_hash=e.user_id_hash AND r.collection=e.collection AND r.id=e.record_id
-LEFT JOIN server_users u ON u.user_id_hash=e.user_id_hash
-WHERE e.seq>?1
-ORDER BY e.seq
-SQL_END;
 TombstoneSQL :: "SELECT EXISTS(SELECT 1 FROM server_account_tombstones WHERE user_id_hash=?1)";
 DeleteSQL :: #string SQL_END
 DELETE FROM server_encrypted_records

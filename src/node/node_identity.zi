@@ -1,3 +1,4 @@
+name_rules :: #import "name_rules";
 #import "protocol"
 #import "std/go_types"
 keys :: #import "std/ed25519_go";
@@ -317,20 +318,7 @@ NormalizeName :: (name: string) -> string {
     return Lower(TrimSpace(name))
 }
 ValidName :: (name: string) -> bool {
-    if name.count == 0 || name.count > 63 {
-        return false
-    }
-    index: s64 = 0
-    while index < name.count {
-        value := name[index]
-        if (value < cast(u8)97 || value > cast(u8)122) && (value < cast(u8)48 || value > cast(u8)57) {
-            if value != cast(u8)45 || index == 0 || index == name.count - 1 {
-                return false
-            }
-        }
-        index += 1
-    }
-    return true
+    return name_rules.Valid(name)
 }
 NameClaimMessage :: (claim: NameClaim) -> []u8 {
     services := json.Marshal(claim.Services)

@@ -1,0 +1,11 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+
+    Allowance :: (database: *void, user: string, now: s64, baseline: s64, plansEnabled: bool) -> sql.IntegerResult {
+        if !plansEnabled {
+            return .{value = baseline}
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(now), sql.IntArg(baseline)]
+        return sql.ReadInteger(database, "SELECT COALESCE((SELECT CASE size WHEN '5gb' THEN 5368709120 ELSE 1073741824 END FROM server_storage_plans WHERE user_id=?1 AND expires_at>?2),?3)", arguments[:])
+    }
+}

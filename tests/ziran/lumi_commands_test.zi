@@ -1,0 +1,47 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+commands :: #import "lumi_commands";
+
+#program_export "TestLumiCommandAddressAndArguments"
+LumiCommandAddressAndArguments :: (test: *testing.Test) {
+    addressed: [2]string = .[
+        "/journal@inlumi_bot  A calm morning\n水を飲む  ",
+        "/JOURNAL@INLUMI_BOT  A calm morning\n水を飲む  "
+    ]
+    for input: addressed {
+        got := commands.Parse(input)
+        if got.foreign || got.name != "journal" || got.message != "/journal  A calm morning\n水を飲む  " || !got.has_argument {
+            arguments: [1]Any = .[got]
+            testing.Fatalf(test, "command changed its arguments: %#v", arguments[:])
+        }
+    }
+    foreign: [3]string = .["/todo@other_bot text", "/todo@inlumi_bot.evil text", "/todo@ text"]
+    for input: foreign {
+        if !commands.Parse(input).foreign {
+            arguments: [1]Any = .[input]
+            testing.Fatalf(test, "accepted foreign bot command %q", arguments[:])
+        }
+    }
+    if commands.Parse("/todo \t\n").has_argument {
+        testing.Fatal(test, "whitespace counted as a task title")
+    }
+    message := "hello @inlumi_bot\n/journal private text"
+    plain := commands.Parse(message)
+    if plain.name != "" || plain.message != message {
+        testing.Fatal(test, "ordinary chat was interpreted as a command")
+    }
+    diary: [2]string = .["/journal: A calm morning", "/diary: A calm morning"]
+    for input: diary {
+        got := commands.Parse(input)
+        if !commands.Known(got.name) || got.message != input {
+            testing.Fatal(test, "existing diary colon syntax was rejected or changed")
+        }
+    }
+    colon := commands.Parse("/journal@inlumi_bot: A calm morning")
+    if colon.foreign || colon.name != "journal" || colon.message != "/journal: A calm morning" {
+        testing.Fatal(test, "addressed diary colon syntax did not preserve content")
+    }
+    if !commands.Parse("/diary@other_bot: Private text").foreign {
+        testing.Fatal(test, "addressed diary colon syntax accepted another bot")
+    }
+}

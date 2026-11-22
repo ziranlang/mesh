@@ -1,0 +1,228 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    gift :: #import "token_gift_native";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    mutex :: #import "std/mutex_linux";
+    response :: #import "http_json_native";
+    reward :: #import "token_reward_native";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    strict :: #import "strict_json_native";
+    time :: #import "timestamp_value";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    #scope_file
+    NativeGiftPath :: "/api/v1/tokens/gifts";
+    NativeRewardsPath :: "/api/v1/rewards";
+    NativeGiftRewardBodyLimit :: 1024;
+
+    RewardStreakSQL :: #string SQL
+SELECT COUNT(*) FROM (
+ SELECT day, ROW_NUMBER() OVER (ORDER BY day DESC) AS position
+ FROM reward_checkins WHERE account_id=?1 AND game=?2 AND day<=?3
+) WHERE day + position = ?3 + 1
+SQL;
+
+    RewardCompletionSQL :: #string SQL
+WITH RECURSIVE levels(level) AS (SELECT 1 UNION ALL SELECT level+1 FROM levels WHERE level<?2)
+SELECT COUNT(*) FROM levels WHERE EXISTS(SELECT 1 FROM game_completions c WHERE c.account_id=?1
+ AND c.game='shovey.classic' AND c.level=levels.level AND c.evidence_complete=1 AND c.moves>=10)
+SQL;
+
+    PrivateReply :: (connection: *void, method: string, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"}]
+        if method == "HEAD" {
+            empty: []u8
+            return http.WriteWithHeaders(connection, status, "application/json", empty, headers[:])
+        }
+        return response.ReplyWithHeaders(connection, status, document, root, headers[:])
+    }
+
+    PrivateError :: (connection: *void, method: string, status: u32, error: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "error", error) { return 0 }
+        return PrivateReply(connection, method, status, *document, root)
+    }
+
+    GiftFields :: (document: *json.JsonDocument, fields: []s32) -> bool {
+        if json.JsonKindOf(document, document.root) != .Object { return false }
+        for index: 0..fields.count - 1 { fields[index] = -1 }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            field := TextView(name)
+            index := ifx field == "recipient" then 0 else ifx field == "request_id" then 1 else ifx field == "units" then 2 else -1
+            if index < 0 || fields[index] >= 0 { return false }
+            kind := json.JsonKindOf(document, node)
+            if (index == 2 && kind != .Number) || (index != 2 && kind != .String) { return false }
+            fields[index] = node
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    SendGift :: (database: *void, signer: *issuer.Issuer, connection: *void, sender: string, now: time.TimestampValue,
+        input: []u8, overflow: bool, zstd: bool) -> s32 {
+        body: response.Body
+        fields: [3]s32
+        {
+            read := response.Read(connection, input, overflow || input.count > NativeGiftRewardBodyLimit, NativeGiftRewardBodyLimit, zstd, *body)
+            if read.status != 0 { return PrivateError(connection, "POST", 400, "invalid gift") }
+        }
+        if !GiftFields(*body.document, fields[:]) {
+            return PrivateError(connection, "POST", 400, "invalid gift")
+        }
+        recipientText: Text = json.JsonString(*body.document, fields[0])
+        idText: Text = json.JsonString(*body.document, fields[1])
+        recipient := TextView(recipientText)
+        id := TextView(idText)
+        units, ok := json.JsonInteger(*body.document, fields[2])
+        if !ok || units <= 0 || !identity.ValidUserID(recipient) || recipient == sender || !identity.ValidClientID(id) {
+            return PrivateError(connection, "POST", 400, "invalid gift")
+        }
+        if !signer.signing { return PrivateError(connection, "POST", 503, "gifts unavailable") }
+        timestamp: [31]u8
+        at := signing.WireTime(now, false, timestamp[:])
+        if at == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return PrivateError(connection, "POST", 503, "gift unavailable")
+        }
+        defer writes.Rollback(database)
+        result := gift.Send(database, signer, sender, recipient, units, id, at)
+        if result.status != 200 { return PrivateError(connection, "POST", result.status, result.error) }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "request_id", id) || !ledger.PutText(*document, root, "recipient", recipient) ||
+            !ledger.PutInt(*document, root, "units", units) || !ledger.PutInt(*document, root, "balance", result.balance) ||
+            !ledger.PutText(*document, root, "receipt_id", TextView(result.id[:])) ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return PrivateError(connection, "POST", 503, "gift unavailable")
+        }
+        return PrivateReply(connection, "POST", 200, *document, root)
+    }
+
+    ListRewards :: (database: *void, connection: *void, method: string) -> s32 {
+        campaign := reward.NextCampaignUnits(database)
+        if campaign <= 0 { return PrivateError(connection, method, 503, "rewards unavailable") }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        list := json.JsonNewArray(*document)
+        for name, index: reward.RewardCatalogNames {
+            units := ifx name == reward.NativeCampaignReward then campaign else reward.RewardCatalogUnits[index]
+            item := json.JsonNewObject(*document)
+            if !ledger.PutText(*document, item, "reward", name) || !ledger.PutInt(*document, item, "units", units) ||
+                !json.JsonAppend(*document, list, item) { return 0 }
+        }
+        if !json.JsonSet(*document, root, "rewards", list) { return 0 }
+        return PrivateReply(connection, method, 200, *document, root)
+    }
+
+    Streak :: (database: *void, account: string, seconds: s64) -> sql.IntegerResult {
+        day := seconds / 86400
+        arguments: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg("wurm"), sql.IntArg(day), sql.IntArg(seconds)]
+        if sql.Execute(database, "INSERT INTO reward_checkins(account_id,game,day,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING", arguments[:]) != sqlite.SQLITE_OK {
+            return .{}
+        }
+        return sql.ReadInteger(database, RewardStreakSQL, arguments[:3])
+    }
+
+    ClaimReward :: (database: *void, signer: *issuer.Issuer, connection: *void, account: string, now: time.TimestampValue,
+        input: []u8, overflow: bool, zstd: bool) -> s32 {
+        body: response.Body
+        decoded := false
+        length: s64 = 0
+        {
+            read := response.Decode(connection, input, overflow || input.count > NativeGiftRewardBodyLimit, NativeGiftRewardBodyLimit, zstd, *body)
+            if read.status != 0 { return PrivateError(connection, "POST", 400, "invalid reward") }
+            decoded = read.decoded
+            length = read.length
+        }
+        names: [1]string = .["reward"]
+        fields: [1]s32
+        documentInput: json.JsonDocument
+        raw := ifx decoded then VecSlice(body.scratch, 0, length) else input
+        if !strict.ReadStringFields(*documentInput, raw, names[:], fields[:]) {
+            return PrivateError(connection, "POST", 400, "invalid reward")
+        }
+        nameText: Text = json.JsonString(*documentInput, fields[0])
+        name := TextView(nameText)
+        if !identity.ValidNamespace(name) { return PrivateError(connection, "POST", 400, "invalid reward") }
+        catalogIndex: s64 = -1
+        for offered, index: reward.RewardCatalogNames {
+            if offered == name { catalogIndex = index; break }
+        }
+        if catalogIndex < 0 { return PrivateError(connection, "POST", 404, "unknown reward") }
+        if catalogIndex >= 2 {
+            counted := Streak(database, account, now.seconds)
+            if !counted.found { return PrivateError(connection, "POST", 503, "check-ins unavailable") }
+            if counted.value < 5 * (catalogIndex - 1) {
+                return PrivateError(connection, "POST", 403, "check in on more consecutive days before claiming this reward")
+            }
+        } else {
+            levels: s64 = ifx catalogIndex == 0 then 28 else 175
+            arguments: [2]sql.Argument = .[sql.TextArg(account), sql.IntArg(levels)]
+            completed := sql.ReadInteger(database, RewardCompletionSQL, arguments[:])
+            if !completed.found { return PrivateError(connection, "POST", 503, "completion archive unavailable") }
+            if completed.value != levels {
+                return PrivateError(connection, "POST", 403, "sync complete evidence for every required level with at least 10 moves before claiming this reward")
+            }
+        }
+        timestamp: [31]u8
+        at := signing.WireTime(now, false, timestamp[:])
+        if at == "" { return PrivateError(connection, "POST", 503, "rewards unavailable") }
+        awarded := reward.Claim(database, signer, name, account, reward.RewardCatalogUnits[catalogIndex], at)
+        if awarded.error != "" { return PrivateError(connection, "POST", 503, "rewards unavailable") }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "reward", name) || !ledger.PutInt(*document, root, "units", awarded.units) ||
+            !json.JsonSet(*document, root, "credited", json.JsonNewBool(*document, awarded.credited)) ||
+            !ledger.PutInt(*document, root, "balance", awarded.balance) || !ledger.PutInt(*document, root, "place", awarded.place, true) {
+            return 0
+        }
+        return PrivateReply(connection, "POST", 200, *document, root)
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool {
+        return path == NativeGiftPath || path == NativeRewardsPath
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return method == "POST" && Handles(path)
+    }
+
+    Handle :: (signer: *issuer.Issuer, access: *accounts.AccountAccess, giftsEnabled: bool, connection: *void,
+        method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        allowed := path == NativeRewardsPath && (method == "GET" || method == "HEAD")
+        if method != "POST" && !allowed {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = ifx path == NativeGiftPath then "POST" else "GET, HEAD, POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return response.ErrorReply(connection, method, 503, "rewards unavailable", access.configuration.zstdResponses)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := signing.Now()
+        if !now.valid { return response.ErrorReply(connection, method, 503, "rewards unavailable", access.configuration.zstdResponses) }
+        actor := auth.Authenticate(database, connection, access.configuration.secret, now.seconds, "", false)
+        if actor.status != 0 {
+            return response.ErrorReply(connection, method, actor.status, actor.message, access.configuration.zstdResponses)
+        }
+        account := TextView(actor.userID[:])
+        if path == NativeGiftPath {
+            if !giftsEnabled { return PrivateError(connection, method, 403, "gifts are paused") }
+            return SendGift(database, signer, connection, account, now, input, overflow, access.configuration.zstdRequests)
+        }
+        if allowed { return ListRewards(database, connection, method) }
+        return ClaimReward(database, signer, connection, account, now, input, overflow, access.configuration.zstdRequests)
+    }
+}

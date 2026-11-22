@@ -1,0 +1,125 @@
+#if TARGET == .C && OS == .LINUX {
+    wallet :: #import "monero_wallet_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    ledger :: #import "token_ledger_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    AccountAddress :: struct {
+        address: Text
+        alias: Text
+        icon: s64
+        found: bool
+        status: s32
+    }
+
+    #scope_file
+    AddressSQL :: #string SQL
+SELECT m.address,COALESCE(u.alias,''),COALESCE(u.profile_icon,0)
+FROM monero_account_addresses m LEFT JOIN server_users u ON u.user_id_hash=m.account_id
+WHERE m.account_id=?1 AND m.disabled_at=''
+SQL;
+    DepositSQL :: #string SQL
+SELECT tx_id,amount_atomic,token_units,block_height,confirmations,status,first_seen_at,
+     confirmed_at,credited_at,usd_cents,usd_updated_at,usd_sources,receipt_id
+FROM monero_deposits WHERE account_id=?1 ORDER BY first_seen_at DESC LIMIT 100
+SQL;
+    InsertSQL :: #string SQL
+INSERT INTO monero_account_addresses(account_id,account_index,address_index,address,allocation_id)
+SELECT ?1,0,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?1)
+AND NOT EXISTS(SELECT 1 FROM token_payment_intents WHERE provider='monero' AND (provider_address=?3 OR provider_ref=CAST(?2 AS TEXT)))
+ON CONFLICT(account_id) DO NOTHING
+SQL;
+
+    EscapeURI :: (address: string) -> Text {
+        uri: Vec(u8)
+        if !BuilderAppend(uri, "monero:") { return .{} }
+        hex := "0123456789ABCDEF"
+        for byte: address {
+            safe := (byte >= #char "a" && byte <= #char "z") || (byte >= #char "A" && byte <= #char "Z") ||
+                (byte >= #char "0" && byte <= #char "9") || byte == #char "-" || byte == #char "_" ||
+                byte == #char "." || byte == #char "~" || byte == #char "$" || byte == #char "&" ||
+                byte == #char "+" || byte == #char ":" || byte == #char "=" || byte == #char "@"
+            if safe {
+                if !VecPush(uri, byte) { return .{} }
+            } else if !VecPush(uri, cast(u8)(#char "%")) || !VecPush(uri, hex[byte >> 4]) || !VecPush(uri, hex[byte & 15]) {
+                return .{}
+            }
+        }
+        return BuilderFinish(uri)
+    }
+
+    #scope_export
+    Load :: (database: *void, account: string) -> AccountAddress {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        row := sql.Prepare(database, AddressSQL, args[:])
+        if row.status != sqlite.SQLITE_OK { return .{status = row.status} }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE { return .{} }
+        if step != sqlite.SQLITE_ROW { return .{status = step} }
+        return .{found = true, address = TextCopy(sql.ColumnText(row.value, 0)), alias = TextCopy(sql.ColumnText(row.value, 1)),
+            icon = sqlite.SqliteColumnInt64(row.value, 2)}
+    }
+
+    Insert :: (database: *void, account: string, id: string, allocation: *wallet.Allocation) -> AccountAddress {
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.IntArg(allocation.index), sql.TextArg(TextView(allocation.address)), sql.TextArg(id)]
+        status := sql.Execute(database, InsertSQL, args[:])
+        existing := Load(database, account)
+        if !existing.found && status != sqlite.SQLITE_OK { return .{status = status} }
+        return existing
+    }
+
+    Write :: (configuration: wallet.Configuration, account: string, value: *AccountAddress, document: *json.JsonDocument) -> s32 {
+        address := TextView(value.address)
+        uri: Text = EscapeURI(address)
+        if address == "" || TextView(uri) == "" { return -1 }
+        root := json.JsonNewObject(document)
+        rate := json.JsonNewObject(document)
+        if !ledger.PutText(document, root, "account_id", account) || !ledger.PutText(document, root, "alias", TextView(value.alias), true) ||
+            !ledger.PutInt(document, root, "profile_icon", value.icon, true) || !ledger.PutText(document, root, "asset_id", ledger.AssetID) ||
+            !ledger.PutText(document, root, "address", address) || !ledger.PutText(document, root, "uri", TextView(uri)) ||
+            !ledger.PutText(document, root, "network", wallet.Network(configuration)) ||
+            !ledger.PutInt(document, root, "confirmations_required", wallet.Confirmations(configuration)) ||
+            !ledger.PutInt(document, root, "minimum_atomic_amount", wallet.Minimum(configuration)) ||
+            !ledger.PutInt(document, rate, "xmr_atomic_units", configuration.rateAtomic) ||
+            !ledger.PutInt(document, rate, "token_units", configuration.rateTokens) || !json.JsonSet(document, root, "rate", rate) { return -1 }
+        return root
+    }
+
+    Deposits :: (database: *void, account: string, document: *json.JsonDocument) -> s32 {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        row := sql.Prepare(database, DepositSQL, args[:])
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        root := json.JsonNewObject(document)
+        list := json.JsonNewArray(document)
+        if !json.JsonSet(document, root, "deposits", list) { return -1 }
+        while true {
+            step := sqlite.SqliteStep(row.value)
+            if step == sqlite.SQLITE_DONE { return root }
+            if step != sqlite.SQLITE_ROW { return -1 }
+            item := json.JsonNewObject(document)
+            if !ledger.PutText(document, item, "tx_id", sql.ColumnText(row.value, 0)) || !ledger.PutText(document, item, "account_id", account) ||
+                !ledger.PutInt(document, item, "amount_atomic", sqlite.SqliteColumnInt64(row.value, 1)) ||
+                !ledger.PutInt(document, item, "token_units", sqlite.SqliteColumnInt64(row.value, 2), true) ||
+                !ledger.PutInt(document, item, "block_height", sqlite.SqliteColumnInt64(row.value, 3), true) ||
+                !ledger.PutInt(document, item, "confirmations", sqlite.SqliteColumnInt64(row.value, 4)) ||
+                !ledger.PutText(document, item, "status", sql.ColumnText(row.value, 5)) ||
+                !ledger.PutText(document, item, "first_seen_at", sql.ColumnText(row.value, 6)) ||
+                !ledger.PutText(document, item, "confirmed_at", sql.ColumnText(row.value, 7), true) ||
+                !ledger.PutText(document, item, "credited_at", sql.ColumnText(row.value, 8), true) ||
+                !ledger.PutInt(document, item, "usd_cents", sqlite.SqliteColumnInt64(row.value, 9), true) ||
+                !ledger.PutInt(document, item, "usd_rate_time", sqlite.SqliteColumnInt64(row.value, 10), true) ||
+                !ledger.PutText(document, item, "usd_sources", sql.ColumnText(row.value, 11), true) || !json.JsonAppend(document, list, item) { return -1 }
+            id := sql.ColumnText(row.value, 12)
+            if id != "" {
+                receipt := ledger.Receipt(database, id, document)
+                owner: Text = json.JsonString(document, json.JsonMember(document, receipt.node, "account_id"))
+                if receipt.status != 200 || TextView(owner) != account || !json.JsonSet(document, item, "receipt", receipt.node) { return -1 }
+            }
+        }
+        return -1
+    }
+}

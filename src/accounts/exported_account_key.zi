@@ -1,0 +1,57 @@
+wire :: #import "wire_text";
+identity :: #import "identity";
+binary :: #import "binary_codec";
+codec :: #import "codec";
+#import "std/vec"
+
+ExportedKey :: struct {
+    publicID: [64]u8
+    hasPublicID: bool
+    privateKey: Vec(u8)
+    error: string
+}
+
+Parse :: (value: string) -> ExportedKey {
+    first := wire.Cut(value, #char "\n")
+    header := wire.TrimSpace(first.before)
+    if header != "ksync-account-key-v1" && header != "lyra-account-key-v1" &&
+        header != "account-key-v1" && header != "inbe-sync-key-v1" {
+        return .{error = "invalid account key file"}
+    }
+    algorithm := ""
+    publicID := ""
+    privateKey := ""
+    remaining := first.after
+    while remaining != "" {
+        line := wire.Cut(remaining, #char "\n")
+        remaining = line.after
+        entry := wire.Cut(line.before, #char "=")
+        if !entry.found {
+            continue
+        }
+        key := wire.TrimSpace(entry.before)
+        field := wire.TrimSpace(entry.after)
+        if key == "algorithm" {
+            algorithm = field
+        } else if key == "public_id" {
+            publicID = field
+        } else if key == "private_key" {
+            privateKey = field
+        }
+    }
+    if algorithm != "ML-DSA-44" {
+        return .{error = "account key algorithm must be ML-DSA-44"}
+    }
+    id: [64]u8
+    if publicID != "" && !identity.NormalizeUserID(publicID, id[:]) {
+        return .{error = "invalid public_id"}
+    }
+    decoded := binary.DecodeBinaryField(privateKey)
+    if decoded.error != "" {
+        return .{error = "invalid private_key"}
+    }
+    // The caller checks the size and can cleanse the decoded bytes even when
+    // the input was an unsupported key size.
+    error := ifx decoded.value.count == codec.mlDSA44PrivateKeySize then "" else "wrong private_key size"
+    return .{publicID = id, hasPublicID = publicID != "", privateKey = decoded.value, error = error}
+}

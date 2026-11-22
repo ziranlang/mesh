@@ -124,16 +124,6 @@ SettledTx :: (transaction: *sql.Transaction, context: ctx.Context, account: stri
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS account_unlocks (
- account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- product TEXT NOT NULL, receipt_id TEXT NOT NULL, created_at INTEGER NOT NULL,
- PRIMARY KEY(account_id,product)
-);
-SQL;
-}
-
 RegularPrice :: (product: string) -> s64 {
     offer := Find(product)
     return offer.units

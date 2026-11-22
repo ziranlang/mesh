@@ -1,0 +1,25 @@
+#if TARGET == .C && OS == .LINUX {
+    files :: #import "std/file_linux";
+    stored :: #import "package_files_native";
+    json :: #import "std/json_document";
+    identity :: #import "identity";
+    #import "std/vec"
+
+    #scope_export
+    // A sync hint. The client verifies the package before installing an update.
+    LatestSequence :: (databasePath: string, app: string) -> s64 {
+        if databasePath == "" || !identity.ValidNamespace(app) {
+            return 0
+        }
+        directory := stored.Open(databasePath, app)
+        if !directory.valid { return 0 }
+        defer files.CloseFile(directory)
+        metadata := stored.Read(directory, "latest-v2.json")
+        if !metadata.valid { return 0 }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(VecSlice(metadata.bytes, 0, metadata.bytes.count))) { return 0 }
+        appID: Text = json.JsonString(*document, json.JsonMember(*document, document.root, "app_id"))
+        sequence, valid := json.JsonInteger(*document, json.JsonMember(*document, document.root, "sequence"))
+        return ifx valid && sequence > 0 && TextView(appID) == app then sequence else 0
+    }
+}

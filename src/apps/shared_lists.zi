@@ -1,6 +1,7 @@
 // Explicit, accepted collaboration. Private encrypted records never enter this
 // store; an owner deliberately sends only the list selected for sharing.
 #import "std/go_types"
+features :: #import "schema_features";
 accounts :: #import "account_http";
 auth :: #import "http_auth";
 body :: #import "http_body";
@@ -345,32 +346,6 @@ Execute :: (transaction: *sql.Transaction, context: ctx.Context,
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS server_shared_lists (
- id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- title TEXT NOT NULL, items TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
-);
-CREATE TABLE IF NOT EXISTS server_list_invitations (
- id TEXT PRIMARY KEY, list_id TEXT NOT NULL REFERENCES server_shared_lists(id) ON DELETE CASCADE,
- target TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- status TEXT NOT NULL CHECK(status IN ('pending','accepted','declined')),
- updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(list_id,target)
-);
-CREATE INDEX IF NOT EXISTS server_list_invitations_target ON server_list_invitations(target,status);
-CREATE TABLE IF NOT EXISTS server_list_permissions (
- list_id TEXT NOT NULL, target TEXT NOT NULL,
- access TEXT NOT NULL CHECK(access IN ('owner','editor','viewer')),
- PRIMARY KEY(list_id,target),
- FOREIGN KEY(list_id,target) REFERENCES server_list_invitations(list_id,target) ON DELETE CASCADE
-);
-CREATE TABLE IF NOT EXISTS server_list_commands (
- user_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- request_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(user_id,request_id)
-);
-SQL;
-}
-
 Read :: (database: *sql.Database, context: ctx.Context, user: string) -> Snapshot {
     result: Snapshot
     result.lists = MakeLists(cast(isize)0)
@@ -519,4 +494,9 @@ Handle :: (account: accounts.Accounts, writer: http.ResponseWriter, request: *ht
         return
     }
     response.JSON(writer, cast(isize)200, snapshot)
+}
+
+#scope_export
+SchemaSQL :: () -> string {
+    return features.SharedLists
 }

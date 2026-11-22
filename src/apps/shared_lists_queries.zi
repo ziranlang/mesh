@@ -1,0 +1,79 @@
+Lists :: #string SQL
+SELECT l.id,l.owner,COALESCE(u.alias,''),l.title,l.revision,
+       CASE WHEN l.deleted=0 THEN l.items ELSE '[]' END,l.deleted,
+       CASE WHEN l.owner=?1 THEN 'owner' ELSE COALESCE(p.access,'editor') END
+FROM server_shared_lists l JOIN server_users u ON u.user_id_hash=l.owner
+LEFT JOIN server_list_permissions p ON p.list_id=l.id AND p.target=?1
+WHERE l.owner=?1 OR (l.deleted=0 AND EXISTS (
+    SELECT 1 FROM server_list_invitations i WHERE i.list_id=l.id AND i.target=?1 AND i.status='accepted'
+) AND EXISTS (
+    SELECT 1 FROM server_friendships f WHERE f.user_id_a=min(?1,l.owner) AND f.user_id_b=max(?1,l.owner)
+)) ORDER BY l.id
+SQL;
+
+Invitations :: #string SQL
+SELECT i.id,l.id,l.title,l.owner,COALESCE(u.alias,''),i.target,COALESCE(t.alias,''),i.status,COALESCE(p.access,'editor')
+FROM server_list_invitations i
+LEFT JOIN server_list_permissions p ON p.list_id=i.list_id AND p.target=i.target
+JOIN server_shared_lists l ON l.id=i.list_id
+JOIN server_users u ON u.user_id_hash=l.owner
+JOIN server_users t ON t.user_id_hash=i.target
+WHERE l.deleted=0 AND (l.owner=?1 OR (i.target=?1 AND i.status='pending') OR (EXISTS (
+    SELECT 1 FROM server_list_invitations m WHERE m.list_id=l.id AND m.target=?1 AND m.status='accepted'
+) AND EXISTS (
+    SELECT 1 FROM server_friendships f WHERE f.user_id_a=min(?1,l.owner) AND f.user_id_b=max(?1,l.owner)
+))) ORDER BY i.updated_at DESC,i.id
+SQL;
+
+Capacity :: #string SQL
+SELECT COUNT(*)<32 AND COALESCE(SUM(json_array_length(l.items)),0)+?3<=256
+FROM server_shared_lists l WHERE l.deleted=0 AND l.id<>?2 AND (l.owner=?1 OR EXISTS (
+    SELECT 1 FROM server_list_invitations i WHERE i.list_id=l.id AND i.target=?1 AND i.status='accepted'
+))
+SQL;
+
+ReadInvitation :: #string SQL
+SELECT l.owner,i.target,i.status,l.id,json_array_length(l.items)
+FROM server_list_invitations i JOIN server_shared_lists l ON l.id=i.list_id
+WHERE i.id=?1 AND l.deleted=0
+SQL;
+
+ReadMembership :: #string SQL
+SELECT COALESCE(p.access,'editor') FROM server_list_invitations i
+LEFT JOIN server_list_permissions p ON p.list_id=i.list_id AND p.target=i.target
+WHERE i.list_id=?1 AND i.target=?2 AND i.status='accepted'
+SQL;
+
+Invite :: #string SQL
+INSERT INTO server_list_invitations(id,list_id,target,status) VALUES(?3,?1,?2,'pending')
+ON CONFLICT(list_id,target) DO UPDATE SET id=excluded.id,status='pending',updated_at=CURRENT_TIMESTAMP
+WHERE server_list_invitations.status='declined'
+SQL;
+
+InviteAccess :: #string SQL
+INSERT INTO server_list_permissions(list_id,target,access)
+SELECT list_id,target,?4 FROM server_list_invitations WHERE list_id=?1 AND target=?2 AND id=?3 AND status='pending'
+ON CONFLICT(list_id,target) DO UPDATE SET access=excluded.access
+SQL;
+
+SetAccess :: #string SQL
+INSERT INTO server_list_permissions(list_id,target,access) VALUES(?1,?2,?3)
+ON CONFLICT(list_id,target) DO UPDATE SET access=excluded.access
+SQL;
+
+ChangeInvitation :: "UPDATE server_list_invitations SET status=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?1 AND status='pending'";
+RemoveInvitation :: "UPDATE server_list_invitations SET status='declined',updated_at=CURRENT_TIMESTAMP WHERE list_id=?1 AND target=?2 AND status IN ('pending','accepted')";
+
+    NotifyRecipients :: #string SQL
+WITH changed_list AS (
+    SELECT id,owner FROM server_shared_lists WHERE id=?1 OR id=(SELECT list_id FROM server_list_invitations WHERE id=?5)
+)
+SELECT owner FROM changed_list
+UNION SELECT ?2
+UNION SELECT ?3 WHERE ?3<>''
+UNION
+SELECT i.target FROM server_list_invitations i JOIN changed_list l ON l.id=i.list_id
+WHERE (?4<>0 AND i.status='pending') OR (i.status='accepted' AND EXISTS (
+    SELECT 1 FROM server_friendships f WHERE f.user_id_a=min(i.target,l.owner) AND f.user_id_b=max(i.target,l.owner)
+))
+SQL;

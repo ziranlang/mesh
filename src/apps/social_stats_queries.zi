@@ -1,0 +1,120 @@
+UpsertProfile :: #string SQL
+INSERT INTO server_profile_stats(user_id_hash,app,practice,metric,value,label,local_date,updated_at)
+VALUES(?1,?2,?3,?4,?8,?5,?6,?7)
+ON CONFLICT(user_id_hash,app,practice,metric) DO UPDATE SET
+    value=excluded.value, label=excluded.label, local_date=excluded.local_date, updated_at=excluded.updated_at
+WHERE excluded.value<>server_profile_stats.value OR excluded.label<>server_profile_stats.label
+   OR excluded.local_date<>server_profile_stats.local_date
+SQL;
+
+// Fill only missing or invalidated derived entries. Calculate the streak and
+// source timestamp using the same legacy sessions and meditation logs.
+RefreshPractice :: #string SQL
+WITH RECURSIVE
+visible(user) AS (
+    SELECT ?1
+    UNION
+    SELECT CASE WHEN user_id_a=?1 THEN user_id_b ELSE user_id_a END
+    FROM server_friendships WHERE user_id_a=?1 OR user_id_b=?1
+), needed(user, version) AS (
+    SELECT v.user, COALESCE(s.server_version,0) FROM visible v
+    LEFT JOIN server_sync_state s ON s.user_id_hash=v.user
+    WHERE NOT EXISTS (
+        SELECT 1 FROM server_leaderboard_stats c
+        WHERE c.user_id_hash=v.user AND c.app=?2 AND c.practice=?3 AND c.metric=?4
+          AND c.source_version=COALESCE(s.server_version,0) AND c.calc_version=5
+          AND (?4<>'streak' OR c.local_date=CAST(strftime('%Y%m%d',?5) AS INTEGER))
+    )
+), history(user, local_date, updated_at) AS (
+    SELECT s.user_id_hash,s.local_date,s.updated_at FROM server_sessions s JOIN needed n ON n.user=s.user_id_hash
+    WHERE s.deleted_at=0 AND s.activity=?6 AND s.local_date>0
+    UNION ALL
+    SELECT l.user_id_hash,CAST(strftime('%Y%m%d',l.completed_at) AS INTEGER),l.completed_at
+    FROM server_meditation_logs l JOIN needed n ON n.user=l.user_id_hash
+    WHERE ?6=1 AND l.duration_seconds>0
+), streak(user, day, value) AS (
+    SELECT user,date(?5),0 FROM needed WHERE ?4='streak'
+    UNION ALL
+    SELECT s.user,date(s.day,'-1 day'),s.value+1 FROM streak s
+    WHERE s.value<=370 AND EXISTS (
+        SELECT 1 FROM history h WHERE h.user=s.user AND h.local_date=CAST(strftime('%Y%m%d',s.day) AS INTEGER)
+    )
+), session_totals(user, id, seconds) AS (
+    SELECT s.user_id_hash,s.id,SUM(r.hold_seconds) FROM server_sessions s
+    JOIN needed n ON n.user=s.user_id_hash
+    JOIN server_session_rounds r ON r.user_id_hash=s.user_id_hash AND r.session_id=s.id
+    WHERE ?4='avg_time' AND s.deleted_at=0 AND s.activity=1 AND r.hold_seconds>0
+    GROUP BY s.user_id_hash,s.id
+), time_totals(user, seconds) AS (
+    SELECT user,seconds FROM session_totals
+    UNION ALL
+    SELECT l.user_id_hash,l.duration_seconds FROM server_meditation_logs l JOIN needed n ON n.user=l.user_id_hash
+    WHERE ?4='avg_time' AND l.duration_seconds>0 AND NOT EXISTS (
+        SELECT 1 FROM session_totals s WHERE s.user=l.user_id_hash AND s.id=l.session_id
+    )
+), derived(user, version, value, updated_at) AS (
+    SELECT n.user,n.version,CASE ?4
+        WHEN 'streak' THEN (SELECT MAX(value) FROM streak WHERE user=n.user)
+        WHEN 'avg_time' THEN COALESCE((SELECT AVG(seconds) FROM time_totals WHERE user=n.user),0)
+        ELSE COALESCE((SELECT AVG(r.hold_seconds) FROM server_sessions s
+            JOIN server_session_rounds r ON r.user_id_hash=s.user_id_hash AND r.session_id=s.id
+            WHERE s.user_id_hash=n.user AND s.deleted_at=0 AND s.activity=0 AND r.hold_seconds>0),0)
+        END,
+        COALESCE((SELECT MAX(h.updated_at) FROM history h WHERE h.user=n.user),'')
+    FROM needed n
+)
+INSERT INTO server_leaderboard_stats(user_id_hash,app,practice,metric,source_version,calc_version,value,label,local_date,updated_at)
+SELECT user,?2,?3,?4,version,5,value,
+    CASE ?4
+        WHEN 'streak' THEN printf('%d',value)
+        WHEN 'avg_time' THEN printf('%d:%02d',CAST(value+0.5 AS INTEGER)/3600,CAST(value+0.5 AS INTEGER)%3600/60)
+        ELSE printf('%d',CASE WHEN value-CAST(value AS INTEGER)=0.5 AND CAST(value AS INTEGER)%2=0
+            THEN CAST(value AS INTEGER) ELSE CAST(value+0.5 AS INTEGER) END)
+    END,
+    CAST(strftime('%Y%m%d',?5) AS INTEGER),updated_at
+FROM derived WHERE true
+ON CONFLICT(user_id_hash,app,practice,metric) DO UPDATE SET
+    source_version=excluded.source_version, calc_version=excluded.calc_version, value=excluded.value,
+    label=excluded.label, local_date=excluded.local_date, updated_at=excluded.updated_at
+SQL;
+
+ReadBoard :: #string SQL
+WITH visible(user) AS (
+    SELECT ?1
+    UNION
+    SELECT CASE WHEN user_id_a=?1 THEN user_id_b ELSE user_id_a END
+    FROM server_friendships WHERE user_id_a=?1 OR user_id_b=?1
+), sources AS (
+    SELECT u.user_id_hash,COALESCE(u.alias,'') AS alias,u.profile_icon,
+        c.value AS derived_value,c.label AS derived_label,c.local_date AS derived_date,c.updated_at AS derived_time,
+        p.value,p.local_date,p.updated_at,
+        CASE WHEN ?6 AND p.value IS NOT NULL AND a.value BETWEEN 1 AND 256
+               AND a.value=CAST(a.value AS INTEGER) THEN CAST(a.value AS INTEGER) ELSE 0 END AS game_icon,
+        CASE
+            WHEN ?6 THEN p.value BETWEEN 0 AND CASE WHEN ?4='achievements' THEN 512 ELSE 100000 END
+            ELSE julianday(p.updated_at)>=julianday(?5,'-30 days') AND p.value BETWEEN 0 AND CASE ?4
+                WHEN 'avg_hold' THEN 3600 WHEN 'avg_time' THEN 86400 ELSE 100000 END
+        END AS use_published
+    FROM visible v JOIN server_users u ON u.user_id_hash=v.user
+    LEFT JOIN server_profile_stats p ON p.user_id_hash=v.user AND p.app=?2 AND p.practice=?3 AND p.metric=?4
+    LEFT JOIN server_profile_stats a ON ?6 AND a.user_id_hash=v.user AND a.app=?2 AND a.practice=?3 AND a.metric='appearance'
+    LEFT JOIN server_leaderboard_stats c ON NOT ?6 AND c.user_id_hash=v.user AND c.app=?2 AND c.practice=?3 AND c.metric=?4
+), ranked AS (
+    SELECT user_id_hash,alias,profile_icon,game_icon,
+        CASE WHEN use_published THEN CASE WHEN ?4='streak' AND local_date<CAST(strftime('%Y%m%d',?5,'-1 day') AS INTEGER)
+                THEN 0 ELSE value END
+            WHEN ?6 THEN 0 ELSE derived_value END AS rank_value,
+        CASE WHEN ?6 THEN 0 WHEN use_published THEN local_date ELSE derived_date END AS day,
+        CASE WHEN ?6 THEN '' WHEN use_published THEN updated_at ELSE derived_time END AS timestamp,
+        use_published,derived_label
+    FROM sources
+)
+SELECT user_id_hash,alias,profile_icon,game_icon,rank_value,
+    CASE WHEN ?6 OR (use_published AND ?4='streak') THEN printf('%d',rank_value)
+         WHEN use_published AND ?4='avg_time' THEN printf('%d:%02d',CAST(rank_value+0.5 AS INTEGER)/3600,CAST(rank_value+0.5 AS INTEGER)%3600/60)
+         WHEN use_published THEN printf('%d',CASE WHEN rank_value-CAST(rank_value AS INTEGER)=0.5 AND CAST(rank_value AS INTEGER)%2=0
+             THEN CAST(rank_value AS INTEGER) ELSE CAST(rank_value+0.5 AS INTEGER) END)
+         ELSE derived_label END,
+    day,timestamp
+FROM ranked ORDER BY rank_value DESC,COALESCE(NULLIF(alias,''),user_id_hash),user_id_hash
+SQL;

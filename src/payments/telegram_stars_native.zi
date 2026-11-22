@@ -1,0 +1,525 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    authorization :: #import "authorization_native";
+    calendar :: #import "std/date_time_linux";
+    cString :: #import "std/c_string";
+    coding :: #import "encoding_preferences";
+    format :: #import "timestamp_format";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    initData :: #import "delegate_telegram_native";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    limiting :: #import "rate_limit_native";
+    lumi :: #import "lumi_telegram_native";
+    mutex :: #import "std/mutex_linux";
+    provider :: #import "telegram_stars_provider_native";
+    replies :: #import "http_json_native";
+    session :: #import "delegate_session_native";
+    sqlite :: #import "sqlite/SQLite";
+    store :: #import "telegram_stars_store_native";
+    telegram :: #import "telegram_transport_native";
+    timer :: #import "std/timer";
+    tokens :: #import "token_http_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    State :: struct {
+        settings: provider.Configuration
+    }
+
+    #scope_file
+    LaunchPath :: "/api/v1/telegram/launch";
+    CatalogPath :: "/api/v1/tokens/purchases/telegram/catalog";
+    BalancePath :: "/api/v1/tokens/purchases/telegram/balance";
+    InvoicesPath :: "/api/v1/tokens/purchases/telegram/invoices";
+    InvoicePrefix :: "/api/v1/tokens/purchases/telegram/invoices/";
+    ReconcilePath :: "/api/v1/admin/tokens/purchases/telegram/reconcile";
+    PurchasesUnavailable :: "Telegram purchases temporarily unavailable";
+    InvoiceUnavailable :: "Telegram invoice temporarily unavailable";
+    InvoiceMissing :: "Telegram invoice not found";
+    ProductMissing :: "Telegram product unavailable";
+
+    // The shared header accessor joins absent and empty fields into the same string.
+    mhd :: #system_library "microhttpd";
+    Lookup :: (connection: *void, kind: s32, name: *u8) -> *u8 #foreign mhd "MHD_lookup_connection_value";
+
+    Request :: struct {
+        access: *accounts.AccountAccess
+        connection: *void
+        method: string
+        route: string
+        bot: telegram.Configuration
+        settings: *provider.Configuration
+        merchant: store.Merchant
+        database: *void
+        now: s64
+    }
+
+    Principal :: struct {
+        bearer: auth.BearerAuthentication
+        delegated: bool
+        grant: authorization.Grant
+    }
+
+    Input :: struct {
+        app: Text
+        init: Text
+        product: Text
+        requestID: Text
+    }
+
+    LinkWork :: struct {
+        record: store.Record
+        attempt: s64
+        queued: s32
+        pending: bool
+    }
+
+    Route :: enum {
+        Missing
+        Launch
+        Catalog
+        Balance
+        Create
+        Detail
+        Cancel
+        Reconcile
+    }
+
+    Match :: (path: string) -> Route {
+        if path == LaunchPath { return .Launch }
+        if path == CatalogPath { return .Catalog }
+        if path == BalancePath { return .Balance }
+        if path == InvoicesPath { return .Create }
+        if path == ReconcilePath { return .Reconcile }
+        relative := wire.TrimPrefix(path, InvoicePrefix)
+        if relative == "" || relative.count == path.count { return .Missing }
+        item := wire.Cut(relative, #char "/")
+        if !item.found { return .Detail }
+        if item.before != "" && item.after == "cancel" { return .Cancel }
+        return .Missing
+    }
+
+    GetRoute :: (route: Route) -> bool {
+        return route == .Catalog || route == .Balance || route == .Detail
+    }
+
+    Allowed :: (route: Route, verb: string) -> bool {
+        if route == .Missing { return false }
+        if GetRoute(route) { return verb == "GET" || verb == "HEAD" }
+        return verb == "POST"
+    }
+
+    MethodNotAllowed :: (connection: *void, allow: string) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+        body: Text = TextCopy("Method Not Allowed\n")
+        return http.WriteWithHeaders(connection, 405, "text/plain; charset=utf-8", VecSlice(body.bytes, 0, body.bytes.count), headers[:])
+    }
+
+    Error :: (request: Request, status: u32, message: string) -> s32 {
+        return replies.ErrorReply(request.connection, request.method, status, message, request.access.configuration.zstdResponses)
+    }
+
+    Reply :: (request: Request, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        return replies.Reply(request.connection, request.method, status, document, root, request.access.configuration.zstdResponses)
+    }
+
+    Merchant :: (settings: *provider.Configuration, bot: telegram.Configuration) -> store.Merchant {
+        return .{bot = initData.BotID(bot.token), node = settings.node, audience = settings.audience}
+    }
+
+    HeaderTotal :: (connection: *void, name: string, value: string) -> bool {
+        buffer: [4096]u8
+        return http.JoinHeader(connection, name, buffer[:]) == value.count
+    }
+
+    EncodingPresent :: (connection: *void) -> bool {
+        name: [17]u8
+        return cString.CopyCString("Content-Encoding", name[:]) && Lookup(connection, 1, *name[0]) != null
+    }
+
+    Decode :: (request: Request, raw: []u8, overflow: bool, limit: s64, scratch: *replies.Body) -> bool {
+        encoding: [128]u8
+        count := http.JoinHeader(request.connection, "Content-Encoding", encoding[:])
+        if count < 0 || coding.Request(TextView(encoding[:count])) == .Unsupported || raw.count > limit {
+            return false
+        }
+        read := replies.Read(request.connection, raw, overflow, limit, request.access.configuration.zstdRequests, scratch)
+        return read.status == 0
+    }
+
+    Commit :: (request: Request) -> bool {
+        return sqlite.SqliteExecText(request.database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Buyer :: (request: Request, principal: *Principal, account: string, app: string, purchasing: bool,
+        rejected: *s32) -> s64 {
+        merchant := request.merchant
+        if !identity.ValidNamespace(app) || merchant.bot <= 0 || !authorization.HexID(merchant.node, 64) || merchant.audience == "" {
+            <<rejected = Error(request, 403, "Telegram application unavailable")
+            return 0
+        }
+        grant := *principal.grant
+        if principal.delegated && (TextView(grant.app) != app || grant.botID != merchant.bot || grant.telegramID <= 0 ||
+            (purchasing && !grant.telegramStars)) {
+            <<rejected = Error(request, 403, "Telegram purchase permission required")
+            return 0
+        }
+        buyer := store.LinkedBuyer(request.database, account, app, request.now)
+        if buyer.status != sqlite.SQLITE_OK || !buyer.found || buyer.value <= 0 || (principal.delegated && buyer.value != grant.telegramID) {
+            <<rejected = Error(request, 403, "Telegram buyer is not linked to this account")
+            return 0
+        }
+        return buyer.value
+    }
+
+    BindLaunch :: (request: Request, account: string, app: string, body: string, buyer: s64,
+        rejected: *s32) -> initData.Identity {
+        verified := initData.Validate(body, request.bot.token, request.now)
+        if !verified.valid || verified.userID != buyer {
+            <<rejected = Error(request, 401, "invalid Telegram launch")
+            return .{}
+        }
+        bound := store.BindLaunch(request.database, request.merchant, TextView(verified.digest[:64]), account,
+            app, buyer, verified.authDate + 300, request.now)
+        if bound.status != sqlite.SQLITE_OK {
+            <<rejected = Error(request, 503, "Telegram launch temporarily unavailable")
+            return .{}
+        }
+        if !bound.accepted {
+            <<rejected = Error(request, 409, "Telegram launch is bound to another session")
+            return .{}
+        }
+        return verified
+    }
+
+    Launch :: (request: Request, app: string, verified: *initData.Identity, principal: *Principal) -> s32 {
+        if !Commit(request) { return Error(request, 503, PurchasesUnavailable) }
+        available := (!principal.delegated || principal.grant.telegramStars) && provider.Catalog(request.settings, request.merchant, app).count > 0
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        start := TextView(verified.startParam)
+        chat := TextView(verified.chatType)
+        if !authorization.PutText(*body, root, "app_id", app) || !authorization.PutBool(*body, root, "stars_available", available) ||
+            (start != "" && !authorization.PutText(*body, root, "start_param", start)) ||
+            (chat != "" && !authorization.PutText(*body, root, "chat_type", chat)) {
+            return Error(request, 503, PurchasesUnavailable)
+        }
+        return Reply(request, 200, *body, root)
+    }
+
+    Catalog :: (request: Request, app: string) -> s32 {
+        if !Commit(request) { return Error(request, 503, PurchasesUnavailable) }
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        offers := json.JsonNewArray(*body)
+        for *offer: provider.Catalog(request.settings, request.merchant, app) {
+            member := json.JsonNewObject(*body)
+            if !authorization.PutText(*body, member, "product_id", TextView(offer.product)) ||
+                !authorization.PutText(*body, member, "title", TextView(offer.title)) ||
+                !authorization.PutInt(*body, member, "amount", offer.amount) || !authorization.PutInt(*body, member, "units", offer.units) ||
+                !json.JsonAppend(*body, offers, member) {
+                return Error(request, 503, PurchasesUnavailable)
+            }
+        }
+        if !authorization.PutText(*body, root, "currency", store.Currency) || !json.JsonSet(*body, root, "products", offers) {
+            return Error(request, 503, PurchasesUnavailable)
+        }
+        return Reply(request, 200, *body, root)
+    }
+
+    Balance :: (request: Request, account: string, app: string) -> s32 {
+        balance := ledger.Balance(request.database, account)
+        if balance.status != sqlite.SQLITE_OK {
+            return Error(request, 503, "Telegram wallet balance temporarily unavailable")
+        }
+        if !Commit(request) { return Error(request, 503, PurchasesUnavailable) }
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        if !authorization.PutText(*body, root, "account_id", account) || !authorization.PutText(*body, root, "app_id", app) ||
+            !authorization.PutText(*body, root, "asset_id", ledger.AssetID) || !authorization.PutInt(*body, root, "balance", balance.value) {
+            return Error(request, 503, PurchasesUnavailable)
+        }
+        return Reply(request, 200, *body, root)
+    }
+
+    InvoiceReply :: (request: Request, invoice: *store.Invoice, status: u32, active: bool,
+        updatedState: string = "", updatedLink: string = "") -> s32 {
+        state := ifx updatedState == "" then store.State(TextView(invoice.state), invoice.expires, request.now) else updatedState
+        link: string
+        if state == "pending" && active {
+            link = ifx updatedLink == "" then TextView(invoice.link) else updatedLink
+        }
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        if !authorization.PutText(*body, root, "invoice_id", TextView(invoice.id)) ||
+            !authorization.PutText(*body, root, "product_id", TextView(invoice.product)) ||
+            !authorization.PutText(*body, root, "currency", store.Currency) ||
+            !authorization.PutInt(*body, root, "amount", invoice.amount) || !authorization.PutInt(*body, root, "units", invoice.units) ||
+            !authorization.PutText(*body, root, "status", state) || (link != "" && !authorization.PutText(*body, root, "invoice_url", link)) {
+            return Error(request, 503, InvoiceUnavailable)
+        }
+        return Reply(request, status, *body, root)
+    }
+
+    Reserve :: (request: Request, desired: *store.Invoice, app: string, product: string, rejected: *s32) -> store.Record {
+        present := store.ForRequest(request.database, desired)
+        if present.status != sqlite.SQLITE_OK || present.found { return present }
+        selected := provider.Product(request.settings, request.merchant, app, product)
+        if selected.amount == 0 {
+            <<rejected = Error(request, 404, ProductMissing)
+            return .{}
+        }
+        identifier: [33]u8
+        if !authorization.Nonce(identifier[:]) {
+            <<rejected = Error(request, 503, InvoiceUnavailable)
+            return .{}
+        }
+        invoiceID: Text = TextCopy(TextView(identifier[:32]))
+        VecSwap(desired.id.bytes, invoiceID.bytes)
+        VecSwap(desired.product.bytes, selected.product.bytes)
+        VecSwap(desired.title.bytes, selected.title.bytes)
+        desired.amount = selected.amount
+        desired.units = selected.units
+        return store.Reserve(request.database, desired)
+    }
+
+    Create :: (request: Request, input: *Input, account: string, buyer: s64) -> LinkWork {
+        bucket: Vec(u8)
+        if !BuilderAppend(bucket, "telegram-stars:") || !BuilderAppend(bucket, account) ||
+            !limiting.Allow(*request.access.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 30, 60000, timer.MonotonicMilliseconds()) {
+            return .{queued = Error(request, 429, "Telegram purchase rate limit exceeded")}
+        }
+        app := TextView(input.app)
+        rejected: s32
+        verified := BindLaunch(request, account, app, TextView(input.init), buyer, *rejected)
+        if !verified.valid { return .{queued = rejected} }
+        product := TextView(input.product)
+        merchant := request.merchant
+        desired: store.Invoice = .{account = TextCopy(account), app = TextCopy(app), bot = merchant.bot, buyer = buyer,
+            node = TextCopy(merchant.node), audience = TextCopy(merchant.audience), requestID = TextCopy(TextView(input.requestID)),
+            expires = request.now + store.InvoiceLifetime}
+        record := Reserve(request, *desired, app, product, *rejected)
+        if !record.found {
+            if rejected != 0 { return .{queued = rejected} }
+            return .{queued = Error(request, 503, InvoiceUnavailable)}
+        }
+        {
+            invoice := *record.invoice
+            if invoice.buyer != buyer || TextView(invoice.product) != product {
+                return .{queued = Error(request, 409, "purchase request terms changed")}
+            }
+            current := store.State(TextView(invoice.state), invoice.expires, request.now)
+            if current == "pending" && TextView(invoice.checkout) == "" && !provider.OfferActive(request.settings, merchant, invoice) {
+                return .{queued = Error(request, 404, ProductMissing)}
+            }
+            if current != "pending" || TextView(invoice.link) != "" {
+                if !Commit(request) { return .{queued = Error(request, 503, PurchasesUnavailable)} }
+                return .{queued = InvoiceReply(request, invoice, 200, true)}
+            }
+            claim := store.ClaimLink(request.database, TextView(invoice.id), request.now)
+            if claim.status != sqlite.SQLITE_OK || !claim.accepted {
+                return .{queued = Error(request, 503, "Telegram invoice creation in progress")}
+            }
+            if !Commit(request) { return .{queued = Error(request, 503, PurchasesUnavailable)} }
+        }
+        return .{record = record, attempt = request.now, pending = true}
+    }
+
+    Invoice :: (request: Request, principal: *Principal, account: string, id: string, cancel: bool) -> s32 {
+        record := store.Read(request.database, id)
+        if record.status != sqlite.SQLITE_OK { return Error(request, 503, InvoiceUnavailable) }
+        invoice := *record.invoice
+        merchant := request.merchant
+        app := TextView(invoice.app)
+        if !record.found || TextView(invoice.account) != account || invoice.bot != merchant.bot || TextView(invoice.node) != merchant.node ||
+            TextView(invoice.audience) != merchant.audience ||
+            (principal.delegated && (TextView(principal.grant.app) != app || !principal.grant.telegramStars)) {
+            return Error(request, 404, InvoiceMissing)
+        }
+        rejected: s32
+        buyer := Buyer(request, principal, account, app, true, *rejected)
+        if buyer == 0 { return rejected }
+        if buyer != invoice.buyer { return Error(request, 404, InvoiceMissing) }
+        cancelled := cancel && store.State(TextView(invoice.state), invoice.expires, request.now) == "pending"
+        if cancelled {
+            changed := store.Cancel(request.database, id, request.now)
+            if changed.status != sqlite.SQLITE_OK { return Error(request, 503, "Telegram cancellation temporarily unavailable") }
+            if !changed.accepted { return Error(request, 409, "Telegram checkout already approved") }
+        }
+        if !Commit(request) { return Error(request, 503, PurchasesUnavailable) }
+        active := TextView(invoice.checkout) != "" || provider.OfferActive(request.settings, merchant, invoice)
+        return InvoiceReply(request, invoice, 200, active, ifx cancelled then "cancelled" else "")
+    }
+
+    Run :: (request: Request, route: Route, input: *Input, body: []u8, credential: string,
+        delegated: bool, id: string) -> LinkWork {
+        if !mutex.Lock(*request.access.databaseLock) { return .{queued = Error(request, 503, PurchasesUnavailable)} }
+        defer mutex.Unlock(*request.access.databaseLock)
+        milliseconds := calendar.UnixMilliseconds()
+        request.now = milliseconds / 1000
+        principal: Principal = .{delegated = delegated}
+        if !delegated {
+            at: [32]u8
+            count := format.UTC(.{seconds = request.now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000,
+                valid = milliseconds >= 0}, at[:])
+            if count == 0 { return .{queued = Error(request, 500, "authentication failed")} }
+            principal.bearer = auth.Authenticate(request.database, request.connection, request.access.configuration.secret,
+                request.now, TextView(at[:count]), false)
+            if principal.bearer.status != 0 { return .{queued = Error(request, principal.bearer.status, principal.bearer.message)} }
+        }
+        if sqlite.SqliteExecText(request.database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{queued = Error(request, 503, PurchasesUnavailable)}
+        }
+        defer authorization.Rollback(request.database)
+        if delegated {
+            merchant := request.merchant
+            authorized := session.AuthenticateTx(.{database = request.database, node = merchant.node, audience = merchant.audience, now = request.now},
+                .{method = request.method, path = request.route, target = http.RequestTarget(request.connection), body = body,
+                    proof = http.Header(request.connection, "X-Mesh-Delegate"), credential = credential,
+                    user = http.Header(request.connection, "X-Mesh-User")})
+            if authorized.failure.status != 0 { return .{queued = Error(request, authorized.failure.status, authorized.failure.message)} }
+            principal.grant = authorized.grant
+        }
+        account := ifx delegated then TextView(principal.grant.account) else TextView(principal.bearer.userID[:])
+        if route == .Detail || route == .Cancel { return .{queued = Invoice(request, *principal, account, id, route == .Cancel)} }
+        app := ifx route == .Catalog || route == .Balance then http.QueryArgument(request.connection, "app_id") else TextView(input.app)
+        rejected: s32
+        buyer := Buyer(request, *principal, account, app, route != .Launch, *rejected)
+        if buyer == 0 { return .{queued = rejected} }
+        if route == .Catalog { return .{queued = Catalog(request, app)} }
+        if route == .Balance { return .{queued = Balance(request, account, app)} }
+        if route == .Create { return Create(request, input, account, buyer) }
+        verified := BindLaunch(request, account, app, TextView(input.init), buyer, *rejected)
+        if !verified.valid { return .{queued = rejected} }
+        return .{queued = Launch(request, app, *verified, *principal)}
+    }
+
+    CompleteLink :: (request: Request, work: *LinkWork) -> s32 {
+        invoice := *work.record.invoice
+        link: Text = provider.CreateLink(request.bot, invoice)
+        if !mutex.Lock(*request.access.databaseLock) { return Error(request, 503, InvoiceUnavailable) }
+        saved := store.StoreLink(request.database, TextView(invoice.id), work.attempt, TextView(link))
+        mutex.Unlock(*request.access.databaseLock)
+        if TextView(link) == "" || saved.status != sqlite.SQLITE_OK || !saved.accepted { return Error(request, 503, InvoiceUnavailable) }
+        request.now = work.attempt
+        return InvoiceReply(request, invoice, 201, true, updatedLink = TextView(link))
+    }
+
+    Reconcile :: (request: Request, raw: []u8, overflow: bool, admin: string) -> s32 {
+        operator := auth.LocalOperator(request.connection, admin)
+        if operator.status != 0 { return Error(request, operator.status, operator.problem) }
+        fields: replies.Body
+        key: [1]string = .["offset"]
+        types: [1]json.JsonKind = .[.Number]
+        values: [1]s32
+        if !Decode(request, raw, overflow, 128, *fields) ||
+            !authorization.ReadFields(*fields.document, fields.document.root, key[:], types[:], values[:]) {
+            return Error(request, 400, "invalid Telegram history offset")
+        }
+        offset := authorization.Integer(*fields.document, values[0])
+        if offset < 0 || offset > 1000000 { return Error(request, 400, "invalid Telegram history offset") }
+        merchant := request.merchant
+        if merchant.bot <= 0 || merchant.audience == "" || issuer.Status(request.settings.signer) != "ok" {
+            return Error(request, 503, "Telegram reconciliation unavailable")
+        }
+        page := provider.Reconcile(request.access, request.settings, request.bot, merchant, offset)
+        if page.unavailable { return Error(request, 503, "Telegram payment temporarily unavailable") }
+        if !page.valid { return Error(request, 503, "Telegram history temporarily unavailable") }
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        if !authorization.PutInt(*body, root, "seen", page.seen) || !authorization.PutInt(*body, root, "matched", page.matched) ||
+            !authorization.PutInt(*body, root, "next_offset", offset + page.seen) {
+            return Error(request, 503, "Telegram history temporarily unavailable")
+        }
+        return Reply(request, 200, *body, root)
+    }
+
+    #scope_export
+    Open :: (state: *State, token: *tokens.State, apps: string, prices: string, node: string, audience: string,
+        accountsEnabled: bool, webhookConfigured: bool) -> bool {
+        state.settings.signer = *token.signer
+        state.settings.node = node
+        state.settings.audience = audience
+        state.settings.enabled = accountsEnabled && webhookConfigured
+        configuredApps: Text = TextCopy(apps)
+        VecSwap(state.settings.apps.bytes, configuredApps.bytes)
+        return provider.Offers(VecSlice(token.products, 0, token.products.count), prices, *state.settings.offers)
+    }
+
+    Handles :: (route: string) -> bool { return Match(route) != .Missing }
+    ReadsBody :: (route: string, verb: string) -> bool { return Allowed(Match(route), verb) }
+
+    BodyLimit :: (route: string) -> s64 {
+        matched := Match(route)
+        if matched == .Launch || matched == .Create { return 32768 }
+        if matched == .Reconcile { return 128 }
+        return 1
+    }
+
+    Handle :: (state: *State, access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        raw: []u8, overflow: bool, bot: telegram.Configuration, admin: string) -> s32 {
+        matched := Match(route)
+        if matched == .Missing { return 0 }
+        if !Allowed(matched, verb) { return MethodNotAllowed(connection, ifx GetRoute(matched) then "GET, HEAD" else "POST") }
+        request: Request = .{access = access, connection = connection, method = verb, route = route, bot = bot,
+            settings = *state.settings, merchant = Merchant(*state.settings, bot), database = access.configuration.database}
+        if matched == .Reconcile { return Reconcile(request, raw, overflow, admin) }
+        id := wire.Cut(wire.TrimPrefix(route, InvoicePrefix), #char "/").before
+        if (matched == .Detail || matched == .Cancel) && !authorization.HexID(id, 32) { return Error(request, 404, InvoiceMissing) }
+        credential := http.Header(connection, "Authorization")
+        delegated := wire.TrimPrefix(credential, "Delegate ").count != credential.count
+        input: Input
+        fields: replies.Body
+        if matched == .Launch || matched == .Create {
+            if delegated && EncodingPresent(connection) { return Error(request, 400, "Telegram delegate requests require unencoded JSON") }
+            invalid := ifx matched == .Launch then "invalid Telegram launch request" else "invalid Telegram invoice request"
+            names: [4]string = .["app_id", "init_data", "product_id", "request_id"]
+            types: [4]json.JsonKind = .[.String, .String, .String, .String]
+            indices: [4]s32
+            size := ifx matched == .Launch then 2 else 4
+            if !Decode(request, raw, overflow, 32768, *fields) ||
+                !authorization.ReadFields(*fields.document, fields.document.root, names[:size], types[:size], indices[:size]) {
+                return Error(request, 400, invalid)
+            }
+            input.app = json.JsonString(*fields.document, indices[0])
+            input.init = json.JsonString(*fields.document, indices[1])
+            if matched == .Create {
+                input.product = json.JsonString(*fields.document, indices[2])
+                input.requestID = json.JsonString(*fields.document, indices[3])
+                if !provider.ValidID(TextView(input.product), 1, 128) || !provider.ValidID(TextView(input.requestID), 8, 128) {
+                    return Error(request, 400, invalid)
+                }
+            }
+        } else if overflow || raw.count != 0 {
+            return Error(request, 400, "Telegram request requires an empty body")
+        }
+        if !HeaderTotal(connection, "Authorization", credential) { return Error(request, 401, "ambiguous Telegram authorization") }
+        if delegated {
+            proof := http.Header(connection, "X-Mesh-Delegate")
+            if proof == "" || !HeaderTotal(connection, "X-Mesh-Delegate", proof) {
+                return Error(request, 401, "one Telegram delegate proof is required")
+            }
+        }
+        link := Run(request, matched, *input, raw, credential, delegated, id)
+        if link.pending { return CompleteLink(request, *link) }
+        return link.queued
+    }
+
+    Webhook :: (context: *void, access: *accounts.AccountAccess, connection: *void, bot: telegram.Configuration,
+        document: *json.JsonDocument) -> lumi.PaymentResponse {
+        if context == null { return .{} }
+        state := cast(*State)context
+        handled := provider.Process(access, *state.settings, bot, Merchant(*state.settings, bot), document)
+        if handled.status == 0 { return .{} }
+        if handled.error != "" {
+            return .{handled = true, queued = replies.ErrorReply(connection, "POST", handled.status, handled.error, access.configuration.zstdResponses)}
+        }
+        body: json.JsonDocument
+        root := json.JsonNewBool(*body, true)
+        return .{handled = true, queued = replies.Reply(connection, "POST", handled.status, *body, root, access.configuration.zstdResponses)}
+    }
+}

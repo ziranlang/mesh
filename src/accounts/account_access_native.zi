@@ -1,0 +1,692 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    transport :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    replies :: #import "http_json_native";
+    address :: #import "client_address_native";
+    limiting :: #import "rate_limit_native";
+    bearer :: #import "http_auth_native";
+    challenges :: #import "challenge_native";
+    signature :: #import "account_signature_native";
+    login :: #import "account_login_native";
+    nativeProfile :: #import "account_profile_native";
+    exporter :: #import "account_export_native";
+    profileRules :: #import "account_profile_rules";
+    sessions :: #import "auth_sessions_native";
+    devices :: #import "device_keys_native";
+    holds :: #import "account_hold_native";
+    accountKeys :: #import "account_keys_native";
+    exportedKey :: #import "exported_account_key";
+    signing :: #import "ml_dsa44_native";
+    oqs :: #import "oqs/Oqs";
+    sizes :: #import "codec";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    format :: #import "timestamp_format";
+    time :: #import "timestamp_value";
+    limits :: #import "server_limits";
+    sha :: #import "crypto/sha256";
+    mutex :: #import "std/mutex_linux";
+    clock :: #import "std/timer";
+    calendar :: #import "std/date_time_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Configuration :: struct {
+        database: *void
+        path: string
+        secret: []u8
+        challengeSeconds: s64
+        tokenSeconds: s64
+        maximumBodyBytes: s64
+        accountStorageLimit: s64
+        storagePlansEnabled: bool
+        encryptedPayloadAccountLimit: s64
+        encryptedPayloadMaxReturn: s64
+        encryptedPayloadRetentionSeconds: s64
+        zstdRequests: bool
+        zstdResponses: bool
+        verify: signature.VerifySignature
+    }
+
+    AccountAccess :: struct {
+        configuration: Configuration
+        databaseLock: mutex.Mutex
+        challenges: challenges.ChallengeStore
+        limiter: limiting.RateLimiter
+    }
+
+    #scope_file
+    RateWindowMilliseconds :: 60000;
+    ReadLoginProfile :: "SELECT alias,profile_icon FROM server_users WHERE user_id_hash=?1";
+    DeviceRoute :: "/api/v1/account/devices";
+    LegacyDeleteRoute :: "/api/v1/account";
+    DeleteRoute :: "/api/v1/account/delete";
+    DeleteWithKeyRoute :: "/api/v1/account/delete-with-key";
+    ProfileIconRoute :: "/api/v1/account/profile-icon";
+    ExportRoute :: "/api/v1/account/export";
+
+    AuditTime :: (now: s64, target: []u8) -> s64 {
+        return format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, target)
+    }
+
+    Reply :: (access: *AccountAccess, connection: *void, method: string, status: u32,
+        document: *json.JsonDocument, root: s32) -> s32 {
+        return replies.Reply(connection, method, status, document, root, access.configuration.zstdResponses)
+    }
+
+    ErrorReply :: (access: *AccountAccess, connection: *void, method: string, status: u32, message: string) -> s32 {
+        return replies.ErrorReply(connection, method, status, message, access.configuration.zstdResponses)
+    }
+
+    Allow :: (access: *AccountAccess, connection: *void, prefix: string, user: string, addressLimit: s64) -> bool {
+        ip := address.FromRequest(connection)
+        bucket: Vec(u8)
+        if !BuilderAppend(bucket, prefix) || !BuilderAppend(bucket, TextView(ip.bytes[:ip.count])) {
+            return false
+        }
+        now := clock.MonotonicMilliseconds()
+        if !limiting.Allow(*access.limiter, TextView(VecSlice(bucket, 0, bucket.count)), addressLimit, RateWindowMilliseconds, now) {
+            return false
+        }
+        if !BuilderAppend(bucket, "|") || !BuilderAppend(bucket, user) {
+            return false
+        }
+        return limiting.Allow(*access.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 20, RateWindowMilliseconds, now)
+    }
+
+    Challenge :: (access: *AccountAccess, connection: *void, method: string) -> s32 {
+        account: [64]u8
+        if !identity.NormalizeUserID(transport.QueryArgument(connection, "user_id"), account[:]) {
+            return ErrorReply(access, connection, method, 400, "invalid user_id")
+        }
+        user := TextView(account[:])
+        if !Allow(access, connection, "challenge:", user, 60) {
+            return ErrorReply(access, connection, method, 429, "rate limit exceeded")
+        }
+        issued := challenges.Issue(*access.challenges, user, clock.MonotonicMilliseconds())
+        if issued.status == .Busy {
+            return ErrorReply(access, connection, method, 503, "challenges are busy")
+        }
+        nonce: [65]u8
+        if issued.status != .OK || sha.BytesToHex(*issued.nonce[0], issued.nonce.count, *nonce[0], nonce.count) != 1 {
+            return ErrorReply(access, connection, method, 500, "challenge failed")
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "user_id_hash", json.JsonNewString(*document, user)) ||
+            !json.JsonSet(*document, root, "nonce", json.JsonNewString(*document, TextView(nonce[:64]))) ||
+            !json.JsonSet(*document, root, "expires_in_seconds", json.JsonNewInteger(*document, access.configuration.challengeSeconds)) {
+            return 0
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    LoginFields :: struct {
+        user: Text
+        client: Text
+        key: Text
+        restore: bool
+        valid: bool
+    }
+
+    ReadLogin :: (payload: []u8) -> LoginFields {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(payload)) {
+            return .{}
+        }
+        kind := json.JsonKindOf(*document, document.root)
+        if kind != .Null && kind != .Object {
+            return .{}
+        }
+        result: LoginFields
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(*document, node)
+            key := TextView(name)
+            valueKind := json.JsonKindOf(*document, node)
+            if valueKind != .Null {
+                if wire.MatchesToken(key, "restore") {
+                    if valueKind != .True && valueKind != .False {
+                        return .{}
+                    }
+                    result.restore = valueKind == .True
+                } else if wire.MatchesToken(key, "user_id_hash") {
+                    if valueKind != .String {
+                        return .{}
+                    }
+                    result.user = json.JsonString(*document, node)
+                } else if wire.MatchesToken(key, "client_id") {
+                    if valueKind != .String {
+                        return .{}
+                    }
+                    result.client = json.JsonString(*document, node)
+                } else if wire.MatchesToken(key, "public_key") {
+                    if valueKind != .String {
+                        return .{}
+                    }
+                    result.key = json.JsonString(*document, node)
+                }
+            }
+            node = json.JsonNext(*document, node)
+        }
+        result.valid = true
+        return result
+    }
+
+    RequestSignature :: struct {
+        value: string
+        context: string
+    }
+    SignedHeader :: (connection: *void) -> RequestSignature {
+        names: [3]string = .["X-Mesh-Signature", "X-Ksync-Signature", "X-Inbe-Signature"]
+        contexts: [3]string = .["daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
+        for name, index: names {
+            value := wire.TrimSpace(transport.Header(connection, name))
+            if value != "" {
+                return .{value = value, context = contexts[index]}
+            }
+        }
+        return .{context = "ksync-sync-v1"}
+    }
+
+    WriteLogin :: (access: *AccountAccess, connection: *void, method: string, user: string,
+        token: string, now: s64) -> s32 {
+        database := access.configuration.database
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        profile := sql.Prepare(database, ReadLoginProfile, arguments[:])
+        if profile.status != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "account alias failed")
+        }
+        defer sqlite.SqliteFinalize(profile.value)
+        if sqlite.SqliteStep(profile.value) != sqlite.SQLITE_ROW {
+            return ErrorReply(access, connection, method, 500, "account alias failed")
+        }
+        alias := sql.ColumnText(profile.value, 0)
+        icon := sqlite.SqliteColumnInt64(profile.value, 1)
+        held := holds.HeldUntil(database, user)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "status", json.JsonNewString(*document, "ok")) ||
+            !json.JsonSet(*document, root, "auth_token", json.JsonNewString(*document, token)) ||
+            !json.JsonSet(*document, root, "expires_in_seconds", json.JsonNewInteger(*document, access.configuration.tokenSeconds)) ||
+            !json.JsonSet(*document, root, "server_time", json.JsonNewInteger(*document, now)) ||
+            (alias != "" && !json.JsonSet(*document, root, "account_alias", json.JsonNewString(*document, alias))) ||
+            (icon != 0 && !json.JsonSet(*document, root, "profile_icon", json.JsonNewInteger(*document, icon))) ||
+            (held.value != 0 && !json.JsonSet(*document, root, "held_until", json.JsonNewInteger(*document, held.value))) {
+            return 0
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    LoginPayload :: (access: *AccountAccess, connection: *void, method: string, path: string, payload: []u8) -> s32 {
+        values := ReadLogin(payload)
+        if !values.valid {
+            return ErrorReply(access, connection, method, 400, "invalid json")
+        }
+        header := bearer.UserHeader(connection)
+        if header.value == "" {
+            return ErrorReply(access, connection, method, 400, "missing X-Mesh-User")
+        }
+        bodyUser := TextView(values.user)
+        account: [64]u8
+        bodyAccount: [64]u8
+        valid := identity.NormalizeUserID(header.value, account[:])
+        if bodyUser != "" && (!identity.NormalizeUserID(bodyUser, bodyAccount[:]) || !valid ||
+            TextView(account[:]) != TextView(bodyAccount[:])) {
+            detail: Vec(u8)
+            if !BuilderAppend(detail, header.name) || !BuilderAppend(detail, " does not match user_id_hash") {
+                return 0
+            }
+            return ErrorReply(access, connection, method, 400, TextView(VecSlice(detail, 0, detail.count)))
+        }
+        client := wire.TrimSpace(TextView(values.client))
+        if !identity.ValidClientID(client) {
+            return ErrorReply(access, connection, method, 400, "invalid client_id")
+        }
+        subject := ifx valid then TextView(account[:]) else "invalid"
+        if !Allow(access, connection, "login:", subject, 40) {
+            return ErrorReply(access, connection, method, 429, "rate limit exceeded")
+        }
+        if !valid {
+            return ErrorReply(access, connection, method, 400, "invalid user_id_hash")
+        }
+        signed := SignedHeader(connection)
+        settings := access.configuration
+        auth := signature.AuthenticateWithLock(settings.database, *access.databaseLock, *access.challenges,
+            settings.verify, subject, wire.TrimSpace(TextView(values.key)), signed.value, signed.context,
+            method, path, payload)
+        if auth.databaseError != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "authentication failed")
+        }
+        if !auth.authenticated {
+            return ErrorReply(access, connection, method, auth.status, auth.message)
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "login failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        if values.restore {
+            restored := holds.Restore(settings.database, settings.path, subject)
+            if restored.databaseError != sqlite.SQLITE_OK || restored.error != "" {
+                return ErrorReply(access, connection, method, 500, "restore failed")
+            }
+            if restored.cleanupError != "" {
+                print("Mesh: %\n", restored.cleanupError)
+            }
+        }
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := AuditTime(now, audit[:])
+        if count == 0 {
+            return ErrorReply(access, connection, method, 500, "login failed")
+        }
+        issued := login.Complete(settings.database, auth, settings.secret, client,
+            now / 1000, now / 1000 + settings.tokenSeconds, TextView(audit[:count]))
+        if issued.databaseError != sqlite.SQLITE_OK || issued.error != "" {
+            return ErrorReply(access, connection, method, 500, "login failed")
+        }
+        return WriteLogin(access, connection, method, subject, TextView(VecSlice(issued.token, 0, issued.token.count)), now / 1000)
+    }
+
+    DeletePayload :: (access: *AccountAccess, connection: *void, method: string, path: string, payload: []u8) -> s32 {
+        withKey := path == DeleteWithKeyRoute
+        defer { if withKey { oqs.Cleanse(payload) } }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(payload)) {
+            return ErrorReply(access, connection, method, 400, "invalid json")
+        }
+        rootKind := json.JsonKindOf(*document, document.root)
+        if rootKind != .Object && rootKind != .Null {
+            return ErrorReply(access, connection, method, 400, "invalid json")
+        }
+        userNode: s32 = -1
+        keyNode: s32 = -1
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(*document, node)
+            isUser := wire.MatchesToken(TextView(name), "user_id_hash")
+            if isUser || (withKey && wire.MatchesToken(TextView(name), "exported_key")) {
+                kind := json.JsonKindOf(*document, node)
+                if kind != .Null {
+                    if kind != .String {
+                        return ErrorReply(access, connection, method, 400, "invalid json")
+                    }
+                    if isUser {
+                        userNode = node
+                    } else {
+                        keyNode = node
+                    }
+                }
+            }
+            node = json.JsonNext(*document, node)
+        }
+        supplied: Text = json.JsonString(*document, userNode)
+        user := wire.TrimSpace(TextView(supplied))
+        if withKey {
+            key: Text = json.JsonString(*document, keyNode)
+            return DeleteExportedKey(access, connection, method, user, wire.TrimSpace(TextView(key)))
+        }
+        header := bearer.UserHeader(connection)
+        if header.value == "" {
+            return ErrorReply(access, connection, method, 400, "missing X-Mesh-User")
+        }
+        account: [64]u8
+        fromBody: [64]u8
+        valid := identity.NormalizeUserID(header.value, account[:])
+        if user != "" && (!valid || !identity.NormalizeUserID(user, fromBody[:]) || TextView(account[:]) != TextView(fromBody[:])) {
+            message: Vec(u8)
+            if !BuilderAppend(message, header.name) || !BuilderAppend(message, " does not match user_id_hash") {
+                return 0
+            }
+            return ErrorReply(access, connection, method, 400, TextView(VecSlice(message, 0, message.count)))
+        }
+        if !valid {
+            return ErrorReply(access, connection, method, 400, "invalid user_id_hash")
+        }
+        subject := TextView(account[:])
+        signed := SignedHeader(connection)
+        settings := access.configuration
+        proof := signature.AuthenticateWithLock(settings.database, *access.databaseLock, *access.challenges,
+            settings.verify, subject, "", signed.value, signed.context, method, path, payload)
+        if proof.databaseError != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "authentication failed")
+        }
+        if !proof.authenticated {
+            return ErrorReply(access, connection, method, proof.status, proof.message)
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "delete failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return DeleteAccount(access, connection, method, subject)
+    }
+
+    DeleteExportedKey :: (access: *AccountAccess, connection: *void, method: string, user: string, key: string) -> s32 {
+        normalized: [64]u8
+        if !identity.NormalizeUserID(user, normalized[:]) {
+            return ErrorReply(access, connection, method, 400, "invalid user_id_hash")
+        }
+        if key == "" {
+            return ErrorReply(access, connection, method, 400, "exported_key required")
+        }
+        now := clock.MonotonicMilliseconds()
+        remote := address.FromRequest(connection)
+        source: Vec(u8)
+        subject: Vec(u8)
+        accountID := TextView(normalized[:])
+        if !BuilderAppend(source, "delete-key:ip:") || !BuilderAppend(source, TextView(remote.bytes[:remote.count])) ||
+            !BuilderAppend(subject, "delete-key:user:") || !BuilderAppend(subject, accountID) {
+            return 0
+        }
+        if !limiting.Allow(*access.limiter, TextView(VecSlice(source, 0, source.count)), 8, 3600000, now) ||
+            !limiting.Allow(*access.limiter, TextView(VecSlice(subject, 0, subject.count)), 4, 3600000, now) {
+            return ErrorReply(access, connection, method, 429, "rate limit exceeded")
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "delete failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        settings := access.configuration
+        account := accountKeys.Read(settings.database, accountID)
+        if account.status != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "delete failed")
+        }
+        if !account.found {
+            return ErrorReply(access, connection, method, 404, "sync account not found")
+        }
+        exported := exportedKey.Parse(key)
+        privateKey := VecSlice(exported.privateKey, 0, exported.privateKey.count)
+        defer oqs.Cleanse(privateKey)
+        if exported.error != "" {
+            return ErrorReply(access, connection, method, 400, exported.error)
+        }
+        if exported.hasPublicID && TextView(exported.publicID[:]) != accountID {
+            return ErrorReply(access, connection, method, 400, "exported key public_id does not match user_id_hash")
+        }
+        message: Vec(u8)
+        if !BuilderAppend(message, "inbe-delete-account-v1\n") || !BuilderAppend(message, accountID) || !BuilderAppend(message, "\n") {
+            return 0
+        }
+        bytes := VecSlice(message, 0, message.count)
+        signatureBytes: [sizes.mlDSA44SignatureSize]u8
+        if account.count != sizes.mlDSA44PublicKeySize || !signing.Sign(privateKey, bytes, signatureBytes[:]) ||
+            !settings.verify(account.bytes[:], bytes, signatureBytes[:]) {
+            return ErrorReply(access, connection, method, 401, "exported key does not match sync account")
+        }
+        return DeleteAccount(access, connection, method, accountID)
+    }
+
+    DeleteAccount :: (access: *AccountAccess, connection: *void, method: string, subject: string) -> s32 {
+        settings := access.configuration
+        result := holds.Delete(settings.database, settings.path, subject, calendar.UnixMilliseconds() / 1000)
+        if result.databaseError != sqlite.SQLITE_OK || result.error != "" {
+            return ErrorReply(access, connection, method, 500, "delete failed")
+        }
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        if !json.JsonSet(*response, root, "status", json.JsonNewString(*response, "deleted")) {
+            return 0
+        }
+        return Reply(access, connection, method, 200, *response, root)
+    }
+
+    Export :: (access: *AccountAccess, connection: *void, method: string) -> s32 {
+        settings := access.configuration
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := AuditTime(now, audit[:])
+        if now < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "export failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        auth := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
+        if auth.status != 0 {
+            return ErrorReply(access, connection, method, auth.status, auth.message)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        status := exporter.Export(settings.database, TextView(auth.userID[:]), *document, root)
+        if status == 404 {
+            return ErrorReply(access, connection, method, 404, "sync account not found")
+        }
+        if status != 0 {
+            return ErrorReply(access, connection, method, 500, "export failed")
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    ProfileIcon :: (access: *AccountAccess, connection: *void, method: string, body: []u8) -> s32 {
+        header := bearer.UserHeader(connection)
+        input := nativeProfile.ReadIcon(body, header.value)
+        if !input.valid {
+            return ErrorReply(access, connection, method, 400, "invalid json")
+        }
+        if header.value == "" {
+            return ErrorReply(access, connection, method, 400, "missing X-Mesh-User")
+        }
+        if !input.matchesUser {
+            message: Vec(u8)
+            if !BuilderAppend(message, header.name) || !BuilderAppend(message, " does not match user_id_hash") {
+                return 0
+            }
+            return ErrorReply(access, connection, method, 400, TextView(VecSlice(message, 0, message.count)))
+        }
+        settings := access.configuration
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := AuditTime(now, audit[:])
+        if now < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "profile icon failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        timestamp := TextView(audit[:count])
+        auth := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, timestamp, false)
+        if auth.status != 0 {
+            return ErrorReply(access, connection, method, auth.status, auth.message)
+        }
+        if !profileRules.ValidIcon(input.icon) {
+            return ErrorReply(access, connection, method, 400, "invalid profile_icon")
+        }
+        changed := nativeProfile.SetIcon(settings.database, TextView(auth.userID[:]), input.icon, timestamp)
+        if changed == sqlite.SQLITE_DONE {
+            return ErrorReply(access, connection, method, 404, "sync account not found")
+        }
+        if changed != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "profile icon failed")
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "status", json.JsonNewString(*document, "ok")) ||
+            !json.JsonSet(*document, root, "profile_icon", json.JsonNewInteger(*document, input.icon)) {
+            return 0
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    Logout :: (access: *AccountAccess, connection: *void, method: string) -> s32 {
+        settings := access.configuration
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := AuditTime(now, audit[:])
+        if count == 0 || !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "logout failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        auth := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
+        if auth.status != 0 {
+            return ErrorReply(access, connection, method, auth.status, auth.message)
+        }
+        status := sessions.RevokeBearer(settings.database, TextView(auth.userID[:]), bearer.Bearer(connection))
+        if status == sqlite.SQLITE_DONE {
+            return ErrorReply(access, connection, method, 401, "invalid bearer token")
+        }
+        if status != sqlite.SQLITE_OK {
+            return ErrorReply(access, connection, method, 500, "logout failed")
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "status", json.JsonNewString(*document, "ok")) {
+            return 0
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    Devices :: (access: *AccountAccess, connection: *void, method: string, input: []u8, overflow: bool) -> s32 {
+        settings := access.configuration
+        now := calendar.UnixMilliseconds()
+        audit: [31]u8
+        count := AuditTime(now, audit[:])
+        if now < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
+            return ErrorReply(access, connection, method, 500, "authentication failed")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        user := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
+        if user.status != 0 {
+            return ErrorReply(access, connection, method, user.status, user.message)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        account := TextView(user.userID[:])
+        if method == "GET" || method == "HEAD" {
+            listed := devices.List(settings.database, account, *document, root)
+            if listed.status != 0 {
+                return ErrorReply(access, connection, method, listed.status, listed.message)
+            }
+            return Reply(access, connection, method, 200, *document, root)
+        }
+        if overflow || input.count > settings.maximumBodyBytes {
+            return ErrorReply(access, connection, method, 400, "request body too large")
+        }
+        encoding: [limits.MaxHeaderBytes]u8
+        length := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if length < 0 {
+            return ErrorReply(access, connection, method, 400, "unsupported content encoding")
+        }
+        header := TextView(encoding[:length])
+        timestamp: time.TimestampValue = .{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}
+        body := input
+        decoded: Vec(u8)
+        if header != "" && !wire.MatchesToken(wire.TrimSpace(header), "identity") {
+            if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+                return ErrorReply(access, connection, method, 503, "request decoder unavailable")
+            }
+            payload := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
+            if payload.error != "" {
+                return ErrorReply(access, connection, method, 400, payload.error)
+            }
+            body = payload.bytes
+        }
+        changed := devices.Change(settings.database, settings.verify, account, body, method == "DELETE", timestamp, *document, root)
+        if changed.status != 0 {
+            return ErrorReply(access, connection, method, changed.status, changed.message)
+        }
+        return Reply(access, connection, method, 200, *document, root)
+    }
+
+    #scope_export
+    // Initialize before accepting connections. Close after joining all workers.
+    Open :: (access: *AccountAccess, settings: Configuration) -> bool {
+        if settings.database == null || settings.secret.count == 0 || settings.verify == null ||
+            settings.challengeSeconds <= 0 || settings.challengeSeconds > 9223372036854775 ||
+            settings.tokenSeconds <= 0 || settings.tokenSeconds > 9223372036854775 || settings.maximumBodyBytes <= 0 { return false }
+        audit: [32]u8
+        now := calendar.UnixMilliseconds()
+        if now < 0 || settings.tokenSeconds > (9223372036854775807 - now) / 1000 {
+            return false
+        }
+        count := AuditTime(now + settings.tokenSeconds * 1000, audit[:])
+        if count == 0 || sessions.Initialize(settings.database, TextView(audit[:count])) != sqlite.SQLITE_OK {
+            return false
+        }
+        if !mutex.Open(*access.databaseLock) {
+            return false
+        }
+        if !challenges.Open(*access.challenges, settings.challengeSeconds * 1000) {
+            unused mutex.Close(*access.databaseLock)
+            return false
+        }
+        if !limiting.Open(*access.limiter) {
+            challenges.Close(*access.challenges)
+            unused mutex.Close(*access.databaseLock)
+            return false
+        }
+        access.configuration = settings
+        return true
+    }
+
+    Close :: (access: *AccountAccess) {
+        limiting.Close(*access.limiter)
+        challenges.Close(*access.challenges)
+        unused mutex.Close(*access.databaseLock)
+    }
+
+    Handles :: (path: string) -> bool {
+        return path == "/api/v1/sync/challenge" || path == "/api/v1/sync/login" || path == "/api/v1/sync/logout" ||
+            path == LegacyDeleteRoute || path == DeleteRoute || path == DeleteWithKeyRoute || path == DeviceRoute || path == ProfileIconRoute || path == ExportRoute
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return ((path == "/api/v1/sync/login" || path == DeleteRoute || path == DeleteWithKeyRoute ||
+            path == ProfileIconRoute) && method == "POST") ||
+            (path == DeviceRoute && (method == "POST" || method == "DELETE")) ||
+            (path == LegacyDeleteRoute && method == "DELETE")
+    }
+
+    Handle :: (access: *AccountAccess, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        challengeRoute := path == "/api/v1/sync/challenge"
+        readOnly := challengeRoute || path == ExportRoute
+        deviceRoute := path == DeviceRoute
+        reads := method == "GET" || method == "HEAD"
+        deleteOnly := path == LegacyDeleteRoute
+        allowed := ifx deviceRoute then "DELETE, GET, HEAD, POST" else ifx readOnly then "GET, HEAD" else ifx deleteOnly then "DELETE" else "POST"
+        supported := ifx deviceRoute then reads || method == "POST" || method == "DELETE" else ifx readOnly then reads else ifx deleteOnly then method == "DELETE" else method == "POST"
+        if !supported {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allowed}]
+            body: []u8
+            return transport.WriteWithHeaders(connection, 405, "", body, headers[:])
+        }
+        if deviceRoute {
+            return Devices(access, connection, method, input, overflow)
+        }
+        if challengeRoute {
+            return Challenge(access, connection, method)
+        }
+        if path == ExportRoute {
+            return Export(access, connection, method)
+        }
+        if path == "/api/v1/sync/logout" {
+            return Logout(access, connection, method)
+        }
+        settings := access.configuration
+        if overflow || input.count > settings.maximumBodyBytes {
+            return ErrorReply(access, connection, method, 400, "request body too large")
+        }
+        encoding: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if count < 0 {
+            return ErrorReply(access, connection, method, 400, "unsupported content encoding")
+        }
+        header := TextView(encoding[:count])
+        body := input
+        decoded: Vec(u8)
+        if header != "" && !wire.MatchesToken(wire.TrimSpace(header), "identity") {
+            if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+                return ErrorReply(access, connection, method, 503, "request decoder unavailable")
+            }
+            payload := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
+            if payload.error != "" {
+                return ErrorReply(access, connection, method, 400, payload.error)
+            }
+            body = payload.bytes
+        }
+        if deleteOnly || path == DeleteRoute || path == DeleteWithKeyRoute {
+            return DeletePayload(access, connection, method, path, body)
+        }
+        if path == ProfileIconRoute {
+            return ProfileIcon(access, connection, method, body)
+        }
+        return LoginPayload(access, connection, method, path, body)
+    }
+}

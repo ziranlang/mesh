@@ -1,0 +1,65 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "app_manifest_rules";
+    canonical_json :: #import "canonical_json_native";
+    signatures :: #import "device_signature_native";
+    binary :: #import "binary_codec";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    sha :: #import "crypto/sha256";
+    #import "std/vec"
+
+    Verification :: struct {
+        status: u32
+        problem: string
+    }
+
+    #scope_file
+    SignedByActiveKey :: (document: *json.JsonDocument, root: s32, message: []u8, proof: []u8, now: s64) -> bool {
+        key := json.JsonFirst(document, json.JsonMember(document, root, "keys"))
+        while key >= 0 {
+            status: Text = json.JsonString(document, json.JsonMember(document, key, "status"))
+            expiry := fields.Number(document, json.JsonMember(document, key, "expires_at"))
+            if (TextView(status) == "" || TextView(status) == "active") && (expiry <= 0 || now <= expiry) {
+                public: Text = json.JsonString(document, json.JsonMember(document, key, "public_key"))
+                decoded := binary.DecodeBinaryField(TextView(public))
+                if decoded.error == "" && signatures.Verify(VecSlice(decoded.value, 0, decoded.value.count), message, proof) { return true }
+            }
+            key = json.JsonNext(document, key)
+        }
+        return false
+    }
+
+    #scope_export
+    Verify :: (document: *json.JsonDocument, root: s32, id: string, manifestProof: string, approvalProof: string,
+        approvalKey: []u8, now: s64, encoded: *Vec(u8), hash: []u8) -> Verification {
+        failure: Verification = .{status = 500, problem = "app registration failed"}
+        if approvalKey.count != 32 { return .{status = 403, problem = "node registry approval unavailable"} }
+        normalized: Vec(u8)
+        if !canonical_json.Encode(document, root, *normalized) { return failure }
+        canonical := TextView(VecSlice(normalized, 0, normalized.count))
+        digest := sha.Sha256Of(canonical)
+        if hash.count < 65 || sha.BytesToHex(*digest[0], digest.count, *hash[0], hash.count) != 1 { return failure }
+
+        signature := binary.DecodeBinaryField(manifestProof)
+        if signature.error != "" || signature.value.count != 64 { return .{status = 400, problem = "invalid manifest signature"} }
+        message: Vec(u8)
+        if !BuilderAppend(message, rules.AppManifestContext) || !BuilderAppend(message, "\n") ||
+            !BuilderAppend(message, canonical) { return failure }
+        if !SignedByActiveKey(document, root, VecSlice(message, 0, message.count),
+            VecSlice(signature.value, 0, signature.value.count), now) {
+            return .{status = 401, problem = "manifest signature rejected"}
+        }
+
+        approval := binary.DecodeBinaryField(approvalProof)
+        if approval.error != "" || approval.value.count != 64 { return .{status = 400, problem = "invalid approval signature"} }
+        VecClear(message)
+        if !BuilderAppend(message, rules.AppApprovalContext) || !BuilderAppend(message, "\n") ||
+            !BuilderAppend(message, id) || !BuilderAppend(message, "\n") || !BuilderAppend(message, TextView(hash[:64])) ||
+            !BuilderAppend(message, "\n") { return failure }
+        if !signatures.Verify(approvalKey, VecSlice(message, 0, message.count), VecSlice(approval.value, 0, approval.value.count)) {
+            return .{status = 401, problem = "node approval rejected"}
+        }
+        if !BuilderAppend(<<encoded, canonical) { return failure }
+        return .{}
+    }
+}

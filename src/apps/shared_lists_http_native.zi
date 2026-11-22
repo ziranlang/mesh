@@ -1,0 +1,85 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    encoding :: #import "encoding_preferences";
+    limits :: #import "server_limits";
+    lists :: #import "shared_lists_native";
+    snapshots :: #import "shared_lists_read_native";
+    notifications :: #import "sync_hub_native";
+    calendar :: #import "std/date_time_linux";
+    timestamps :: #import "timestamp_format";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    RequestLimit :: 262144;
+
+    #scope_file
+    Route :: "/api/v1/lists";
+    Invalid :: "invalid list command";
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == Route
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return route == Route && verb == "POST"
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        body: []u8, overflow: bool) -> s32 {
+        return HandleWithHub(access, null, connection, verb, route, body, overflow)
+    }
+
+    HandleWithHub :: (access: *accounts.AccountAccess, hub: *notifications.Hub, connection: *void, verb: string,
+        route: string, body: []u8, overflow: bool) -> s32 {
+        post := ReadsBody(route, verb)
+        if !post && verb != "GET" && verb != "HEAD" {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD, POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        settings := access.configuration
+        milliseconds := calendar.UnixMilliseconds()
+        now := milliseconds / 1000
+        timestamp: [31]u8
+        length := timestamps.UTC(.{seconds = now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, timestamp[:])
+        zstd := settings.zstdResponses
+        if length == 0 || !mutex.Lock(*access.databaseLock) {
+            return replies.ErrorReply(connection, verb, 500, "authentication failed", zstd)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := settings.database
+        session := auth.Authenticate(database, connection, settings.secret, now, TextView(timestamp[:length]), false)
+        if session.status != 0 {
+            return replies.ErrorReply(connection, verb, session.status, session.message, zstd)
+        }
+        if post {
+            header: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(connection, "Content-Encoding", header[:])
+            if body.count > RequestLimit || count < 0 || encoding.Request(TextView(header[:count])) == .Unsupported {
+                return replies.ErrorReply(connection, verb, 400, Invalid, zstd)
+            }
+            input: replies.Body
+            decoded := replies.Decode(connection, body, overflow, RequestLimit, settings.zstdRequests, *input)
+            if decoded.status != 0 {
+                return replies.ErrorReply(connection, verb, 400, Invalid, zstd)
+            }
+            payload := ifx decoded.decoded then TextView(VecSlice(input.scratch, 0, decoded.length)) else TextView(body)
+            result := lists.Apply(settings, hub, TextView(session.userID[:]), payload, now)
+            if result.status != 0 {
+                message := ifx result.malformed then Invalid else "list change failed"
+                return replies.ErrorReply(connection, verb, result.status, message, zstd)
+            }
+        }
+        output: json.JsonDocument
+        snapshot := snapshots.Snapshot(database, TextView(session.userID[:]), *output)
+        if snapshot < 0 {
+            return replies.ErrorReply(connection, verb, 500, "list refresh failed", zstd)
+        }
+        return replies.Reply(connection, verb, 200, *output, snapshot, zstd)
+    }
+}

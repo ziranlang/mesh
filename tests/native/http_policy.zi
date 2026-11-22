@@ -1,0 +1,104 @@
+policy :: #import "http_policy_native";
+transport :: #import "http_server_native";
+text :: #import "std/byte_text_linux";
+c_string :: #import "std/c_string";
+
+#scope_file
+c :: #system_library "c";
+mhd :: #system_library "microhttpd";
+Flush :: (stream: *void) -> s32 #foreign c "fflush";
+GetChar :: () -> s32 #foreign c "getchar";
+CreateResponse :: (size: usize, buffer: *u8, mode: s32) -> *void #foreign mhd "MHD_create_response_from_buffer";
+AddHeader :: (response: *void, name: *u8, value: *u8) -> s32 #foreign mhd "MHD_add_response_header";
+Queue :: (connection: *void, status: u32, response: *void) -> s32 #foreign mhd "MHD_queue_response";
+Destroy :: (response: *void) #foreign mhd "MHD_destroy_response";
+
+SetHeader :: (response: *void, name: string, value: string) -> bool {
+    key: [128]u8
+    field: [512]u8
+    if !c_string.CopyCString(name, key[:]) || !c_string.CopyCString(value, field[:]) {
+        return false
+    }
+    return AddHeader(response, *key[0], *field[0]) == 1
+}
+
+Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+    <<request = null
+}
+
+Reply :: (connection: *void, status: u32, body: []u8, headers: []transport.HeaderValue) -> s32 {
+    data: *u8 = null
+    if body.count > 0 {
+        data = *body[0]
+    }
+    // Apply through MicroHTTPD directly so the fixture can isolate the policy
+    // even after the shared transport also applies it.
+    response := CreateResponse(cast(usize)body.count, data, 2)
+    if response == null {
+        return 0
+    }
+    defer Destroy(response)
+    originBytes: [512]u8
+    count := transport.JoinHeader(connection, "Origin", originBytes[:])
+    origin: string = ""
+    if count >= 0 {
+        origin = TextView(originBytes[:count])
+    }
+    if !policy.Apply(response, origin, headers, SetHeader) {
+        return 0
+    }
+    return Queue(connection, status, response)
+}
+
+Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+    version: *u8, upload: *u8, size: *usize, request: **void) -> s32 {
+    if <<request == null {
+        <<request = connection
+        return 1
+    }
+    if <<size != 0 {
+        <<size = 0
+        return 1
+    }
+    empty: []u8
+    if policy.IsPreflight(text.TextFromCString(method)) {
+        headers: []transport.HeaderValue
+        return Reply(connection, policy.PreflightStatus, empty, headers)
+    }
+    route := text.TextFromCString(path)
+    vary := "Accept-Encoding"
+    if route == "/wildcard" {
+        vary = "*"
+    } else if route == "/varies-by-origin" {
+        vary = "oRiGin, Accept-Encoding"
+    }
+    headers: [7]transport.HeaderValue = .[
+        .{name = "X-Fixture-Downstream", value = "true"},
+        .{name = "Content-Type", value = "application/vnd.oai.openapi+json"},
+        .{name = "Vary", value = vary},
+        .{name = "ETag", value = "\"fixture\""},
+        .{name = "cache-control", value = "public, max-age=60"},
+        .{name = "Access-Control-Allow-Origin", value = "*"},
+        .{name = "Access-Control-Allow-Credentials", value = "true"}
+    ]
+    if route == "/protected" && transport.Header(connection, "Authorization") != "Bearer fixture" {
+        return Reply(connection, 401, empty, headers[:1])
+    }
+    body: [3]u8 = .[123, 125, 10]
+    return Reply(connection, 200, body[:], headers[:])
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    daemon := transport.Start(loopback, 0, 8, null, Dispatch, Completed)
+    if daemon == null {
+        return 1
+    }
+    defer transport.Stop(daemon)
+    print("%\n", transport.BoundPort(daemon))
+    unused Flush(null)
+    unused GetChar()
+    return 0
+}

@@ -1,0 +1,77 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    memory :: #import "std/byte_text_linux";
+
+    ArgumentKind :: enum { Text; Integer; Blob; }
+    Argument :: struct {
+        text: string
+        integer: s64
+        blob: []u8
+        kind: ArgumentKind
+    }
+
+    Statement :: struct {
+        value: *void
+        status: s32
+    }
+
+    IntegerResult :: struct {
+        value: s64
+        found: bool
+        status: s32
+    }
+
+    TextArg :: (value: string) -> Argument { return .{text = value} }
+    IntArg :: (value: s64) -> Argument { return .{integer = value, kind = .Integer} }
+
+    BlobArg :: (value: []u8) -> Argument { return .{blob = value, kind = .Blob} }
+
+    Bind :: (statement: *void, slot: s32, argument: Argument) -> s32 {
+        if argument.kind == .Integer { return sqlite.SqliteBindInt64(statement, slot, argument.integer) }
+        if argument.kind == .Blob { return sqlite.SqliteBindBlob(statement, slot, argument.blob) }
+        if argument.text.count > 2147483647 { return sqlite.SQLITE_TOOBIG }
+        return sqlite.SqliteBindTextString(statement, slot, argument.text, cast(s32)argument.text.count)
+    }
+
+    // The caller finalizes a prepared statement after consuming its rows.
+    Prepare :: (database: *void, query: string, arguments: []Argument) -> Statement {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, query, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        if statement == null { return .{status = sqlite.SQLITE_MISUSE} }
+        for argument, index: arguments {
+            status = Bind(statement, cast(s32)(index + 1), argument)
+            if status != sqlite.SQLITE_OK {
+                unused sqlite.SqliteFinalize(statement)
+                return .{status = status}
+            }
+        }
+        return .{value = statement}
+    }
+
+    Execute :: (database: *void, query: string, arguments: []Argument) -> s32 {
+        prepared := Prepare(database, query, arguments)
+        if prepared.status != sqlite.SQLITE_OK { return prepared.status }
+        defer sqlite.SqliteFinalize(prepared.value)
+        status := sqlite.SqliteStep(prepared.value)
+        return ifx status == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else status
+    }
+
+    ReadInteger :: (database: *void, query: string, arguments: []Argument) -> IntegerResult {
+        prepared := Prepare(database, query, arguments)
+        if prepared.status != sqlite.SQLITE_OK { return .{status = prepared.status} }
+        defer sqlite.SqliteFinalize(prepared.value)
+        status := sqlite.SqliteStep(prepared.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        return .{found = true, value = sqlite.SqliteColumnInt64(prepared.value, 0)}
+    }
+
+    // Column storage belongs to SQLite until another step, reset or finalize.
+    ColumnText :: (statement: *void, column: s32) -> string {
+        pointer := sqlite.SqliteColumnText(statement, column)
+        count := sqlite.SqliteColumnBytes(statement, column)
+        if pointer == null || count < 1 { return "" }
+        return TextView(memory.BytesFromPointer(pointer, cast(u64)count))
+    }
+}

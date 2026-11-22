@@ -1,0 +1,500 @@
+#if TARGET == .C && OS == .LINUX {
+    authorization :: #import "authorization_native";
+    #import "authorization_native"
+    session :: #import "delegate_session_native";
+    telegram :: #import "delegate_telegram_native";
+    access :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    signed :: #import "signed_tx_native";
+    scopeRules :: #import "record_scope_native";
+    replies :: #import "http_json_native";
+    http :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    address :: #import "client_address_native";
+    limiting :: #import "rate_limit_native";
+    limits :: #import "server_limits";
+    identity :: #import "identity";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    wire :: #import "wire_text";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    calendar :: #import "std/date_time_linux";
+    format :: #import "timestamp_format";
+    clock :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    #import "std/vec"
+
+    #scope_file
+    Action :: enum { Unknown; Requests; Rendezvous; Cancel; Claim; Approve; Revoke; Challenge; Session; }
+
+    Context :: struct {
+        configuration: access.Configuration
+        environment: session.Environment
+        connection: *void
+        route: string
+        verb: string
+        auditTime: string
+        lumiBotToken: string
+        bytes: []u8
+    }
+
+    Pending :: struct {
+        id: Text
+        grant: Text
+        account: Text
+        app: Text
+        node: Text
+        audience: Text
+        expiresAt: s64
+        botID: s64
+        telegramID: s64
+        client: Text
+        signingKey: Text
+        encryptionKey: Text
+        challenge: Text
+        status: Text
+        scopes: Vec(GrantScope)
+    }
+
+    Operation :: (route: string) -> Action {
+        part := wire.TrimPrefix(route, "/api/v1/authorization/")
+        if part.count == route.count { return .Unknown }
+        if part == "requests" { return .Requests }
+        if part == "rendezvous" { return .Rendezvous }
+        if part == "cancel" { return .Cancel }
+        if part == "claim" { return .Claim }
+        if part == "approve" { return .Approve }
+        if part == "revoke" { return .Revoke }
+        if part == "challenge" { return .Challenge }
+        if part == "session" { return .Session }
+        return .Unknown
+    }
+
+    Error :: (context: Context, status: u32, message: string) -> s32 {
+        return replies.ErrorReply(context.connection, context.verb, status, message, context.configuration.zstdResponses)
+    }
+
+    Reply :: (context: Context, document: *json.JsonDocument, root: s32) -> s32 {
+        return replies.Reply(context.connection, context.verb, 200, document, root, context.configuration.zstdResponses)
+    }
+
+    TrueReply :: (context: Context) -> s32 {
+        document: json.JsonDocument
+        return Reply(context, *document, json.JsonNewBool(*document, true))
+    }
+
+    // Signed owner operations reserve their proof before the business mutation,
+    // matching the released owner endpoints' nonce behavior on subsequent errors.
+    AuthOwner :: (context: Context, app: string, requireSignature: bool) -> auth.BearerAuthentication {
+        database := context.environment.database
+        result := auth.Authenticate(database, context.connection, context.configuration.secret, context.environment.now, context.auditTime, false)
+        if result.status != 0 || !requireSignature { return result }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        defer authorization.Rollback(database)
+        proof := session.Header(context.connection, "X-Mesh-Tx", "X-Daochi-Tx")
+        verified := signed.VerifyTx(database, context.configuration.verify, proof, TextView(result.userID[:]), wire.TrimSpace(app),
+            context.verb, context.route, context.bytes, context.environment.now, context.auditTime)
+        if verified.databaseError != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        if verified.status != 0 { return .{status = verified.status, message = verified.message} }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return .{status = 500, message = "authentication failed"} }
+        return result
+    }
+
+    LoadPending :: (database: *void, id: string) -> Pending {
+        arguments: [1]sql.Argument = .[sql.TextArg(id)]
+        row := sql.Prepare(database, #string QUERY_END
+SELECT r.request_id,COALESCE(g.grant_id,''),r.account_id,r.app_id,r.node_id,r.audience,r.expires_at,r.bot_id,r.telegram_id,
+       r.client_id,r.signing_key,r.encryption_key,r.claim_nonce,r.status,r.scopes_json
+FROM server_authorization_requests r LEFT JOIN server_authorization_grants g ON g.request_id=r.request_id WHERE r.request_id=?1
+QUERY_END, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW { return .{} }
+        scopes: json.JsonDocument
+        if !json.JsonRead(*scopes, sql.ColumnText(row.value, 14)) || json.JsonKindOf(*scopes, scopes.root) != .Array { return .{} }
+        result: Pending = .{id = TextCopy(sql.ColumnText(row.value, 0)), grant = TextCopy(sql.ColumnText(row.value, 1)),
+            account = TextCopy(sql.ColumnText(row.value, 2)), app = TextCopy(sql.ColumnText(row.value, 3)),
+            node = TextCopy(sql.ColumnText(row.value, 4)), audience = TextCopy(sql.ColumnText(row.value, 5)),
+            expiresAt = sqlite.SqliteColumnInt64(row.value, 6), botID = sqlite.SqliteColumnInt64(row.value, 7),
+            telegramID = sqlite.SqliteColumnInt64(row.value, 8), client = TextCopy(sql.ColumnText(row.value, 9)),
+            signingKey = TextCopy(sql.ColumnText(row.value, 10)), encryptionKey = TextCopy(sql.ColumnText(row.value, 11)),
+            challenge = TextCopy(sql.ColumnText(row.value, 12)), status = TextCopy(sql.ColumnText(row.value, 13))}
+        if !authorization.ReadScopes(*scopes, scopes.root, *result.scopes, false) { return .{} }
+        return result
+    }
+
+    MatchNode :: (environment: session.Environment, pending: *Pending) -> bool {
+        return TextView(pending.node) == environment.node && TextView(pending.audience) == environment.audience
+    }
+
+    PendingReply :: (context: Context, pending: *Pending, owned: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        names: [7]string = .["request_id", "grant_id", "app_id", "node_id", "audience", "challenge", "status"]
+        values: [7]string = .[TextView(pending.id), TextView(pending.grant), TextView(pending.app), TextView(pending.node),
+            TextView(pending.audience), TextView(pending.challenge), TextView(pending.status)]
+        for name, index: names {
+            if !authorization.PutText(*document, root, name, values[index]) { return 0 }
+        }
+        if !authorization.PutInt(*document, root, "expires_at", pending.expiresAt) { return 0 }
+        if owned && (!authorization.PutText(*document, root, "account_id", TextView(pending.account)) ||
+            !authorization.PutInt(*document, root, "bot_id", pending.botID) || !authorization.PutInt(*document, root, "telegram_id", pending.telegramID) ||
+            !authorization.PutText(*document, root, "client_id", TextView(pending.client)) ||
+            !authorization.PutText(*document, root, "signing_key", TextView(pending.signingKey)) ||
+            !authorization.PutText(*document, root, "encryption_key", TextView(pending.encryptionKey)) ||
+            !json.JsonSet(*document, root, "scopes", authorization.ScopeJSON(*document, VecSlice(pending.scopes, 0, pending.scopes.count), false))) { return 0 }
+        return Reply(context, *document, root)
+    }
+
+    CreateRequest :: (context: Context, document: *json.JsonDocument) -> s32 {
+        names: [3]string = .["app_id", "telegram", "scopes"]
+        kinds: [3]json.JsonKind = .[.String, .True, .Array]
+        fields: [3]s32
+        if !authorization.ReadFields(document, document.root, names[:], kinds[:], fields[:]) { return Error(context, 400, "invalid authorization request") }
+        result: Pending = .{app = json.JsonString(document, fields[0])}
+        app := TextView(result.app)
+        if !authorization.ReadScopes(document, fields[2], *result.scopes, false) || !identity.ValidNamespace(app) || result.scopes.count < 1 { return Error(context, 400, "invalid authorization request") }
+        owner := AuthOwner(context, app, true)
+        if owner.status != 0 { return Error(context, owner.status, owner.message) }
+        database := context.environment.database
+        registered := scopeRules.Active(database, app, context.environment.now)
+        if registered.status != sqlite.SQLITE_OK || registered.error != "" { return Error(context, 403, "app unavailable") }
+        if !authorization.ScopesValid(VecSlice(result.scopes, 0, result.scopes.count), app, false) { return Error(context, 400, "invalid authorization scopes") }
+        requestID: [33]u8
+        challenge: [33]u8
+        if context.environment.node.count != 64 || !authorization.Nonce(requestID[:]) || !authorization.Nonce(challenge[:]) {
+            return Error(context, 503, "authorization unavailable")
+        }
+        result.id = TextCopy(TextView(requestID[:32]))
+        result.account = TextCopy(TextView(owner.userID[:]))
+        result.node = TextCopy(context.environment.node)
+        result.audience = TextCopy(context.environment.audience)
+        result.challenge = TextCopy(TextView(challenge[:32]))
+        result.expiresAt = context.environment.now + 600
+        result.status = TextCopy("pending")
+        if json.JsonKindOf(document, fields[1]) == .True {
+            result.botID = telegram.BotID(context.lumiBotToken)
+            account: [1]sql.Argument = .[sql.TextArg(TextView(result.account))]
+            linked := sql.ReadInteger(database, "SELECT telegram_id FROM server_lumi_telegram WHERE account_id=?1", account[:])
+            if result.botID == 0 || linked.status != sqlite.SQLITE_OK || linked.value <= 0 {
+                return Error(context, 409, "connect this Telegram chat before requesting Mini App access")
+            }
+            result.telegramID = linked.value
+        }
+        encoded: Vec(u8)
+        scopeDocument: json.JsonDocument
+        if !json.JsonWriteInto(*encoded, *scopeDocument, authorization.ScopeJSON(*scopeDocument, VecSlice(result.scopes, 0, result.scopes.count), false), json.JsonCompactStyle(false)) {
+            return Error(context, 503, "authorization unavailable")
+        }
+        arguments: [10]sql.Argument = .[sql.TextArg(TextView(result.id)), sql.TextArg(TextView(result.account)), sql.TextArg(app),
+            sql.TextArg(context.environment.node), sql.TextArg(context.environment.audience), sql.IntArg(result.expiresAt), sql.IntArg(result.botID),
+            sql.IntArg(result.telegramID), sql.TextArg(TextView(result.challenge)), sql.TextArg(TextView(VecSlice(encoded, 0, encoded.count)))]
+        if sql.Execute(database, "INSERT INTO server_authorization_requests(request_id,account_id,app_id,node_id,audience,expires_at,bot_id,telegram_id,claim_nonce,scopes_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", arguments[:]) != sqlite.SQLITE_OK {
+            return Error(context, 503, "authorization unavailable")
+        }
+        return PendingReply(context, *result, true)
+    }
+
+    ReadPending :: (context: Context, id: string, app: string, cancel: bool) -> s32 {
+        owner: auth.BearerAuthentication
+        owned := cancel || http.Header(context.connection, "Authorization") != ""
+        if owned {
+            owner = AuthOwner(context, app, cancel)
+            if owner.status != 0 { return Error(context, owner.status, owner.message) }
+        }
+        database := context.environment.database
+        if sqlite.SqliteExecText(database, ifx cancel then "BEGIN IMMEDIATE" else "BEGIN") != sqlite.SQLITE_OK {
+            return Error(context, 503, "rendezvous unavailable")
+        }
+        defer authorization.Rollback(database)
+        account := TextView(owner.userID[:])
+        if cancel {
+            args: [3]sql.Argument = .[sql.TextArg(id), sql.TextArg(account), sql.TextArg(app)]
+            if sql.Execute(database, "UPDATE server_authorization_requests SET status='cancelled' WHERE request_id=?1 AND account_id=?2 AND app_id=?3 AND status IN ('pending','claimed')", args[:]) != sqlite.SQLITE_OK {
+                return Error(context, 503, "rendezvous unavailable")
+            }
+            if sqlite.SqliteChanges(database) != 1 { return Error(context, 409, "rendezvous cannot be cancelled") }
+        }
+        pending := LoadPending(database, id)
+        if TextView(pending.status) == "" || !MatchNode(context.environment, *pending) ||
+            (!cancel && pending.expiresAt <= context.environment.now) || (TextView(pending.status) == "approved" && TextView(pending.grant) == "") {
+            return Error(context, 410, "rendezvous unavailable or expired")
+        }
+        if owned && account != TextView(pending.account) { return Error(context, 404, "owned rendezvous not found") }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return Error(context, 503, "rendezvous unavailable") }
+        return PendingReply(context, *pending, owned)
+    }
+
+    ConsumeEntry :: (database: *void, pending: *Pending, entry: string, client: string, key: string, encryption: string, now: s64, digest: []u8) -> bool {
+        args: [10]sql.Argument = .[sql.TextArg(entry), sql.TextArg(TextView(pending.account)), sql.IntArg(pending.botID), sql.IntArg(pending.telegramID),
+            sql.TextArg(client), sql.TextArg(key), sql.TextArg(encryption), sql.TextArg(TextView(pending.node)), sql.TextArg(TextView(pending.audience)), sql.IntArg(now)]
+        row := sql.Prepare(database, "SELECT init_digest FROM server_telegram_account_entries WHERE entry_id=?1", args[:1])
+        if row.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW { return false }
+        actual := sql.ColumnText(row.value, 0)
+        if !authorization.HexID(actual, 64) { return false }
+        for byte, index: actual { digest[index] = byte }
+        return sql.Execute(database, #string QUERY_END
+UPDATE server_telegram_account_entries SET status='consumed',consumed_at=?10
+WHERE entry_id=?1 AND account_id=?2 AND bot_id=?3 AND telegram_id=?4 AND client_id=?5 AND signing_key=?6 AND encryption_key=?7
+AND node_id=?8 AND audience=?9 AND expires_at>?10 AND app_id='inbe' AND status IN ('verified','bound') AND init_digest<>''
+AND EXISTS(SELECT 1 FROM server_lumi_telegram WHERE account_id=?2 AND telegram_id=?4)
+QUERY_END, args[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    Claim :: (context: Context, document: *json.JsonDocument) -> s32 {
+        names: [7]string = .["request_id", "client_id", "signing_key", "encryption_key", "init_data", "entry_id", "proof"]
+        kinds: [7]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String]
+        indices: [7]s32
+        if !authorization.ReadFields(document, document.root, names[:], kinds[:], indices[:]) { return Error(context, 400, "invalid delegate claim") }
+        values: Vec(Text)
+        for index: 0..6 {
+            if !VecPush(values, json.JsonString(document, indices[index])) { return Error(context, 503, "claim unavailable") }
+        }
+        id := TextView(values[0])
+        client := TextView(values[1])
+        key := TextView(values[2])
+        encryption := TextView(values[3])
+        initData := TextView(values[4])
+        entry := TextView(values[5])
+        if !authorization.HexID(id, 32) || !authorization.HexID(client, 64) || !authorization.HexID(key, 64) ||
+            !authorization.HexID(encryption, 2368) || (entry != "" && (!authorization.HexID(entry, 32) || initData != "")) {
+            return Error(context, 400, "invalid delegate claim")
+        }
+        database := context.environment.database
+        now := context.environment.now
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return Error(context, 503, "rendezvous unavailable") }
+        defer authorization.Rollback(database)
+        pending := LoadPending(database, id)
+        if TextView(pending.status) != "pending" || pending.expiresAt <= now || !MatchNode(context.environment, *pending) {
+            return Error(context, 409, "rendezvous expired, cancelled or already claimed")
+        }
+        digest: [64]u8
+        digestLength: s64 = 0
+        if pending.botID > 0 {
+            if entry != "" {
+                if !ConsumeEntry(database, *pending, entry, client, key, encryption, now, digest[:]) {
+                    return Error(context, 409, "verified Telegram entry does not match this request")
+                }
+            } else {
+                verified := telegram.Validate(initData, context.lumiBotToken, now)
+                if !verified.valid || verified.botID != pending.botID || verified.userID != pending.telegramID {
+                    return Error(context, 401, "verified Telegram sender required")
+                }
+                for index: 0..63 { digest[index] = verified.digest[index] }
+            }
+            digestLength = 64
+            if !authorization.TelegramBound(database, TextView(pending.account), pending.telegramID) { return Error(context, 409, "Telegram connection changed") }
+        } else if initData != "" || entry != "" {
+            return Error(context, 400, "unexpected Telegram claim")
+        }
+        digits: [24]u8
+        parts: [11]string = .["daochi-rendezvous-claim-v1", id, TextView(pending.app), TextView(pending.node), TextView(pending.audience),
+            TextView(pending.challenge), numbers.FormatInteger(pending.expiresAt, digits[:]), client, key, encryption, TextView(digest[:digestLength])]
+        message: Vec(u8)
+        if !authorization.AppendLines(*message, parts[:]) || !session.VerifyKeyProof(key, VecSlice(message, 0, message.count), TextView(values[6])) {
+            return Error(context, 401, "delegate claim proof rejected")
+        }
+        if TextView(digest[:digestLength]) != "" && entry == "" {
+            cutoff: [1]sql.Argument = .[sql.IntArg(now)]
+            replay: [3]sql.Argument = .[sql.TextArg(TextView(digest[:digestLength])), sql.TextArg(id), sql.IntArg(now + 300)]
+            global: [2]sql.Argument = .[replay[0], replay[2]]
+            if sql.Execute(database, "DELETE FROM server_telegram_init_claims WHERE expires_at<?1", cutoff[:]) != sqlite.SQLITE_OK ||
+                sql.Execute(database, "DELETE FROM server_telegram_init_replays WHERE expires_at<?1", cutoff[:]) != sqlite.SQLITE_OK ||
+                sql.Execute(database, "INSERT INTO server_telegram_init_replays(digest,expires_at) VALUES(?1,?2) ON CONFLICT(digest) DO NOTHING", global[:]) != sqlite.SQLITE_OK {
+                return Error(context, 503, "claim unavailable")
+            }
+            if sqlite.SqliteChanges(database) != 1 { return Error(context, 409, "Telegram initData already claimed") }
+            if sql.Execute(database, "INSERT INTO server_telegram_init_claims(digest,request_id,expires_at) VALUES(?1,?2,?3) ON CONFLICT(digest) DO NOTHING", replay[:]) != sqlite.SQLITE_OK {
+                return Error(context, 503, "claim unavailable")
+            }
+            if sqlite.SqliteChanges(database) != 1 { return Error(context, 409, "Telegram initData already claimed") }
+        }
+        args: [5]sql.Argument = .[sql.TextArg(id), sql.TextArg(client), sql.TextArg(key), sql.TextArg(encryption), sql.IntArg(now)]
+        if sql.Execute(database, "UPDATE server_authorization_requests SET status='claimed',client_id=?2,signing_key=?3,encryption_key=?4 WHERE request_id=?1 AND status='pending' AND expires_at>?5", args[:]) != sqlite.SQLITE_OK {
+            return Error(context, 503, "claim unavailable")
+        }
+        if sqlite.SqliteChanges(database) != 1 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return Error(context, 409, "claim unavailable") }
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        if !authorization.PutText(*response, root, "request_id", id) || !authorization.PutInt(*response, root, "bot_id", pending.botID) ||
+            !authorization.PutInt(*response, root, "telegram_id", pending.telegramID) || !authorization.PutText(*response, root, "init_digest", TextView(digest[:digestLength])) ||
+            !authorization.PutText(*response, root, "node_id", TextView(pending.node)) || !authorization.PutText(*response, root, "audience", TextView(pending.audience)) { return 0 }
+        return Reply(context, *response, root)
+    }
+
+    Approve :: (context: Context, document: *json.JsonDocument) -> s32 {
+        grant := authorization.ReadGrant(document)
+        if !grant.valid { return Error(context, 400, "invalid authorization grant") }
+        owner := AuthOwner(context, "", false)
+        if owner.status != 0 { return Error(context, owner.status, owner.message) }
+        database := context.environment.database
+        account := TextView(owner.userID[:])
+        env := context.environment
+        verified := authorization.VerifyGrant(database, context.configuration.verify, *grant, account, env.node, env.audience, env.now)
+        if verified.status != 0 { return Error(context, verified.status, verified.message) }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return Error(context, 503, "approval unavailable") }
+        defer authorization.Rollback(database)
+        request := TextView(grant.request)
+        claim: [2]sql.Argument = .[sql.TextArg(request), sql.IntArg(env.now)]
+        if sql.Execute(database, "UPDATE server_authorization_requests SET status='approved' WHERE request_id=?1 AND status='claimed' AND expires_at>?2", claim[:]) != sqlite.SQLITE_OK {
+            return Error(context, 503, "approval unavailable")
+        }
+        changed := sqlite.SqliteChanges(database)
+        pending := LoadPending(database, request)
+        if changed != 1 || TextView(pending.account) != account || TextView(pending.app) != TextView(grant.app) ||
+            !MatchNode(env, *pending) || TextView(pending.client) != TextView(grant.client) || TextView(pending.signingKey) != TextView(grant.signingKey) ||
+            TextView(pending.encryptionKey) != TextView(grant.encryptionKey) || pending.botID != grant.botID || pending.telegramID != grant.telegramID ||
+            pending.scopes.count != grant.scopes.count { return Error(context, 409, "approval does not match verified delegate request") }
+        for *expected, index: pending.scopes {
+            scope := *grant.scopes[index]
+            if TextView(expected.collection) != TextView(scope.collection) || expected.read != scope.read || expected.write != scope.write {
+                return Error(context, 403, "approval scope mismatch")
+            }
+        }
+        id := TextView(grant.id)
+        args: [10]sql.Argument = .[sql.TextArg(id), sql.TextArg(account), sql.TextArg(request), sql.TextArg(TextView(grant.app)),
+            sql.TextArg(env.node), sql.TextArg(env.audience), sql.IntArg(grant.notBefore), sql.IntArg(grant.expiresAt),
+            sql.TextArg(TextView(grant.nonce)), sql.TextArg(TextView(context.bytes))]
+        if sql.Execute(database, "INSERT INTO server_authorization_grants(grant_id,account_id,request_id,app_id,node_id,audience,not_before,expires_at,nonce,grant_json) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", args[:]) != sqlite.SQLITE_OK {
+            return Error(context, 409, "authorization grant already issued")
+        }
+        registration: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(grant.client))]
+        if sql.Execute(database, "INSERT INTO server_clients(user_id_hash,client_id,protocol_version) VALUES(?1,?2,6) ON CONFLICT(user_id_hash,client_id) DO UPDATE SET protocol_version=6", registration[:]) != sqlite.SQLITE_OK {
+            return Error(context, 503, "delegate client registration unavailable")
+        }
+        current := authorization.ActiveGrant(database, id, env.node, env.audience, env.now)
+        if current.failure.status != 0 { return Error(context, current.failure.status, current.failure.message) }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return Error(context, 503, "approval unavailable") }
+        return TrueReply(context)
+    }
+
+    Revoke :: (context: Context, id: string, app: string) -> s32 {
+        owner := AuthOwner(context, app, true)
+        if owner.status != 0 { return Error(context, owner.status, owner.message) }
+        database := context.environment.database
+        args: [4]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(owner.userID[:])), sql.TextArg(app), sql.IntArg(context.environment.now)]
+        if sql.Execute(database, "UPDATE server_authorization_grants SET revoked_at=CASE WHEN revoked_at=0 THEN ?4 ELSE revoked_at END WHERE grant_id=?1 AND account_id=?2 AND app_id=?3", args[:]) != sqlite.SQLITE_OK {
+            return Error(context, 503, "revocation unavailable")
+        }
+        if sqlite.SqliteChanges(database) != 1 { return Error(context, 404, "authorization grant not found") }
+        return TrueReply(context)
+    }
+
+    Issue :: (context: Context, id: string, challenge: string, proof: string, issueSession: bool) -> s32 {
+        database := context.environment.database
+        unavailable := ifx issueSession then "session unavailable" else "session challenge unavailable"
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return Error(context, 503, unavailable) }
+        defer authorization.Rollback(database)
+        response: json.JsonDocument
+        result: session.IssueResult
+        if issueSession {
+            result = session.IssueTx(context.environment, id, challenge, proof, *response)
+        } else {
+            result = session.ChallengeTx(context.environment, id, *response)
+        }
+        if result.failure.status != 0 { return Error(context, result.failure.status, result.failure.message) }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return Error(context, 503, unavailable) }
+        return Reply(context, *response, result.root)
+    }
+
+    InvalidBody :: (action: Action) -> string {
+        if action == .Requests { return "invalid authorization request" }
+        if action == .Claim { return "invalid delegate claim" }
+        if action == .Approve { return "invalid authorization grant" }
+        if action == .Revoke { return "invalid grant revocation" }
+        if action == .Challenge { return "invalid session challenge request" }
+        if action == .Session { return "invalid session request" }
+        return "invalid rendezvous"
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return Operation(route) != .Unknown }
+
+    ReadsBody :: (route: string, verb: string) -> bool { return verb == "POST" && Handles(route) }
+
+    BodyLimit :: (route: string) -> s64 {
+        action := Operation(route)
+        if action == .Requests { return 8192 }
+        if action == .Claim { return 24576 }
+        if action == .Approve { return 262144 }
+        if action == .Session { return 2048 }
+        return ifx action == .Unknown then 0 else 1024
+    }
+
+    Guard :: (state: *access.AccountAccess, connection: *void) -> bool {
+        ip := address.FromRequest(connection)
+        bucket: Vec(u8)
+        return BuilderAppend(bucket, "authorization:") && BuilderAppend(bucket, TextView(ip.bytes[:ip.count])) &&
+            limiting.Allow(*state.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 120, 60000, clock.MonotonicMilliseconds())
+    }
+
+    MethodNotAllowed :: (connection: *void) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Allow", value = "POST"}]
+        body: Text = TextCopy("Method Not Allowed\n")
+        return http.WriteWithHeaders(connection, 405, "text/plain; charset=utf-8", VecSlice(body.bytes, 0, body.bytes.count), headers[:])
+    }
+
+    // Return the decoded bytes because a delegate proof covers that representation.
+    Decode :: (connection: *void, raw: []u8, overflow: bool, maximum: s64, zstd: bool, scratch: *replies.Body) -> coding.DecodedBody {
+        if overflow || raw.count > maximum || maximum <= 0 { return .{error = "request body too large"} }
+        encoding: [limits.MaxHeaderBytes]u8
+        count := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if count < 0 { return .{error = "unsupported Content-Encoding"} }
+        value := wire.TrimSpace(TextView(encoding[:count]))
+        if value == "" || wire.MatchesToken(value, "identity") { return .{bytes = raw} }
+        if !VecResizeBounded(scratch.scratch, maximum, maximum) { return .{error = "could not decode request body"} }
+        return coding.Decode(raw, value, zstd, maximum, VecSlice(scratch.scratch, 0, maximum))
+    }
+
+    Handle :: (state: *access.AccountAccess, connection: *void, verb: string, route: string, raw: []u8, overflow: bool,
+        nodeID: string, audience: string, lumiBotToken: string) -> s32 {
+        action := Operation(route)
+        if action == .Unknown { return 0 }
+        if verb != "POST" { return MethodNotAllowed(connection) }
+        settings := state.configuration
+        context: Context = .{connection = connection, verb = verb, route = route, configuration = settings, lumiBotToken = lumiBotToken}
+        if !Guard(state, connection) { return Error(context, 429, "authorization rate limit exceeded") }
+        scratch: replies.Body
+        decoded := Decode(connection, raw, overflow, BodyLimit(route), settings.zstdRequests, *scratch)
+        body: json.JsonDocument
+        message := InvalidBody(action)
+        if decoded.error != "" || !json.JsonRead(*body, TextView(decoded.bytes)) { return Error(context, 400, message) }
+        context.bytes = decoded.bytes
+        milliseconds := calendar.UnixMilliseconds()
+        now := milliseconds / 1000
+        audit: [31]u8
+        length := format.UTC(.{seconds = now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, audit[:])
+        if length == 0 || !mutex.Lock(*state.databaseLock) { return Error(context, 503, "authorization unavailable") }
+        defer mutex.Unlock(*state.databaseLock)
+        context.auditTime = TextView(audit[:length])
+        context.environment = .{database = settings.database, now = now, node = nodeID, audience = audience}
+        if action == .Requests { return CreateRequest(context, *body) }
+        if action == .Claim { return Claim(context, *body) }
+        if action == .Approve { return Approve(context, *body) }
+        if action == .Session {
+            names: [3]string = .["grant_id", "challenge", "signature"]
+            kinds: [3]json.JsonKind = .[.String, .String, .String]
+            fields: [3]s32
+            if !authorization.ReadFields(*body, body.root, names[:], kinds[:], fields[:]) { return Error(context, 400, message) }
+            grant: Text = json.JsonString(*body, fields[0])
+            challenge: Text = json.JsonString(*body, fields[1])
+            proof: Text = json.JsonString(*body, fields[2])
+            if !authorization.HexID(TextView(grant), 32) || !authorization.HexID(TextView(challenge), 32) { return Error(context, 400, message) }
+            return Issue(context, TextView(grant), TextView(challenge), TextView(proof), true)
+        }
+        key := ifx action == .Rendezvous || action == .Cancel then "request_id" else "grant_id"
+        names: [2]string = .[key, "app_id"]
+        kinds: [2]json.JsonKind = .[.String, .String]
+        fields: [2]s32
+        if !authorization.ReadFields(*body, body.root, names[:], kinds[:], fields[:]) { return Error(context, 400, message) }
+        id: Text = json.JsonString(*body, fields[0])
+        app: Text = json.JsonString(*body, fields[1])
+        if !authorization.HexID(TextView(id), 32) { return Error(context, 400, message) }
+        if action == .Challenge { return Issue(context, TextView(id), "", "", false) }
+        if action == .Revoke { return Revoke(context, TextView(id), TextView(app)) }
+        return ReadPending(context, TextView(id), TextView(app), action == .Cancel)
+    }
+}

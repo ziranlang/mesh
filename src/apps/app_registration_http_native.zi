@@ -1,0 +1,137 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    registry :: #import "app_registry_native";
+    manifest :: #import "app_registration_fields_native";
+    proofs :: #import "app_manifest_proof_native";
+    app_network :: #import "app_network_native";
+    network :: #import "network_scope_native";
+    fields :: #import "sync_json_fields";
+    auth :: #import "http_auth_native";
+    storage :: #import "app_registry_write_native";
+    transport :: #import "http_server_native";
+    reply :: #import "http_json_native";
+    encoding :: #import "encoding_preferences";
+    coding :: #import "content_coding_native";
+    limits :: #import "server_limits";
+    calendar :: #import "std/date_time_linux";
+    text :: #import "std/text_tools";
+    wire :: #import "wire_text";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    sqlite :: #import "sqlite/SQLite";
+    #import "std/vec"
+
+    Authorization :: struct {
+        adminToken: string
+        approvalKey: []u8
+        nodeID: string
+        scope: *network.Scope
+    }
+
+    #scope_file
+    AppsRegistrationPath :: "/api/v1/apps";
+    AppRegistrationPrefix :: "/api/v1/apps/";
+    SignedRegistrationPath :: "/api/v1/apps/register-signed";
+    AppRegistrationFailure :: "app registration failed";
+
+    PlainError :: (connection: *void, status: u32, problem: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "error", json.JsonNewString(*document, problem)) { return 0 }
+        headers: []transport.HeaderValue
+        return reply.ReplyWithHeaders(connection, status, *document, root, headers)
+    }
+
+    #scope_export
+    Handles :: (path: string, method: string) -> bool {
+        if method == "POST" { return path == AppsRegistrationPath || path == SignedRegistrationPath }
+        return method == "PUT" && text.TextHasPrefix(path, AppRegistrationPrefix) &&
+            !text.TextHasSuffix(path, "/collections")
+    }
+
+    Register :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string, authorization: Authorization,
+        body: []u8, overflow: bool) -> s32 {
+        signed := method == "POST" && path == SignedRegistrationPath
+        if !signed {
+            admin := authorization.adminToken
+            if admin == "" { return PlainError(connection, 403, "admin registration disabled") }
+            if !auth.AdminMatches(connection, admin) { return PlainError(connection, 401, "admin token required") }
+        }
+        settings := access.configuration
+        limit := settings.maximumBodyBytes
+        if overflow || body.count > limit { return PlainError(connection, 400, "request body too large") }
+        header: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Content-Encoding", header[:])
+        if count < 0 { return PlainError(connection, 400, "unsupported content encoding") }
+        contentEncoding := TextView(header[:count])
+        scratch: Vec(u8)
+        decodedBody := body
+        if encoding.Request(contentEncoding) != .Identity {
+            if !VecResizeBounded(scratch, limit, limit) { return PlainError(connection, 503, AppRegistrationFailure) }
+            decoded := coding.Decode(body, contentEncoding, settings.zstdRequests, limit, VecSlice(scratch, 0, limit))
+            if decoded.error != "" { return PlainError(connection, 400, decoded.error) }
+            decodedBody = decoded.bytes
+        }
+        document: json.JsonDocument
+        source: json.JsonDocument
+        if !json.JsonRead(*source, TextView(decodedBody)) { return PlainError(connection, 400, "invalid json") }
+        input := source.root
+        proofNodes: [3]s32 = .[-1, -1, -1]
+        if signed {
+            names: [3]string = .["manifest", "manifest_signature", "approval_signature"]
+            kinds: [3]json.JsonKind = .[.Object, .String, .String]
+            if !fields.Read(*source, input, names[:], kinds[:], proofNodes[:]) { return PlainError(connection, 400, "invalid json") }
+            input = proofNodes[0]
+        }
+        root := json.JsonNewObject(*document)
+        now := calendar.UnixMilliseconds() / 1000
+        problem := manifest.Read(*source, input, *document, root, now, signed)
+        if problem != "" { return PlainError(connection, 400, problem) }
+        idText: Text = json.JsonString(*document, json.JsonMember(*document, root, "app_id"))
+        id := TextView(idText)
+        canonical: Vec(u8)
+        hash: [65]u8
+        signatureText: Text = json.JsonString(*source, proofNodes[1])
+        approvalText: Text = json.JsonString(*source, proofNodes[2])
+        signature := wire.TrimSpace(TextView(signatureText))
+        approval := wire.TrimSpace(TextView(approvalText))
+        if signed {
+            nodeText: Text = json.JsonString(*document, json.JsonMember(*document, root, "registration_node_id"))
+            node := TextView(nodeText)
+            if !app_network.Allowed(authorization.scope, *document, root) || (node != "" && node != authorization.nodeID) {
+                return PlainError(connection, 403, "app manifest is restricted to its local node and LAN")
+            }
+            verified := proofs.Verify(*document, root, id, signature, approval, authorization.approvalKey, now, *canonical, hash[:])
+            if verified.status != 0 { return PlainError(connection, verified.status, verified.problem) }
+        } else if path != AppsRegistrationPath {
+            start := AppRegistrationPrefix.count
+            end := path.count
+            while start < end && path[start] == #char "/" { start += 1 }
+            while end > start && path[end - 1] == #char "/" { end -= 1 }
+            pathID := path[start:end]
+            if pathID != "" && pathID != id { return PlainError(connection, 400, "app_id path mismatch") }
+        }
+        if !mutex.Lock(*access.databaseLock) { return PlainError(connection, 500, AppRegistrationFailure) }
+        defer mutex.Unlock(*access.databaseLock)
+        database := settings.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return PlainError(connection, 500, AppRegistrationFailure)
+        }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        stored: s32
+        if signed {
+            result := storage.UpsertSigned(database, *document, root, id, TextView(VecSlice(canonical, 0, canonical.count)),
+                TextView(hash[:64]), signature, approval)
+            if result.outdated { return PlainError(connection, 409, "app manifest is older than the installed manifest") }
+            stored = result.status
+        } else {
+            stored = storage.Upsert(database, *document, root, id)
+        }
+        if stored != sqlite.SQLITE_OK || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return PlainError(connection, 500, AppRegistrationFailure)
+        }
+        return registry.Details(database, connection, id, false)
+    }
+}

@@ -1,14 +1,8 @@
 #import "identity"
 #import "protocol"
-
-go_strings :: #system_library "go:strings";
-TrimSpace :: (value: string) -> string #foreign go_strings "TrimSpace";
-TrimSuffix :: (value: string, suffix: string) -> string #foreign go_strings "TrimSuffix";
-HasSuffix :: (value: string, suffix: string) -> bool #foreign go_strings "HasSuffix";
-HasPrefix :: (value: string, prefix: string) -> bool #foreign go_strings "HasPrefix";
-Split :: (value: string, separator: string) -> []string #foreign go_strings "Split";
-ReplaceAll :: (value: string, old: string, replacement: string) -> string #foreign go_strings "ReplaceAll";
-Join :: (values: []string, separator: string) -> string #foreign go_strings "Join";
+#import "std/vec"
+text :: #import "std/text_tools";
+wire_text :: #import "wire_text";
 
 ValidAppVisibility :: (value: string) -> bool {
     return value == "private" || value == "shared" || value == "friends" || value == "public"
@@ -23,51 +17,55 @@ ValidTokenPolicyPermission :: (value: string) -> bool {
 }
 
 ValidCollectionPrefix :: (input: string) -> bool {
-    value: string = TrimSpace(input)
+    value := wire_text.TrimSpace(input)
     if value == "" {
         return false
     }
     if ValidLegacyEncryptedCollection(value) {
         return true
     }
-    if HasSuffix(value, ".*") {
-        return ValidCollectionPrefixWildcardBase(TrimSuffix(value, ".*"))
+    if text.TextHasSuffix(value, ".*") {
+        return ValidCollectionPrefixWildcardBase(value[:value.count - 2])
     }
     return ValidEncryptedHierarchyCollection(value)
 }
 
 ValidCollectionPrefixWildcardBase :: (value: string) -> bool {
-    parts: []string = Split(TrimSpace(value), ".")
-    if parts.count == 2 && parts[0] == "account" {
-        return ValidVersionSegment(parts[1])
+    visibility := wire_text.Cut(wire_text.TrimSpace(value), #char ".")
+    if !visibility.found {
+        return false
     }
-    if parts.count >= 3 && ValidAppVisibility(parts[0]) {
-        if !ValidNamespaceSegment(parts[1]) || !ValidVersionSegment(parts[2]) {
+    if visibility.before == "account" {
+        return ValidVersionSegment(visibility.after)
+    }
+    app := wire_text.Cut(visibility.after, #char ".")
+    version := wire_text.Cut(app.after, #char ".")
+    if !ValidAppVisibility(visibility.before) || !app.found ||
+        !ValidNamespaceSegment(app.before) || !ValidVersionSegment(version.before) {
+        return false
+    }
+    remaining := version
+    while remaining.found {
+        remaining = wire_text.Cut(remaining.after, #char ".")
+        if !ValidNamespaceSegment(remaining.before) {
             return false
         }
-        index: s64 = 3
-        while index < parts.count {
-            if !ValidNamespaceSegment(parts[index]) {
-                return false
-            }
-            index += 1
-        }
-        return true
     }
-    return false
+    return true
 }
 
 // The app whose data a collection holds: the app segment of a namespaced
 // collection, Inbe for its released v4 names, or "" for account-wide and older
 // names that no app scope claims.
 CollectionOwnerApp :: (collection: string) -> string {
-    value: string = TrimSpace(collection)
+    value := wire_text.TrimSpace(collection)
     if ValidLegacyEncryptedCollection(value) {
         return "inbe"
     }
-    parts: []string = Split(value, ".")
-    if parts.count >= 3 && ValidAppVisibility(parts[0]) {
-        return parts[1]
+    visibility := wire_text.Cut(value, #char ".")
+    app := wire_text.Cut(visibility.after, #char ".")
+    if app.found && ValidAppVisibility(visibility.before) {
+        return app.before
     }
     return ""
 }
@@ -77,11 +75,13 @@ AppOwnsDeclaredScope :: (appID: string, collection: AppCollection) -> bool {
     if appID == "inbe" && ValidLegacyEncryptedCollection(collection.CollectionPrefix) {
         return collection.Visibility == "private"
     }
-    parts: []string = Split(TrimSuffix(collection.CollectionPrefix, ".*"), ".")
-    if parts.count < 3 || parts[1] != appID {
-        return false
+    prefix := collection.CollectionPrefix
+    if text.TextHasSuffix(prefix, ".*") {
+        prefix = prefix[:prefix.count - 2]
     }
-    return parts[0] == collection.Visibility
+    visibility := wire_text.Cut(prefix, #char ".")
+    app := wire_text.Cut(visibility.after, #char ".")
+    return app.found && app.before == appID && visibility.before == collection.Visibility
 }
 
 DeclaresCollection :: (collections: []AppCollection, prefix: string) -> bool {
@@ -99,17 +99,30 @@ CollectionMatchesPrefix :: (collection: string, prefix: string) -> bool {
     if collection == prefix {
         return true
     }
-    if HasSuffix(prefix, ".*") {
-        return HasPrefix(collection, TrimSuffix(prefix, "*"))
+    if text.TextHasSuffix(prefix, ".*") {
+        return text.TextHasPrefix(collection, prefix[:prefix.count - 1])
     }
     return false
 }
 
-LikePatternForCollectionPrefix :: (prefix: string) -> string {
-    base: string = TrimSuffix(prefix, ".*")
-    base = ReplaceAll(base, "\\", "\\\\")
-    base = ReplaceAll(base, "%", "\\%")
-    base = ReplaceAll(base, "_", "\\_")
-    parts: [2]string = .[base, ".%"]
-    return Join(parts[:], "")
+LikePatternForCollectionPrefix :: (prefix: string) -> Vec(u8) {
+    base := prefix
+    if text.TextHasSuffix(base, ".*") {
+        base = base[:base.count - 2]
+    }
+    pattern: Vec(u8)
+    for byte: base {
+        if byte == #char "\\" || byte == #char "%" || byte == #char "_" {
+            if !VecPush(pattern, #char "\\") {
+                return .{}
+            }
+        }
+        if !VecPush(pattern, byte) {
+            return .{}
+        }
+    }
+    if !VecPush(pattern, #char ".") || !VecPush(pattern, #char "%") {
+        return .{}
+    }
+    return pattern
 }

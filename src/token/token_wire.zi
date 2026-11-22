@@ -1,0 +1,52 @@
+binary :: #import "binary_codec";
+wire_text :: #import "wire_text";
+constant_time :: #import "std/constant_time";
+#import "std/vec"
+
+Digest :: #type (key: []u8, payload: string, tag: []u8) -> bool;
+
+Sign :: (secret: []u8, payload: string, digest: Digest) -> binary.BinaryBytes {
+    tag: [32]u8
+    if !digest(secret, payload, tag[:]) {
+        return .{error = "digest allocation failed"}
+    }
+    encodedPayload := binary.EncodeBase64(payload, true, false)
+    encodedTag := binary.EncodeBase64(TextView(tag[:]), true, false)
+    if encodedPayload.error != "" || encodedTag.error != "" {
+        return .{error = "token allocation failed"}
+    }
+    parts := encodedPayload.value
+    signature := encodedTag.value
+    output: Vec(u8)
+    if !BuilderAppend(output, TextView(VecSlice(parts, 0, parts.count))) || !BuilderAppend(output, ".") ||
+        !BuilderAppend(output, TextView(VecSlice(signature, 0, signature.count))) {
+        return .{error = "token allocation failed"}
+    }
+    return .{value = output}
+}
+
+// The caller owns the verified payload and may parse it while retaining it.
+Verify :: (secret: []u8, token: string, digest: Digest) -> binary.BinaryBytes {
+    parts := wire_text.Cut(token, #char ".")
+    if !parts.found || wire_text.Cut(parts.after, #char ".").found || secret.count == 0 {
+        return .{error = "invalid token"}
+    }
+    payload := binary.DecodeBase64(parts.before, true, false)
+    if payload.error != "" {
+        return .{error = "invalid token payload"}
+    }
+    signature := binary.DecodeBase64(parts.after, true, false)
+    if signature.error != "" {
+        return .{error = "invalid token signature"}
+    }
+    value := payload.value
+    tag: [32]u8
+    if !digest(secret, TextView(VecSlice(value, 0, value.count)), tag[:]) {
+        return .{error = "digest allocation failed"}
+    }
+    expected := signature.value
+    if !constant_time.ConstantTimeEqual(VecSlice(expected, 0, expected.count), tag[:]) {
+        return .{error = "invalid token signature"}
+    }
+    return .{value = value}
+}

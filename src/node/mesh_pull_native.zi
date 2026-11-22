@@ -1,0 +1,348 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    app_network :: #import "app_network_native";
+    auth :: #import "node_auth_native";
+    binary :: #import "binary_codec";
+    calendar :: #import "std/date_time_linux";
+    canonical :: #import "canonical_json_native";
+    cursors :: #import "mesh_cursor_native";
+    fields :: #import "sync_json_fields";
+    http :: #import "peer_http_native";
+    imports :: #import "mesh_import_native";
+    json :: #import "std/json_document";
+    keys :: #import "device_signature_native";
+    mutex :: #import "std/mutex_linux";
+    network :: #import "network_scope_native";
+    node :: #import "node_identity_native";
+    numbers :: #import "std/number_text";
+    policy :: #import "mesh_policy_native";
+    proof :: #import "pairing_proof_native";
+    schema :: #import "trust_schema";
+    settings :: #import "mesh_peer_settings_native";
+    sha :: #import "crypto/sha256";
+    sockets :: #import "std/socket_linux";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    stdio :: #import "std/stdio";
+    thread :: #import "std/thread_linux";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Configuration :: struct {
+        access: *accounts.AccountAccess
+        scope: *network.Scope
+        local: *node.Identity
+        approvalKey: []u8
+        configured: *json.JsonDocument
+        token: string
+        batch: s64
+        interval: s64
+    }
+
+    Worker :: struct {
+        configuration: Configuration
+        thread: thread.Thread
+        stopFD: s32
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (fds: *sockets.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+
+    ExportPath :: "/api/v1/node/mesh/export";
+    MaxPages :: 64;
+    ResponseLimit :: 268435456;
+    WakeFlags :: 0x80800; // EFD_CLOEXEC | EFD_NONBLOCK
+
+    Peer :: struct {
+        id: Text
+        address: Text
+        filter: Text
+        failed: bool
+    }
+
+    SavedCursor :: struct {
+        text: Text
+        valid: bool
+    }
+
+    Page :: struct {
+        more: bool
+        error: string
+    }
+
+    WaitForStop :: (worker: *Worker, milliseconds: s32) -> bool {
+        descriptor: sockets.LinuxPollFd = .{fd = worker.stopFD, events = 1}
+        return Poll(*descriptor, 1, milliseconds) != 0
+    }
+
+    Stopping :: (context: *void) -> bool { return WaitForStop(cast(*Worker)context, 0) }
+
+    WaitInterval :: (worker: *Worker) -> bool {
+        remaining := worker.configuration.interval
+        while remaining > 0 {
+            chunk := ifx remaining > 2147483 then 2147483 else remaining
+            if WaitForStop(worker, cast(s32)(chunk * 1000)) { return false }
+            remaining -= chunk
+        }
+        return true
+    }
+
+    NextPaired :: (access: *accounts.AccountAccess, after: string) -> Peer {
+        if !mutex.Lock(*access.databaseLock) { return .{failed = true} }
+        defer mutex.Unlock(*access.databaseLock)
+        arguments: [1]sql.Argument = .[sql.TextArg(after)]
+        row := sql.Prepare(access.configuration.database, schema.NextPairedPeerQuery, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return .{failed = true} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{failed = true} }
+        addresses: json.JsonDocument
+        id: Text = TextCopy(sql.ColumnText(row.value, 0))
+        if !json.JsonRead(*addresses, sql.ColumnText(row.value, 1)) { return .{id = id} }
+        address: Text = json.JsonString(*addresses, json.JsonFirst(*addresses, addresses.root))
+        return .{id = id, address = address, filter = TextCopy(sql.ColumnText(row.value, 2))}
+    }
+
+    ReadCursor :: (access: *accounts.AccountAccess, key: string) -> SavedCursor {
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        arguments: [1]sql.Argument = .[sql.TextArg(key)]
+        row := sql.Prepare(access.configuration.database, schema.LoadCursorSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{valid = true} }
+        if status != sqlite.SQLITE_ROW { return .{} }
+        return .{text = TextCopy(sql.ColumnText(row.value, 0)), valid = true}
+    }
+
+    CursorKey :: (filter: *json.JsonDocument, root: s32, address: string, output: []u8) -> bool {
+        input: Vec(u8)
+        encoded: Vec(u8)
+        if !canonical.Encode(filter, root, *encoded) || !BuilderAppend(input, address) ||
+            !VecPush(input, cast(u8)0) || !BuilderAppend(input, TextView(VecSlice(encoded, 0, encoded.count))) { return false }
+        hash := sha.Sha256Of(TextView(VecSlice(input, 0, input.count)))
+        return sha.BytesToHex(*hash[0], hash.count, *output[0], output.count) == 1
+    }
+
+    RequestBytes :: (filters: *json.JsonDocument, filter: s32, current: string, maximum: s64, data: *Vec(u8)) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        limit := maximum
+        if limit <= 0 { limit = 500 }
+        if limit > 2000 { limit = 2000 }
+        return (current == "" || fields.SetString(*document, root, "cursor", current)) &&
+            json.JsonSet(*document, root, "limit", json.JsonNewInteger(*document, limit)) &&
+            json.JsonSet(*document, root, "policy", json.JsonCopy(*document, filters, filter)) &&
+            json.JsonWriteInto(data, *document, root, json.JsonCompactStyle(false))
+    }
+
+    RequestPage :: (worker: *Worker, address: string, remote: string, body: []u8, received: *http.Response) -> bool {
+        configuration := worker.configuration
+        if remote == "" {
+            if configuration.scope.lanOnly || wire.TrimSpace(configuration.token) == "" { return false }
+            token: Vec(u8)
+            if !BuilderAppend(token, "Bearer ") || !BuilderAppend(token, configuration.token) { return false }
+            headers: [1]transport.HeaderValue = .[.{name = "Authorization", value = TextView(VecSlice(token, 0, token.count))}]
+            options: http.Options = .{timeout = 20, maximum = ResponseLimit, stopping = Stopping,
+                context = cast(*void)worker, headers = headers[:]}
+            return http.Request(configuration.scope, address, ExportPath, body, options, received)
+        }
+        path: Text = http.TargetPath(address, ExportPath)
+        if TextView(path) == "" { return false }
+        stamp: [24]u8
+        timestamp := numbers.FormatInteger(calendar.UnixMilliseconds() / 1000, stamp[:])
+        nonce: [33]u8
+        if !proof.RandomHex(nonce[:]) { return false }
+        identity := TextView(configuration.local.id[:64])
+        message: Vec(u8)
+        signature: [64]u8
+        if !auth.RequestMessage(identity, timestamp, TextView(nonce[:32]), TextView(path), body, *message) ||
+            !keys.Sign(configuration.local.seed[:], VecSlice(message, 0, message.count), signature[:]) { return false }
+        encoded := binary.EncodeBase64(TextView(signature[:]), true, false)
+        if encoded.error != "" { return false }
+        headers: [4]transport.HeaderValue = .[.{name = "X-Mesh-Node-ID", value = identity},
+            .{name = "X-Mesh-Node-Nonce", value = TextView(nonce[:32])},
+            .{name = "X-Mesh-Node-Time", value = timestamp},
+            .{name = "X-Mesh-Node-Signature", value = TextView(VecSlice(encoded.value, 0, encoded.value.count))}]
+        options: http.Options = .{timeout = 20, maximum = ResponseLimit, stopping = Stopping,
+            context = cast(*void)worker, headers = headers[:]}
+        return http.Request(configuration.scope, address, ExportPath, body, options, received)
+    }
+
+    LastSequence :: (input: *json.JsonDocument, list: s32) -> s64 {
+        maximum: s64 = 0
+        item := json.JsonFirst(input, list)
+        while item >= 0 {
+            sequence := fields.Number(input, json.JsonMember(input, item, "mesh_version"))
+            if sequence > maximum { maximum = sequence }
+            item = json.JsonNext(input, item)
+        }
+        return maximum
+    }
+
+    ApplyPage :: (configuration: Configuration, remote: string, key: string, cursor: string,
+        filters: *json.JsonDocument, filter: s32, input: *json.JsonDocument, batch: imports.Batch) -> string {
+        access := configuration.access
+        if !mutex.Lock(*access.databaseLock) { return "peer database unavailable" }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if remote != "" {
+            allowed := auth.CheckPolicy(database, remote, filters, filter, false)
+            if allowed.status != 0 { return allowed.error }
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return "could not start mesh peer import" }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        written := imports.ApplyTx(access.configuration, configuration.scope, configuration.approvalKey,
+            filters, filter, input, batch, calendar.UnixMilliseconds())
+        if written.status != 0 { return written.error }
+        if cursor != "" {
+            arguments: [2]sql.Argument = .[sql.TextArg(key), sql.TextArg(cursor)]
+            if sql.Execute(database, schema.SaveCursorSQL, arguments[:]) != sqlite.SQLITE_OK { return "could not save mesh peer cursor" }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return "could not commit mesh peer import" }
+        return ""
+    }
+
+    NetworkAllowed :: (configuration: Configuration) -> bool {
+        access := configuration.access
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        return app_network.StoredAllowed(configuration.scope, access.configuration.database) == ""
+    }
+
+    Fetch :: (worker: *Worker, address: string, remote: string, key: string,
+        filters: *json.JsonDocument, filter: s32) -> Page {
+        configuration := worker.configuration
+        saved := ReadCursor(configuration.access, key)
+        if !saved.valid { return .{error = "could not load mesh peer cursor"} }
+        current := TextView(saved.text)
+        previous := cursors.Decode(current)
+        if !previous.valid { return .{error = "invalid saved mesh peer cursor"} }
+        body: Vec(u8)
+        if !RequestBytes(filters, filter, current, configuration.batch, *body) { return .{error = "could not encode mesh peer request"} }
+        response: http.Response
+        if !RequestPage(worker, address, remote, VecSlice(body, 0, body.count), *response) || response.status != 200 {
+            return .{error = "mesh peer export request failed"}
+        }
+        if Stopping(cast(*void)worker) { return .{} }
+        input: json.JsonDocument
+        headers: [3]string = .["status", "next_cursor", "truncated"]
+        kinds: [3]json.JsonKind = .[.String, .String, .True]
+        nodes: [3]s32
+        if !json.JsonRead(*input, TextView(VecSlice(response.bytes, 0, response.bytes.count))) ||
+            !fields.Read(*input, input.root, headers[:], kinds[:], nodes[:]) { return .{error = "invalid mesh peer response"} }
+        status: Text = json.JsonString(*input, nodes[0])
+        batch := imports.Read(*input, input.root)
+        if !batch.valid || TextView(status) != "ok" { return .{error = "invalid mesh peer response"} }
+        if batch.count == 0 && json.JsonCount(*input, batch.spaces) == 0 { return .{} }
+        next: Text = json.JsonString(*input, nodes[1])
+        more := json.JsonKindOf(*input, nodes[2]) == .True
+        if TextView(next) != "" {
+            decoded := cursors.Decode(TextView(next))
+            if !decoded.valid || decoded.sequence <= previous.sequence { return .{error = "mesh peer cursor did not advance"} }
+        } else {
+            if more { return .{error = "mesh peer omitted its next cursor"} }
+            upsert := LastSequence(*input, batch.records)
+            removed := LastSequence(*input, batch.deletions)
+            sequence := ifx upsert > removed then upsert else removed
+            if sequence > previous.sequence {
+                fallback: Text = cursors.Encode(sequence)
+                if TextView(fallback) == "" { return .{error = "could not encode mesh peer cursor"} }
+                return .{error = ApplyPage(configuration, remote, key, TextView(fallback), filters, filter, *input, batch)}
+            }
+        }
+        problem := ApplyPage(configuration, remote, key, TextView(next), filters, filter, *input, batch)
+        return .{more = more, error = problem}
+    }
+
+    Pull :: (worker: *Worker, address: string, remote: string, source: *json.JsonDocument, root: s32) {
+        filters: json.JsonDocument
+        filter := policy.Policy(*filters, source, root)
+        if filter < 0 || !policy.ValidInbound(*filters, filter) { return }
+        direction: Text = fields.StringField(*filters, filter, "direction")
+        mode := policy.Direction(TextView(direction))
+        if mode != "pull" && mode != "bidirectional" { return }
+        if !NetworkAllowed(worker.configuration) { return }
+        key: [65]u8
+        if !CursorKey(*filters, filter, address, key[:]) { return }
+        for page: 1..MaxPages {
+            unused page
+            if Stopping(cast(*void)worker) { return }
+            result := Fetch(worker, address, remote, TextView(key[:64]), *filters, filter)
+            if result.error != "" && !Stopping(cast(*void)worker) {
+                unused stdio.PrintError(result.error)
+                unused stdio.PrintError("\n")
+            }
+            if result.error != "" || !result.more { return }
+        }
+    }
+
+    Round :: (worker: *Worker) {
+        configuration := worker.configuration
+        if !configuration.scope.lanOnly && configuration.configured != null {
+            peers := configuration.configured
+            peer := json.JsonFirst(peers, peers.root)
+            while peer >= 0 && !Stopping(cast(*void)worker) {
+                filters := json.JsonMember(peers, peer, "sync")
+                if filters >= 0 {
+                    address: Text = fields.StringField(peers, peer, "url")
+                    Pull(worker, TextView(address), "", peers, filters)
+                }
+                peer = json.JsonNext(peers, peer)
+            }
+        }
+        after: Vec(u8)
+        while !Stopping(cast(*void)worker) {
+            peer := NextPaired(configuration.access, TextView(VecSlice(after, 0, after.count)))
+            if peer.failed {
+                unused stdio.PrintError("could not list mesh peers\n")
+                return
+            }
+            id := TextView(peer.id)
+            if id == "" { return }
+            filters: json.JsonDocument
+            address := settings.TrimAddress(TextView(peer.address))
+            if address != "" && id != TextView(configuration.local.id[:64]) &&
+                json.JsonRead(*filters, TextView(peer.filter)) {
+                Pull(worker, address, id, *filters, filters.root)
+            }
+            VecClear(after)
+            if !BuilderAppend(after, id) { return }
+        }
+    }
+
+    Run :: (context: *void) {
+        worker := cast(*Worker)context
+        while !Stopping(context) {
+            Round(worker)
+            if !WaitInterval(worker) { return }
+        }
+    }
+
+    #scope_export
+    Start :: (worker: *Worker, configuration: Configuration) -> bool {
+        if configuration.interval <= 0 { return true }
+        worker.configuration = configuration
+        worker.stopFD = EventFD(0, WakeFlags)
+        if worker.stopFD < 0 { return false }
+        if thread.ThreadStart(*worker.thread, Run, cast(*void)worker) { return true }
+        unused CloseFD(worker.stopFD)
+        return false
+    }
+
+    Stop :: (worker: *Worker) {
+        if !thread.ThreadRunning(*worker.thread) { return }
+        unused Signal(worker.stopFD, 1)
+        thread.ThreadWait(*worker.thread)
+        unused CloseFD(worker.stopFD)
+    }
+}

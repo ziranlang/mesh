@@ -1,0 +1,5 @@
+HeaderTimeoutMilliseconds :: 5000;
+ReadTimeoutMilliseconds :: 15000;
+WriteTimeoutMilliseconds :: 15000;
+IdleTimeoutMilliseconds :: 60000;
+MaxHeaderBytes :: 65536;

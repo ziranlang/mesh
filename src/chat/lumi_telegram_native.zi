@@ -1,0 +1,697 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    chat :: #import "chat_http_native";
+    coding :: #import "encoding_preferences";
+    commands :: #import "lumi_commands_native";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    group :: #import "lumi_group_native";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    limits :: #import "server_limits";
+    mutex :: #import "std/mutex_linux";
+    proof :: #import "pairing_proof_native";
+    replies :: #import "http_json_native";
+    store :: #import "lumi_telegram_store_native";
+    telegram :: #import "telegram_transport_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    MenuHandler :: #type (access: *accounts.AccountAccess, connection: *void, bot: telegram.Configuration,
+        canvas: string, sender: s64, requestID: string, node: string, audience: string) -> bool;
+
+    PaymentResponse :: struct {
+        handled: bool
+        queued: s32
+    }
+
+    PaymentHandler :: #type (context: *void, access: *accounts.AccountAccess, connection: *void, bot: telegram.Configuration,
+        update: *json.JsonDocument) -> PaymentResponse;
+
+    Configuration :: struct {
+        bot: telegram.Configuration
+        webhookSecret: string
+        ownerID: string
+        canvasURL: string
+        groupID: s64
+        chatSettings: chat.Configuration
+        accountsEnabled: bool
+        entryMenu: MenuHandler
+        entryNode: string
+        entryAudience: string
+        payment: PaymentHandler
+        paymentContext: *void
+    }
+
+    DefaultCanvasURL :: "https://inbe.waozi.xyz/build/telegram/index.html";
+    PruneIntervalSeconds :: 3600;
+
+    #scope_file
+    LinkRoute :: "/api/v1/lumi/telegram/link";
+    UpdatesRoute :: "/api/v1/lumi/telegram/updates";
+    AckRoute :: "/api/v1/lumi/telegram/ack";
+    MessagesRoute :: "/api/v1/lumi/telegram/messages";
+    WebhookRoute :: "/api/v1/lumi/telegram/webhook";
+    Unavailable :: "Lumi Telegram unavailable";
+    StartLink :: "https://t.me/inlumi_bot?start=";
+
+    Request :: struct {
+        access: *accounts.AccountAccess
+        connection: *void
+        configuration: Configuration
+        account: [64]u8
+        route: string
+        verb: string
+        now: s64
+    }
+
+    Message :: struct {
+        sender: s64
+        senderBot: bool
+        chat: s64
+        chatType: Text
+        text: Text
+        original: s64
+        thread: s64
+        replyBot: s64
+        valid: bool
+    }
+
+    Update :: struct {
+        id: s64
+        message: Message
+        callbackID: Text
+        callbackData: Text
+        valid: bool
+    }
+
+    Error :: (request: Request, status: u32, reason: string) -> s32 {
+        return replies.ErrorReply(request.connection, request.verb, status, reason, request.access.configuration.zstdResponses)
+    }
+
+    Reply :: (request: Request, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        if root < 0 {
+            return Error(request, 503, Unavailable)
+        }
+        return replies.Reply(request.connection, request.verb, status, document, root, request.access.configuration.zstdResponses)
+    }
+
+    Accepted :: (request: Request, status: u32 = 200) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewBool(*document, true)
+        return Reply(request, status, *document, root)
+    }
+
+    Authenticate :: (request: Request, milliseconds: s64) -> auth.BearerAuthentication {
+        audit: [32]u8
+        count := format.UTC(.{seconds = request.now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, audit[:])
+        access := request.access
+        if milliseconds < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
+            return .{status = 500, message = "authentication failed"}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        settings := access.configuration
+        return auth.Authenticate(settings.database, request.connection, settings.secret, request.now, TextView(audit[:count]), false)
+    }
+
+    Ready :: (access: *accounts.AccountAccess) -> bool {
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Ensure(access.configuration.database)
+    }
+
+    SaveLink :: (request: Request, code: string) -> bool {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Issue(access.configuration.database, TextView(request.account[:]), code, request.now)
+    }
+
+    Link :: (request: Request) -> s32 {
+        nonce: [33]u8
+        if !proof.RandomHex(nonce[:]) {
+            return Error(request, 503, "link unavailable")
+        }
+        code := TextView(nonce[:32])
+        url: Vec(u8)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !BuilderAppend(url, StartLink) || !BuilderAppend(url, code) ||
+            !fields.SetString(*document, root, "url", TextView(VecSlice(url, 0, url.count))) || !SaveLink(request, code) {
+            return Error(request, 503, "link unavailable")
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    RemoveLink :: (request: Request) -> bool {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Unlink(access.configuration.database, TextView(request.account[:]), request.now)
+    }
+
+    PollResult :: struct {
+        linkedAt: s64
+        linked: bool
+        update: store.PollUpdate
+        problem: string
+    }
+
+    ReadPoll :: (request: Request, client: string) -> PollResult {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return .{problem = Unavailable}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        account := TextView(request.account[:])
+        binding := store.Linked(database, account)
+        if !binding.ok {
+            return .{problem = Unavailable}
+        }
+        if request.configuration.ownerID.count == 64 && account == request.configuration.ownerID &&
+            !store.GatherReports(database, account) {
+            return .{problem = "feedback unavailable"}
+        }
+        update := store.Poll(database, account, client, binding.destination)
+        if !update.ok {
+            return .{problem = Unavailable}
+        }
+        return .{linked = binding.destination > 0, linkedAt = binding.linkedAt, update = update}
+    }
+
+    Poll :: (request: Request) -> s32 {
+        client := http.QueryArgument(request.connection, "client")
+        if client.count != 64 {
+            return Error(request, 400, "app client required")
+        }
+        result := ReadPoll(request, client)
+        if result.problem != "" {
+            return Error(request, 503, result.problem)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        update := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "linked", json.JsonNewBool(*document, result.linked)) ||
+            !json.JsonSet(*document, root, "linked_at", json.JsonNewInteger(*document, result.linkedAt)) ||
+            !json.JsonSet(*document, update, "id", json.JsonNewInteger(*document, result.update.id)) ||
+            !fields.SetString(*document, update, "kind", TextView(result.update.kind)) ||
+            !fields.SetString(*document, update, "text", TextView(result.update.text)) ||
+            !json.JsonSet(*document, update, "choice", json.JsonNewInteger(*document, result.update.choice)) ||
+            (result.update.canReply && !json.JsonSet(*document, update, "can_reply", json.JsonNewBool(*document, true))) ||
+            !json.JsonSet(*document, root, "update", update) {
+            return Error(request, 503, Unavailable)
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    StoreAck :: (request: Request, id: s64, client: string) -> bool {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Ack(access.configuration.database, TextView(request.account[:]), id, client, request.now)
+    }
+
+    PrepareReply :: (request: Request, id: s64, client: string) -> store.ReplyClaim {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return .{}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.PrepareReply(access.configuration.database, TextView(request.account[:]), id, client, request.now)
+    }
+
+    SaveReply :: (request: Request, id: s64, client: string, delivered: s64) -> bool {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.SaveReply(access.configuration.database, TextView(request.account[:]), id, client, request.now, delivered)
+    }
+
+    Ack :: (request: Request, document: *json.JsonDocument) -> s32 {
+        names: [3]string = .["id", "client", "reply"]
+        types: [3]json.JsonKind = .[.Number, .String, .String]
+        values: [3]s32
+        if !fields.Read(document, document.root, names[:], types[:], values[:]) {
+            return Error(request, 400, "invalid receipt")
+        }
+        id := fields.Number(document, values[0])
+        clientText: Text = json.JsonString(document, values[1])
+        replyText: Text = json.JsonString(document, values[2])
+        client := TextView(clientText)
+        reply := TextView(replyText)
+        if id == 0 || client.count != 64 || reply.count > 4096 ||
+            (reply != "" && (id < 0 || wire.TrimSpace(reply) == "")) {
+            return Error(request, 400, "invalid receipt")
+        }
+        if reply == "" {
+            if !StoreAck(request, id, client) {
+                return Error(request, 503, "receipt unavailable")
+            }
+            return Accepted(request)
+        }
+        claim := PrepareReply(request, id, client)
+        if !claim.ok {
+            return Error(request, 503, "Telegram reply claim unavailable")
+        }
+        if !claim.found {
+            return Error(request, 409, "no matching Telegram message claim")
+        }
+        if claim.destination == 0 {
+            return Accepted(request, ifx claim.delivered > 0 then 200 else 202)
+        }
+        // The app claim is consumed before delivery. An uncertain response stays consumed.
+        sent := telegram.Reply(request.configuration.bot, claim.destination, claim.original, 0, reply, false)
+        if sent.messageID > 0 && SaveReply(request, id, client, sent.messageID) {
+            return Accepted(request)
+        }
+        return Accepted(request, 202)
+    }
+
+    Publish :: (request: Request, document: *json.JsonDocument) -> s32 {
+        names: [4]string = .["id", "text", "draft", "time"]
+        types: [4]json.JsonKind = .[.String, .String, .String, .Number]
+        values: [4]s32
+        if !fields.Read(document, document.root, names[:], types[:], values[:]) {
+            return Error(request, 400, "invalid message")
+        }
+        id: Text = json.JsonString(document, values[0])
+        content: Text = json.JsonString(document, values[1])
+        draft: Text = json.JsonString(document, values[2])
+        idLength := TextView(id).count
+        textLength := TextView(content).count
+        draftLength := TextView(draft).count
+        if idLength < 1 || idLength > 180 || textLength < 1 || textLength > 4096 || (draftLength != 0 && draftLength != 32) {
+            return Error(request, 400, "invalid message")
+        }
+        // Installed clients may still upload their history here, including when the bot is disabled.
+        return Accepted(request)
+    }
+
+    ReadUser :: (document: *json.JsonDocument, node: s32, id: *s64, bot: *bool) -> bool {
+        names: [2]string = .["id", "is_bot"]
+        types: [2]json.JsonKind = .[.Number, .True]
+        values: [2]s32
+        if !fields.Read(document, node, names[:], types[:], values[:]) {
+            return false
+        }
+        <<id = fields.Number(document, values[0])
+        <<bot = json.JsonKindOf(document, values[1]) == .True
+        return true
+    }
+
+    ReadMessage :: (document: *json.JsonDocument, node: s32) -> Message {
+        result: Message
+        names: [6]string = .["from", "chat", "text", "message_id", "message_thread_id", "reply_to_message"]
+        types: [6]json.JsonKind = .[.Object, .Object, .String, .Number, .Number, .Object]
+        values: [6]s32
+        if !fields.Read(document, node, names[:], types[:], values[:]) ||
+            !ReadUser(document, values[0], *result.sender, *result.senderBot) {
+            return .{}
+        }
+        chatNames: [2]string = .["id", "type"]
+        chatTypes: [2]json.JsonKind = .[.Number, .String]
+        chatValues: [2]s32
+        replyNames: [1]string = .["from"]
+        replyTypes: [1]json.JsonKind = .[.Object]
+        replyValues: [1]s32
+        bot: bool
+        if !fields.Read(document, values[1], chatNames[:], chatTypes[:], chatValues[:]) ||
+            !fields.Read(document, values[5], replyNames[:], replyTypes[:], replyValues[:]) ||
+            !ReadUser(document, replyValues[0], *result.replyBot, *bot) {
+            return .{}
+        }
+        result.chat = fields.Number(document, chatValues[0])
+        // Extract strings into caller-owned Text; the temporary JSON body can then be released.
+        result.chatType = json.JsonString(document, chatValues[1])
+        result.text = json.JsonString(document, values[2])
+        result.original = fields.Number(document, values[3])
+        result.thread = fields.Number(document, values[4])
+        result.valid = true
+        return result
+    }
+
+    ReadUpdate :: (document: *json.JsonDocument) -> Update {
+        names: [3]string = .["update_id", "message", "callback_query"]
+        types: [3]json.JsonKind = .[.Number, .Object, .Object]
+        values: [3]s32
+        if !fields.Read(document, document.root, names[:], types[:], values[:]) {
+            return .{}
+        }
+        result: Update
+        result.id = fields.Number(document, values[0])
+        message := ReadMessage(document, values[1])
+        if result.id <= 0 || !message.valid {
+            return .{}
+        }
+        callbackNames: [4]string = .["id", "data", "from", "message"]
+        callbackTypes: [4]json.JsonKind = .[.String, .String, .Object, .Object]
+        callbackValues: [4]s32
+        if !fields.Read(document, values[2], callbackNames[:], callbackTypes[:], callbackValues[:]) {
+            return .{}
+        }
+        callback := ReadMessage(document, callbackValues[3])
+        if !callback.valid ||
+            !ReadUser(document, callbackValues[2], *callback.sender, *callback.senderBot) {
+            return .{}
+        }
+        result.callbackID = json.JsonString(document, callbackValues[0])
+        result.callbackData = json.JsonString(document, callbackValues[1])
+        if TextView(result.callbackID) != "" {
+            result.message = callback
+        } else {
+            result.message = message
+        }
+        result.valid = true
+        return result
+    }
+
+    Consume :: (request: Request, code: string, sender: s64) -> string {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return ""
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Consume(access.configuration.database, code, sender, request.now)
+    }
+
+    LinkedAccount :: (request: Request, sender: s64) -> Text {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return .{}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.AccountFor(access.configuration.database, sender)
+    }
+
+    Queue :: (request: Request, account: string, id: s64, sender: s64, kind: string, text: string, choice: s64, original: s64) -> s32 {
+        access := request.access
+        if !mutex.Lock(*access.databaseLock) {
+            return -1
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Queue(access.configuration.database, account, id, sender, kind, text, choice, original)
+    }
+
+    AccountMenu :: (request: Request, sender: s64, requestID: string) -> bool {
+        settings := request.configuration
+        return settings.accountsEnabled && settings.entryMenu != null &&
+            settings.entryMenu(request.access, request.connection, settings.bot, settings.canvasURL, sender, requestID,
+                settings.entryNode, settings.entryAudience)
+    }
+
+    SendLinkNotice :: (request: Request, sender: s64, code: string) -> s32 {
+        status := Consume(request, code, sender)
+        if status == "" {
+            return Error(request, 503, "link temporarily unavailable")
+        }
+        notice := "This link does not work. In Inner Breeze, tap Connect Telegram again."
+        if status == "connected" {
+            notice = "✅ Connected to Inner Breeze.\n\nWrite to me like a chat, or try /lists, /todo Buy tea or /help. I answer while Inner Breeze is open on one of your devices."
+        } else if status == "expired" {
+            notice = "This link expired. In Inner Breeze, tap Connect Telegram again."
+        } else if status == "reused" {
+            notice = "This link was already used. If this chat is not connected yet, tap Connect Telegram in Inner Breeze again."
+        } else if status == "conflicting_account" {
+            notice = "This Telegram account is already connected to another Inner Breeze account. Disconnect it there first."
+        }
+        settings := request.configuration
+        canvas := ifx settings.accountsEnabled then "" else settings.canvasURL
+        unused telegram.Send(settings.bot, sender, notice, canvas)
+        if status == "connected" && settings.accountsEnabled {
+            unused AccountMenu(request, sender, "")
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !fields.SetString(*document, root, "link_status", status) {
+            return Error(request, 503, Unavailable)
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    PrivateText :: (request: Request, id: s64, sender: s64, original: s64, parsed: *commands.Command) -> s32 {
+        if parsed.foreign {
+            return Accepted(request)
+        }
+        settings := request.configuration
+        text := TextView(parsed.message)
+        if text == "/paysupport" {
+            if !telegram.Send(settings.bot, sender,
+                "For help with a Telegram Stars purchase or refund, send /feedback followed by a description. Include the date and Dew pack. Keep your passwords and sign-in codes private.", "") {
+                return Error(request, 503, "Telegram payment support temporarily unavailable")
+            }
+            return Accepted(request)
+        }
+        if text.count == 0 || text.count >= 1024 {
+            return Accepted(request)
+        }
+        if text.count == 44 && text[:12] == "/start auth_" {
+            if !AccountMenu(request, sender, text[12:]) {
+                unused telegram.Send(settings.bot, sender,
+                    "This Mini App request is unavailable or expired. Request access again in Inner Breeze.", "")
+            }
+            return Accepted(request)
+        }
+        if text.count == 39 && text[:7] == "/start " {
+            return SendLinkNotice(request, sender, text[7:])
+        }
+        account: Text = LinkedAccount(request, sender)
+        linked := TextView(account) != ""
+        name := TextView(parsed.name)
+        if name == "help" {
+            help: Text = commands.Help(linked)
+            unused telegram.Send(settings.bot, sender, TextView(help), settings.canvasURL)
+            return Accepted(request)
+        }
+        if name == "start" || name == "app" || name == "history" {
+            if settings.accountsEnabled {
+                if !AccountMenu(request, sender, "") {
+                    return Error(request, 503, "Telegram account entry unavailable")
+                }
+            } else {
+                notice := "Open Inner Breeze, sign in, then open Profile, Telegram input, and tap Connect Telegram to link this chat."
+                if linked {
+                    notice = "You are connected. Write to me here, or open Inner Breeze for your full Lumi history."
+                }
+                unused telegram.Send(settings.bot, sender, notice, settings.canvasURL)
+            }
+            return Accepted(request)
+        }
+        if !linked {
+            unused telegram.Send(settings.bot, sender,
+                "Connect this chat first: in Inner Breeze, open Settings and tap Connect Telegram.", settings.canvasURL)
+            return Accepted(request)
+        }
+        if text[0] == #char "/" {
+            if !commands.Known(name) {
+                unused telegram.Send(settings.bot, sender,
+                    "Unknown command. Use /help to see Lumi's commands, or send a normal chat message.", "")
+                return Accepted(request)
+            }
+            usage := commands.Usage(name)
+            if usage != "" && !parsed.hasArgument {
+                notice: Vec(u8)
+                if BuilderAppend(notice, "Use ") && BuilderAppend(notice, usage) {
+                    unused telegram.Send(settings.bot, sender, TextView(VecSlice(notice, 0, notice.count)), "")
+                }
+                return Accepted(request)
+            }
+        }
+        queued := Queue(request, TextView(account), id, sender, "message", text, 0, original)
+        if queued < 0 {
+            return Error(request, 503, "app queue unavailable")
+        }
+        if queued > 0 {
+            unused telegram.Typing(settings.bot, sender)
+        }
+        return Accepted(request)
+    }
+
+    Callback :: (request: Request, id: s64, sender: s64, callbackID: string, data: string) -> s32 {
+        settings := request.configuration
+        account: Text = LinkedAccount(request, sender)
+        if TextView(account) == "" {
+            unused telegram.Send(settings.bot, sender,
+                "Connect this chat first: in Inner Breeze, open Settings and tap Connect Telegram.", settings.canvasURL)
+            return Accepted(request)
+        }
+        if data.count != 33 || (data[0] != #char "Y" && data[0] != #char "N") {
+            return Accepted(request)
+        }
+        choice := ifx data[0] == #char "Y" then 1 else 2
+        queued := Queue(request, TextView(account), id, sender, "confirmation", data[1:], choice, 0)
+        if queued < 0 {
+            return Error(request, 503, "app queue unavailable")
+        }
+        if queued > 0 {
+            unused telegram.AnswerCallback(settings.bot, callbackID)
+        }
+        return Accepted(request)
+    }
+
+    Webhook :: (request: Request, document: *json.JsonDocument) -> s32 {
+        settings := request.configuration
+        if settings.payment != null {
+            payment := settings.payment(settings.paymentContext, request.access, request.connection, settings.bot, document)
+            if payment.handled {
+                return payment.queued
+            }
+        }
+        update := ReadUpdate(document)
+        if !update.valid {
+            return Error(request, 400, "invalid update")
+        }
+        if !Ready(request.access) {
+            return Error(request, 503, "Telegram queue temporarily unavailable")
+        }
+        chatType := TextView(update.message.chatType)
+        callbackID := TextView(update.callbackID)
+        sender := update.message.sender
+        if callbackID == "" && (chatType == "group" || chatType == "supergroup") {
+            if !update.message.senderBot {
+                message: group.Message = .{id = update.id, chat = update.message.chat, sender = sender,
+                    original = update.message.original, thread = update.message.thread, replyBot = update.message.replyBot}
+                if !group.Handle(request.access, request.connection, settings.groupID, settings.bot, settings.chatSettings,
+                    message, TextView(update.message.text), request.now) {
+                    return Error(request, 503, "group receipt unavailable")
+                }
+            }
+            return Accepted(request)
+        }
+        if chatType != "private" || sender <= 0 || update.message.senderBot || update.message.chat != sender {
+            return Accepted(request)
+        }
+        if callbackID != "" {
+            return Callback(request, update.id, sender, callbackID, TextView(update.callbackData))
+        }
+        parsed := commands.Parse(TextView(update.message.text))
+        return PrivateText(request, update.id, sender, update.message.original, *parsed)
+    }
+
+    WithJSON :: (request: Request, source: string, problem: string) -> s32 {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, source) {
+            return Error(request, 400, problem)
+        }
+        if request.route == AckRoute {
+            return Ack(request, *document)
+        }
+        if request.route == MessagesRoute {
+            return Publish(request, *document)
+        }
+        return Webhook(request, *document)
+    }
+
+    ReadBody :: (request: Request, body: []u8, overflow: bool, limit: s64, problem: string) -> s32 {
+        if overflow || body.count > limit {
+            return Error(request, 400, problem)
+        }
+        {
+            encoding: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(request.connection, "Content-Encoding", encoding[:])
+            if count < 0 || coding.Request(TextView(encoding[:count])) == .Unsupported {
+                return Error(request, 400, problem)
+            }
+        }
+        decoded: replies.Body
+        read := replies.Decode(request.connection, body, overflow, limit, request.access.configuration.zstdRequests, *decoded)
+        if read.status != 0 {
+            return Error(request, 400, problem)
+        }
+        if read.decoded {
+            return WithJSON(request, TextView(VecSlice(decoded.scratch, 0, read.length)), problem)
+        }
+        return WithJSON(request, TextView(body), problem)
+    }
+
+    #scope_export
+    // Call on startup and hourly with Unix seconds, including when the bot is disabled.
+    Prune :: (access: *accounts.AccountAccess, now: s64) -> bool {
+        if now <= 0 || !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Prune(access.configuration.database, now)
+    }
+
+    Handles :: (route: string) -> bool {
+        return route == LinkRoute || route == UpdatesRoute || route == AckRoute || route == MessagesRoute || route == WebhookRoute
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return verb == "POST" && (route == AckRoute || route == MessagesRoute || route == WebhookRoute)
+    }
+
+    BodyLimit :: (route: string) -> s64 {
+        if route == MessagesRoute {
+            return 16384
+        }
+        if route == AckRoute || route == WebhookRoute {
+            return 32768
+        }
+        return 0
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        configuration: Configuration, body: []u8, overflow: bool) -> s32 {
+        empty: [0]u8
+        if !Handles(route) {
+            return http.Write(connection, 404, "", empty[:])
+        }
+        validMethod := ReadsBody(route, verb) || (route == LinkRoute && (verb == "POST" || verb == "DELETE")) ||
+            (route == UpdatesRoute && (verb == "GET" || verb == "HEAD"))
+        if !validMethod {
+            allow := ifx route == LinkRoute then "DELETE, POST" else ifx route == UpdatesRoute then "GET, HEAD" else "POST"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            return http.WriteWithHeaders(connection, 405, "", empty[:], headers[:])
+        }
+        now := calendar.UnixMilliseconds()
+        request: Request = .{access = access, connection = connection, configuration = configuration,
+            verb = verb, route = route, now = now / 1000}
+        if request.configuration.canvasURL == "" {
+            request.configuration.canvasURL = DefaultCanvasURL
+        }
+        if route == WebhookRoute {
+            if configuration.bot.token == "" || !telegram.TrustedWebhook(connection, configuration.webhookSecret) {
+                return Error(request, 401, "Telegram authentication required")
+            }
+            return ReadBody(request, body, overflow, BodyLimit(route), "invalid update")
+        }
+        authorized := Authenticate(request, now)
+        if authorized.status != 0 {
+            return Error(request, authorized.status, authorized.message)
+        }
+        request.account = authorized.userID
+        if route == MessagesRoute {
+            return ReadBody(request, body, overflow, BodyLimit(route), "invalid message")
+        }
+        if configuration.bot.token == "" || !Ready(access) {
+            return Error(request, 503, Unavailable)
+        }
+        if route == LinkRoute {
+            if verb == "POST" {
+                return Link(request)
+            }
+            if !RemoveLink(request) {
+                return Error(request, 503, "unlink unavailable")
+            }
+            return Accepted(request)
+        }
+        if route == UpdatesRoute {
+            return Poll(request)
+        }
+        return ReadBody(request, body, overflow, BodyLimit(route), "invalid receipt")
+    }
+}

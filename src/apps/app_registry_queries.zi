@@ -1,0 +1,37 @@
+// Registry reads shared by the Go and native servers.
+RegistryListSQL :: #string SQL_END
+
+SELECT app_id,display_name,description,homepage_url,source_url,public_key,status,
+       app_schema_version,min_supported_client_version,current_client_version,
+       compatibility_until,features_json,legacy_protocols_json,created_at,updated_at
+FROM server_apps ORDER BY app_id
+SQL_END;
+ByIDSQL :: #string SQL_END
+
+SELECT app_id,display_name,description,homepage_url,source_url,public_key,status,
+       app_schema_version,min_supported_client_version,current_client_version,
+       compatibility_until,features_json,legacy_protocols_json,created_at,updated_at
+FROM server_apps WHERE app_id=?1
+SQL_END;
+CollectionsSQL :: #string SQL_END
+
+SELECT app_id,collection_prefix,visibility,schema_version,description,created_at
+FROM server_app_collections WHERE app_id=?1 ORDER BY collection_prefix
+SQL_END;
+CapabilitiesSQL :: "SELECT capability FROM server_app_capabilities WHERE app_id=?1 ORDER BY capability";
+KeysSQL :: #string SQL_END
+
+SELECT key_id,algorithm,public_key,purpose,status,expires_at,created_at
+FROM server_app_keys WHERE app_id=?1 ORDER BY key_id
+SQL_END;
+PoliciesSQL :: #string SQL_END
+
+SELECT asset_id,permission,status,legacy_unsigned_until
+FROM token_app_permissions WHERE app_id=?1 ORDER BY asset_id,permission
+SQL_END;
+HydrateSQL :: #string SQL_END
+
+SELECT manifest_version,manifest_json,manifest_hash,manifest_signature,approval_signature,expires_at
+FROM server_app_manifests WHERE app_id=?1 AND status='active'
+SQL_END;
+ActiveAppSQL :: "SELECT EXISTS(SELECT 1 FROM server_apps WHERE app_id=?1 AND status='active')";

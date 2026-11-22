@@ -1,0 +1,158 @@
+#if TARGET == .C && OS == .LINUX {
+    transport :: #import "http_server_native";
+    frames :: #import "websocket_frame";
+    handshake :: #import "websocket_handshake";
+    wire_text :: #import "wire_text";
+    socket :: #import "std/socket_linux";
+    clock :: #import "std/timer";
+    #import "std/vec"
+
+    Stream :: struct {
+        socket: socket.LinuxSocket
+        buffered: *u8
+        bufferedCount: usize
+        consumed: usize
+        readDeadline: s64
+        writeDeadline: s64
+    }
+
+    Frame :: struct {
+        opcode: u8
+        payload: Vec(u8)
+        closed: bool
+        error: string
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    WouldBlock :: 11;
+    Interrupted :: 4;
+    DontWait :: 64;
+    NoSignal :: 16384;
+    Writable :: 4;
+    PollError :: 8;
+    SendSome :: (fd: s32, data: *u8, count: usize, flags: s32) -> isize #foreign c "send";
+
+    RemainingMilliseconds :: (deadline: s64) -> s32 {
+        now := clock.MonotonicMilliseconds()
+        if now < 0 || deadline <= now {
+            return 0
+        }
+        remaining := deadline - now
+        if remaining > 2147483647 {
+            return 2147483647
+        }
+        return cast(s32)remaining
+    }
+
+    ReadExact :: (context: *void, output: []u8) -> bool {
+        stream := cast(*Stream)context
+        index: s64 = 0
+        while index < output.count && stream.consumed < stream.bufferedCount {
+            output[index] = stream.buffered[stream.consumed]
+            stream.consumed += 1
+            index += 1
+        }
+        while index < output.count {
+            timeout := RemainingMilliseconds(stream.readDeadline)
+            if timeout == 0 {
+                return false
+            }
+            received := socket.SocketReceive(stream.socket, output[index:], timeout)
+            if received <= 0 {
+                return false
+            }
+            index += received
+        }
+        return true
+    }
+
+    WriteExact :: (context: *void, output: []u8) -> bool {
+        if output.count == 0 {
+            return true
+        }
+        stream := cast(*Stream)context
+        index: s64 = 0
+        while index < output.count {
+            timeout := RemainingMilliseconds(stream.writeDeadline)
+            if timeout == 0 {
+                return false
+            }
+            event := socket.SocketWaitForEvents(stream.socket, Writable | PollError, timeout)
+            if event.error != 0 {
+                return false
+            }
+            // The upgraded descriptor belongs to MicroHTTPD. Send without
+            // blocking or delivering SIGPIPE if the peer has disconnected.
+            written := SendSome(stream.socket.fd, *output[index], cast(usize)(output.count - index), DontWait | NoSignal)
+            if written > cast(isize)0 {
+                index += cast(s64)written
+            } else if written == cast(isize)0 {
+                return false
+            } else {
+                error := socket.LinuxErrno()
+                if error != Interrupted && error != WouldBlock {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    ReplyError :: (connection: *void, status: u32, body: string) -> s32 {
+        output: Vec(u8)
+        if !BuilderAppend(output, body) {
+            return 0
+        }
+        return transport.Write(connection, status, "application/json", VecSlice(output, 0, output.count))
+    }
+
+    #scope_export
+    Accept :: (connection: *void, context: *void, handler: transport.UpgradeHandler) -> s32 {
+        if !handshake.UpgradeRequested(transport.Header(connection, "Upgrade"), transport.Header(connection, "Connection")) {
+            return ReplyError(connection, 400, "{\"error\":\"websocket upgrade required\"}\n")
+        }
+        key := wire_text.TrimSpace(transport.Header(connection, "Sec-WebSocket-Key"))
+        if !handshake.ValidKey(key) || transport.Header(connection, "Sec-WebSocket-Version") != "13" {
+            return ReplyError(connection, 400, "{\"error\":\"invalid websocket handshake\"}\n")
+        }
+        accept := handshake.AcceptKey(key)
+        if accept.count == 0 {
+            return ReplyError(connection, 500, "{\"error\":\"websocket handshake failed\"}\n")
+        }
+        protocol := handshake.SelectProtocol(transport.Header(connection, "Sec-WebSocket-Protocol"))
+        return transport.Upgrade(connection, TextView(VecSlice(accept, 0, accept.count)), protocol, context, handler)
+    }
+
+    // The buffered bytes belong to MicroHTTPD and survive until its upgrade
+    // callback returns. Deadlines use the monotonic clock in milliseconds.
+    Open :: (fd: s32, buffered: *u8, count: usize, readDeadline: s64, writeDeadline: s64) -> Stream {
+        return .{socket = .{fd = fd, valid = fd >= 0}, buffered = buffered, bufferedCount = count,
+            readDeadline = readDeadline, writeDeadline = writeDeadline}
+    }
+
+    ReadClientFrame :: (stream: *Stream) -> Frame {
+        decoded := frames.ReadFrameHeader(cast(*void)stream, ReadExact, true)
+        if decoded.readFailed {
+            return .{error = "websocket read failed"}
+        }
+        header := decoded.header
+        if header.error != "" {
+            return .{error = header.error}
+        }
+        payload: Vec(u8)
+        length := cast(s64)header.length
+        if !VecResizeBounded(payload, length, frames.MaxPayloadBytes) {
+            return .{error = "websocket payload allocation failed"}
+        }
+        if !ReadExact(cast(*void)stream, VecSlice(payload, 0, length)) {
+            return .{error = "websocket read failed"}
+        }
+        frames.Unmask(VecSlice(payload, 0, length), decoded.mask)
+        return .{opcode = header.opcode, payload = payload, closed = header.opcode == 8}
+    }
+
+    WriteFrame :: (stream: *Stream, opcode: u8, payload: []u8) -> bool {
+        return frames.WriteFrame(cast(*void)stream, WriteExact, opcode, payload)
+    }
+}

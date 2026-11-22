@@ -1,0 +1,229 @@
+#if TARGET == .C && OS == .LINUX {
+    identity :: #import "identity";
+    lookup :: #import "account_lookup_native";
+    issuer :: #import "token_issuer_native";
+    ledger :: #import "token_ledger_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    RewardCatalogNames: [7]string = .["shovey.secret-chest", "shovey.campaign-complete", "wurm.daily-05", "wurm.daily-10",
+        "wurm.daily-15", "wurm.daily-20", "wurm.daily-25"];
+    RewardCatalogUnits: [7]s64 = .[2000000, 5000000, 1000000, 2000000, 2000000, 2000000, 3000000];
+    NativeCampaignReward :: "shovey.campaign-complete";
+
+    Award :: struct {
+        account: [64]u8
+        units: s64
+        place: s64
+        balance: s64
+        credited: bool
+        error: string
+    }
+
+    RewardCommandResult :: struct {
+        award: Award
+        sequence: s64
+        root: [64]u8
+        error: string
+    }
+
+    CampaignSettlement :: struct {
+        accounts: s64
+        units: s64
+        error: string
+    }
+
+    #scope_file
+    NativeRewardProvider :: "reward-v1";
+    NativeCampaignPrefix :: "shovey.campaign-complete:";
+    NativeCampaignFlatUnits :: 5000000;
+    NativeRewardsUnavailable :: "rewards unavailable";
+
+    PaidCampaignPlaceSQL :: #string SQL
+SELECT paid.amount,
+ (SELECT COUNT(*) FROM token_processed_payments AS earlier
+  WHERE earlier.provider=paid.provider AND substr(earlier.provider_payment_id,1,length(?3))=?3 AND earlier.rowid<=paid.rowid)
+FROM token_processed_payments AS paid
+WHERE paid.provider=?1 AND paid.provider_payment_id=?2
+SQL;
+
+    RewardPlace :: struct {
+        number: s64
+        amount: s64
+        ok: bool
+    }
+
+    CampaignDue :: (place: s64) -> s64 {
+        if place <= 10 { return 100000000 }
+        if place <= 30 { return 50000000 }
+        if place <= 100 { return 20000000 }
+        return NativeCampaignFlatUnits
+    }
+
+    ExistingCampaignPlace :: (database: *void, payment: string) -> RewardPlace {
+        arguments: [3]sql.Argument = .[sql.TextArg(NativeRewardProvider), sql.TextArg(payment), sql.TextArg(NativeCampaignPrefix)]
+        row := sql.Prepare(database, PaidCampaignPlaceSQL, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{ok = true} }
+        if status != sqlite.SQLITE_ROW || sqlite.SqliteColumnType(row.value, 0) != sqlite.SQLITE_INTEGER { return .{} }
+        amount := sqlite.SqliteColumnInt64(row.value, 0)
+        place := sqlite.SqliteColumnInt64(row.value, 1)
+        return .{number = place, amount = amount, ok = place > 0 && amount > 0}
+    }
+
+    NextCampaignPlace :: (database: *void) -> RewardPlace {
+        arguments: [2]sql.Argument = .[sql.TextArg(NativeRewardProvider), sql.TextArg(NativeCampaignPrefix)]
+        result := sql.ReadInteger(database, "SELECT COUNT(*) FROM token_processed_payments WHERE provider=?1 AND substr(provider_payment_id,1,length(?2))=?2", arguments[:])
+        if !result.found || result.value >= 9223372036854775807 { return .{} }
+        place := result.value + 1
+        return .{number = place, amount = CampaignDue(place), ok = true}
+    }
+
+    RewardCredit :: (database: *void, signer: *issuer.Issuer, reward: string, account: string, payment: string,
+        units: s64, at: string) -> writes.EventResult {
+        event: signing.Event = .{account = account, kind = "credit", amount = units, source = "reward", reference = reward}
+        return writes.CreditPayment(database, signer, NativeRewardProvider, payment, event, at)
+    }
+
+    AwardInTransaction :: (database: *void, signer: *issuer.Issuer, reward: string, account: string,
+        units: s64, byPlace: bool, at: string) -> Award {
+        payment: Vec(u8)
+        if !BuilderAppend(payment, reward) || !BuilderAppend(payment, ":") || !BuilderAppend(payment, account) {
+            return .{error = NativeRewardsUnavailable}
+        }
+        id := TextView(VecSlice(payment, 0, payment.count))
+        place := RewardPlace.{amount = units, ok = true}
+        if byPlace {
+            place = ExistingCampaignPlace(database, id)
+            if place.ok && place.number == 0 { place = NextCampaignPlace(database) }
+        }
+        if !place.ok { return .{error = NativeRewardsUnavailable} }
+        credited := RewardCredit(database, signer, reward, account, id, place.amount, at)
+        if credited.status != 200 { return .{error = credited.error} }
+        balance := ledger.Balance(database, account)
+        if !balance.found { return .{error = NativeRewardsUnavailable} }
+        result: Award = .{credited = credited.created, units = place.amount, place = place.number, balance = balance.value}
+        for byte, index: account { result.account[index] = byte }
+        return result
+    }
+
+    CampaignEarlyCredit :: struct {
+        account: [64]u8
+        due: s64
+    }
+
+    ReadEarlyCampaign :: (database: *void, credits: []CampaignEarlyCredit) -> s64 {
+        arguments: [3]sql.Argument = .[sql.TextArg(NativeRewardProvider), sql.TextArg(NativeCampaignPrefix), sql.IntArg(credits.count)]
+        row := sql.Prepare(database, "SELECT account_id,amount,created_at<'2026-10-28 00:00:00' FROM token_processed_payments WHERE provider=?1 AND substr(provider_payment_id,1,length(?2))=?2 ORDER BY rowid LIMIT ?3", arguments[:])
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        place: s64 = 0
+        count: s64 = 0
+        status := sqlite.SqliteStep(row.value)
+        while status == sqlite.SQLITE_ROW {
+            place += 1
+            due := CampaignDue(place)
+            if sqlite.SqliteColumnInt64(row.value, 2) != 0 && sqlite.SqliteColumnInt64(row.value, 1) < due && due > NativeCampaignFlatUnits {
+                account := sql.ColumnText(row.value, 0)
+                if !identity.ValidUserID(account) { return -1 }
+                credits[count].due = due - NativeCampaignFlatUnits
+                for byte, index: account { credits[count].account[index] = byte }
+                count += 1
+            }
+            status = sqlite.SqliteStep(row.value)
+        }
+        return ifx status == sqlite.SQLITE_DONE then count else -1
+    }
+
+    #scope_export
+    NextCampaignUnits :: (database: *void) -> s64 {
+        place := NextCampaignPlace(database)
+        return place.amount
+    }
+
+    // A caller with the shared account store holds its database lock. This
+    // transaction serializes new campaign places across database connections.
+    Claim :: (database: *void, signer: *issuer.Issuer, reward: string, account: string, units: s64, at: string) -> Award {
+        if !identity.ValidNamespace(reward) || !identity.ValidUserID(account) || units <= 0 {
+            return .{error = "invalid reward"}
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{error = NativeRewardsUnavailable}
+        }
+        defer writes.Rollback(database)
+        award := AwardInTransaction(database, signer, reward, account, units, reward == NativeCampaignReward, at)
+        if award.error == "" && sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{error = NativeRewardsUnavailable}
+        }
+        return award
+    }
+
+    // The offline reward command takes whole Dew, resolves an alias or ID,
+    // and commits the credit with its checkpoint before reporting success.
+    RewardDew :: (database: *void, signer: *issuer.Issuer, reward: string, reference: string, dew: s64) -> RewardCommandResult {
+        if !identity.ValidNamespace(reward) || dew <= 0 || dew > 1000000 {
+            return .{error = "invalid reward"}
+        }
+        if !signer.signing { return .{error = "rewards need the Dew issuer private key"} }
+        timestamp: [31]u8
+        at := signing.WireTime(signing.Now(), false, timestamp[:])
+        if at == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{error = NativeRewardsUnavailable}
+        }
+        defer writes.Rollback(database)
+        normalized: [64]u8
+        account := lookup.ResolveNormalized(database, lookup.Normalize(reference, normalized[:]))
+        if account.status != sqlite.SQLITE_OK { return .{error = NativeRewardsUnavailable} }
+        if !account.found { return .{error = "unknown account"} }
+        award := AwardInTransaction(database, signer, reward, TextView(account.id[:]), dew * 1000000, false, at)
+        if award.error != "" { return .{error = award.error} }
+        document: json.JsonDocument
+        checkpoint := writes.Checkpoint(database, signer, *document)
+        if checkpoint.status != 200 { return .{error = checkpoint.error} }
+        sequence, ok := json.JsonInteger(*document, json.JsonMember(*document, checkpoint.node, "ledger_seq"))
+        root: Text = json.JsonString(*document, json.JsonMember(*document, checkpoint.node, "ledger_root"))
+        if !ok || TextView(root).count != 64 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{error = "token checkpoint failed"}
+        }
+        result: RewardCommandResult = .{award = award, sequence = sequence}
+        for byte, index: TextView(root) { result.root[index] = byte }
+        return result
+    }
+
+    SettleCampaign :: (database: *void, signer: *issuer.Issuer) -> CampaignSettlement {
+        if !signer.signing { return .{} }
+        timestamp: [31]u8
+        at := signing.WireTime(signing.Now(), false, timestamp[:])
+        if at == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{error = NativeRewardsUnavailable}
+        }
+        defer writes.Rollback(database)
+        credits: [100]CampaignEarlyCredit
+        count := ReadEarlyCampaign(database, credits[:])
+        if count < 0 { return .{error = NativeRewardsUnavailable} }
+        result: CampaignSettlement
+        for credit: credits[:count] {
+            account := TextView(credit.account[:])
+            payment: Vec(u8)
+            if !BuilderAppend(payment, "shovey.campaign-complete.place:") || !BuilderAppend(payment, account) {
+                return .{error = NativeRewardsUnavailable}
+            }
+            value := RewardCredit(database, signer, NativeCampaignReward, account, TextView(VecSlice(payment, 0, payment.count)), credit.due, at)
+            if value.status != 200 { return .{error = value.error} }
+            if value.created {
+                result.accounts += 1
+                result.units += credit.due
+            }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{error = NativeRewardsUnavailable}
+        }
+        return result
+    }
+}

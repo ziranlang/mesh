@@ -1,0 +1,235 @@
+sqlite :: #import "sqlite/SQLite";
+schema :: #import "sqlite_schema";
+statements :: #import "sqlite_statement_native";
+login :: #import "account_login_native";
+sessions :: #import "auth_sessions_native";
+auth :: #import "account_signature_native";
+signed_transactions :: #import "signed_tx_native";
+sync :: #import "record_sync_native";
+startup :: #import "store_startup_native";
+json :: #import "std/json_document";
+timestamp :: #import "timestamp_value";
+challenge :: #import "challenge_native";
+limits :: #import "challenge_limits";
+mesh :: #import "ml_dsa44_native";
+oqs :: #import "oqs/Oqs";
+sha :: #import "crypto/sha256";
+clock :: #import "std/timer";
+thread :: #import "std/thread";
+#import "std/vec"
+
+#scope_file
+OtherUser :: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+IssuedAt :: 100;
+
+BoundedChallenges :: () -> bool {
+    store: challenge.ChallengeStore
+    if !challenge.Open(*store, 1000) { return false }
+    defer challenge.Close(*store)
+    first := challenge.Issue(*store, OtherUser, IssuedAt)
+    if first.status != .OK { return false }
+    for index: 1..limits.MaxOutstanding {
+        if challenge.Issue(*store, OtherUser, IssuedAt + index).status != .OK { return false }
+    }
+    entries := challenge.Outstanding(*store, OtherUser, IssuedAt + 10)
+    if entries.count != limits.MaxOutstanding || entries.challenges[0].expiresAt != IssuedAt + 1000 + limits.MaxOutstanding ||
+        challenge.Take(*store, OtherUser, first.nonce[:], IssuedAt + 10) { return false }
+    last := entries.challenges[0]
+    if !challenge.Take(*store, OtherUser, last.nonce[:], last.expiresAt) ||
+        challenge.Take(*store, OtherUser, last.nonce[:], last.expiresAt) { return false }
+    return challenge.Outstanding(*store, OtherUser, last.expiresAt).count == 0
+}
+
+Attempt :: struct {
+    database: *void
+    store: *challenge.ChallengeStore
+    user: string
+    signature: string
+    status: u32
+    databaseError: s32
+}
+
+SignIn :: (context: *void) {
+    attempt := cast(*Attempt)context
+    body: [8]u8 = .[114, 97, 119, 0, 119, 105, 114, 101]
+    result := auth.Authenticate(attempt.database, attempt.store, mesh.Verify, attempt.user,
+        "", attempt.signature, "ksync-sync-v1", "post", "/api/v1/login", body[:])
+    attempt.status = result.status
+    attempt.databaseError = result.databaseError
+}
+
+SignedChallenges :: () -> s32 {
+    opened := schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return 2 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    challenges: challenge.ChallengeStore
+    if !challenge.Open(*challenges, 10000) { return 3 }
+    defer challenge.Close(*challenges)
+    key: [oqs.MlDsa44PublicKeyBytes]u8
+    privateKey: [oqs.MlDsa44SecretKeyBytes]u8
+    signature: [oqs.MlDsa44SignatureBytes]u8
+    defer oqs.Cleanse(privateKey[:])
+    if !mesh.KeyPair(key[:], privateKey[:]) { return 4 }
+    digest := sha.Sha256Of(TextView(key[:]))
+    user: [65]u8
+    publicKey: [oqs.MlDsa44PublicKeyBytes * 2 + 1]u8
+    if sha.BytesToHex(*digest[0], digest.count, *user[0], user.count) != 1 ||
+        sha.BytesToHex(*key[0], key.count, *publicKey[0], publicKey.count) != 1 { return 5 }
+    userID := TextView(user[:64])
+    publicText := TextView(publicKey[:publicKey.count - 1])
+    body: [8]u8 = .[114, 97, 119, 0, 119, 105, 114, 101]
+    now := clock.MonotonicMilliseconds()
+    if challenge.Issue(*challenges, OtherUser, now).status != .OK { return 6 }
+    mismatch := auth.Authenticate(database, *challenges, mesh.Verify, OtherUser, publicText, "", "ksync-sync-v1", "POST", "/api/v1/login", body[:])
+    if mismatch.status != 400 || mismatch.message != "public_key does not match user_id_hash" { return 7 }
+    issued := challenge.Issue(*challenges, userID, now)
+    if issued.status != .OK || challenge.Issue(*challenges, userID, now).status != .OK { return 8 }
+    nonce: [65]u8
+    if sha.BytesToHex(*issued.nonce[0], issued.nonce.count, *nonce[0], nonce.count) != 1 { return 9 }
+    signed: Vec(u8)
+    // This digest is from Python hashlib over the exact eight body bytes.
+    if !BuilderAppend(signed, "ksync-sync-v1\nPOST\n/api/v1/login\n3e4317bb7badca8e5c6c85d3e1269e93908e4331a080afabe067e15254a6d3dc\n") ||
+        !BuilderAppend(signed, TextView(nonce[:64])) || !BuilderAppend(signed, "\n") ||
+        !mesh.Sign(privateKey[:], VecSlice(signed, 0, signed.count), signature[:]) { return 10 }
+    encoded: [oqs.MlDsa44SignatureBytes * 2 + 1]u8
+    if sha.BytesToHex(*signature[0], signature.count, *encoded[0], encoded.count) != 1 { return 11 }
+    proof := TextView(encoded[:encoded.count - 1])
+    tampered := auth.Authenticate(database, *challenges, mesh.Verify, userID, publicText, proof, "ksync-sync-v1", "POST", "/api/v1/other", body[:])
+    if tampered.status != 401 { return 12 }
+    authenticated := auth.Authenticate(database, *challenges, mesh.Verify, userID, publicText, proof, "ksync-sync-v1", "post", "/api/v1/login", body[:])
+    if !authenticated.authenticated || authenticated.status != 0 || authenticated.databaseError != sqlite.SQLITE_OK { return 13 }
+    sessionTime := "1970-01-01T00:01:40.000000000Z"
+    secret: [32]u8
+    if sessions.Initialize(database, "1970-01-01T00:05:00.000000000Z") != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "CREATE TRIGGER reject_session BEFORE INSERT ON server_auth_sessions BEGIN SELECT RAISE(ABORT,'blocked'); END") != sqlite.SQLITE_OK { return 14 }
+    rejected := login.Complete(database, authenticated, secret[:], "test-client", 100, 200, sessionTime)
+    if rejected.token.count != 0 || rejected.databaseError == sqlite.SQLITE_OK || !sqlite.SqliteGetAutocommit(database) ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER reject_session") != sqlite.SQLITE_OK { return 23 }
+    if sqlite.SqliteExecText(database, "CREATE TRIGGER ignore_session BEFORE INSERT ON server_auth_sessions BEGIN SELECT RAISE(IGNORE); END") != sqlite.SQLITE_OK { return 27 }
+    ignored := login.Complete(database, authenticated, secret[:], "test-client", 100, 200, sessionTime)
+    if ignored.token.count != 0 || ignored.databaseError == sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER ignore_session") != sqlite.SQLITE_OK { return 28 }
+    // Failure must roll back account and device writes as well as the token.
+    noArguments: []statements.Argument
+    remainingRows := statements.ReadInteger(database, "SELECT (SELECT COUNT(*) FROM server_clients)+(SELECT COUNT(*) FROM server_sync_state)+(SELECT COUNT(*) FROM server_users)+(SELECT COUNT(*) FROM server_auth_sessions)", noArguments)
+    if remainingRows.status != sqlite.SQLITE_OK || !remainingRows.found || remainingRows.value != 0 { return 29 }
+    noRegistration := auth.Authenticate(database, *challenges, mesh.Verify, userID, "", proof, "ksync-sync-v1", "POST", "/api/v1/login", body[:])
+    if noRegistration.message != "public_key required for first sync" { return 24 }
+    issuedSession := login.Complete(database, authenticated, secret[:], "test-client", 100, 200, sessionTime)
+    if issuedSession.error != "" || issuedSession.databaseError != sqlite.SQLITE_OK || issuedSession.token.count == 0 { return 25 }
+    bearer := TextView(VecSlice(issuedSession.token, 0, issuedSession.token.count))
+    if !sessions.Authorize(database, secret[:], bearer, userID, 200, sessionTime, false).active ||
+        sessions.Authorize(database, secret[:], bearer, userID, 201, sessionTime, false).active ||
+        sessions.RevokeBearer(database, userID, bearer) != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bearer, userID, 200, sessionTime, false).active ||
+        sessions.RevokeBearer(database, userID, bearer) != sqlite.SQLITE_DONE { return 26 }
+    replay := auth.Authenticate(database, *challenges, mesh.Verify, userID, "", proof, "ksync-sync-v1", "POST", "/api/v1/login", body[:])
+    if replay.status != 401 { return 15 }
+    // Both threads may finish signature verification, but only one can take
+    // the challenge. Use a fresh proof for the remaining overlapping sign-in.
+    remaining := challenge.Outstanding(*challenges, userID, now)
+    if remaining.count != 1 { return 16 }
+    candidate := remaining.challenges[0]
+    if sha.BytesToHex(*candidate.nonce[0], candidate.nonce.count, *nonce[0], nonce.count) != 1 { return 17 }
+    signedBytes := VecSlice(signed, 0, signed.count)
+    start := signedBytes.count - 65
+    for byte, index: nonce[:64] { signedBytes[start + index] = byte }
+    nextEncoded: [oqs.MlDsa44SignatureBytes * 2 + 1]u8
+    if !mesh.Sign(privateKey[:], signedBytes, signature[:]) ||
+        sha.BytesToHex(*signature[0], signature.count, *nextEncoded[0], nextEncoded.count) != 1 { return 18 }
+    first := Attempt.{database = database, store = *challenges, user = userID, signature = TextView(nextEncoded[:nextEncoded.count - 1]), status = 500}
+    second := first
+    workerOne: thread.Thread
+    workerTwo: thread.Thread
+    callback: thread.ThreadProcedure = SignIn
+    if !thread.ThreadStart(*workerOne, callback, cast(*void)(*first)) { return 19 }
+    if !thread.ThreadStart(*workerTwo, callback, cast(*void)(*second)) {
+        thread.ThreadWait(*workerOne)
+        return 20
+    }
+    thread.ThreadWait(*workerOne)
+    thread.ThreadWait(*workerTwo)
+    if first.databaseError != 0 || second.databaseError != 0 { return 21 }
+    if first.status == 0 && second.status == 400 || second.status == 0 && first.status == 400 { return 0 }
+    return 22
+}
+
+SignedTransaction :: () -> s32 {
+    opened := schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return 30 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    key: [oqs.MlDsa44PublicKeyBytes]u8
+    secret: [oqs.MlDsa44SecretKeyBytes]u8
+    defer oqs.Cleanse(secret[:])
+    proof: [oqs.MlDsa44SignatureBytes]u8
+    if !mesh.KeyPair(key[:], secret[:]) { return 31 }
+    account: [2]statements.Argument = .[statements.TextArg(OtherUser), statements.BlobArg(key[:])]
+    if statements.Execute(database, "INSERT INTO server_users(user_id_hash,public_key) VALUES(?1,?2)", account[:]) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "INSERT INTO server_apps(app_id,display_name) VALUES('signedapp','Signed')") != sqlite.SQLITE_OK { return 32 }
+    device: [2]statements.Argument = .[statements.TextArg(OtherUser), statements.TextArg("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")]
+    if statements.Execute(database, "INSERT INTO server_device_keys(account_id,app_id,device_key_id,client_id,public_key,last_used_at) VALUES(?1,'signedapp','device-fixture','fixture-client',?2,'initial')", device[:]) != sqlite.SQLITE_OK { return 33 }
+    message := "daochi-tx-v1\n6\ntx-fixture-01\nffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\nsignedapp\ndevice-fixture\nPOST\n/api/v1/sync\nc04aa275b01a7f5936ce18ba6bda682542c9c5c9e019f9a3347a86f5c6cca166\nnonce-fixture\n200\n"
+    toSign: Vec(u8)
+    hex: [oqs.MlDsa44SignatureBytes * 2 + 1]u8
+    if !BuilderAppend(toSign, message) || !mesh.Sign(secret[:], VecSlice(toSign, 0, toSign.count), proof[:]) ||
+        sha.BytesToHex(*proof[0], proof.count, *hex[0], hex.count) != 1 { return 34 }
+    header: Vec(u8)
+    // The device proof was also generated independently with Python's Ed25519
+    // using the published RFC 8032 seed and these literal message bytes.
+    if !BuilderAppend(header, "{\"Protocol_Version\":6,\"tx_id\":\"tx-fixture-01\",\"account_id\":\"FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF\",\"app_id\":\"signedapp\",\"device_key_id\":\"device-fixture\",\"method\":\"post\",\"path\":\"/api/v1/sync\",\"body_sha256\":\"C04AA275B01A7F5936CE18BA6BDA682542C9C5C9E019F9A3347A86F5C6CCA166\",\"nonce\":\"nonce-fixture\",\"expires_at\":200,\"signature\":\"") ||
+        !BuilderAppend(header, TextView(hex[:hex.count - 1])) ||
+        !BuilderAppend(header, "\",\"device_signature\":\"a4864a83446fa30d38110d06c117838e36e8dc64f742d64691535fde3e13af44660338399a420bde69916dd77ad0e109fbfdecd259f474731c612ca85e7a2f08\"}") { return 35 }
+    headerText := TextView(VecSlice(header, 0, header.count))
+    body: Vec(u8)
+    if !BuilderAppend(body, "{\"protocol_version\":6,\"app_id\":\"signedapp\",\"client_id\":\"fixture-client\",\"encrypted_records_only\":true,\"encrypted_records\":[{\"collection\":\"private.signedapp.v1.records.sample\",\"id\":\"first\",\"ciphertext\":\"ciphertext\",\"updated_at\":\"1970-01-01T00:01:40.000000000Z\"}]}") { return 45 }
+    payload := VecSlice(body, 0, body.count)
+    audit := "1970-01-01T00:01:40.000000000Z"
+    if signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload, 100, audit).databaseError != sqlite.SQLITE_MISUSE ||
+        sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return 36 }
+    if signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload, 200, audit).message != "signed transaction expired" ||
+        signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/other", payload, 100, audit).message != "signed transaction route mismatch" ||
+        signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload[:7], 100, audit).message != "signed transaction body mismatch" ||
+        signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "secondapp", "POST", "/api/v1/sync", payload, 100, audit).message != "signed transaction app mismatch" { return 37 }
+    authorized := signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload, 100, audit)
+    if authorized.status != 0 || authorized.databaseError != sqlite.SQLITE_OK ||
+        signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload, 100, audit).status != 409 ||
+        sqlite.SqliteExecText(database, "ROLLBACK") != sqlite.SQLITE_OK { return 38 }
+    empty: []statements.Argument
+    rolledBack := statements.ReadInteger(database, "SELECT COUNT(*)=0 FROM server_signed_transactions WHERE expires_at=200", empty)
+    touched := statements.ReadInteger(database, "SELECT last_used_at='initial' FROM server_device_keys", empty)
+    if rolledBack.value != 1 || touched.value != 1 ||
+        startup.InitializeFeatures(database) != sqlite.SQLITE_OK || sessions.Initialize(database, audit) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "INSERT INTO server_app_collections(app_id,collection_prefix) VALUES('signedapp','private.signedapp.v1.records.*')") != sqlite.SQLITE_OK { return 39 }
+    tokenSecret: [32]u8
+    session := sessions.Issue(database, tokenSecret[:], OtherUser, "fixture-client", 100, 200, audit)
+    if session.databaseError != sqlite.SQLITE_OK || session.token.count == 0 { return 40 }
+    context: sync.Context = .{database = database, tokenSecret = tokenSecret[:], verify = mesh.Verify, storageLimit = 1}
+    request: sync.RequestProof = .{bearer = TextView(VecSlice(session.token, 0, session.token.count)),
+        signedTransaction = headerText, path = "/api/v1/sync", body = payload, now = timestamp.Parse(audit)}
+    full := sync.Receive(context, OtherUser, request)
+    if full.status != 413 || full.databaseError != sqlite.SQLITE_OK || full.usedBytes != 0 { return 41 }
+    context.storageLimit = 1000
+    result := sync.Receive(context, OtherUser, request)
+    if result.status != 0 || result.databaseError != sqlite.SQLITE_OK || result.serverVersion != 1 || result.applied != 1 ||
+        result.usedBytes <= 0 || result.page.more || json.JsonCount(*result.page.records, result.page.records.root) != 1 { return 42 }
+    row := json.JsonFirst(*result.page.records, result.page.records.root)
+    replayed := sync.Receive(context, OtherUser, request)
+    if !json.JsonIs(*result.page.records, json.JsonMember(*result.page.records, row, "id"), "first") ||
+        !json.JsonIs(*result.page.records, json.JsonMember(*result.page.records, row, "ciphertext"), "ciphertext") ||
+        replayed.status != 409 { return 46 }
+    if sqlite.SqliteExecText(database, "UPDATE server_device_keys SET revoked_at='revoked'; BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return 43 }
+    revoked := signed_transactions.VerifyTx(database, mesh.Verify, headerText, OtherUser, "signedapp", "POST", "/api/v1/sync", payload, 100, audit)
+    if revoked.message != "device key not registered" || sqlite.SqliteExecText(database, "ROLLBACK") != sqlite.SQLITE_OK { return 44 }
+    return 0
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    if !BoundedChallenges() { return 1 }
+    challenges := SignedChallenges()
+    if challenges != 0 { return challenges }
+    return SignedTransaction()
+}

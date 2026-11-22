@@ -1,0 +1,260 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    queries :: #import "habit_migration_queries";
+    accounts :: #import "account_state_native";
+    statements :: #import "sqlite_statement_native";
+    identifiers :: #import "habit_id_native";
+    habit_id :: #import "habit_id_text";
+    names :: #import "habit_recovery_name";
+    timestamp :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    clock :: #import "std/date_time_linux";
+    #import "std/json_document"
+    #import "std/vec"
+
+    #scope_file
+    Migration :: struct {
+        changed: bool
+        status: s32
+    }
+
+    StagedRows :: struct {
+        stage: string
+        read: string
+        drop: string
+    }
+
+    Accounts :: StagedRows.{stage = "CREATE TEMP TABLE mesh_habit_accounts AS ",
+        read = "SELECT rowid,user_id_hash FROM temp.mesh_habit_accounts WHERE rowid>?1 ORDER BY rowid LIMIT 1", drop = "DROP TABLE temp.mesh_habit_accounts"};
+    HabitIDs :: StagedRows.{stage = "CREATE TEMP TABLE mesh_habit_ids AS ",
+        read = "SELECT * FROM temp.mesh_habit_ids ORDER BY rowid", drop = "DROP TABLE temp.mesh_habit_ids"};
+    Operations :: StagedRows.{stage = "CREATE TEMP TABLE mesh_habit_ops AS ",
+        read = "SELECT * FROM temp.mesh_habit_ops ORDER BY rowid", drop = "DROP TABLE temp.mesh_habit_ops"};
+    Orphans :: StagedRows.{stage = "CREATE TEMP TABLE mesh_habit_orphans AS ",
+        read = "SELECT * FROM temp.mesh_habit_orphans ORDER BY rowid", drop = "DROP TABLE temp.mesh_habit_orphans"};
+
+    Stage :: (database: *void, rows: StagedRows, query: string, arguments: []statements.Argument) -> s32 {
+        // Isolate ordered results from triggers and writes to their source tables.
+        command: Vec(u8)
+        if !BuilderAppend(command, rows.stage) || !BuilderAppend(command, query) { return sqlite.SQLITE_NOMEM }
+        return statements.Execute(database, TextView(VecSlice(command, 0, command.count)), arguments)
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    HabitExists :: (database: *void, arguments: []statements.Argument) -> Migration {
+        found := statements.ReadInteger(database, queries.ExistsQuery, arguments)
+        return .{status = found.status, changed = found.value != 0}
+    }
+
+    MergeRows :: (database: *void, userID: string, keeperID: string, duplicateID: string) -> s32 {
+        if keeperID == duplicateID { return sqlite.SQLITE_OK }
+        keeperKey: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(keeperID)]
+        keeper := HabitExists(database, keeperKey[:])
+        if keeper.status != sqlite.SQLITE_OK { return keeper.status }
+        arguments: [3]statements.Argument = .[statements.TextArg(userID), statements.TextArg(duplicateID),
+            statements.TextArg(keeperID)]
+        duplicate := HabitExists(database, arguments[:2])
+        if duplicate.status != sqlite.SQLITE_OK { return duplicate.status }
+        if duplicate.changed {
+            merge := ifx keeper.changed then queries.MergeHabitQuery else queries.RenameQuery
+            status := statements.Execute(database, merge, arguments[:])
+            if status != sqlite.SQLITE_OK { return status }
+            if keeper.changed {
+                status = statements.Execute(database, queries.DeleteHabitQuery, arguments[:2])
+                if status != sqlite.SQLITE_OK { return status }
+            }
+        }
+        status := statements.Execute(database, queries.MergeDaysQuery, arguments[:])
+        if status != sqlite.SQLITE_OK { return status }
+        return statements.Execute(database, queries.DeleteDaysQuery, arguments[:2])
+    }
+
+    RewritePayload :: (payload: string, canonicalID: string, output: *Vec(u8)) -> bool {
+        if payload == "" || canonicalID == "" { return true }
+        document: JsonDocument
+        if !JsonRead(*document, payload) { return document.error != "out of memory reading JSON" }
+        if JsonKindOf(*document, document.root) != .Object { return true }
+        changed := false
+        keys: [2]string = .["id", "habit_id"]
+        for key: keys {
+            if JsonMember(*document, document.root, key) < 0 { continue }
+            child := JsonNewString(*document, canonicalID)
+            if child < 0 || !JsonSet(*document, document.root, key, child) { return false }
+            changed = true
+        }
+        return !changed || JsonWriteInto(output, *document, document.root, JsonCompactStyle(false, true))
+    }
+
+    CanonicalizeOperations :: (database: *void, userID: string) -> Migration {
+        user: [1]statements.Argument = .[statements.TextArg(userID)]
+        status := Stage(database, Operations, queries.OperationsQuery, user[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteExecText(database, Operations.drop)
+        noArguments: []statements.Argument
+        rows := statements.Prepare(database, Operations.read, noArguments)
+        if rows.status != sqlite.SQLITE_OK { return .{status = rows.status} }
+        defer sqlite.SqliteFinalize(rows.value)
+        changed := false
+        status = sqlite.SqliteStep(rows.value)
+        while status == sqlite.SQLITE_ROW {
+            entityID := statements.ColumnText(rows.value, 1)
+            canonical := identifiers.ForRead(database, userID, entityID)
+            if canonical.status != sqlite.SQLITE_OK { return .{status = canonical.status} }
+            if canonical.mapped {
+                id := TextView(VecSlice(canonical.value, 0, canonical.value.count))
+                operation := statements.ColumnText(rows.value, 0)
+                payload := statements.ColumnText(rows.value, 2)
+                rewritten: Vec(u8)
+                if !RewritePayload(payload, id, *rewritten) { return .{status = sqlite.SQLITE_NOMEM} }
+                if rewritten.count > 0 { payload = TextView(VecSlice(rewritten, 0, rewritten.count)) }
+                arguments: [4]statements.Argument = .[user[0], statements.TextArg(operation),
+                    statements.TextArg(id), statements.TextArg(payload)]
+                status = statements.Execute(database, queries.UpdateOperationQuery, arguments[:])
+                if status != sqlite.SQLITE_OK { return .{status = status} }
+                changed = changed || sqlite.SqliteChanges(database) > 0
+            }
+            status = sqlite.SqliteStep(rows.value)
+        }
+        if status != sqlite.SQLITE_DONE { return .{status = status} }
+        return .{changed = changed}
+    }
+
+    CanonicalizeIDs :: (database: *void, userID: string) -> Migration {
+        user: [1]statements.Argument = .[statements.TextArg(userID)]
+        status := Stage(database, HabitIDs, queries.AllIDsQuery, user[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteExecText(database, HabitIDs.drop)
+        noArguments: []statements.Argument
+        rows := statements.Prepare(database, HabitIDs.read, noArguments)
+        if rows.status != sqlite.SQLITE_OK { return .{status = rows.status} }
+        defer sqlite.SqliteFinalize(rows.value)
+        changed := false
+        status = sqlite.SqliteStep(rows.value)
+        while status == sqlite.SQLITE_ROW {
+            oldID := statements.ColumnText(rows.value, 0)
+            if oldID != "" && !habit_id.IsCanonical(oldID) {
+                canonical := identifiers.ForWrite(database, userID, oldID, "protocol-v3-canonical")
+                if canonical.status != sqlite.SQLITE_OK { return .{status = canonical.status} }
+                id := TextView(VecSlice(canonical.value, 0, canonical.value.count))
+                if id != oldID {
+                    status = MergeRows(database, userID, id, oldID)
+                    if status != sqlite.SQLITE_OK { return .{status = status} }
+                    changed = changed || canonical.mapped
+                }
+            }
+            status = sqlite.SqliteStep(rows.value)
+        }
+        if status != sqlite.SQLITE_DONE { return .{status = status} }
+        return .{changed = changed}
+    }
+
+    NormalizeTime :: (stored: string, output: []u8) -> s64 {
+        if stored != "" { return format.UTC(timestamp.Parse(stored), output) }
+        milliseconds := clock.UnixMilliseconds()
+        seconds := milliseconds / 1000
+        remaining := milliseconds % 1000
+        if remaining < 0 {
+            seconds -= 1
+            remaining += 1000
+        }
+        return format.UTC(.{valid = true, seconds = seconds, nanoseconds = cast(s32)(remaining * 1000000)}, output)
+    }
+
+    MaterializeDays :: (database: *void, userID: string) -> Migration {
+        user: [1]statements.Argument = .[statements.TextArg(userID)]
+        status := Stage(database, Orphans, queries.LegacyDaysQuery, user[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteExecText(database, Orphans.drop)
+        noArguments: []statements.Argument
+        rows := statements.Prepare(database, Orphans.read, noArguments)
+        if rows.status != sqlite.SQLITE_OK { return .{status = rows.status} }
+        defer sqlite.SqliteFinalize(rows.value)
+        sortOrder: s64 = 1000
+        changed := false
+        status = sqlite.SqliteStep(rows.value)
+        while status == sqlite.SQLITE_ROW {
+            oldID := statements.ColumnText(rows.value, 0)
+            storedTime := statements.ColumnText(rows.value, 1)
+            version := sqlite.SqliteColumnInt64(rows.value, 2)
+            canonical := identifiers.ForWrite(database, userID, oldID, "protocol-v3-orphan")
+            if canonical.status != sqlite.SQLITE_OK { return .{status = canonical.status} }
+            id := TextView(VecSlice(canonical.value, 0, canonical.value.count))
+            name := names.DisplayName(oldID)
+            if name.count == 0 { return .{status = sqlite.SQLITE_NOMEM} }
+            scratch: [31]u8
+            length := NormalizeTime(storedTime, scratch[:])
+            updated := ifx length > 0 then TextView(scratch[:length]) else "0001-01-01T00:00:00.000000000Z"
+            arguments: [6]statements.Argument = .[user[0], statements.TextArg(id),
+                statements.TextArg(TextView(VecSlice(name, 0, name.count))), statements.IntArg(sortOrder),
+                statements.TextArg(updated), statements.IntArg(version)]
+            status = statements.Execute(database, queries.RecoverHabitQuery, arguments[:])
+            if status != sqlite.SQLITE_OK { return .{status = status} }
+            changed = changed || sqlite.SqliteChanges(database) > 0
+            status = MergeRows(database, userID, id, oldID)
+            if status != sqlite.SQLITE_OK { return .{status = status} }
+            sortOrder += 1
+            status = sqlite.SqliteStep(rows.value)
+        }
+        if status != sqlite.SQLITE_DONE { return .{status = status} }
+        return .{changed = changed}
+    }
+
+    #scope_export
+    Account :: (database: *void, userID: string) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        status = AccountTx(database, userID)
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    AccountTx :: (database: *void, userID: string) -> s32 {
+        if database == null || sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        canonical := CanonicalizeIDs(database, userID)
+        if canonical.status != sqlite.SQLITE_OK { return canonical.status }
+        operations := CanonicalizeOperations(database, userID)
+        if operations.status != sqlite.SQLITE_OK { return operations.status }
+        recovered := MaterializeDays(database, userID)
+        if recovered.status != sqlite.SQLITE_OK { return recovered.status }
+        user: [1]statements.Argument = .[statements.TextArg(userID)]
+        status := statements.Execute(database, queries.CleanupQuery, user[:])
+        if status != sqlite.SQLITE_OK { return status }
+        if canonical.changed || operations.changed || recovered.changed || sqlite.SqliteChanges(database) > 0 {
+            next := accounts.NextVersion(database, userID)
+            if next.status != sqlite.SQLITE_OK { return next.status }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    AllAccounts :: (database: *void) -> s32 {
+        if database == null || !sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        noArguments: []statements.Argument
+        status := Stage(database, Accounts, queries.AllAccountsQuery, noArguments)
+        if status != sqlite.SQLITE_OK { return status }
+        defer sqlite.SqliteExecText(database, Accounts.drop)
+        initial: [1]statements.Argument = .[statements.IntArg(0)]
+        roster := statements.Prepare(database, Accounts.read, initial[:])
+        if roster.status != sqlite.SQLITE_OK { return roster.status }
+        defer sqlite.SqliteFinalize(roster.value)
+        while true {
+            status = sqlite.SqliteStep(roster.value)
+            if status == sqlite.SQLITE_DONE { return sqlite.SQLITE_OK }
+            if status != sqlite.SQLITE_ROW { return status }
+            rowID := sqlite.SqliteColumnInt64(roster.value, 0)
+            userID: Vec(u8)
+            if !BuilderAppend(userID, statements.ColumnText(roster.value, 1)) { return sqlite.SQLITE_NOMEM }
+            // Release the roster's active cursor before modifying the temp schema.
+            status = sqlite.SqliteReset(roster.value)
+            if status != sqlite.SQLITE_OK { return status }
+            status = Account(database, TextView(VecSlice(userID, 0, userID.count)))
+            if status != sqlite.SQLITE_OK { return status }
+            status = sqlite.SqliteBindInt64(roster.value, 1, rowID)
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SQLITE_OK
+    }
+}

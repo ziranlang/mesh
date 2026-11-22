@@ -3,6 +3,7 @@ sql :: #import "std/sql_go";
 driver :: #import "sqlite_driver";
 ctx :: #import "std/context_go";
 schema :: #import "store_schema";
+core :: #import "schema_sql";
 referrals :: #import "referral_schema";
 aliases :: #import "alias_case";
 usage :: #import "storage_usage";
@@ -55,7 +56,7 @@ Initialize :: (database: *sql.Database, context: ctx.Context) -> Error {
         return error
     }
     indexed := sql.Exec(database, context,
-        "CREATE INDEX IF NOT EXISTS server_record_page_order ON server_encrypted_records(user_id_hash,server_version,collection,id)", empty[:])
+        core.RecordPageIndex, empty[:])
     if indexed.error != null {
         return indexed.error
     }

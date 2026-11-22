@@ -17,6 +17,8 @@ errors :: #import "std/errors_go";
 files :: #import "std/file_go";
 locks :: #import "std/sync_go";
 identity :: #import "identity";
+queries :: #import "account_hold_queries";
+account_queries :: #import "account_state_queries";
 state :: #import "account_state";
 storage :: #import "account_storage";
 go_sql :: #system_library "go:database/sql";
@@ -73,72 +75,6 @@ LogWarning :: (message: string, key: string, value: string, errorKey: string, er
 // the store's single connection, so one runs at a time.
 attaching: locks.Mutex;
 
-// Tables a deletion of the account reaches, parents before children. Storage
-// totals are derived from the other rows, which rebuild them on restore.
-HeldTablesSQL :: #string SQL_END
-WITH RECURSIVE
-edges(child, parent) AS (
-    SELECT tables.name, keys."table"
-    FROM sqlite_master AS tables, pragma_foreign_key_list(tables.name, 'main') AS keys
-    WHERE tables.type='table' AND keys.on_delete='CASCADE'
-),
-reached(name, depth) AS (
-    SELECT 'server_users', 0
-    UNION
-    SELECT edges.child, reached.depth+1
-    FROM edges JOIN reached ON edges.parent=reached.name
-    WHERE reached.depth<16 AND edges.child<>'server_storage_usage'
-)
-SELECT name FROM reached GROUP BY name ORDER BY MAX(depth), name
-SQL_END;
-
-// The rows of a table that its held parents own: exactly those a deletion
-// cascades to. Parents are held first, so their copies already exist.
-HoldConditionSQL :: #string SQL_END
-SELECT COALESCE(group_concat(clause, ' OR '), '') FROM (
-    SELECT 'EXISTS(SELECT 1 FROM held."' || keys."table" || '" AS parent WHERE ' ||
-        group_concat('parent."' || keys."to" || '"=item."' || keys."from" || '"', ' AND ') || ')' AS clause
-    FROM pragma_foreign_key_list(?1, 'main') AS keys
-    WHERE keys.on_delete='CASCADE'
-      AND EXISTS(SELECT 1 FROM held.sqlite_master WHERE type='table' AND name=keys."table")
-    GROUP BY keys.id
-)
-SQL_END;
-
-// Columns a held table and its live table share, so a column added while
-// the account was on hold takes its default.
-RestoreColumnsSQL :: #string SQL_END
-SELECT COALESCE(group_concat('"' || kept.name || '"', ','), '')
-FROM pragma_table_info(?1, 'held') AS kept
-WHERE EXISTS(SELECT 1 FROM pragma_table_info(?1, 'main') AS live WHERE live.name=kept.name)
-SQL_END;
-
-// A held row comes back only where every row it refers to still exists, such
-// as a friend who has not deleted their own account.
-RestoreConditionSQL :: #string SQL_END
-SELECT COALESCE(group_concat(clause, ' AND '), '') FROM (
-    SELECT '(item."' || MIN(CASE WHEN keys.seq=0 THEN keys."from" END) ||
-        '" IS NULL OR EXISTS(SELECT 1 FROM main."' || keys."table" || '" AS parent WHERE ' ||
-        group_concat('parent."' || keys."to" || '"=item."' || keys."from" || '"', ' AND ') || '))' AS clause
-    FROM pragma_foreign_key_list(?1, 'main') AS keys
-    GROUP BY keys.id
-)
-SQL_END;
-
-HeldTableSQL :: "SELECT EXISTS(SELECT 1 FROM held.sqlite_master WHERE type='table' AND name=?1)";
-
-// Someone may have taken the account's alias while it was on hold.
-AliasTakenSQL :: #string SQL_END
-UPDATE held.server_users SET alias=NULL
-WHERE alias IS NOT NULL AND EXISTS(
-    SELECT 1 FROM main.server_users AS other WHERE lower(other.alias)=lower(held.server_users.alias))
-SQL_END;
-
-HoldRecordSQL :: #string SQL_END
-INSERT INTO server_account_holds(user_id_hash,held_at,purge_after) VALUES(?1,?2,?3)
-ON CONFLICT(user_id_hash) DO UPDATE SET held_at=excluded.held_at,purge_after=excluded.purge_after
-SQL_END;
-
 Folder :: (dbPath: string) -> string {
     return Concat(dbPath, ".held")
 }
@@ -193,7 +129,7 @@ Flag :: (database: *sql.Database, context: ctx.Context, query: string, value: st
 HeldTables :: (database: *sql.Database, context: ctx.Context) -> TablesResult {
     result: TablesResult
     empty: [0]Any
-    queried := sql.Query(database, context, HeldTablesSQL, empty[:])
+    queried := sql.Query(database, context, queries.HeldTables, empty[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -219,13 +155,13 @@ Attach :: (database: *sql.Database, context: ctx.Context, file: string) -> Error
     // A run that failed before detaching must not block this one.
     unused Detach(database, context)
     arguments: [1]Any = .[file]
-    attached := sql.Exec(database, context, "ATTACH DATABASE ?1 AS held", arguments[:])
+    attached := sql.Exec(database, context, queries.Attach, arguments[:])
     return attached.error
 }
 
 Detach :: (database: *sql.Database, context: ctx.Context) -> Error {
     empty: [0]Any
-    detached := sql.Exec(database, context, "DETACH DATABASE held", empty[:])
+    detached := sql.Exec(database, context, queries.Detach, empty[:])
     return detached.error
 }
 
@@ -242,7 +178,7 @@ CopyRows :: (database: *sql.Database, context: ctx.Context, tables: []string, us
             }
             continue
         }
-        condition := Text(database, context, HoldConditionSQL, table)
+        condition := Text(database, context, queries.HoldCondition, table)
         if condition.error != null {
             return condition.error
         }
@@ -292,7 +228,7 @@ RemoveLive :: (database: *sql.Database, context: ctx.Context, userID: string, no
     heldAt := clock.Unix(now)
     purgeAfter := heldAt + cast(s64)(HoldDays * Day)
     arguments: [3]Any = .[userID, heldAt, purgeAfter]
-    recorded := sql.ExecTx(opened.value, context, HoldRecordSQL, arguments[:])
+    recorded := sql.ExecTx(opened.value, context, queries.HoldRecord, arguments[:])
     if recorded.error != null {
         return recorded.error
     }
@@ -310,7 +246,7 @@ RestoreStatements :: (database: *sql.Database, context: ctx.Context) -> TablesRe
     }
     statements := AllocateTexts(cast(isize)0)
     for table: tables.value {
-        present := Flag(database, context, HeldTableSQL, table)
+        present := Flag(database, context, queries.HeldTable, table)
         if present.error != null {
             result.error = present.error
             return result
@@ -318,7 +254,7 @@ RestoreStatements :: (database: *sql.Database, context: ctx.Context) -> TablesRe
         if !present.value {
             continue
         }
-        columns := Text(database, context, RestoreColumnsSQL, table)
+        columns := Text(database, context, queries.RestoreColumns, table)
         if columns.error != null {
             result.error = columns.error
             return result
@@ -326,7 +262,7 @@ RestoreStatements :: (database: *sql.Database, context: ctx.Context) -> TablesRe
         if columns.value == "" {
             continue
         }
-        condition := Text(database, context, RestoreConditionSQL, table)
+        condition := Text(database, context, queries.RestoreCondition, table)
         if condition.error != null {
             result.error = condition.error
             return result
@@ -356,7 +292,7 @@ RestoreRows :: (database: *sql.Database, context: ctx.Context, userID: string) -
     transaction := opened.value
     RollbackAtReturn(transaction)
     empty: [0]Any
-    freed := sql.ExecTx(transaction, context, AliasTakenSQL, empty[:])
+    freed := sql.ExecTx(transaction, context, queries.AliasTaken, empty[:])
     if freed.error != null {
         return freed.error
     }
@@ -370,18 +306,18 @@ RestoreRows :: (database: *sql.Database, context: ctx.Context, userID: string) -
     back: isize = 0
     destinations: [1]Any = .[*back]
     error := sql.ScanRow(sql.QueryRowTx(transaction, context,
-        "SELECT EXISTS(SELECT 1 FROM main.server_users WHERE user_id_hash=?1)", owner[:]), destinations[:])
+        queries.AccountExists, owner[:]), destinations[:])
     if error != null {
         return error
     }
     if back == cast(isize)0 {
         return errors.New("held account did not come back")
     }
-    released := sql.ExecTx(transaction, context, "DELETE FROM server_account_holds WHERE user_id_hash=?1", owner[:])
+    released := sql.ExecTx(transaction, context, queries.ReleaseHold, owner[:])
     if released.error != null {
         return released.error
     }
-    revived := sql.ExecTx(transaction, context, "DELETE FROM server_account_tombstones WHERE user_id_hash=?1", owner[:])
+    revived := sql.ExecTx(transaction, context, account_queries.ClearTombstone, owner[:])
     if revived.error != null {
         return revived.error
     }
@@ -413,16 +349,6 @@ PurgeOne :: (database: *sql.Database, context: ctx.Context, dbPath: string, user
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL_END
-CREATE TABLE IF NOT EXISTS server_account_holds (
-    user_id_hash TEXT PRIMARY KEY,
-    held_at INTEGER NOT NULL,
-    purge_after INTEGER NOT NULL
-);
-SQL_END;
-}
-
 // Deletes the account from the live tables and keeps its rows and blob files
 // on hold for HoldDays. A hold left from an earlier deletion gives way.
 Delete :: (database: *sql.Database, context: ctx.Context, dbPath: string, userID: string,
@@ -472,7 +398,7 @@ Restore :: (database: *sql.Database, context: ctx.Context, dbPath: string, userI
     }
     locks.Lock(*attaching)
     UnlockAtReturn(*attaching)
-    held := Flag(database, context, "SELECT EXISTS(SELECT 1 FROM server_account_holds WHERE user_id_hash=?1)", userID)
+    held := Flag(database, context, queries.HoldExists, userID)
     if held.error != null || !held.value {
         result.error = held.error
         return result
@@ -492,7 +418,7 @@ Restore :: (database: *sql.Database, context: ctx.Context, dbPath: string, userI
     if found.error != null {
         LogWarning("restore held account", "user", userID, "error", found.error)
         owner: [1]Any = .[userID]
-        ended := sql.Exec(database, context, "DELETE FROM server_account_holds WHERE user_id_hash=?1", owner[:])
+        ended := sql.Exec(database, context, queries.ReleaseHold, owner[:])
         result.error = ended.error
         return result
     }
@@ -527,7 +453,7 @@ HeldUntil :: (database: *sql.Database, context: ctx.Context, userID: string) -> 
     arguments: [1]Any = .[userID]
     destinations: [1]Any = .[*result.value]
     result.error = sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT COALESCE((SELECT purge_after FROM server_account_holds WHERE user_id_hash=?1),0)", arguments[:]), destinations[:])
+        queries.HeldUntil, arguments[:]), destinations[:])
     return result
 }
 

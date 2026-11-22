@@ -1,0 +1,13 @@
+// Check the portable byte restrictions for a single path component. The
+// filesystem adapter also checks its platform's rules for local paths.
+Valid :: (value: string) -> bool {
+    if value == "" || value == "." || value == ".." {
+        return false
+    }
+    for byte: value {
+        if byte == 0 || byte == #char "/" || byte == #char "\\" {
+            return false
+        }
+    }
+    return true
+}

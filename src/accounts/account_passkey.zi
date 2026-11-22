@@ -14,6 +14,8 @@ auth :: #import "http_auth";
 response :: #import "response";
 body :: #import "http_body";
 strict :: #import "strict_json";
+rules :: #import "account_passkey_rules";
+queries :: #import "account_passkey_queries";
 limiting :: #import "rate_limit";
 request_rate :: #import "request_rate";
 address :: #import "client_address";
@@ -82,20 +84,12 @@ LockedOutput :: struct {
     retry_after: s64 #go_tag "json:\"retry_after\""
 }
 
-// The whole wrapper text a device sends.
-WRAPPER_MAX_BYTES :: 17800
-// A copy that claims another key source is refused.
-WRAPPER_PREFIX :: "waozi-account-passkey-v1\nalgorithm=ML-DSA-44\nkdf=WebAuthn-PRF-SHA-256\ncredential="
-HEX_64 :: 64
-LABEL_MAX_BYTES :: 40
-PASSKEYS_PER_ACCOUNT :: 8
 OPEN_REQUESTS_PER_MINUTE :: 20
 RETRY_SECONDS :: 60
 WRONG_PASSKEY :: "passkey not recognized"
 
 #scope_file
 
-HasPrefix :: (value: string, prefix: string) -> bool #foreign go_strings;
 Join :: (values: []string, separator: string) -> string #foreign go_strings;
 EncodeHex :: (value: []u8) -> string #foreign go_hex "EncodeToString";
 Sum256 :: (value: []u8) -> [32]u8 #foreign go_sha256 "Sum256";
@@ -110,36 +104,6 @@ CloseRowsAtReturn :: (rows: *sql.Rows) #go_defer #foreign go_sql "(*Rows).Close"
 
 MinuteWindow :: () -> clock.Duration {
     return cast(clock.Duration)60000000000
-}
-
-LowerHex :: (value: string, length: s64) -> bool {
-    if value.count != length {
-        return false
-    }
-    for byte: value {
-        digit := byte >= cast(u8)48 && byte <= cast(u8)57
-        letter := byte >= cast(u8)97 && byte <= cast(u8)102
-        if !digit && !letter {
-            return false
-        }
-    }
-    return true
-}
-
-// Plain letters, digits, spaces, - and _ only: other devices show this text.
-LabelValid :: (label: string) -> bool {
-    if label.count > LABEL_MAX_BYTES {
-        return false
-    }
-    for byte: label {
-        lower := byte >= cast(u8)97 && byte <= cast(u8)122
-        upper := byte >= cast(u8)65 && byte <= cast(u8)90
-        digit := byte >= cast(u8)48 && byte <= cast(u8)57
-        if !lower && !upper && !digit && byte != cast(u8)32 && byte != cast(u8)45 && byte != cast(u8)95 {
-            return false
-        }
-    }
-    return true
 }
 
 NoStore :: (writer: http.ResponseWriter) {
@@ -164,31 +128,19 @@ SignedInAccount :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, requ
     return signed.value
 }
 
-// The copy's credential line must carry the credential sent beside it.
 WrapperValid :: (input: StoreInput) -> bool {
-    if input.wrapper.count > WRAPPER_MAX_BYTES {
-        return false
-    }
-    if !LowerHex(input.credential, HEX_64) || !LowerHex(input.verifier, HEX_64) || !LabelValid(input.label) {
-        return false
-    }
-    parts: [3]string = .[WRAPPER_PREFIX, input.credential, "\n"]
-    header := Join(parts[:], "")
-    return input.wrapper.count > header.count && HasPrefix(input.wrapper, header)
+    return rules.PasskeyWrapperValid(input.wrapper, input.credential) &&
+        rules.LowerHex64(input.verifier) && rules.PasskeyLabelValid(input.label)
 }
 
 CountPasskeys :: (database: *sql.Database, context: ctx.Context, account: string, except: string, result: *s64) -> Error {
     arguments: [2]Any = .[account, except]
     destinations: [1]Any = .[result]
     return sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT COUNT(*) FROM server_account_passkeys WHERE user_id_hash=?1 AND credential<>?2", arguments[:]), destinations[:])
+        queries.CountOtherPasskeysSQL, arguments[:]), destinations[:])
 }
 
 #scope_export
-
-SchemaSQL :: () -> string {
-    return "CREATE TABLE IF NOT EXISTS server_account_passkeys(user_id_hash TEXT NOT NULL,credential TEXT NOT NULL,wrapper TEXT NOT NULL,verifier TEXT NOT NULL,label TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(user_id_hash,credential));"
-}
 
 // Releases a stored copy for the right proof. An unknown account or credential
 // and a wrong proof all get the same refusal.
@@ -203,7 +155,7 @@ Open :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.
     input: OpenInput
     raw := body.ReadJSON(writer, request, 1024)
     if raw.error != null || strict.Decode(raw.value, *input) != null ||
-        !LowerHex(input.account, HEX_64) || !LowerHex(input.credential, HEX_64) || !LowerHex(input.proof, HEX_64) {
+        !rules.LowerHex64(input.account) || !rules.LowerHex64(input.credential) || !rules.LowerHex64(input.proof) {
         response.Error(writer, 400, "invalid passkey request")
         return
     }
@@ -213,7 +165,7 @@ Open :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.
     arguments: [2]Any = .[input.account, input.credential]
     destinations: [2]Any = .[*verifier, *wrapper]
     found := sql.ScanRow(sql.QueryRow(passkeys.database, http.Context(request),
-        "SELECT verifier,wrapper FROM server_account_passkeys WHERE user_id_hash=?1 AND credential=?2", arguments[:]), destinations[:])
+        queries.OpenAccountPasskeySQL, arguments[:]), destinations[:])
     if found != null && !errors.Is(found, sql.NoRows()) {
         response.Error(writer, 500, "account passkey unavailable")
         return
@@ -233,7 +185,7 @@ Put :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.R
         return
     }
     input: StoreInput
-    raw := body.ReadJSON(writer, request, WRAPPER_MAX_BYTES + 1024)
+    raw := body.ReadJSON(writer, request, rules.PasskeyWrapperMaximum + 1024)
     if raw.error != null || strict.Decode(raw.value, *input) != null || !WrapperValid(input) {
         response.Error(writer, 400, "invalid passkey copy")
         return
@@ -245,17 +197,17 @@ Put :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.R
         response.Error(writer, 500, "account passkey unavailable")
         return
     }
-    if others >= PASSKEYS_PER_ACCOUNT {
+    if others >= rules.MaximumAccountPasskeys {
         response.Error(writer, 409, "too many passkeys")
         return
     }
     now := clock.Unix(clock.Now())
-    arguments: [7]Any = .[account, input.credential, input.wrapper, input.verifier, input.label, now, PASSKEYS_PER_ACCOUNT]
+    arguments: [7]Any = .[account, input.credential, input.wrapper, input.verifier, input.label, now, rules.MaximumAccountPasskeys]
     // The account must still exist when the row is written, so a copy cannot
     // outlive an account deleted in the meantime. The limit is checked in the
     // same statement, so two uploads at once cannot both pass it.
     written := sql.Exec(passkeys.database, context,
-        "INSERT INTO server_account_passkeys(user_id_hash,credential,wrapper,verifier,label,created_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?1) AND (SELECT COUNT(*) FROM server_account_passkeys WHERE user_id_hash=?1 AND credential<>?2)<?7 ON CONFLICT(user_id_hash,credential) DO UPDATE SET wrapper=excluded.wrapper,verifier=excluded.verifier,label=excluded.label",
+        queries.StoreAccountPasskeySQL,
         arguments[:])
     if written.error != null {
         response.Error(writer, 500, "account passkey unavailable")
@@ -264,7 +216,7 @@ Put :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.R
     affected := sql.RowsAffected(written.value)
     if affected.error == null && affected.value == 0 {
         recount := CountPasskeys(passkeys.database, context, account, input.credential, *others)
-        if recount == null && others >= PASSKEYS_PER_ACCOUNT {
+        if recount == null && others >= rules.MaximumAccountPasskeys {
             response.Error(writer, 409, "too many passkeys")
             return
         }
@@ -284,7 +236,7 @@ List :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *http.
     }
     arguments: [1]Any = .[account]
     queried := sql.Query(passkeys.database, http.Context(request),
-        "SELECT credential,label,created_at FROM server_account_passkeys WHERE user_id_hash=?1 ORDER BY created_at,credential", arguments[:])
+        queries.ListAccountPasskeysSQL, arguments[:])
     if queried.error != null {
         response.Error(writer, 500, "account passkey unavailable")
         return
@@ -318,13 +270,13 @@ Remove :: (passkeys: AccountPasskeys, writer: http.ResponseWriter, request: *htt
     }
     input: RemoveInput
     raw := body.ReadJSON(writer, request, 1024)
-    if raw.error != null || strict.Decode(raw.value, *input) != null || !LowerHex(input.credential, HEX_64) {
+    if raw.error != null || strict.Decode(raw.value, *input) != null || !rules.LowerHex64(input.credential) {
         response.Error(writer, 400, "invalid passkey")
         return
     }
     arguments: [2]Any = .[account, input.credential]
     removed := sql.Exec(passkeys.database, http.Context(request),
-        "DELETE FROM server_account_passkeys WHERE user_id_hash=?1 AND credential=?2", arguments[:])
+        queries.RemoveAccountPasskeySQL, arguments[:])
     if removed.error != null {
         response.Error(writer, 500, "account passkey unavailable")
         return

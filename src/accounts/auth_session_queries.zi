@@ -1,0 +1,64 @@
+Schema :: #string SQL_END
+CREATE TABLE IF NOT EXISTS server_auth_settings (
+ name TEXT PRIMARY KEY,
+ value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_auth_sessions (
+ token_hash TEXT PRIMARY KEY,
+ user_id_hash TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ session_id TEXT NOT NULL UNIQUE,
+ client_id TEXT NOT NULL DEFAULT '',
+ issued_at INTEGER NOT NULL,
+ expires_at INTEGER NOT NULL,
+ created_at TEXT NOT NULL,
+ revoked_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS server_auth_sessions_device
+ON server_auth_sessions(user_id_hash,client_id,revoked_at,expires_at);
+CREATE TABLE IF NOT EXISTS server_auth_legacy_revocations (
+ account_id TEXT PRIMARY KEY,
+ invalidated_at TEXT NOT NULL
+);
+SQL_END;
+
+Insert :: #string SQL_END
+INSERT INTO server_auth_sessions(token_hash,user_id_hash,session_id,client_id,issued_at,expires_at,created_at)
+VALUES(?1,?2,?3,?4,?5,?6,?7)
+ON CONFLICT(token_hash) DO NOTHING
+SQL_END;
+
+Active :: #string SQL_END
+SELECT EXISTS(
+ SELECT 1 FROM server_auth_sessions
+ WHERE token_hash=?1 AND user_id_hash=?2 AND revoked_at='' AND expires_at>=?3
+)
+SQL_END;
+
+Setting :: "SELECT value FROM server_auth_settings WHERE name=?1";
+AccountCreated :: "SELECT created_at FROM server_users WHERE user_id_hash=?1";
+AccountCreatedAndMigration :: "SELECT u.created_at,s.value FROM server_users u,server_auth_settings s WHERE u.user_id_hash=?1 AND s.name='legacy_v1_started'";
+LegacyRevoked :: "SELECT EXISTS(SELECT 1 FROM server_auth_legacy_revocations WHERE account_id=?1)";
+AccountTombstoned :: "SELECT EXISTS(SELECT 1 FROM server_account_tombstones WHERE user_id_hash=?1)";
+AccountExists :: "SELECT EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?1)";
+
+RevokeBearer :: #string SQL_END
+UPDATE server_auth_sessions
+SET revoked_at=CURRENT_TIMESTAMP
+WHERE user_id_hash=?1 AND token_hash=?2 AND revoked_at=''
+SQL_END;
+
+RevokeSession :: #string SQL_END
+UPDATE server_auth_sessions
+SET revoked_at=CURRENT_TIMESTAMP
+WHERE user_id_hash=?1 AND session_id=?2 AND revoked_at=''
+SQL_END;
+
+RevokeDevice :: #string SQL_END
+UPDATE server_auth_sessions
+SET revoked_at=CURRENT_TIMESTAMP
+WHERE user_id_hash=?1 AND client_id=?2 AND revoked_at=''
+SQL_END;
+
+InitializeStarted :: "INSERT OR IGNORE INTO server_auth_settings(name,value) VALUES(?1,CURRENT_TIMESTAMP)";
+InitializeDeadline :: "INSERT OR IGNORE INTO server_auth_settings(name,value) VALUES(?1,?2)";
+RevokeLegacy :: "INSERT OR IGNORE INTO server_auth_legacy_revocations(account_id,invalidated_at) VALUES(?1,?2)";

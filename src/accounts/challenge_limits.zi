@@ -1,0 +1,3 @@
+MaxOutstanding :: 8;
+MaxOutstandingChallenges :: 65536;
+NonceSize :: 32;

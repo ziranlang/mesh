@@ -1,0 +1,86 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    statements :: #import "sqlite_statement_native";
+    wire :: #import "wire_text";
+    identifiers :: #import "habit_id_text";
+    queries :: #import "habit_id_queries";
+    random :: #import "std/random_linux";
+    #import "std/vec"
+
+    IDResult :: struct {
+        value: Vec(u8)
+        mapped: bool
+        found: bool
+        status: s32
+    }
+
+    #scope_file
+    EntropyUnavailable :: 10; // SQLITE_IOERR
+
+    Copy :: (id: string, mapped: bool) -> IDResult {
+        result: IDResult
+        if !BuilderAppend(result.value, id) { return .{status = sqlite.SQLITE_NOMEM} }
+        result.mapped = mapped
+        result.found = true
+        return result
+    }
+
+    LowerUUID :: (id: string) -> IDResult {
+        bytes: [36]u8
+        for byte, index: id {
+            if byte >= #char "A" && byte <= #char "F" {
+                bytes[index] = byte + (#char "a" - #char "A")
+            } else {
+                bytes[index] = byte
+            }
+        }
+        return Copy(TextView(bytes[:]), false)
+    }
+
+    Mapping :: (database: *void, userID: string, id: string) -> IDResult {
+        arguments: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(id)]
+        opened := statements.Prepare(database, queries.Lookup, arguments[:])
+        if opened.status != sqlite.SQLITE_OK { return .{status = opened.status} }
+        defer sqlite.SqliteFinalize(opened.value)
+        status := sqlite.SqliteStep(opened.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        mapped := statements.ColumnText(opened.value, 0)
+        return Copy(mapped, mapped != id)
+    }
+
+    #scope_export
+    // Called inside the account transaction that uses this identifier.
+    ForWrite :: (database: *void, userID: string, id: string, source: string) -> IDResult {
+        normalized := wire.TrimSpace(id)
+        if normalized == "" || sqlite.SqliteGetAutocommit(database) {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        if identifiers.IsCanonical(normalized) { return LowerUUID(normalized) }
+        existing := Mapping(database, userID, normalized)
+        if existing.status != sqlite.SQLITE_OK { return .{status = existing.status} }
+        if existing.found && existing.value.count != 0 {
+            existing.mapped = true
+            return existing
+        }
+        entropy: [16]u8
+        if !random.FillSecure(entropy[:]) { return .{status = EntropyUnavailable} }
+        generated := identifiers.Version4(entropy)
+        canonical := TextView(generated[:])
+        arguments: [4]statements.Argument = .[statements.TextArg(userID), statements.TextArg(normalized),
+            statements.TextArg(canonical), statements.TextArg(source)]
+        status := statements.Execute(database, queries.Save, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        return Copy(canonical, true)
+    }
+
+    ForRead :: (database: *void, userID: string, id: string) -> IDResult {
+        normalized := wire.TrimSpace(id)
+        if normalized == "" { return Copy("", false) }
+        if identifiers.IsCanonical(normalized) { return LowerUUID(normalized) }
+        existing := Mapping(database, userID, normalized)
+        if existing.status != sqlite.SQLITE_OK { return .{status = existing.status} }
+        if existing.found { return existing }
+        return Copy(normalized, false)
+    }
+}

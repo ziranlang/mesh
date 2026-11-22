@@ -1,0 +1,103 @@
+#if TARGET == .C && OS == .LINUX {
+    files :: #import "std/file_linux";
+    directories :: #import "std/file_tree_linux";
+    random :: #import "std/random_linux";
+    strings :: #import "std/c_string";
+    #import "std/vec"
+
+    #scope_file
+    c :: #system_library "c";
+    OpenAt :: (directory: s32, name: *u8, flags: s32, mode: u32) -> s32 #foreign c "openat";
+    Flock :: (fd: s32, operation: s32) -> s32 #foreign c "flock";
+    EffectiveUser :: () -> u32 #foreign c "geteuid";
+    PrivateDirectoryMode :: 448;
+    PrivateFileMode :: 384;
+    GroupAndOther :: 63;
+    LeaseFlags :: 657474; // O_RDWR | O_CREAT | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC
+    ExclusiveNonblockingLock :: 6;
+
+    PrivateFile :: (info: directories.PathInfo) -> bool {
+        return info.kind == .File && (info.mode & GroupAndOther) == 0
+    }
+
+    #scope_export
+    // Match the Go host's cleaned absolute profile name. Open each component
+    // relative to its parent so creation cannot follow a directory symlink.
+    Profile :: (raw: string) -> Text {
+        if raw.count == 0 || raw.count > 4095 || raw[0] != #char "/" { return .{} }
+        path: Vec(u8)
+        if !VecPush(path, #char "/") { return .{} }
+        start: s64 = 1
+        while start < raw.count {
+            end := start
+            while end < raw.count && raw[end] != #char "/" { end += 1 }
+            part := raw[start:end]
+            if part == ".." {
+                endOfParent := path.count
+                while endOfParent > 1 && path[endOfParent - 1] != #char "/" { endOfParent -= 1 }
+                if !VecResize(path, ifx endOfParent > 1 then endOfParent - 1 else 1) { return .{} }
+            } else if part != "" && part != "." {
+                if (path.count > 1 && !VecPush(path, #char "/")) || !BuilderAppend(path, part) { return .{} }
+            }
+            start = end + 1
+        }
+        cleaned := TextView(VecSlice(path, 0, path.count))
+        directory := directories.OpenDirectoryHandle("/")
+        if !directory.valid { return .{} }
+        defer files.CloseFile(directory)
+        start = 1
+        while start < cleaned.count {
+            end := start
+            while end < cleaned.count && cleaned[end] != #char "/" { end += 1 }
+            child := directories.OpenOrCreateChildDirectory(directory, cleaned[start:end], PrivateDirectoryMode)
+            if !child.valid { return .{} }
+            unused files.CloseFile(directory)
+            directory = child
+            start = end + 1
+        }
+        info := directories.PathStatus(cleaned, false)
+        if info.kind != .Directory || (info.mode & GroupAndOther) != 0 || info.owner_uid != EffectiveUser() { return .{} }
+        return TextFromBuilder(path)
+    }
+
+    Lease :: (directory: files.FileHandle, root: string) -> files.FileHandle {
+        name: [10]u8
+        if !strings.CopyCString("node.lock", name[:]) { return .{} }
+        fd := OpenAt(directory.fd, *name[0], LeaseFlags, PrivateFileMode)
+        if fd < 0 { return .{} }
+        handle: files.FileHandle = .{fd = fd, valid = true}
+        path := directories.JoinPath(root, "node.lock")
+        if !PrivateFile(directories.PathStatus(path, false)) || Flock(fd, ExclusiveNonblockingLock) != 0 {
+            unused files.CloseFile(handle)
+            return .{}
+        }
+        return handle
+    }
+
+    StateFileAllowed :: (path: string) -> bool {
+        info := directories.PathQuery(path, false)
+        return info.missing || (info.valid && PrivateFile(info.info))
+    }
+
+    Secret :: (directory: files.FileHandle, root: string, name: string, output: []u8) -> bool {
+        path := directories.JoinPath(root, name)
+        existing := directories.PathQuery(path, false)
+        if existing.missing {
+            if !random.FillSecure(output) { return false }
+            file := directories.OpenNewChildFile(directory, name, PrivateFileMode)
+            if !file.valid { return false }
+            saved := files.WriteAt(file, output, 0) == output.count && files.SyncFile(file)
+            closed := files.CloseFile(file)
+            if !saved || !closed {
+                unused directories.RemoveChildFile(directory, name)
+                return false
+            }
+            return files.SyncFile(directory)
+        }
+        if !existing.valid || !PrivateFile(existing.info) || existing.info.size != output.count { return false }
+        file := directories.OpenChildRegularFile(directory, name)
+        if !file.valid { return false }
+        defer files.CloseFile(file)
+        return files.FileSize(file) == output.count && files.ReadAt(file, output, 0) == output.count
+    }
+}

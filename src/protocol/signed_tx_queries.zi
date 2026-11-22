@@ -1,0 +1,11 @@
+DeleteExpiredSignedTransactionsSQL :: "DELETE FROM server_signed_transactions WHERE expires_at<?1";
+InsertSignedTransactionSQL :: "INSERT INTO server_signed_transactions(account_id,tx_id,app_id,nonce,expires_at) VALUES(?1,?2,?3,?4,?5)";
+ReserveSignedTransactionSQL :: "INSERT INTO server_signed_transactions(account_id,tx_id,app_id,nonce,expires_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";
+DeleteSignedTransactionSQL :: "DELETE FROM server_signed_transactions WHERE account_id=?1 AND tx_id=?2 AND app_id=?3 AND nonce=?4";
+
+ReadDeviceVerifyKeySQL :: "SELECT public_key FROM server_device_keys WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''";
+TouchSignedDeviceSQL :: #string SQL_END
+
+UPDATE server_device_keys SET last_used_at=?4
+WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
+SQL_END;

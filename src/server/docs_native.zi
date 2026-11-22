@@ -1,0 +1,167 @@
+#if TARGET == .C && OS == .LINUX {
+    transport :: #import "http_server_native";
+    page :: #import "docs_page";
+    spec :: #import "docs_openapi";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    files :: #import "std/file_tree_linux";
+    c_string :: #import "std/c_string";
+    numbers :: #import "std/number_text";
+    #import "std/vec"
+
+    #scope_file
+    libc :: #system_library "c";
+    GiB :: 1073741824;
+    NoSniff :: "nosniff";
+    NoStore :: "no-store";
+
+    // Only the leading block fields of Linux statvfs64 are read. The trailing
+    // buffer accommodates the filesystem ID, flags, inode counts and padding.
+    FilesystemStats :: struct {
+        blockSize: usize
+        fragmentSize: usize
+        blocks: u64
+        freeBlocks: u64
+        availableBlocks: u64
+        remaining: [16]u64
+    }
+
+    StatFilesystem :: (path: *u8, result: *FilesystemStats) -> s32 #foreign libc "statvfs64";
+
+    PublicStats :: struct {
+        available: bool
+        users: s64
+        usedGB: s64
+        totalGB: s64
+    }
+
+    ReadStats :: (database: *void, path: string) -> PublicStats {
+        if database == null {
+            return .{}
+        }
+        arguments: [0]sql.Argument
+        count := sql.Prepare(database, "SELECT COUNT(*) FROM server_users", arguments[:])
+        if count.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(count.value)
+        if sqlite.SqliteStep(count.value) != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        users := sqlite.SqliteColumnInt64(count.value, 0)
+
+        directory: [4096]u8
+        filesystem: FilesystemStats
+        if !c_string.CopyCString(files.PathParent(path), directory[:]) ||
+            StatFilesystem(*directory[0], *filesystem) != 0 {
+            return .{}
+        }
+        usedBytes := files.PathStatus(path).size
+        suffixes: [2]string = .["-wal", "-shm"]
+        for suffix: suffixes {
+            name: Vec(u8)
+            if !BuilderAppend(name, path) || !BuilderAppend(name, suffix) {
+                return .{}
+            }
+            usedBytes += files.PathStatus(TextView(VecSlice(name, 0, name.count))).size
+        }
+        usedGB := usedBytes / GiB
+        if usedBytes > 0 && usedGB == 0 {
+            usedGB = 1
+        }
+        freeGB := filesystem.availableBlocks * cast(u64)filesystem.blockSize / cast(u64)GiB
+        if freeGB > 0 {
+            freeGB -= 1
+        }
+        return .{available = true, users = users, usedGB = usedGB, totalGB = usedGB + cast(s64)freeGB}
+    }
+
+    AppendStats :: (body: *Vec(u8), stats: PublicStats) -> bool {
+        if !stats.available {
+            return BuilderAppend(<<body, page.StatsUnavailable)
+        }
+        usersBuffer: [24]u8
+        usedBuffer: [24]u8
+        totalBuffer: [24]u8
+        users := numbers.FormatInteger(stats.users, usersBuffer[:])
+        usedGB := numbers.FormatInteger(stats.usedGB, usedBuffer[:])
+        totalGB := numbers.FormatInteger(stats.totalGB, totalBuffer[:])
+        return BuilderAppend(<<body, "<footer class=\"status\" aria-label=\"Users: ") &&
+            BuilderAppend(<<body, users) && BuilderAppend(<<body, "; Storage: ") &&
+            BuilderAppend(<<body, usedGB) && BuilderAppend(<<body, "/") &&
+            BuilderAppend(<<body, totalGB) && BuilderAppend(<<body, " GB\">\n<span><strong>Users</strong> ") &&
+            BuilderAppend(<<body, users) && BuilderAppend(<<body, "</span>\n<span><strong>Storage</strong> ") &&
+            BuilderAppend(<<body, usedGB) && BuilderAppend(<<body, "/") &&
+            BuilderAppend(<<body, totalGB) && BuilderAppend(<<body, " GB</span>\n</footer>")
+    }
+
+    LandingPage :: (connection: *void, stats: PublicStats, headers: []transport.HeaderValue) -> s32 {
+        sections := page.PageSections()
+        body: Vec(u8)
+        for section: sections[:5] {
+            if !BuilderAppend(body, section) {
+                return 0
+            }
+        }
+        if !AppendStats(*body, stats) || !BuilderAppend(body, sections[5]) {
+            return 0
+        }
+        return transport.WriteWithHeaders(connection, 200, "text/html; charset=utf-8", VecSlice(body, 0, body.count), headers)
+    }
+
+    OpenAPI :: (connection: *void, headers: []transport.HeaderValue) -> s32 {
+        body: Vec(u8)
+        if !VecReserve(body, spec.ByteCount) {
+            return 0
+        }
+        chunks := spec.Chunks()
+        for part: chunks {
+            if !BuilderAppend(body, part) {
+                return 0
+            }
+        }
+        return transport.WriteWithHeaders(connection, 200, "application/vnd.oai.openapi+json", VecSlice(body, 0, body.count), headers)
+    }
+
+    WriteText :: (connection: *void, status: u32, contentType: string, text: string, headers: []transport.HeaderValue) -> s32 {
+        body: Vec(u8)
+        if !BuilderAppend(body, text) {
+            return 0
+        }
+        return transport.WriteWithHeaders(connection, status, contentType, VecSlice(body, 0, body.count), headers)
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == "/" || route == "/openapi.json"
+    }
+
+    Handle :: (connection: *void, verb: string, route: string, zstdResponses: bool) -> s32 {
+        return HandleWithStats(connection, verb, route, zstdResponses, null, "")
+    }
+
+    HandleWithStats :: (connection: *void, verb: string, route: string, zstdResponses: bool,
+        database: *void, databasePath: string) -> s32 {
+        // These endpoints have always sent their identity representations.
+        unused zstdResponses
+        headers: [3]transport.HeaderValue = .[
+            .{name = "X-Content-Type-Options", value = NoSniff},
+            .{name = "Cache-Control", value = NoStore},
+            .{name = "Allow", value = "GET, HEAD"}
+        ]
+        if !Handles(route) {
+            return WriteText(connection, 404, "application/json", "{\"error\":\"not found\"}\n", headers[:2])
+        }
+        if verb == "OPTIONS" {
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 204, "", empty, headers[:2])
+        }
+        if verb != "GET" && verb != "HEAD" {
+            return WriteText(connection, 405, "text/plain; charset=utf-8", "Method Not Allowed\n", headers[:])
+        }
+        if route == "/openapi.json" {
+            return OpenAPI(connection, headers[:2])
+        }
+        return LandingPage(connection, ReadStats(database, databasePath), headers[:2])
+    }
+}

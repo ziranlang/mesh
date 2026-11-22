@@ -1,0 +1,44 @@
+#if TARGET == .C && OS == .LINUX {
+    network :: #import "network_scope_native";
+    json :: #import "std/json_document";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    #scope_export
+    Allowed :: (scope: *network.Scope, document: *json.JsonDocument, manifest: s32) -> bool {
+        declared := json.JsonMember(document, manifest, "lan_networks")
+        if json.JsonKindOf(document, json.JsonMember(document, manifest, "lan_only")) != .True {
+            return json.JsonCount(document, declared) == 0
+        }
+        if !scope.lanOnly || json.JsonKindOf(document, declared) != .Array || json.JsonCount(document, declared) == 0 {
+            return false
+        }
+        networks: network.Scope
+        node := json.JsonFirst(document, declared)
+        while node >= 0 {
+            raw: Text = json.JsonString(document, node)
+            parsed := network.PrivateNetwork(TextView(raw))
+            if parsed.address.count == 0 || !network.AddNetwork(*networks, parsed) { return false }
+            node = json.JsonNext(document, node)
+        }
+        return network.Covers(*networks, scope)
+    }
+
+    StoredAllowed :: (scope: *network.Scope, database: *void) -> string {
+        arguments: []sql.Argument
+        read := sql.Prepare(database, "SELECT manifest_json FROM server_app_manifests", arguments)
+        if read.status != sqlite.SQLITE_OK { return "could not read stored app manifests" }
+        defer sqlite.SqliteFinalize(read.value)
+        while true {
+            status := sqlite.SqliteStep(read.value)
+            if status == sqlite.SQLITE_DONE { return "" }
+            if status != sqlite.SQLITE_ROW { return "could not read stored app manifests" }
+            document: json.JsonDocument
+            if !json.JsonRead(*document, sql.ColumnText(read.value, 0)) ||
+                !Allowed(scope, *document, document.root) {
+                return "stored app manifest forbids this node network scope"
+            }
+        }
+        return ""
+    }
+}

@@ -1,0 +1,175 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+    fields :: #import "sync_json_fields";
+    files :: #import "std/file_tree_linux";
+    queries :: #import "store_stats_queries";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    #import "std/vec"
+
+    #scope_file
+    UsageSQL :: #string SQL_END
+SELECT (SELECT COUNT(*) FROM server_users),
+    (SELECT COUNT(*) FROM server_users WHERE last_seen_at>=datetime('now','-30 days')),
+    (SELECT COUNT(*) FROM server_clients),
+    (SELECT COUNT(*) FROM server_clients WHERE last_seen_at>=datetime('now','-30 days'))
+SQL_END;
+
+    StorageStart :: "WITH collections(collection,record_count,record_bytes) AS (";
+    StorageEnd :: #string SQL_END
+), matched AS (
+    SELECT collection,record_count,record_bytes,
+        (SELECT c.rowid FROM server_app_collections c
+         WHERE CASE WHEN substr(c.collection_prefix,-1)='*'
+              THEN substr(collections.collection,1,length(c.collection_prefix)-1)=
+                   substr(c.collection_prefix,1,length(c.collection_prefix)-1)
+              ELSE collections.collection=c.collection_prefix END
+         ORDER BY length(CAST(c.collection_prefix AS BLOB))-(substr(c.collection_prefix,-1)='*') DESC,
+                  c.app_id,c.collection_prefix
+         LIMIT 1) AS matcher
+    FROM collections
+), attributed AS (
+    SELECT COALESCE(c.app_id,'unregistered') AS app_id,
+           COALESCE(c.collection_prefix,'') AS collection_prefix,
+           m.collection,m.record_count,m.record_bytes
+    FROM matched m LEFT JOIN server_app_collections c ON c.rowid=m.matcher
+), apps AS (
+    SELECT a.app_id,a.display_name FROM server_apps a
+    WHERE EXISTS (SELECT 1 FROM server_app_collections c WHERE c.app_id=a.app_id)
+    UNION ALL
+    SELECT 'unregistered','Unregistered collections'
+    WHERE EXISTS (SELECT 1 FROM attributed WHERE app_id='unregistered')
+      AND NOT EXISTS (SELECT 1 FROM server_app_collections WHERE app_id='unregistered')
+)
+SELECT a.app_id,a.display_name,COALESCE(c.collection_prefix,''),c.collection,
+       COALESCE(c.record_count,0),COALESCE(c.record_bytes,0)
+FROM apps a LEFT JOIN attributed c ON c.app_id=a.app_id
+ORDER BY a.app_id,c.collection
+SQL_END;
+
+    Totals :: struct {
+        records: s64
+        unassigned: s64
+    }
+
+    RegisterCounts :: (database: *void, output: *json.JsonDocument, root: s32) -> bool {
+        arguments: [0]sql.Argument
+        result := sql.Prepare(database, UsageSQL, arguments[:])
+        if result.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(result.value)
+        if sqlite.SqliteStep(result.value) != sqlite.SQLITE_ROW { return false }
+        labels: [4]string = .["registered_users", "active_users_30d", "registered_clients", "active_clients_30d"]
+        for label, index: labels {
+            if !SetNumber(output, root, label, sqlite.SqliteColumnInt64(result.value, cast(s32)index)) { return false }
+        }
+        return true
+    }
+
+    SetNumber :: (output: *json.JsonDocument, root: s32, key: string, value: s64) -> bool {
+        return json.JsonSet(output, root, key, json.JsonNewInteger(output, value))
+    }
+
+    AddTotals :: (output: *json.JsonDocument, root: s32, count: s64, bytes: s64) -> bool {
+        return SetNumber(output, root, "record_count", count) &&
+            SetNumber(output, root, "record_bytes", bytes) && SetNumber(output, root, "logical_bytes", bytes)
+    }
+
+    FileBytes :: (path: string, suffix: string) -> s64 {
+        if path == "" || path == ":memory:" { return 0 }
+        name: Vec(u8)
+        if !BuilderAppend(name, path) || !BuilderAppend(name, suffix) { return 0 }
+        return files.PathStatus(TextView(VecSlice(name, 0, name.count))).size
+    }
+
+    Apps :: (database: *void, output: *json.JsonDocument, root: s32, totals: *Totals) -> bool {
+        statement: Vec(u8)
+        if !BuilderAppend(statement, StorageStart) || !BuilderAppend(statement, queries.CollectionStorageSQL) ||
+            !BuilderAppend(statement, StorageEnd) { return false }
+        arguments: [0]sql.Argument
+        result := sql.Prepare(database, TextView(VecSlice(statement, 0, statement.count)), arguments[:])
+        if result.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(result.value)
+        array := json.JsonNewArray(output)
+        if !json.JsonSet(output, root, "apps", array) { return false }
+        active: Vec(u8)
+        app: s32 = -1
+        collections: s32 = -1
+        count: s64 = 0
+        size: s64 = 0
+        while true {
+            status := sqlite.SqliteStep(result.value)
+            if status == sqlite.SQLITE_DONE { break }
+            if status != sqlite.SQLITE_ROW { return false }
+            id := sql.ColumnText(result.value, 0)
+            if app < 0 || id != TextView(VecSlice(active, 0, active.count)) {
+                if app >= 0 && !AddTotals(output, app, count, size) { return false }
+                VecClear(active)
+                if !BuilderAppend(active, id) { return false }
+                app = json.JsonNewObject(output)
+                collections = json.JsonNewArray(output)
+                name := sql.ColumnText(result.value, 1)
+                if !fields.SetString(output, app, "app_id", id) ||
+                    (name != "" && !fields.SetString(output, app, "display_name", name)) ||
+                    !json.JsonSet(output, app, "collections", collections) || !json.JsonAppend(output, array, app) { return false }
+                count = 0
+                size = 0
+            }
+            records := sqlite.SqliteColumnInt64(result.value, 4)
+            if records == 0 { continue }
+            bytes := sqlite.SqliteColumnInt64(result.value, 5)
+            count += records
+            size += bytes
+            totals.records += bytes
+            if id == "unregistered" { totals.unassigned += bytes }
+            item := json.JsonNewObject(output)
+            prefix := sql.ColumnText(result.value, 2)
+            if !fields.SetString(output, item, "collection", sql.ColumnText(result.value, 3)) ||
+                (prefix != "" && !fields.SetString(output, item, "collection_prefix", prefix)) ||
+                !AddTotals(output, item, records, bytes) || !json.JsonAppend(output, collections, item) { return false }
+        }
+        return app < 0 || AddTotals(output, app, count, size)
+    }
+
+    #scope_export
+    Usage :: (database: *void, connectedUsers: s64, connectedClients: s64, limit: s64,
+        output: *json.JsonDocument, root: s32) -> bool {
+        return RegisterCounts(database, output, root) &&
+            SetNumber(output, root, "connected_users", connectedUsers) &&
+            SetNumber(output, root, "connected_websocket_clients", connectedClients) &&
+            SetNumber(output, root, "recent_activity_window_days", 30) &&
+            SetNumber(output, root, "websocket_connection_limit_per_user", limit)
+    }
+
+    Storage :: (database: *void, path: string, output: *json.JsonDocument, root: s32) -> bool {
+        file := FileBytes(path, "")
+        wal := FileBytes(path, "-wal")
+        shm := FileBytes(path, "-shm")
+        arguments: [0]sql.Argument
+        pages := sql.Prepare(database, queries.PageBytesSQL, arguments[:])
+        if pages.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(pages.value)
+        if sqlite.SqliteStep(pages.value) != sqlite.SQLITE_ROW { return false }
+        pageBytes := sqlite.SqliteColumnInt64(pages.value, 0)
+        payloads := sql.Prepare(database, queries.PayloadStorageSQL, arguments[:])
+        if payloads.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(payloads.value)
+        if sqlite.SqliteStep(payloads.value) != sqlite.SQLITE_ROW { return false }
+        payloadCount := sqlite.SqliteColumnInt64(payloads.value, 0)
+        payloadBytes := sqlite.SqliteColumnInt64(payloads.value, 1)
+        totals: Totals
+        if !Apps(database, output, root, *totals) { return false }
+        bucket := json.JsonNewObject(output)
+        unassigned := totals.unassigned + payloadBytes
+        return SetNumber(output, root, "database_file_bytes", file) &&
+            (wal == 0 || SetNumber(output, root, "database_wal_bytes", wal)) &&
+            (shm == 0 || SetNumber(output, root, "database_shm_bytes", shm)) &&
+            SetNumber(output, root, "database_total_bytes", file + wal + shm) &&
+            (pageBytes == 0 || SetNumber(output, root, "sqlite_page_bytes", pageBytes)) &&
+            SetNumber(output, root, "logical_bytes", totals.records + payloadBytes) &&
+            SetNumber(output, root, "encrypted_record_bytes", totals.records) &&
+            SetNumber(output, root, "encrypted_payload_bytes", payloadBytes) &&
+            (unassigned == 0 || SetNumber(output, root, "unassigned_bytes", unassigned)) &&
+            SetNumber(output, bucket, "count", payloadCount) && SetNumber(output, bucket, "logical_bytes", payloadBytes) &&
+            json.JsonSet(output, root, "unassigned_encrypted_payloads", bucket)
+    }
+}

@@ -1,3 +1,4 @@
+schema :: #import "trust_schema";
 #import "std/go_types"
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
@@ -19,7 +20,7 @@ Scan :: (row: *sql.Row, value: *[]u8) -> Error #foreign go_sql "(*Row).Scan";
 PublicKey :: (database: *sql.Database, context: ctx.Context, nodeID: string) -> PeerKeyResult {
     result: PeerKeyResult
     key: []u8
-    row := Query(database, context, "SELECT public_key FROM trusted_node_peers WHERE node_id=?1 AND revoked_at=''", nodeID)
+    row := Query(database, context, schema.PeerKeyQuery, nodeID)
     error := Scan(row, *key)
     if errors.Is(error, sql.NoRows()) {
         return result

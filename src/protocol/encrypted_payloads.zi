@@ -1,3 +1,4 @@
+queries :: #import "encrypted_payload_queries";
 #import "std/go_types"
 #import "sync_types"
 sql :: #import "std/sql_go";
@@ -88,7 +89,7 @@ Store :: (database: *sql.Database, context: ctx.Context, userID: string,
         return result
     }
     arguments: [5]Any = .[userID, clientID, text.FromBytes(payload), version.value, timestamp.CanonicalNow()]
-    written := sql.ExecTx(transaction, context, "\nINSERT INTO server_encrypted_payloads(user_id_hash,client_id,payload_json,server_version,created_at)\nVALUES(?1,?2,?3,?4,?5)", arguments[:])
+    written := sql.ExecTx(transaction, context, queries.Insert, arguments[:])
     result.error = written.error
     if result.error != null {
         return result
@@ -106,7 +107,7 @@ Since :: (database: *sql.Database, context: ctx.Context, userID: string, sinceVe
         queryLimit += cast(isize)1
         limitClause = " LIMIT ?3"
     }
-    parts: [2]string = .["\nSELECT id,client_id,payload_json,created_at,server_version\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1 AND server_version>?2\nORDER BY server_version,id", limitClause]
+    parts: [2]string = .[queries.Since, limitClause]
     query := Join(parts[:], "")
     queried: sql.QueryResult
     if queryLimit > cast(isize)0 {
@@ -139,7 +140,7 @@ Recent :: (database: *sql.Database, context: ctx.Context, userID: string, limit:
         limit = cast(isize)10
     }
     arguments: [2]Any = .[userID, limit]
-    queried := sql.Query(database, context, "\nSELECT id,client_id,payload_json,created_at,server_version\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1\nORDER BY id DESC\nLIMIT ?2", arguments[:])
+    queried := sql.Query(database, context, queries.Recent, arguments[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -154,7 +155,7 @@ Bytes :: (database: *sql.Database, context: ctx.Context, userID: string) -> Payl
     total: PayloadByteTotal
     arguments: [1]Any = .[userID]
     destinations: [1]Any = .[*total]
-    row := sql.QueryRow(database, context, "\nSELECT SUM(LENGTH(payload_json))\nFROM server_encrypted_payloads\nWHERE user_id_hash=?1", arguments[:])
+    row := sql.QueryRow(database, context, queries.Bytes, arguments[:])
     result.error = sql.ScanRow(row, destinations[:])
     if result.error == null && TotalValid(total) {
         result.value = TotalValue(total)
@@ -178,7 +179,7 @@ Prune :: (database: *sql.Database, context: ctx.Context, userID: string,
     if cast(s64)maxAge > 0 {
         cutoff := timestamp.CanonicalTimestamp(clock.Add(clock.UTC(clock.Now()), cast(clock.Duration)(-cast(s64)maxAge)))
         arguments: [2]Any = .[userID, cutoff]
-        deleted := sql.ExecTx(transaction, context, "\nDELETE FROM server_encrypted_payloads\nWHERE user_id_hash=?1 AND created_at<?2", arguments[:])
+        deleted := sql.ExecTx(transaction, context, queries.PruneBefore, arguments[:])
         result.error = deleted.error
         if result.error != null {
             return result

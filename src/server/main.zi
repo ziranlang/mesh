@@ -1,6 +1,15 @@
-startup :: #import "startup";
-signatures :: #import "ml_dsa44";
+#if TARGET == .C && OS == .LINUX {
+    server :: #import "server_native";
 
-Main :: () {
-    startup.Main(signatures.New, signatures.Sign)
+    #program_export
+    Main :: (argc: s32, argv: **u8) -> s32 {
+        return server.Main(argc, argv)
+    }
+} else {
+    startup :: #import "startup";
+    signatures :: #import "ml_dsa44";
+
+    Main :: () {
+        startup.Main(signatures.New, signatures.Sign)
+    }
 }

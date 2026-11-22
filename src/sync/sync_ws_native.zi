@@ -1,0 +1,256 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    sessions :: #import "auth_sessions_native";
+    accounts :: #import "account_state_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    handshake :: #import "websocket_handshake";
+    websocket :: #import "websocket_native";
+    notifications :: #import "sync_hub_native";
+    delegated :: #import "delegated_ws_native";
+    addresses :: #import "client_address_native";
+    rates :: #import "rate_limit_native";
+    sqlite :: #import "sqlite/SQLite";
+    sockets :: #import "std/socket_linux";
+    clock :: #import "std/timer";
+    calendar :: #import "std/date_time_linux";
+    mutex :: #import "std/mutex_linux";
+    format :: #import "timestamp_format";
+    numbers :: #import "std/number_text";
+    #import "std/vec"
+
+    UpgradeRequest :: struct {
+        accounts: *access.AccountAccess
+        watcher: *notifications.Watcher
+        delegated: delegated.Watch
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    Poll :: (fds: *sockets.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+    VersionResult :: struct {
+        value: s64
+        active: bool
+    }
+    ValidationMilliseconds :: 500;
+    PingMilliseconds :: 30000;
+    ReadIdleMilliseconds :: 90000;
+    WriteMilliseconds :: 10000;
+    PollReadable :: 1;
+    PollDisconnected :: 56;
+
+    Credential :: (connection: *void) -> string {
+        token := handshake.BearerToken(http.Header(connection, "Sec-WebSocket-Protocol"))
+        return ifx token != "" then token else auth.Bearer(connection)
+    }
+
+    Error :: (connection: *void, status: u32, description: string) -> s32 {
+        output: Vec(u8)
+        if !BuilderAppend(output, "{\"error\":\"") || !BuilderAppend(output, description) ||
+            !BuilderAppend(output, "\"}\n") {
+            return 0
+        }
+        return http.Write(connection, status, "application/json", VecSlice(output, 0, output.count))
+    }
+
+    Authorize :: (state: *access.AccountAccess, token: string, user: string) -> sessions.SessionStatus {
+        milliseconds := calendar.UnixMilliseconds()
+        if milliseconds < 0 {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        audit: [31]u8
+        size := format.UTC(.{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, audit[:])
+        if size == 0 {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        settings := state.configuration
+        return sessions.Authorize(settings.database, settings.secret, token, user, milliseconds / 1000, TextView(audit[:size]), false)
+    }
+
+    Version :: (state: *access.AccountAccess, token: string, user: string, initial: bool) -> VersionResult {
+        if !mutex.Lock(*state.databaseLock) {
+            return .{}
+        }
+        defer mutex.Unlock(*state.databaseLock)
+        session := Authorize(state, token, user)
+        if !session.active || session.databaseError != sqlite.SQLITE_OK {
+            return .{}
+        }
+        if !initial {
+            return .{active = true}
+        }
+        version := accounts.CurrentVersion(state.configuration.database, user)
+        return .{value = version.value, active = version.status == sqlite.SQLITE_OK}
+    }
+
+    Allowed :: (state: *access.AccountAccess, prefix: string, subject: string, limit: s64) -> bool {
+        key: Vec(u8)
+        if !BuilderAppend(key, prefix) || !BuilderAppend(key, subject) {
+            return false
+        }
+        return rates.Allow(*state.limiter, TextView(VecSlice(key, 0, key.count)), limit, 60000, clock.MonotonicMilliseconds())
+    }
+
+    Send :: (stream: *websocket.Stream, event: string, user: string, version: s64) -> bool {
+        frame: Vec(u8)
+        digits: [24]u8
+        if !BuilderAppend(frame, "{\"type\":\"") || !BuilderAppend(frame, event) ||
+            !BuilderAppend(frame, "\",\"user_id_hash\":\"") || !BuilderAppend(frame, user) ||
+            !BuilderAppend(frame, "\",\"server_version\":") || !BuilderAppend(frame, numbers.FormatInteger(version, digits[:])) ||
+            !BuilderAppend(frame, "}") {
+            return false
+        }
+        stream.writeDeadline = clock.MonotonicMilliseconds() + WriteMilliseconds
+        return websocket.WriteFrame(stream, 1, VecSlice(frame, 0, frame.count))
+    }
+
+    Upgraded :: (context: *void, connection: *void, request: *void, buffered: *u8,
+        count: usize, fd: s32, upgrade: *void) {
+        defer http.CloseUpgrade(upgrade)
+        upgraded := cast(*UpgradeRequest)context
+        state := upgraded.accounts
+        watcher := upgraded.watcher
+        account := watcher.account
+        user := TextView(account[:])
+        token := Credential(connection)
+        version := Version(state, token, user, true)
+        if !version.active {
+            return
+        }
+        now := clock.MonotonicMilliseconds()
+        stream := websocket.Open(fd, buffered, count, now + ValidationMilliseconds, now + WriteMilliseconds)
+        if !Send(*stream, "sync_ready", user, version.value) {
+            return
+        }
+        lastRead := now
+        pingAt := now + PingMilliseconds
+        checkAt := now + ValidationMilliseconds
+        sent := version.value
+        waiters: [2]sockets.LinuxPollFd = .[.{fd = fd, events = PollReadable}, .{fd = watcher.fd, events = PollReadable}]
+        while true {
+            now = clock.MonotonicMilliseconds()
+            if now < 0 || now - lastRead >= ReadIdleMilliseconds {
+                return
+            }
+            latest := notifications.Latest(watcher)
+            if latest.stopping {
+                return
+            }
+            if now >= checkAt || latest.version > sent || latest.hintCount > 0 {
+                if !Version(state, token, user, false).active {
+                    return
+                }
+                checkAt = now + ValidationMilliseconds
+            }
+            for barrier: latest.hintVersions[:latest.hintCount] {
+                if barrier > sent {
+                    if !Send(*stream, "sync_changed", user, barrier) {
+                        return
+                    }
+                    sent = barrier
+                }
+                if !Send(*stream, "sync_changed", user, 0) {
+                    return
+                }
+            }
+            if latest.version > sent {
+                if !Send(*stream, "sync_changed", user, latest.version) {
+                    return
+                }
+                sent = latest.version
+            }
+            if now >= pingAt {
+                empty: []u8
+                stream.writeDeadline = now + WriteMilliseconds
+                if !websocket.WriteFrame(*stream, 9, empty) {
+                    return
+                }
+                pingAt = now + PingMilliseconds
+            }
+            if stream.consumed >= stream.bufferedCount {
+                ready := Poll(*waiters[0], 2, ValidationMilliseconds)
+                if ready < 0 && sockets.LinuxErrno() != 4 {
+                    return
+                }
+                if ready <= 0 {
+                    continue
+                }
+                if (waiters[0].revents & PollReadable) == 0 {
+                    if (waiters[0].revents & PollDisconnected) != 0 {
+                        return
+                    }
+                    continue
+                }
+            }
+            stream.readDeadline = clock.MonotonicMilliseconds() + 1000
+            frame := websocket.ReadClientFrame(*stream)
+            if frame.error != "" {
+                return
+            }
+            lastRead = clock.MonotonicMilliseconds()
+            if frame.opcode == 9 || frame.closed {
+                stream.writeDeadline = lastRead + WriteMilliseconds
+                opcode := ifx frame.closed then cast(u8)8 else cast(u8)10
+                if !websocket.WriteFrame(*stream, opcode, VecSlice(frame.payload, 0, frame.payload.count)) || frame.closed {
+                    return
+                }
+            }
+        }
+    }
+
+    #scope_export
+    Handle :: (state: *access.AccountAccess, hub: *notifications.Hub, upgraded: *UpgradeRequest,
+        connection: *void, method: string) -> s32 {
+        if method != "GET" {
+            return Error(connection, 405, "method not allowed")
+        }
+        if http.QueryArgument(connection, "token") != "" {
+            return Error(connection, 401, "websocket query tokens are not accepted")
+        }
+        token := Credential(connection)
+        if token == "" {
+            return Error(connection, 401, "bearer token required")
+        }
+        if !mutex.Lock(*state.databaseLock) {
+            return Error(connection, 500, "authentication failed")
+        }
+        session := Authorize(state, token, "")
+        unused mutex.Unlock(*state.databaseLock)
+        if session.databaseError != sqlite.SQLITE_OK {
+            return Error(connection, 500, "authentication failed")
+        }
+        if session.accountMissing {
+            return Error(connection, 401, "sync account not found")
+        }
+        if !session.active {
+            return Error(connection, 401, "invalid bearer token")
+        }
+        address := addresses.FromRequest(connection)
+        if !Allowed(state, "ws:ip:", TextView(address.bytes[:address.count]), 120) ||
+            !Allowed(state, "ws:user:", TextView(session.userID[:]), 40) {
+            return Error(connection, 429, "rate limit exceeded")
+        }
+        watched := notifications.Watch(hub, session.userID)
+        if watched.status == 429 {
+            return Error(connection, 429, "too many websocket connections")
+        }
+        if watched.status != 0 {
+            return Error(connection, 503, "websocket unavailable")
+        }
+        upgraded.accounts = state
+        upgraded.watcher = watched.watcher
+        return websocket.Accept(connection, cast(*void)upgraded, Upgraded)
+    }
+
+    HandlesDelegated :: (route: string) -> bool { return route == delegated.DelegatedSocketPath }
+
+    HandleDelegated :: (state: *access.AccountAccess, hub: *notifications.Hub, upgraded: *UpgradeRequest,
+        connection: *void, method: string, node: string, audience: string) -> s32 {
+        return delegated.Handle(state, hub, *upgraded.delegated, connection, method, node, audience)
+    }
+
+    Complete :: (upgraded: *UpgradeRequest) {
+        notifications.Unwatch(upgraded.watcher)
+        upgraded.watcher = null
+    }
+}

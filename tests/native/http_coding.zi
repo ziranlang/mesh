@@ -1,0 +1,90 @@
+transport :: #import "http_server_native";
+coding :: #import "content_coding_native";
+text :: #import "std/byte_text_linux";
+environment :: #import "std/environment_linux";
+
+#scope_file
+Capacity :: 4096;
+c :: #system_library "c";
+Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+Free :: (pointer: *void) #foreign c "free";
+GetChar :: () -> s32 #foreign c "getchar";
+Flush :: (stream: *void) -> s32 #foreign c "fflush";
+
+State :: struct {
+    wire: [Capacity]u8
+    count: s64
+    overflow: bool
+}
+
+Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+    Free(<<request)
+    <<request = null
+}
+
+Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+    version: *u8, upload: *u8, size: *usize, request: **void) -> s32 {
+    if <<request == null {
+        <<request = Allocate(1, size_of(State))
+        return ifx <<request == null then 0 else 1
+    }
+    state := cast(*State)(<<request)
+    if <<size > 0 {
+        if <<size > cast(usize)(Capacity - state.count) {
+            state.overflow = true
+        } else if !state.overflow {
+            data := text.BytesFromPointer(upload, cast(u64)(<<size))
+            for byte: data {
+                state.wire[state.count] = byte
+                state.count += 1
+            }
+        }
+        <<size = 0
+        return 1
+    }
+    empty: []u8
+    if state.overflow {
+        return transport.Write(connection, 413, "", empty)
+    }
+    header: [Capacity]u8
+    count := transport.JoinHeader(connection, "Content-Encoding", header[:])
+    if count < 0 {
+        return transport.Write(connection, 415, "", empty)
+    }
+    output: [Capacity]u8
+    zstdEnabled := context != null
+    route := text.TextFromCString(path)
+    decodedLimit := ifx route == "/small" then Capacity / 2 else Capacity
+    decoded := coding.Decode(state.wire[:state.count], TextView(header[:count]), zstdEnabled, Capacity, output[:decodedLimit])
+    if decoded.error == "unsupported content encoding" {
+        return transport.Write(connection, 415, "", empty)
+    }
+    if decoded.error != "" {
+        return transport.Write(connection, 400, "", empty)
+    }
+    status: u32 = 200
+    if route == "/partial" {
+        status = 206
+    }
+    return coding.WriteJSON(connection, text.TextFromCString(method), status, decoded.bytes, zstdEnabled)
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    enabled := environment.EnvironmentText("MESH_TEST_NATIVE_ZSTD") != "0"
+    context: *void = null
+    if enabled {
+        context = cast(*void)(*enabled)
+    }
+    daemon := transport.Start(loopback, 0, 8, context, Dispatch, Completed)
+    if daemon == null {
+        return 1
+    }
+    defer transport.Stop(daemon)
+    print("%\n", transport.BoundPort(daemon))
+    Flush(null)
+    GetChar()
+    return 0
+}

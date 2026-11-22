@@ -1,0 +1,131 @@
+#import "std/vec"
+text :: #import "std/text";
+
+WarningCounts :: struct {
+    legacy_clients: s64
+    queued_payloads: s64
+    payload_bytes: s64
+    full_snapshots: s64
+}
+
+AppendID :: (output: *Vec(u8), value: string, full: bool) {
+    if full || value.count <= 16 {
+        BuilderAppend(<<output, value)
+        return
+    }
+    BuilderAppend(<<output, value[:12])
+    BuilderAppend(<<output, "...")
+    BuilderAppend(<<output, value[value.count - 8:])
+}
+
+LowerHex :: (value: string) -> Vec(u8) {
+    result: Vec(u8)
+    for byte: value {
+        VecPush(result, text.LowerASCII(byte))
+    }
+    return result
+}
+
+UserListLine :: (id: string, hexKey: string, created: string, seen: string, full: bool) -> Vec(u8) {
+    key := LowerHex(hexKey)
+    output: Vec(u8)
+    AppendID(*output, id, full)
+    BuilderAppend(output, "  key=")
+    AppendID(*output, TextView(VecSlice(key, 0, key.count)), full)
+    BuilderPrint(*output, "  created=%  last_seen=%\n", created, seen)
+    return output
+}
+
+UserHeader :: (id: string, hexKey: string, created: string, seen: string, full: bool) -> Vec(u8) {
+    key := LowerHex(hexKey)
+    output: Vec(u8)
+    BuilderAppend(output, "User ")
+    AppendID(*output, id, full)
+    BuilderAppend(output, "\npublic_key=")
+    AppendID(*output, TextView(VecSlice(key, 0, key.count)), full)
+    BuilderPrint(*output, "\ncreated=%\nlast_seen=%\n", created, seen)
+    return output
+}
+
+DoctorHeader :: (id: string, full: bool, created: string, seen: string, version: s64, compacted: s64) -> Vec(u8) {
+    output: Vec(u8)
+    BuilderAppend(output, "Mesh doctor ")
+    AppendID(*output, id, full)
+    BuilderPrint(*output, "\nstatus=ok server_version=% compacted_through=%\n", version, compacted)
+    BuilderPrint(*output, "created=% last_seen=%\n", created, seen)
+    return output
+}
+
+ClientLine :: (id: string, protocol: s64, login: string, sync: string, seen: s64, clock: s64) -> Vec(u8) {
+    status := ifx protocol > 0 && protocol < 5 then "legacy" else "current"
+    output: Vec(u8)
+    BuilderPrint(*output, "% protocol=% status=% last_login=% last_sync=% seen=% clock=%\n",
+        id, protocol, status, DashIfEmpty(login), DashIfEmpty(sync), seen, clock)
+    return output
+}
+
+AuditLine :: (id: string, protocol: s64, version: s64, remoteOps: s64, fullSnapshot: bool,
+    reason: string, encrypted: bool, bytes: s64, created: string) -> Vec(u8) {
+    output: Vec(u8)
+    BuilderPrint(*output, "% protocol=% version=% remote_ops=% full_snapshot=% reason=% encrypted_payload=% bytes=% at=%\n",
+        id, protocol, version, remoteOps, fullSnapshot, DashIfEmpty(reason), encrypted, bytes, created)
+    return output
+}
+
+HabitLine :: (id: string, quotedName: string, mode: s64, activity: s64, deleted: s64, updated: string) -> Vec(u8) {
+    output: Vec(u8)
+    BuilderPrint(*output, "%  %  sync=%/%  deleted=%  updated=%\n", id, quotedName, mode, activity, deleted, updated)
+    return output
+}
+
+SessionLine :: (id: string, started: string, date: s64, topic: string, activity: s64, deleted: s64, updated: string) -> Vec(u8) {
+    output: Vec(u8)
+    BuilderPrint(*output, "%  started=%  local_date=%  topic=%  activity=%  deleted=%  updated=%\n",
+        id, started, date, topic, activity, deleted, updated)
+    return output
+}
+
+DashIfEmpty :: (value: string) -> string {
+    return ifx value == "" then "-" else value
+}
+
+// The count reports use fixed column widths for ASCII table names.
+CountLine :: (table: string, doctor: bool, count: s64) -> Vec(u8) {
+    output: Vec(u8)
+    BuilderAppend(output, table)
+    padding := "                            "
+    width: s64 = ifx doctor then padding.count else 24
+    if table.count < width {
+        BuilderAppend(output, padding[:width - table.count])
+    }
+    BuilderPrint(*output, " %\n", count)
+    return output
+}
+
+// The database adapter supplies zero payload bytes for a NULL aggregate.
+// Return the end of each line so adapters can preserve per-line writes.
+AppendWarnings :: (output: *Vec(u8), counts: WarningCounts) -> [5]s64 {
+    ends: [5]s64
+    BuilderAppend(<<output, "\nWarnings\n")
+    ends[0] = output.count
+    if counts.legacy_clients > 0 {
+        BuilderPrint(output, "- % legacy clients below protocol 5 seen recently\n", counts.legacy_clients)
+    }
+    ends[1] = output.count
+    if counts.queued_payloads > 1000 {
+        BuilderPrint(output, "- % encrypted payloads queued; consider pagination/retention tuning\n", counts.queued_payloads)
+    }
+    ends[2] = output.count
+    if counts.payload_bytes > (64 << 20) {
+        BuilderPrint(output, "- % encrypted payload bytes stored; check account quota/retention\n", counts.payload_bytes)
+    }
+    ends[3] = output.count
+    if counts.full_snapshots >= 3 {
+        BuilderPrint(output, "- % recent syncs required full snapshots\n", counts.full_snapshots)
+    }
+    if output.count == ends[0] {
+        BuilderAppend(<<output, "- none\n")
+    }
+    ends[4] = output.count
+    return ends
+}

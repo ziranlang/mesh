@@ -1,0 +1,144 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    files :: #import "std/file_linux";
+    json :: #import "std/json_document";
+    fields :: #import "sync_json_fields";
+    wire :: #import "wire_text";
+    identity :: #import "identity";
+    clock :: #import "std/date_time_linux";
+    http :: #import "http_server_native";
+    response :: #import "http_json_native";
+    delivery :: #import "package_delivery_native";
+    stored :: #import "package_files_native";
+    #import "std/vec"
+
+    #scope_file
+    Prefix :: "/api/v1/packages/";
+    Release :: struct {
+        app: Text
+        sequence: s64
+        version: Text
+        runtime: Text
+        hash: Text
+        size: s64
+        key: Text
+        proof: Text
+        valid: bool
+    }
+
+    ValidVersion :: (version: string) -> bool {
+        return version != "" && !wire.Cut(version, #char "\r").found && !wire.Cut(version, #char "\n").found
+    }
+
+    Read :: (metadata: *stored.SmallFile, app: string) -> Release {
+        if !metadata.valid { return .{} }
+        document: json.JsonDocument
+        bytes := VecSlice(metadata.bytes, 0, metadata.bytes.count)
+        if !json.JsonRead(*document, TextView(bytes)) { return .{} }
+        keys: [8]string = .["app_id", "sequence", "version", "runtime", "sha256", "size", "key_id", "signature"]
+        kinds: [8]json.JsonKind = .[.String, .Number, .String, .String, .String, .Number, .String, .String]
+        nodes: [8]s32
+        if !fields.Read(*document, document.root, keys[:], kinds[:], nodes[:]) { return .{} }
+        release: Release
+        release.app = json.JsonString(*document, nodes[0])
+        release.sequence = fields.Number(*document, nodes[1])
+        release.version = json.JsonString(*document, nodes[2])
+        release.runtime = json.JsonString(*document, nodes[3])
+        release.hash = json.JsonString(*document, nodes[4])
+        release.size = fields.Number(*document, nodes[5])
+        release.key = json.JsonString(*document, nodes[6])
+        release.proof = json.JsonString(*document, nodes[7])
+        release.valid = TextView(release.app) == app && release.sequence > 0 && ValidVersion(TextView(release.version)) &&
+            TextView(release.runtime) == "kryon-desktop-v1" && stored.LowerHash(TextView(release.hash)) &&
+            release.size >= 8 && identity.ValidNamespace(TextView(release.key))
+        return release
+    }
+
+    Proof :: (access: *accounts.AccountAccess, release: *Release, now: s64) -> bool {
+        message: Vec(u8)
+        if !delivery.AppendLine(*message, "daochi-zib-release-v1") ||
+            !delivery.AppendLine(*message, TextView(release.app)) || !delivery.AppendNumber(*message, release.sequence) ||
+            !delivery.AppendLine(*message, TextView(release.version)) || !delivery.AppendLine(*message, TextView(release.runtime)) ||
+            !delivery.AppendLine(*message, TextView(release.hash)) || !delivery.AppendNumber(*message, release.size) ||
+            !delivery.AppendLine(*message, TextView(release.key)) { return false }
+        return delivery.Trusted(access, TextView(release.app), TextView(release.key), TextView(release.proof),
+            VecSlice(message, 0, message.count), now)
+    }
+
+    Latest :: (connection: *void, release: *Release) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        keys: [8]string = .["app_id", "sequence", "version", "runtime", "sha256", "size", "key_id", "signature"]
+        values: [8]s32 = .[json.JsonNewString(*document, TextView(release.app)),
+            json.JsonNewInteger(*document, release.sequence), json.JsonNewString(*document, TextView(release.version)),
+            json.JsonNewString(*document, TextView(release.runtime)), json.JsonNewString(*document, TextView(release.hash)),
+            json.JsonNewInteger(*document, release.size), json.JsonNewString(*document, TextView(release.key)),
+            json.JsonNewString(*document, TextView(release.proof))]
+        for node, index: values {
+            if !json.JsonSet(*document, root, keys[index], node) { return 0 }
+        }
+        return delivery.Metadata(connection, *document, root)
+    }
+
+    Serve :: (access: *accounts.AccountAccess, connection: *void, method: string,
+        directory: files.FileHandle, release: *Release, asset: string, now: s64) -> s32 {
+        if !Proof(access, release, now) {
+            return response.ErrorReply(connection, method, 503, "untrusted portable release", false)
+        }
+        if asset == "latest" { return Latest(connection, release) }
+        sidecar: Vec(u8)
+        if !BuilderAppend(sidecar, asset) || !BuilderAppend(sidecar, ".product") { return 0 }
+        gate := stored.Read(directory, TextView(VecSlice(sidecar, 0, sidecar.count)), 256)
+        if gate.found { return response.ErrorReply(connection, method, 403, "package grant required", false) }
+        written := delivery.Artifact(connection, directory, asset, TextView(release.hash), release.size,
+            "application/octet-stream", false)
+        if written < 0 { return response.ErrorReply(connection, method, 503, "portable release bytes do not match", false) }
+        return written
+    }
+
+    AssetValid :: (asset: string) -> bool {
+        if asset.count != 68 { return false }
+        return asset[64] == #char "." && asset[65] == #char "z" && asset[66] == #char "i" &&
+            asset[67] == #char "b" && stored.LowerHash(asset[:64])
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return wire.TrimPrefix(route, Prefix) != route }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, route: string) -> s32 {
+        if method != "GET" && method != "HEAD" {
+            empty: [0]u8
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            return http.WriteWithHeaders(connection, 405, "", empty[:], headers[:])
+        }
+        parts := wire.Cut(wire.TrimPrefix(route, Prefix), #char "/")
+        app := parts.before
+        asset := parts.after
+        latest := asset == "latest"
+        if !parts.found || !identity.ValidNamespace(app) || (!latest && !AssetValid(asset)) {
+            return response.ErrorReply(connection, method, 404, "package not found", false)
+        }
+        now := clock.UnixMilliseconds() / 1000
+        status := delivery.CheckApplication(access, app, now)
+        if status == 500 { return response.ErrorReply(connection, method, 500, "package registry unavailable", false) }
+        if status == 404 { return response.ErrorReply(connection, method, 404, "package not found", false) }
+        directory := stored.Open(access.configuration.path, app)
+        if !directory.valid { return response.ErrorReply(connection, method, 404, "no portable release", false) }
+        defer files.CloseFile(directory)
+        metadata := stored.Read(directory, "latest.json")
+        if !metadata.valid { return response.ErrorReply(connection, method, 404, "no portable release", false) }
+        release := Read(*metadata, app)
+        if !release.valid { return response.ErrorReply(connection, method, 503, "invalid portable release", false) }
+        if !latest && asset[:64] != TextView(release.hash) {
+            name: Vec(u8)
+            if !BuilderAppend(name, asset) || !BuilderAppend(name, ".json") { return 0 }
+            archived := stored.Read(directory, TextView(VecSlice(name, 0, name.count)))
+            previous := Read(*archived, app)
+            if !previous.valid || asset[:64] != TextView(previous.hash) {
+                return response.ErrorReply(connection, method, 404, "package not found", false)
+            }
+            return Serve(access, connection, method, directory, *previous, asset, now)
+        }
+        return Serve(access, connection, method, directory, *release, asset, now)
+    }
+}

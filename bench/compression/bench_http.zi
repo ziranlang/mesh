@@ -11,7 +11,7 @@ go_http :: #system_library "go:net/http";
 go_testing :: #system_library "go:net/http/httptest";
 go_sync :: #system_library "go:sync";
 go_reflect :: #system_library "go:reflect";
-trace :: #system_library "go:mesh-compression-bench/httptrace";
+trace :: #system_library "go:net/http/httptrace";
 builtin :: #system_library "go:builtin";
 
 #scope_file
@@ -21,6 +21,9 @@ Server :: #type #foreign go_testing "Server";
 Handler :: #type #foreign go_http "Handler";
 Pool :: #type #foreign go_sync "Pool";
 WaitGroup :: #type #foreign go_sync "WaitGroup";
+ClientTrace :: #type #foreign trace "ClientTrace";
+TraceCallback :: #type () -> void;
+TimedTraceCallback :: #type (started: clock.Time, elapsed: *float64) -> void;
 Responder :: struct {
     data: []u8
     profile: codecs.Profile
@@ -77,7 +80,11 @@ SetIdleHostLimit :: (transport: *Transport, count: isize) #go_field #foreign go_
 SetHostLimit :: (transport: *Transport, count: isize) #go_field #foreign go_http "(*Transport).MaxConnsPerHost";
 SetTransport :: (client: *http.Client, transport: RoundTripper) #go_field #foreign go_http "(*Client).Transport";
 CloseIdle :: (transport: *Transport) #go_defer #foreign go_http "(*Transport).CloseIdleConnections";
-FirstByte :: (request: *http.Request, started: clock.Time, elapsed: *float64) -> *http.Request #foreign trace;
+AllocateTrace :: () -> *ClientTrace #foreign builtin "new";
+SetFirstByteCallback :: (value: *ClientTrace, callback: TraceCallback) #go_field #foreign trace "(*ClientTrace).GotFirstResponseByte";
+BindTrace :: (callback: TimedTraceCallback, started: clock.Time, elapsed: *float64) -> TraceCallback #foreign builtin "bind";
+WithClientTrace :: (context: ctx.Context, value: *ClientTrace) -> ctx.Context #foreign trace;
+WithContext :: (request: *http.Request, context: ctx.Context) -> *http.Request #foreign go_http "(*Request).WithContext";
 PoolGet :: (pool: *Pool) -> Any #foreign go_sync "(*Pool).Get";
 AsEncoder :: (value: Any) -> CachedEncoder #go_results #foreign builtin "assert";
 PoolPut :: (pool: *Pool, value: Any) #foreign go_sync "(*Pool).Put";
@@ -91,6 +98,16 @@ Receive :: (queue: channel.Channel) -> Received #go_results #foreign go_reflect 
 Index :: (value: channel.Channel) -> s64 #foreign go_reflect "Value.Int";
 WorkFunction :: #type (work: Work) -> void;
 Spawn :: (callback: WorkFunction, work: Work) #foreign builtin "spawn";
+
+RecordFirstByte :: (started: clock.Time, elapsed: *float64) {
+    <<elapsed = support.ElapsedMS(started)
+}
+
+FirstByte :: (request: *http.Request, started: clock.Time, elapsed: *float64) -> *http.Request {
+    value := AllocateTrace()
+    SetFirstByteCallback(value, BindTrace(RecordFirstByte, started, elapsed))
+    return WithContext(request, WithClientTrace(http.Context(request), value))
+}
 
 Serve :: (handler: *Responder, writer: http.ResponseWriter, request: *http.Request) #go_method "ServeHTTP" {
     if handler.profile.encoding == "identity" {

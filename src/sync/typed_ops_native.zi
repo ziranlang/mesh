@@ -1,0 +1,203 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    state :: #import "account_state_native";
+    ids :: #import "habit_id_native";
+    input :: #import "typed_request_native";
+    fields :: #import "sync_json_fields";
+    writes :: #import "typed_write_native";
+    queries :: #import "sync_operation_queries";
+    views :: #import "sync_view_queries";
+    output :: #import "sync_response_native";
+    protocol :: #import "protocol";
+    wire :: #import "wire_text";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    WriteOperation :: (database: *void, user: string, document: *json.JsonDocument, node: s32,
+        now: string, applied: *protocol.SyncResult, response: *json.JsonDocument, accepted: s32) -> bool {
+        keys: [8]string = .["op_id", "client_id", "entity_type", "entity_id", "op_type", "created_at", "seq", "local_date"]
+        kinds: [8]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .Number, .Number]
+        slots: [8]s32
+        if !fields.Read(document, node, keys[:], kinds[:], slots[:]) { return false }
+        operation: Text = json.JsonString(document, slots[0])
+        client: Text = json.JsonString(document, slots[1])
+        sequence := fields.Number(document, slots[6])
+        if TextView(operation) == "" || TextView(client) == "" || sequence <= 0 { return false }
+        lookup: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(operation))]
+        exists := sql.ReadInteger(database, queries.OperationExists, lookup[:])
+        if exists.status != sqlite.SQLITE_OK { return false }
+        if exists.value == 0 {
+            entity: Text = json.JsonString(document, slots[2])
+            identifier: Text = json.JsonString(document, slots[3])
+            action: Text = json.JsonString(document, slots[4])
+            created: Text = json.JsonString(document, slots[5])
+            date := fields.Number(document, slots[7])
+            payload: s32 = -1
+            child := json.JsonFirst(document, node)
+            while child >= 0 {
+                name: Text = json.JsonKey(document, child)
+                if wire.MatchesToken(TextView(name), "payload") { payload = child }
+                child = json.JsonNext(document, child)
+            }
+            kind := TextView(entity)
+            mapped: Vec(u8)
+            if kind == "habit" || kind == "habit_day" {
+                id := wire.TrimSpace(TextView(identifier))
+                member := json.JsonMember(document, payload, "habit_id")
+                if json.JsonKindOf(document, member) != .String || json.JsonIs(document, member, "") {
+                    member = json.JsonMember(document, payload, "id")
+                }
+                fallback: Text = json.JsonString(document, member)
+                if id == "" { id = TextView(fallback) }
+                if id == "" { return false }
+                canonical := ids.ForWrite(database, user, id, "legacy-op")
+                if canonical.status != sqlite.SQLITE_OK { return false }
+                VecSwap(mapped, canonical.value)
+                idFields: [2]string = .["id", "habit_id"]
+                for key: idFields {
+                    if json.JsonMember(document, payload, key) >= 0 &&
+                        !output.TextField(document, payload, key, TextView(VecSlice(mapped, 0, mapped.count))) { return false }
+                }
+            }
+            id := ifx kind == "habit" || kind == "habit_day" then TextView(VecSlice(mapped, 0, mapped.count)) else TextView(identifier)
+            if !Materialize(database, user, kind, id, date, TextView(action) == "delete", document, payload, now, applied) {
+                return false
+            }
+            version := state.CurrentVersion(database, user)
+            if version.status == sqlite.SQLITE_OK && version.value <= 0 { version = state.NextVersion(database, user) }
+            if version.status != sqlite.SQLITE_OK { return false }
+            raw: Vec(u8)
+            if payload >= 0 && !json.JsonWriteInto(*raw, document, payload, json.JsonCompactStyle(false)) { return false }
+            time: [31]u8
+            when := writes.NormalizeTime(TextView(created), "", now, time[:])
+            arguments: [11]sql.Argument = .[lookup[0], lookup[1], sql.TextArg(TextView(client)), sql.IntArg(sequence),
+                sql.TextArg(kind), sql.TextArg(id), sql.IntArg(date), sql.TextArg(TextView(action)), sql.TextArg(TextView(VecSlice(raw, 0, raw.count))),
+                sql.TextArg(when), sql.IntArg(version.value)]
+            if sql.Execute(database, queries.InsertOperation, arguments[:]) != sqlite.SQLITE_OK { return false }
+        }
+        return json.JsonAppend(response, accepted, json.JsonNewStringCopy(response, TextView(operation)))
+    }
+
+    Materialize :: (database: *void, user: string, kind: string, id: string, date: s64, remove: bool,
+        document: *json.JsonDocument, payload: s32, now: string, applied: *protocol.SyncResult) -> bool {
+        if kind == "habit" {
+            decoded := input.ReadHabit(document, payload)
+            if payload < 0 || !decoded.valid { return false }
+            row := decoded.row
+            row.ID = ifx TextView(decoded.id) == "" then id else TextView(decoded.id)
+            row.Name = TextView(decoded.name)
+            row.UpdatedAt = TextView(decoded.updatedAt)
+            if remove && row.DeletedAt <= 0 { row.DeletedAt = 1 }
+            written := writes.Habit(database, user, row, now)
+            applied.Habits += cast(isize)written.applied
+            return written.status == sqlite.SQLITE_OK
+        }
+        if kind == "habit_day" {
+            decoded := input.ReadDay(document, payload)
+            if payload < 0 || !decoded.valid { return false }
+            row := decoded.row
+            row.HabitID = ifx TextView(decoded.id) == "" then id else TextView(decoded.id)
+            row.UpdatedAt = TextView(decoded.updatedAt)
+            if row.LocalDate == 0 { row.LocalDate = cast(isize)date }
+            written := writes.HabitDay(database, user, row, now, remove)
+            applied.HabitDays += cast(isize)written.applied
+            return written.status == sqlite.SQLITE_OK
+        }
+        if kind == "session" {
+            decoded := input.ReadSession(document, payload)
+            if payload < 0 || !decoded.valid { return false }
+            written := writes.SessionInput(database, user, *decoded, now, id, remove)
+            applied.Sessions += cast(isize)written.applied
+            return written.status == sqlite.SQLITE_OK
+        }
+        if kind == "social_snapshots" { return false }
+        version := state.NextVersion(database, user)
+        return version.status == sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    Apply :: (database: *void, user: string, document: *json.JsonDocument, operations: s32, now: string,
+        applied: *protocol.SyncResult, response: *json.JsonDocument, accepted: s32) -> bool {
+        node := json.JsonFirst(document, operations)
+        while node >= 0 {
+            if !WriteOperation(database, user, document, node, now, applied, response, accepted) { return false }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    Attach :: (database: *void, user: string, since: s64, document: *json.JsonDocument, root: s32) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(since)]
+        rows := sql.Prepare(database, views.OperationsSince, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        keys: [9]string = .["op_id", "client_id", "seq", "entity_type", "entity_id", "local_date", "op_type", "payload", "created_at"]
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { return true }
+            if status != sqlite.SQLITE_ROW { return false }
+            item := json.JsonNewObject(document)
+            if item < 0 { return false }
+            for key, index: keys {
+                column := cast(s32)index
+                if index == 2 || index == 5 {
+                    number := sqlite.SqliteColumnInt64(rows.value, column)
+                    if (index == 2 || number != 0) && !output.IntegerField(document, item, key, number) { return false }
+                    continue
+                }
+                text := sql.ColumnText(rows.value, column)
+                if index == 7 {
+                    if !AttachPayload(document, item, text) { return false }
+                } else if (index != 8 || text != "") && !output.TextField(document, item, key, text) { return false }
+            }
+            if !json.JsonAppend(document, root, item) { return false }
+        }
+        return false
+    }
+
+    AttachLogs :: (database: *void, user: string, since: s64, document: *json.JsonDocument, root: s32) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(since)]
+        rows := sql.Prepare(database, #string SQL_END
+SELECT server_version,entity_type,entity_id,local_date,op_type,payload_json,created_at
+FROM server_sync_ops WHERE user_id_hash=?1 AND server_version>?2
+ORDER BY server_version,client_id,seq,op_id
+SQL_END, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        logs := json.JsonNewArray(document)
+        deletes := json.JsonNewArray(document)
+        if logs < 0 || deletes < 0 { return false }
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { break }
+            if status != sqlite.SQLITE_ROW { return false }
+            item := json.JsonNewObject(document)
+            action := sql.ColumnText(rows.value, 4)
+            date := sqlite.SqliteColumnInt64(rows.value, 3)
+            if !output.IntegerField(document, item, "server_version", sqlite.SqliteColumnInt64(rows.value, 0)) ||
+                !output.TextField(document, item, "kind", "op") ||
+                !output.TextField(document, item, "entity_type", sql.ColumnText(rows.value, 1)) ||
+                !output.TextField(document, item, "entity_id", sql.ColumnText(rows.value, 2)) ||
+                (date != 0 && !output.IntegerField(document, item, "local_date", date)) ||
+                !output.TextIfPresent(document, item, "op_type", action) ||
+                !output.TextIfPresent(document, item, "created_at", sql.ColumnText(rows.value, 6)) ||
+                !AttachPayload(document, item, sql.ColumnText(rows.value, 5)) || !json.JsonAppend(document, logs, item) { return false }
+            if action == "delete" {
+                deleted := json.JsonCopy(document, document, item)
+                if !output.TextField(document, deleted, "kind", "delete") || !json.JsonAppend(document, deletes, deleted) { return false }
+            }
+        }
+        return (json.JsonCount(document, logs) == 0 || json.JsonSet(document, root, "logs", logs)) &&
+            (json.JsonCount(document, deletes) == 0 || json.JsonSet(document, root, "deletes", deletes))
+    }
+
+    #scope_file
+    AttachPayload :: (document: *json.JsonDocument, item: s32, value: string) -> bool {
+        if value == "" { return true }
+        payload: json.JsonDocument
+        return json.JsonRead(*payload, value) && json.JsonSet(document, item, "payload", json.JsonCopy(document, *payload, payload.root))
+    }
+
+}

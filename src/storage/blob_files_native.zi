@@ -1,0 +1,70 @@
+#if TARGET == .C && OS == .LINUX {
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    random :: #import "std/random_linux";
+    binary :: #import "binary_codec";
+    #import "std/vec"
+
+    Directory :: struct {
+        handle: files.FileHandle
+        status: s32
+    }
+
+    Missing :: 2; // ENOENT
+
+    Open :: (databasePath: string, user: string, app: string, create: bool) -> Directory {
+        store: Vec(u8)
+        if !BuilderAppend(store, databasePath) || !BuilderAppend(store, ".blobs") { return .{status = 12} }
+        path := TextView(VecSlice(store, 0, store.count))
+        if create && !tree.CreateDirectories(path, 448) { return .{status = 5} }
+        result: Directory
+        root := tree.OpenDirectoryHandle(path, *result.status)
+        if !root.valid { return result }
+        defer files.CloseFile(root)
+        account: files.FileHandle
+        if create {
+            account = tree.OpenOrCreateChildDirectory(root, user)
+        } else {
+            account = tree.OpenChildDirectory(root, user, *result.status)
+        }
+        if !account.valid { return result }
+        defer files.CloseFile(account)
+        if create {
+            result.handle = tree.OpenOrCreateChildDirectory(account, app)
+        } else {
+            result.handle = tree.OpenChildDirectory(account, app, *result.status)
+        }
+        return result
+    }
+
+    TemporaryName :: (prefix: string) -> Text {
+        bytes: [18]u8
+        if !random.FillSecure(bytes[:]) { return .{} }
+        encoded := binary.EncodeBase64(TextView(bytes[:]), true, false)
+        name: Vec(u8)
+        if encoded.error != "" || !BuilderAppend(name, prefix) ||
+            !BuilderAppend(name, TextView(VecSlice(encoded.value, 0, encoded.value.count))) { return .{} }
+        return BuilderFinish(name)
+    }
+
+    Save :: (directory: files.FileHandle, name: string, data: []u8) -> bool {
+        staged: Text = TemporaryName(".upload-")
+        temporary := TextView(staged)
+        if temporary == "" { return false }
+        file := tree.OpenNewChildFile(directory, temporary)
+        if !file.valid { return false }
+        defer tree.RemoveChildFile(directory, temporary, true)
+        at: s64 = 0
+        while at < data.count {
+            count := files.WriteAt(file, data[at:], at)
+            if count <= 0 {
+                unused files.CloseFile(file)
+                return false
+            }
+            at += count
+        }
+        synced := files.SyncFile(file)
+        closed := files.CloseFile(file)
+        return synced && closed && tree.RenameChild(directory, temporary, name)
+    }
+}

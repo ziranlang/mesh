@@ -1,3 +1,5 @@
+device_queries :: #import "device_key_queries";
+signed_queries :: #import "signed_tx_queries";
 #import "std/go_types"
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
@@ -10,6 +12,7 @@ accounts :: #import "account_keys";
 auth :: #import "authentication";
 sessions :: #import "auth_sessions";
 codec :: #import "codec";
+wire_text :: #import "wire_text";
 go_sql :: #system_library "go:database/sql";
 go_strings :: #system_library "go:strings";
 go_strconv :: #system_library "go:strconv";
@@ -74,9 +77,7 @@ KeyResult :: struct {
     value: []u8
     error: Error
 }
-TrimSpace :: (value: string) -> string #foreign go_strings;
 Lower :: (value: string) -> string #foreign go_strings "ToLower";
-Contains :: (value: string, fragment: string) -> bool #foreign go_strings;
 Join :: (values: []string, separator: string) -> string #foreign go_strings;
 FormatInteger :: (value: s64, base: isize) -> string #foreign go_strconv "FormatInt";
 DecodeHex :: (value: string) -> KeyResult #go_results #foreign go_hex "DecodeString";
@@ -97,15 +98,22 @@ AppendDevice :: (devices: []DeviceKey, device: DeviceKey) -> []DeviceKey #foreig
 
 RecordNonce :: (transaction: *sql.Transaction, context: ctx.Context, accountID: string, nonce: string, replay: Error) -> Error {
     cutoff := timestamp.CanonicalTimestamp(clock.Add(clock.Now(), cast(clock.Duration)-1800000000000))
-    deleted := DeleteNonces(transaction, context, DeleteNoncesSQL, cutoff)
+    deleted := DeleteNonces(transaction, context, device_queries.DeleteDeviceNoncesSQL, cutoff)
     if deleted.error != null {
         return deleted.error
     }
-    inserted := InsertNonce(transaction, context, InsertNonceSQL, accountID, nonce, timestamp.CanonicalNow())
-    if inserted.error != null && Contains(errors.Message(inserted.error), "UNIQUE") {
+    inserted := InsertNonce(transaction, context, device_queries.InsertDeviceNonceSQL, accountID, nonce, timestamp.CanonicalNow())
+    if inserted.error != null {
+        return inserted.error
+    }
+    changed := sql.RowsAffected(inserted.value)
+    if changed.error != null {
+        return changed.error
+    }
+    if changed.value == 0 {
         return replay
     }
-    return inserted.error
+    return null
 }
 
 #scope_export
@@ -125,18 +133,18 @@ RevocationMessage :: (accountID: string, request: DeviceRevocationRequest) -> []
     return text.ToBytes(Join(parts[:], "\n"))
 }
 NormalizeRegistration :: (request: *DeviceRegistrationRequest) {
-    request.AppID = TrimSpace(request.AppID)
-    request.KeyID = TrimSpace(request.KeyID)
-    request.ClientID = TrimSpace(request.ClientID)
-    request.PublicKey = Lower(TrimSpace(request.PublicKey))
-    request.Nonce = TrimSpace(request.Nonce)
-    request.Signature = TrimSpace(request.Signature)
+    request.AppID = wire_text.TrimSpace(request.AppID)
+    request.KeyID = wire_text.TrimSpace(request.KeyID)
+    request.ClientID = wire_text.TrimSpace(request.ClientID)
+    request.PublicKey = Lower(wire_text.TrimSpace(request.PublicKey))
+    request.Nonce = wire_text.TrimSpace(request.Nonce)
+    request.Signature = wire_text.TrimSpace(request.Signature)
 }
 NormalizeRevocation :: (request: *DeviceRevocationRequest) {
-    request.AppID = TrimSpace(request.AppID)
-    request.KeyID = TrimSpace(request.KeyID)
-    request.Nonce = TrimSpace(request.Nonce)
-    request.Signature = TrimSpace(request.Signature)
+    request.AppID = wire_text.TrimSpace(request.AppID)
+    request.KeyID = wire_text.TrimSpace(request.KeyID)
+    request.Nonce = wire_text.TrimSpace(request.Nonce)
+    request.Signature = wire_text.TrimSpace(request.Signature)
 }
 ValidExpiry :: (expiresAt: s64) -> bool {
     now := clock.Now()
@@ -206,7 +214,7 @@ Register :: (database: *sql.Database, context: ctx.Context, device: DeviceKey, n
     if error != null {
         return error
     }
-    inserted := InsertDevice(transaction, context, RegisterSQL, device.AccountID,
+    inserted := InsertDevice(transaction, context, device_queries.RegisterDeviceSQL, device.AccountID,
         device.AppID, device.KeyID, device.ClientID, device.PublicKey, timestamp.CanonicalNow())
     if inserted.error != null {
         return inserted.error
@@ -231,7 +239,7 @@ Revoke :: (database: *sql.Database, context: ctx.Context, accountID: string, req
     if error != null {
         return error
     }
-    revoked := RevokeDevice(transaction, context, RevokeSQL, accountID, request.AppID,
+    revoked := RevokeDevice(transaction, context, device_queries.RevokeAccountDeviceSQL, accountID, request.AppID,
         request.KeyID, timestamp.CanonicalNow())
     if revoked.error != null {
         return revoked.error
@@ -247,7 +255,7 @@ Revoke :: (database: *sql.Database, context: ctx.Context, accountID: string, req
     clientID: string
     clientDestinations: [1]Any = .[*clientID]
     clientError := sql.ScanRow(sql.QueryRowTx(transaction, context,
-        "SELECT client_id FROM server_device_keys WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3",
+        device_queries.DeviceClientSQL,
         clientArguments[:]), clientDestinations[:])
     if clientError != null {
         return clientError
@@ -265,7 +273,7 @@ Revoke :: (database: *sql.Database, context: ctx.Context, accountID: string, req
 Active :: (database: *sql.Database, context: ctx.Context, accountID: string, appID: string, keyID: string) -> DeviceKeyResult {
     result: DeviceKeyResult
     device: DeviceKey
-    row := QueryDevice(database, context, ActiveSQL, accountID, appID, keyID)
+    row := QueryDevice(database, context, device_queries.ActiveAccountDeviceSQL, accountID, appID, keyID)
     error := ScanDevice(row, *device.AccountID, *device.AppID, *device.KeyID,
         *device.ClientID, *device.PublicKey, *device.CreatedAt, *device.LastUsedAt, *device.RevokedAt)
     if errors.Is(error, sql.NoRows()) {
@@ -277,12 +285,12 @@ Active :: (database: *sql.Database, context: ctx.Context, accountID: string, app
     return result
 }
 Touch :: (database: *sql.Database, context: ctx.Context, accountID: string, appID: string, keyID: string) -> Error {
-    touched := TouchDevice(database, context, TouchSQL, accountID, appID, keyID, timestamp.CanonicalNow())
+    touched := TouchDevice(database, context, signed_queries.TouchSignedDeviceSQL, accountID, appID, keyID, timestamp.CanonicalNow())
     return touched.error
 }
 List :: (database: *sql.Database, context: ctx.Context, accountID: string) -> DeviceListResult {
     result: DeviceListResult
-    queried := QueryDevices(database, context, ListSQL, accountID)
+    queried := QueryDevices(database, context, device_queries.ListAccountDevicesSQL, accountID)
     if queried.error != null {
         result.error = queried.error
         return result
@@ -303,38 +311,3 @@ List :: (database: *sql.Database, context: ctx.Context, accountID: string) -> De
     result.error = sql.RowsError(rows)
     return result
 }
-
-#scope_file
-DeleteNoncesSQL :: "DELETE FROM server_device_registration_nonces WHERE created_at<?1";
-InsertNonceSQL :: "INSERT INTO server_device_registration_nonces(account_id,nonce,created_at) VALUES(?1,?2,?3)";
-RegisterSQL :: #string SQL_END
-
-INSERT INTO server_device_keys(account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at)
-VALUES(?1,?2,?3,?4,?5,?6,?6,'')
-ON CONFLICT(account_id,app_id,device_key_id) DO UPDATE SET
- client_id=excluded.client_id,
- public_key=excluded.public_key,
- last_used_at=excluded.last_used_at
-WHERE server_device_keys.revoked_at=''
-SQL_END;
-RevokeSQL :: #string SQL_END
-
-UPDATE server_device_keys SET revoked_at=?4
-WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
-SQL_END;
-ActiveSQL :: #string SQL_END
-
-SELECT account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at
-FROM server_device_keys
-WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
-SQL_END;
-TouchSQL :: #string SQL_END
-
-UPDATE server_device_keys SET last_used_at=?4
-WHERE account_id=?1 AND app_id=?2 AND device_key_id=?3 AND revoked_at=''
-SQL_END;
-ListSQL :: #string SQL_END
-
-SELECT account_id,app_id,device_key_id,client_id,public_key,created_at,last_used_at,revoked_at
-FROM server_device_keys WHERE account_id=?1 ORDER BY app_id,device_key_id
-SQL_END;

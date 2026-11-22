@@ -1,0 +1,287 @@
+#if TARGET == .C && OS == .LINUX {
+    authorization :: #import "authorization_native";
+    #import "authorization_native"
+    authorizationHTTP :: #import "authorization_http_native";
+    session :: #import "delegate_session_native";
+    account :: #import "account_access_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    requests :: #import "record_request_native";
+    #import "record_request_native"
+    records :: #import "record_rows_native";
+    writes :: #import "record_write_native";
+    validation :: #import "record_validation";
+    protocol :: #import "protocol";
+    scopeRules :: #import "record_scope_native";
+    identity :: #import "identity";
+    storage :: #import "storage_allowance_native";
+    usage :: #import "storage_usage_rules";
+    output :: #import "sync_response_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    calendar :: #import "std/date_time_linux";
+    mutex :: #import "std/mutex_linux";
+    #import "std/vec"
+
+    Path :: "/api/v1/delegated/sync";
+
+    #scope_file
+    DelegatedRequest :: struct {
+        collection: Text
+        app: Text
+        user: Text
+        client: Text
+        read: bool
+        sinceVersion: s64
+        limit: s64
+        records: requests.Request
+        failure: authorization.Failure
+    }
+
+    Context :: struct {
+        connection: *void
+        method: string
+        settings: account.Configuration
+    }
+
+    Unavailable :: "delegated sync unavailable";
+
+    Error :: (context: Context, status: u32, message: string) -> s32 {
+        return replies.ErrorReply(context.connection, context.method, status, message, context.settings.zstdResponses)
+    }
+
+    ReadRequest :: (document: *json.JsonDocument) -> DelegatedRequest {
+        names: [5]string = .["collection", "since_version", "limit", "read", "sync"]
+        kinds: [5]json.JsonKind = .[.String, .Number, .Number, .True, .Object]
+        fields: [5]s32
+        invalid: authorization.Failure = .{status = 400, message = "invalid delegated sync request"}
+        if !authorization.ReadFields(document, document.root, names[:], kinds[:], fields[:]) { return .{failure = invalid} }
+        result: DelegatedRequest = .{collection = json.JsonString(document, fields[0]), sinceVersion = authorization.Integer(document, fields[1]),
+            limit = authorization.Integer(document, fields[2]), read = json.JsonKindOf(document, fields[3]) == .True}
+        if result.sinceVersion < 0 || result.limit < 1 || result.limit > 512 { return .{failure = invalid} }
+        syncNames: [20]string = .["app_id", "user_id_hash", "client_id", "protocol_version", "encrypted_records",
+            "public_key", "client_state_hash", "last_server_state_hash", "since_server_version", "client_clock",
+            "full_sync_requested", "bootstrap", "include_legacy_data", "client_capabilities", "ops", "meditation_logs",
+            "habits", "habit_days", "sessions", "social_cache"]
+        syncKinds: [20]json.JsonKind = .[.String, .String, .String, .Number, .Array, .String, .String, .String, .Number, .Number,
+            .True, .True, .True, .Array, .Array, .Array, .Array, .Array, .Array, .Array]
+        sync: [20]s32
+        if !authorization.ReadFields(document, fields[4], syncNames[:], syncKinds[:], sync[:]) { return .{failure = invalid} }
+        result.app = json.JsonString(document, sync[0])
+        result.user = json.JsonString(document, sync[1])
+        result.client = json.JsonString(document, sync[2])
+        recordNames: [13]string = .["collection", "id", "key_id", "nonce", "ciphertext", "updated_at", "content_hash", "parent_id",
+            "packed_nonce", "packed_ciphertext", "deleted_at", "schema_version", "free_bytes"]
+        recordKinds: [13]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String, .String, .String, .String, .Number, .Number, .Number]
+        item := json.JsonFirst(document, sync[4])
+        while item >= 0 {
+            fields: [13]s32
+            record: RecordFields
+            if !authorization.ReadFields(document, item, recordNames[:], recordKinds[:], fields[:]) ||
+                !requests.ReadRecord(document, item, *result.records.decoded, *record) || !VecPush(result.records.records, record) { return .{failure = invalid} }
+            item = json.JsonNext(document, item)
+        }
+        result.records.count = result.records.records.count
+        capability := json.JsonFirst(document, sync[13])
+        while capability >= 0 {
+            kind := json.JsonKindOf(document, capability)
+            if kind != .String && kind != .Null { return .{failure = invalid} }
+            capability = json.JsonNext(document, capability)
+        }
+        restricted: authorization.Failure = .{status = 403, message = "delegation permits only scoped encrypted records"}
+        if authorization.Integer(document, sync[3]) != 6 { return .{failure = restricted} }
+        for index: 5..7 {
+            value: Text = json.JsonString(document, sync[index])
+            if TextView(value) != "" { return .{failure = restricted} }
+        }
+        for index: 8..9 {
+            if authorization.Integer(document, sync[index]) != 0 { return .{failure = restricted} }
+        }
+        for index: 10..12 {
+            if json.JsonKindOf(document, sync[index]) == .True { return .{failure = restricted} }
+        }
+        for index: 13..19 {
+            if json.JsonCount(document, sync[index]) > 0 { return .{failure = restricted} }
+        }
+        return result
+    }
+
+    ValidRecords :: (database: *void, request: *DelegatedRequest, now: s64) -> bool {
+        app := TextView(request.app)
+        if !identity.ValidNamespace(app) { return false }
+        registered := scopeRules.Active(database, app, now)
+        if registered.status != sqlite.SQLITE_OK || registered.error != "" { return false }
+        decoded := VecSlice(request.records.decoded, 0, request.records.decoded.count)
+        for row: request.records.records {
+            record := requests.WireRecord(row, decoded)
+            if !validation.ValidForProtocol(record, 6) { return false }
+            owned := scopeRules.OwnsSignedCollection(database, app, record.Collection)
+            if owned.status != sqlite.SQLITE_OK || owned.error != "" { return false }
+        }
+        return true
+    }
+
+    Full :: (context: Context, used: s64, limit: s64) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !authorization.PutText(*document, root, "error", "account storage limit reached") ||
+            !authorization.PutText(*document, root, "code", "storage_full") || !output.Storage(*document, root, used, limit) { return 0 }
+        return replies.Reply(context.connection, context.method, 413, *document, root, context.settings.zstdResponses)
+    }
+
+    Page :: struct {
+        root: s32
+        version: s64
+        more: bool
+        failure: authorization.Failure
+    }
+
+    ReadPage :: (database: *void, args: []sql.Argument, after: s64, response: *json.JsonDocument) -> Page {
+        failed: authorization.Failure = .{status = 503, message = "delegated read unavailable"}
+        row := sql.Prepare(database, #string QUERY_END
+SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes,server_version
+FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 AND key_id=?3 AND server_version>?4
+ORDER BY server_version,id LIMIT ?5
+QUERY_END, args)
+        if row.status != sqlite.SQLITE_OK { return .{failure = failed} }
+        defer sqlite.SqliteFinalize(row.value)
+        result: Page = .{root = json.JsonNewArray(response), version = after}
+        if result.root < 0 { return .{failure = failed} }
+        size: s64 = 256
+        count: s64 = 0
+        while true {
+            step := sqlite.SqliteStep(row.value)
+            if step == sqlite.SQLITE_DONE { break }
+            if step != sqlite.SQLITE_ROW { return .{failure = failed} }
+            record := records.Read(row.value, 10)
+            candidate: json.JsonDocument
+            array := json.JsonNewArray(*candidate)
+            bytes: Vec(u8)
+            if !records.Append(*candidate, array, record) || !json.JsonWriteInto(*bytes, *candidate,
+                json.JsonFirst(*candidate, array), json.JsonCompactStyle(false)) { return .{failure = failed} }
+            if size + bytes.count + 1 > 1000000 {
+                if count == 0 { return .{failure = .{status = 413, message = "record exceeds delegated response bound"}} }
+                result.more = true
+                return result
+            }
+            if !json.JsonAppend(response, result.root, json.JsonCopy(response, *candidate, json.JsonFirst(*candidate, array))) { return .{failure = failed} }
+            result.version = sqlite.SqliteColumnInt64(row.value, 11)
+            size += bytes.count + 1
+            count += 1
+        }
+        cursor: [4]sql.Argument = .[args[0], args[1], args[2], sql.IntArg(result.version)]
+        remaining := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 AND key_id=?3 AND server_version>?4)", cursor[:])
+        if remaining.status != sqlite.SQLITE_OK { return .{failure = .{status = 503, message = "delegated cursor unavailable"}} }
+        result.more = remaining.value != 0
+        return result
+    }
+
+    SyncTx :: (context: Context, request: *DelegatedRequest, principal: *session.Principal, now: time.TimestampValue) -> s32 {
+        database := context.settings.database
+        grant := *principal.grant
+        accountID := TextView(grant.account)
+        app := TextView(grant.app)
+        collection := TextView(request.collection)
+        allowed: *GrantScope = null
+        for *candidate, index: grant.scopes {
+            if TextView(candidate.collection) == collection { allowed = *grant.scopes[index]; break }
+        }
+        count := request.records.count
+        if TextView(request.user) != accountID || TextView(request.app) != app || TextView(request.client) != TextView(grant.client) ||
+            allowed == null || (request.read && !allowed.read) || (count > 0 && !allowed.write) || (!request.read && count == 0) {
+            return Error(context, 403, "delegate scope mismatch")
+        }
+        key := TextView(allowed.keyID)
+        allowance := storage.Allowance(database, accountID, now.seconds, context.settings.accountStorageLimit, context.settings.storagePlansEnabled)
+        if allowance.status != sqlite.SQLITE_OK { return Error(context, 503, "storage unavailable") }
+        usageArgs: [1]sql.Argument = .[sql.TextArg(accountID)]
+        checkStorage := allowance.value > 0 && count > 0
+        usedBefore: s64 = 0
+        if checkStorage {
+            before := sql.ReadInteger(database, usage.UsageSQL, usageArgs[:])
+            if before.status != sqlite.SQLITE_OK { return Error(context, 503, Unavailable) }
+            usedBefore = before.value
+        }
+        latest := now
+        latest.seconds += 300
+        cutoff: [31]u8
+        cutoffLength := format.UTC(latest, cutoff[:])
+        if cutoffLength == 0 { return Error(context, 503, Unavailable) }
+        applied: s64 = 0
+        decoded := VecSlice(request.records.decoded, 0, request.records.decoded.count)
+        for row: request.records.records {
+            record := requests.WireRecord(row, decoded)
+            if record.Collection != collection || record.KeyID != key || record.DeletedAt != 0 {
+                return Error(context, 403, "delegate collection, key or operation mismatch")
+            }
+            args: [4]sql.Argument = .[sql.TextArg(accountID), sql.TextArg(collection), sql.TextArg(record.ID), sql.TextArg(key)]
+            conflict := sql.ReadInteger(database, "SELECT COUNT(*) FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 AND id=?3 AND key_id<>?4", args[:])
+            if conflict.status != sqlite.SQLITE_OK { return Error(context, 503, Unavailable) }
+            if conflict.value != 0 { return Error(context, 403, "record key generation is outside grant") }
+            // Delegated writes store the authoritative ciphertext only.
+            record.PackedNonce = ""
+            record.PackedCiphertext = ""
+            written := writes.Write(database, accountID, record, allowance.value, latest, TextView(cutoff[:cutoffLength]))
+            if written.status != sqlite.SQLITE_OK { return Error(context, 503, Unavailable) }
+            applied += written.applied
+        }
+        if checkStorage {
+            measured := sql.ReadInteger(database, usage.UsageSQL, usageArgs[:])
+            if measured.status != sqlite.SQLITE_OK { return Error(context, 503, Unavailable) }
+            if usage.Exceeds(usedBefore, measured.value, allowance.value) { return Full(context, usedBefore, allowance.value) }
+        }
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        page: Page = .{version = request.sinceVersion}
+        if request.read {
+            args: [5]sql.Argument = .[sql.TextArg(accountID), sql.TextArg(collection), sql.TextArg(key), sql.IntArg(request.sinceVersion), sql.IntArg(request.limit)]
+            page = ReadPage(database, args[:], request.sinceVersion, *response)
+            if page.failure.status != 0 { return Error(context, page.failure.status, page.failure.message) }
+        } else {
+            page.root = json.JsonNewNull(*response)
+        }
+        if !authorization.PutText(*response, root, "collection", collection) || !json.JsonSet(*response, root, "records", page.root) ||
+            !authorization.PutInt(*response, root, "next_version", page.version) || !authorization.PutBool(*response, root, "truncated", page.more) ||
+            !authorization.PutInt(*response, root, "applied", applied) || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(context, 503, Unavailable)
+        }
+        return replies.Reply(context.connection, context.method, 200, *response, root, context.settings.zstdResponses)
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return route == Path }
+    ReadsBody :: (route: string, verb: string) -> bool { return Handles(route) && verb == "POST" }
+
+    Handle :: (state: *account.AccountAccess, connection: *void, verb: string, route: string, raw: []u8, overflow: bool,
+        nodeID: string, audience: string, requestTarget: string) -> s32 {
+        if !Handles(route) { return 0 }
+        if verb != "POST" { return authorizationHTTP.MethodNotAllowed(connection) }
+        settings := state.configuration
+        context: Context = .{connection = connection, method = verb, settings = settings}
+        if !authorizationHTTP.Guard(state, connection) { return Error(context, 429, "authorization rate limit exceeded") }
+        scratch: replies.Body
+        cap := ifx settings.maximumBodyBytes < 1048576 then settings.maximumBodyBytes else 1048576
+        loaded := authorizationHTTP.Decode(connection, raw, overflow, cap, settings.zstdRequests, *scratch)
+        body: json.JsonDocument
+        if loaded.error != "" || !json.JsonRead(*body, TextView(loaded.bytes)) { return Error(context, 400, "invalid delegated sync request") }
+        input := ReadRequest(*body)
+        if input.failure.status != 0 { return Error(context, input.failure.status, input.failure.message) }
+        if !mutex.Lock(*state.databaseLock) { return Error(context, 503, Unavailable) }
+        defer mutex.Unlock(*state.databaseLock)
+        milliseconds := calendar.UnixMilliseconds()
+        now: time.TimestampValue = .{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
+        database := settings.database
+        if !ValidRecords(database, *input, now.seconds) { return Error(context, 400, "invalid delegated sync records or app") }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return Error(context, 503, Unavailable) }
+        defer authorization.Rollback(database)
+        principal := session.AuthenticateTx(.{database = database, node = nodeID, audience = audience, now = now.seconds},
+            .{method = verb, path = route, target = requestTarget, body = loaded.bytes,
+              proof = session.Header(connection, "X-Mesh-Delegate", "X-Daochi-Delegate"), credential = http.Header(connection, "Authorization"),
+              user = session.Header(connection, "X-Mesh-User", "X-Daochi-User")})
+        if principal.failure.status != 0 { return Error(context, principal.failure.status, principal.failure.message) }
+        return SyncTx(context, *input, *principal, now)
+    }
+}

@@ -1,0 +1,149 @@
+#if TARGET == .C && OS == .LINUX {
+    queries :: #import "account_backup_queries";
+    rules :: #import "account_backup_rules";
+    secure :: #import "std/constant_time";
+    random :: #import "std/random_linux";
+    bytes :: #import "std/byte_text_linux";
+    oqs :: #import "oqs/Oqs";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    #import "std/vec"
+
+    SaltResult :: struct {
+        salt: [32]u8
+        found: bool
+        status: s32
+    }
+
+    Attempt :: struct {
+        backup: Vec(u8)
+        retryAfter: s64
+        opened: bool
+        missing: bool
+        status: s32
+    }
+
+    RemovedBackup :: struct {
+        failures: s64
+        lockedUntil: s64
+        deleted: bool
+        status: s32
+    }
+
+    #scope_file
+    ReadSecret :: (database: *void, output: []u8) -> s32 {
+        empty: [0]sql.Argument
+        read := sql.Prepare(database, queries.ReadBackupSecretSQL, empty[:])
+        if read.status != sqlite.SQLITE_OK { return read.status }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status != sqlite.SQLITE_ROW { return status }
+        pointer := sqlite.SqliteColumnBlob(read.value, 0)
+        if pointer == null || sqlite.SqliteColumnBytes(read.value, 0) != output.count { return sqlite.SQLITE_MISUSE }
+        for byte, index: bytes.BytesFromPointer(pointer, cast(u64)output.count) { output[index] = byte }
+        return sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    // Preserve the same persistent node secret across backend changes and restarts.
+    NodeSecret :: (database: *void, output: []u8) -> s32 {
+        if output.count != 32 { return sqlite.SQLITE_MISUSE }
+        status := ReadSecret(database, output)
+        if status != sqlite.SQLITE_DONE { return status }
+        candidate: [32]u8
+        defer oqs.Cleanse(candidate[:])
+        if !random.FillSecure(candidate[:]) { return sqlite.SQLITE_MISUSE }
+        args: [1]sql.Argument = .[sql.BlobArg(candidate[:])]
+        status = sql.Execute(database, queries.CreateBackupSecretSQL, args[:])
+        if status != sqlite.SQLITE_OK { return status }
+        return ReadSecret(database, output)
+    }
+
+    ReadSalt :: (database: *void, account: string) -> SaltResult {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        read := sql.Prepare(database, queries.ReadBackupSaltSQL, args[:])
+        if read.status != sqlite.SQLITE_OK { return .{status = read.status} }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        salt := sql.ColumnText(read.value, 0)
+        result: SaltResult = .{found = true}
+        if salt.count != result.salt.count { return .{status = sqlite.SQLITE_MISUSE} }
+        for byte, index: salt { result.salt[index] = byte }
+        return result
+    }
+
+    #scope_file
+    RecordedAttempt :: struct {
+        backup: Vec(u8)
+        failures: s64
+        lockedUntil: s64
+        matched: bool
+        missing: bool
+        status: s32
+    }
+
+    ReadAttempt :: (database: *void, account: []sql.Argument, digest: string, charged: bool) -> RecordedAttempt {
+        read := sql.Prepare(database, queries.ReadBackupAttemptSQL, account)
+        if read.status != sqlite.SQLITE_OK { return .{status = read.status} }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status == sqlite.SQLITE_DONE { return .{missing = true} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        found: RecordedAttempt = .{failures = sqlite.SqliteColumnInt64(read.value, 2),
+            lockedUntil = sqlite.SqliteColumnInt64(read.value, 3)}
+        if charged && secure.ConstantTimeTextEqual(digest, sql.ColumnText(read.value, 1)) {
+            if !BuilderAppend(found.backup, sql.ColumnText(read.value, 0)) { return .{status = sqlite.SQLITE_NOMEM} }
+            found.matched = true
+        }
+        return found
+    }
+
+    #scope_export
+    // Take the write lock before reading a stored attempt, including when
+    // another process holds a connection to the same account database.
+    Open :: (database: *void, account: string, digest: string, now: s64) -> Attempt {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.IntArg(now)]
+        status = sql.Execute(database, queries.ChargeBackupAttemptSQL, args[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        charged := sqlite.SqliteChanges(database) != 0
+        attempt := ReadAttempt(database, args[:1], digest, charged)
+        if attempt.status != sqlite.SQLITE_OK { return .{status = attempt.status} }
+        if attempt.missing { return .{missing = true} }
+        if !charged { return .{retryAfter = ifx attempt.lockedUntil > now then attempt.lockedUntil - now else 1} }
+        if attempt.matched {
+            status = sql.Execute(database, queries.ClearBackupAttemptSQL, args[:1])
+        } else {
+            lock := rules.BackupLockSeconds(attempt.failures)
+            if lock > 0 {
+                args[1] = sql.IntArg(now + lock)
+                status = sql.Execute(database, queries.LockBackupAttemptSQL, args[:])
+            }
+        }
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        return .{opened = attempt.matched, backup = attempt.backup}
+    }
+
+    Remove :: (database: *void, account: string) -> RemovedBackup {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        removed := sql.Prepare(database, queries.RemoveBackupSQL, args[:])
+        if removed.status != sqlite.SQLITE_OK { return .{status = removed.status} }
+        defer sqlite.SqliteFinalize(removed.value)
+        status := sqlite.SqliteStep(removed.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        result: RemovedBackup = .{deleted = true, failures = sqlite.SqliteColumnInt64(removed.value, 0),
+            lockedUntil = sqlite.SqliteColumnInt64(removed.value, 1)}
+        status = sqlite.SqliteStep(removed.value)
+        if status != sqlite.SQLITE_DONE { return .{status = status} }
+        return result
+    }
+}

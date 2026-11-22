@@ -1,0 +1,58 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    apps :: #import "mesh_apps_import_native";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    names :: #import "name_store_native";
+    network :: #import "network_scope_native";
+    records :: #import "mesh_records_import_native";
+
+    Batch :: struct {
+        valid: bool
+        count: s64
+        apps: s32
+        records: s32
+        deletions: s32
+        spaces: s32
+        names: s32
+    }
+
+    Result :: struct {
+        status: u32
+        error: string
+        applied: s64
+        usedBytes: s64
+        limit: s64
+    }
+
+    Read :: (input: *json.JsonDocument, root: s32) -> Batch {
+        keys: [5]string = .["apps", "records", "deletions", "spaces", "names"]
+        kinds: [5]json.JsonKind = .[.Array, .Array, .Array, .Array, .Array]
+        nodes: [5]s32
+        if !fields.Read(input, root, keys[:], kinds[:], nodes[:]) { return .{} }
+        count: s64 = 0
+        for index: 0..4 {
+            if index != 3 { count += cast(s64)json.JsonCount(input, nodes[index]) }
+        }
+        return .{valid = true, count = count, apps = nodes[0], records = nodes[1], deletions = nodes[2],
+            spaces = nodes[3], names = nodes[4]}
+    }
+
+    // The caller commits or rolls back. A pull advances its cursor in the same
+    // transaction as the imported records, manifests, and namespace claims.
+    ApplyTx :: (settings: accounts.Configuration, scope: *network.Scope, approvalKey: []u8, filters: *json.JsonDocument,
+        selected: s32, input: *json.JsonDocument, batch: Batch, now: s64) -> Result {
+        database := settings.database
+        installed := apps.Import(database, scope, approvalKey, filters, selected, input, batch.apps, now / 1000)
+        if installed.status != 0 { return .{status = installed.status, error = installed.error} }
+        changed := records.Import(database, filters, selected, input, batch.records, batch.deletions,
+            now, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if changed.limit > 0 {
+            return .{status = 413, error = changed.error, usedBytes = changed.usedBytes, limit = changed.limit}
+        }
+        if changed.error != "" { return .{status = 400, error = changed.error} }
+        received := names.Import(database, filters, selected, input, batch.spaces, batch.names, now)
+        if received.error != "" { return .{status = 400, error = received.error} }
+        return .{applied = installed.applied + changed.applied + received.applied}
+    }
+}

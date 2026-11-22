@@ -1,0 +1,46 @@
+#if TARGET == .C && OS == .LINUX {
+    memory :: #import "std/byte_text_linux";
+    #import "std/vec"
+
+    Upload :: struct {
+        bytes: Vec(u8)
+        overflow: bool
+        unavailable: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+    Free :: (pointer: *void) #foreign c "free";
+
+    #scope_export
+    New :: () -> *Upload {
+        return cast(*Upload)Allocate(1, size_of(Upload))
+    }
+
+    Delete :: (upload: *Upload) {
+        if upload != null {
+            VecFree(upload.bytes)
+            Free(cast(*void)upload)
+        }
+    }
+
+    // Discard any further chunks after the first overflow or allocation failure.
+    Append :: (upload: *Upload, chunk: *u8, size: usize, limit: s64) {
+        if upload.overflow || upload.unavailable || size == 0 { return }
+        start := upload.bytes.count
+        if limit < start || size > cast(usize)(limit - start) {
+            upload.overflow = true
+            VecFree(upload.bytes)
+            return
+        }
+        if !VecResizeBounded(upload.bytes, start + cast(s64)size, limit) {
+            upload.unavailable = true
+            VecFree(upload.bytes)
+            return
+        }
+        source := memory.BytesFromPointer(chunk, cast(u64)size)
+        target := VecSlice(upload.bytes, start, upload.bytes.count)
+        for byte, index: source { target[index] = byte }
+    }
+}

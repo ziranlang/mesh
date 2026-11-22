@@ -392,6 +392,16 @@ func TestContentCodingRepeatedHeadersAndRange(t *testing.T) {
 	if recorder.Header().Get("Vary") != "Origin, X-Client, Accept-Encoding" {
 		t.Fatal("repeated Vary selectors lost", recorder.Header())
 	}
+	for _, selector := range []string{"X-Client, aCcEpT-eNcOdInG", "\t*\t"} {
+		recorder = httptest.NewRecorder()
+		recorder.Header().Add("Vary", "Origin")
+		recorder.Header().Add("Vary", selector)
+		Response_JSONRequest(recorder, request, 200, "record")
+		vary := recorder.Header().Values("Vary")
+		if len(vary) != 2 || vary[0] != "Origin" || vary[1] != selector {
+			t.Fatalf("existing Vary selectors changed: %q", vary)
+		}
+	}
 	request = httptest.NewRequest("POST", "/", bytes.NewReader(zstdFixture(t, []byte(`{"ok":true}`))))
 	request.Header.Add("Content-Encoding", "zstd")
 	request.Header.Add("Content-Encoding", "gzip")

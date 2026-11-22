@@ -1,0 +1,84 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    scopes :: #import "record_scope_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    signature :: #import "device_signature_native";
+    binary :: #import "binary_codec";
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    http :: #import "http_server_native";
+    digest :: #import "file_digest_native";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    mutex :: #import "std/mutex_linux";
+    #import "std/vec"
+
+    #scope_file
+    ActiveKey :: "SELECT algorithm,public_key,expires_at FROM server_app_keys WHERE app_id=?1 AND key_id=?2 AND status='active'";
+
+    #scope_export
+    CheckApplication :: (access: *accounts.AccountAccess, app: string, now: s64) -> u32 {
+        if !mutex.Lock(*access.databaseLock) { return 500 }
+        defer mutex.Unlock(*access.databaseLock)
+        // Packages expire at the start of expires_at. Sync accepts that second.
+        active := scopes.Active(access.configuration.database, app, now + 1)
+        if active.status != sqlite.SQLITE_OK { return 500 }
+        return ifx active.error == "" then 200 else 404
+    }
+
+    Trusted :: (access: *accounts.AccountAccess, app: string, key: string, proof: string,
+        message: []u8, now: s64) -> bool {
+        if proof.count != 128 || !binary.IsHex(proof) || !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        arguments: [2]sql.Argument = .[sql.TextArg(app), sql.TextArg(key)]
+        selected := sql.Prepare(access.configuration.database, ActiveKey, arguments[:])
+        if selected.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(selected.value)
+        if sqlite.SqliteStep(selected.value) != sqlite.SQLITE_ROW || sql.ColumnText(selected.value, 0) != "ed25519" {
+            return false
+        }
+        expires := sqlite.SqliteColumnInt64(selected.value, 2)
+        public := sql.ColumnText(selected.value, 1)
+        if (expires > 0 && expires <= now) || public.count != 64 || !binary.IsHex(public) { return false }
+        keyBytes := binary.DecodeBinaryField(public)
+        proofBytes := binary.DecodeBinaryField(proof)
+        return signature.Verify(VecSlice(keyBytes.value, 0, keyBytes.value.count), message,
+            VecSlice(proofBytes.value, 0, proofBytes.value.count))
+    }
+
+    AppendLine :: (buffer: *Vec(u8), line: string) -> bool {
+        return BuilderAppend(<<buffer, line) && BuilderAppend(<<buffer, "\n")
+    }
+
+    AppendNumber :: (buffer: *Vec(u8), number: s64) -> bool {
+        digits: [24]u8
+        return AppendLine(buffer, numbers.FormatInteger(number, digits[:]))
+    }
+
+    Metadata :: (connection: *void, document: *json.JsonDocument, root: s32) -> s32 {
+        buffer: Vec(u8)
+        if !json.JsonWriteInto(*buffer, document, root, json.JsonCompactStyle(false)) || !BuilderAppend(buffer, "\n") {
+            return 0
+        }
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "no-store"}]
+        return http.WriteWithHeaders(connection, 200, "application/json", VecSlice(buffer, 0, buffer.count), headers[:])
+    }
+
+    Artifact :: (connection: *void, directory: files.FileHandle, name: string, hash: string,
+        size: s64, contentType: string, gated: bool) -> s32 {
+        file := tree.OpenChildRegularFile(directory, name)
+        if !digest.Matches(file, size, hash) {
+            if file.valid { files.CloseFile(file) }
+            return -1
+        }
+        tag: [66]u8
+        tag[0] = #char "\""
+        for byte, index: hash { tag[index + 1] = byte }
+        tag[65] = #char "\""
+        caching := ifx gated then "private, no-store" else "public, max-age=31536000, immutable"
+        headers: [2]http.HeaderValue = .[.{name = "Cache-Control", value = caching},
+            .{name = "ETag", value = TextView(tag[:])}]
+        return http.WriteFile(connection, 200, contentType, file, size, headers[:])
+    }
+}

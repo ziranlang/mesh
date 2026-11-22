@@ -7,7 +7,9 @@ text :: #import "std/text_go";
 identity :: #import "identity";
 timestamp :: #import "timestamp";
 token :: #import "token";
+payload_rules :: #import "token_payload";
 codec :: #import "codec";
+queries :: #import "auth_session_queries";
 
 go_sha256 :: #system_library "go:crypto/sha256";
 go_hex :: #system_library "go:encoding/hex";
@@ -48,20 +50,20 @@ Initialize :: (database: *sql.Database, context: ctx.Context, legacyTTL: clock.D
     }
     arguments: [1]Any = .["legacy_v1_started"]
     started := sql.Exec(database, context,
-        "INSERT OR IGNORE INTO server_auth_settings(name,value) VALUES(?1,CURRENT_TIMESTAMP)", arguments[:])
+        queries.InitializeStarted, arguments[:])
     if started.error != null {
         return started.error
     }
     deadline := timestamp.CanonicalTimestamp(clock.Add(clock.Now(), legacyTTL))
     deadlineArguments: [2]Any = .["legacy_v1_deadline", deadline]
     deadlineWritten := sql.Exec(database, context,
-        "INSERT OR IGNORE INTO server_auth_settings(name,value) VALUES(?1,?2)", deadlineArguments[:])
+        queries.InitializeDeadline, deadlineArguments[:])
     return deadlineWritten.error
 }
 
 EnsureSchema :: (database: *sql.Database, context: ctx.Context) -> Error {
     empty: []Any
-    schema := sql.Exec(database, context, SchemaSQL, empty[:])
+    schema := sql.Exec(database, context, queries.Schema, empty[:])
     return schema.error
 }
 
@@ -145,7 +147,7 @@ BearerSessionActive :: (database: *sql.Database, context: ctx.Context, bearer: s
 
 RevokeBearer :: (database: *sql.Database, context: ctx.Context, userID: string, bearer: string) -> Error {
     arguments: [2]Any = .[userID, BearerHash(bearer)]
-    revoked := sql.Exec(database, context, RevokeBearerSQL, arguments[:])
+    revoked := sql.Exec(database, context, queries.RevokeBearer, arguments[:])
     if revoked.error != null {
         return revoked.error
     }
@@ -164,7 +166,7 @@ RevokeSession :: (database: *sql.Database, context: ctx.Context, userID: string,
         return errors.New("invalid bearer session")
     }
     arguments: [2]Any = .[userID, sessionID]
-    revoked := sql.Exec(database, context, RevokeSessionSQL, arguments[:])
+    revoked := sql.Exec(database, context, queries.RevokeSession, arguments[:])
     if revoked.error != null {
         return revoked.error
     }
@@ -180,14 +182,14 @@ RevokeSession :: (database: *sql.Database, context: ctx.Context, userID: string,
 
 RevokeDeviceTx :: (transaction: *sql.Transaction, context: ctx.Context, accountID: string, clientID: string) -> Error {
     arguments: [2]Any = .[accountID, clientID]
-    revoked := sql.ExecTx(transaction, context, RevokeDeviceSQL, arguments[:])
+    revoked := sql.ExecTx(transaction, context, queries.RevokeDevice, arguments[:])
     return revoked.error
 }
 
 RevokeLegacyTx :: (transaction: *sql.Transaction, context: ctx.Context, accountID: string) -> Error {
     arguments: [2]Any = .[accountID, timestamp.CanonicalNow()]
     revoked := sql.ExecTx(transaction, context,
-        "INSERT OR IGNORE INTO server_auth_legacy_revocations(account_id,invalidated_at) VALUES(?1,?2)", arguments[:])
+        queries.RevokeLegacy, arguments[:])
     return revoked.error
 }
 
@@ -196,69 +198,15 @@ LegacyRevoked :: (database: *sql.Database, context: ctx.Context, accountID: stri
     exists: bool
     destinations: [1]Any = .[*exists]
     error := sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT EXISTS(SELECT 1 FROM server_auth_legacy_revocations WHERE account_id=?1)", arguments[:]), destinations[:])
+        queries.LegacyRevoked, arguments[:]), destinations[:])
     return error == null && exists
 }
 
 #scope_file
-SchemaSQL :: #string SQL_END
-CREATE TABLE IF NOT EXISTS server_auth_settings (
- name TEXT PRIMARY KEY,
- value TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS server_auth_sessions (
- token_hash TEXT PRIMARY KEY,
- user_id_hash TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- session_id TEXT NOT NULL UNIQUE,
- client_id TEXT NOT NULL DEFAULT '',
- issued_at INTEGER NOT NULL,
- expires_at INTEGER NOT NULL,
- created_at TEXT NOT NULL,
- revoked_at TEXT NOT NULL DEFAULT ''
-);
-CREATE INDEX IF NOT EXISTS server_auth_sessions_device
-ON server_auth_sessions(user_id_hash,client_id,revoked_at,expires_at);
-CREATE TABLE IF NOT EXISTS server_auth_legacy_revocations (
- account_id TEXT PRIMARY KEY,
- invalidated_at TEXT NOT NULL
-);
-SQL_END;
-
-InsertSessionSQL :: #string SQL_END
-INSERT INTO server_auth_sessions(token_hash,user_id_hash,session_id,client_id,issued_at,expires_at,created_at)
-VALUES(?1,?2,?3,?4,?5,?6,?7)
-ON CONFLICT(token_hash) DO NOTHING
-SQL_END;
-
-SessionActiveSQL :: #string SQL_END
-SELECT EXISTS(
- SELECT 1 FROM server_auth_sessions
- WHERE token_hash=?1 AND user_id_hash=?2 AND revoked_at='' AND expires_at>=?3
-)
-SQL_END;
-
-RevokeBearerSQL :: #string SQL_END
-UPDATE server_auth_sessions
-SET revoked_at=CURRENT_TIMESTAMP
-WHERE user_id_hash=?1 AND token_hash=?2 AND revoked_at=''
-SQL_END;
-
-RevokeSessionSQL :: #string SQL_END
-UPDATE server_auth_sessions
-SET revoked_at=CURRENT_TIMESTAMP
-WHERE user_id_hash=?1 AND session_id=?2 AND revoked_at=''
-SQL_END;
-
-RevokeDeviceSQL :: #string SQL_END
-UPDATE server_auth_sessions
-SET revoked_at=CURRENT_TIMESTAMP
-WHERE user_id_hash=?1 AND client_id=?2 AND revoked_at=''
-SQL_END;
-
-InsertSession :: (database: *sql.Database, context: ctx.Context, metadata: token.AuthTokenMetadata, tokenHash: string, clientID: string) -> Error {
+InsertSession :: (database: *sql.Database, context: ctx.Context, metadata: payload_rules.AuthTokenMetadata, tokenHash: string, clientID: string) -> Error {
     arguments: [7]Any = .[tokenHash, metadata.userID, metadata.sessionID, clientID,
         metadata.issuedAt, metadata.expiresAt, timestamp.CanonicalNow()]
-    inserted := sql.Exec(database, context, InsertSessionSQL, arguments[:])
+    inserted := sql.Exec(database, context, queries.Insert, arguments[:])
     return inserted.error
 }
 
@@ -267,7 +215,7 @@ SessionActive :: (database: *sql.Database, context: ctx.Context, userID: string,
     arguments: [3]Any = .[tokenHash, userID, now]
     active: bool
     destinations: [1]Any = .[*active]
-    result.error = sql.ScanRow(sql.QueryRow(database, context, SessionActiveSQL, arguments[:]), destinations[:])
+    result.error = sql.ScanRow(sql.QueryRow(database, context, queries.Active, arguments[:]), destinations[:])
     result.value = result.error == null && active
     return result
 }
@@ -279,7 +227,7 @@ AccountCreatedBeforeMigration :: (database: *sql.Database, context: ctx.Context,
     startedAt: string
     destinations: [2]Any = .[*createdAt, *startedAt]
     result.error = sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT u.created_at,s.value FROM server_users u,server_auth_settings s WHERE u.user_id_hash=?1 AND s.name='legacy_v1_started'", arguments[:]), destinations[:])
+        queries.AccountCreatedAndMigration, arguments[:]), destinations[:])
     if errors.Is(result.error, sql.NoRows()) {
         result.error = null
         return result
@@ -305,7 +253,7 @@ LegacyWindow :: (database: *sql.Database, context: ctx.Context) -> LegacyWindowR
     value: string
     destinations: [1]Any = .[*value]
     result.error = sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT value FROM server_auth_settings WHERE name=?1", arguments[:]), destinations[:])
+        queries.Setting, arguments[:]), destinations[:])
     if result.error != null {
         return result
     }
@@ -324,7 +272,7 @@ MigrationStarted :: (database: *sql.Database, context: ctx.Context) -> string {
     value: string
     destinations: [1]Any = .[*value]
     error := sql.ScanRow(sql.QueryRow(database, context,
-        "SELECT value FROM server_auth_settings WHERE name=?1", arguments[:]), destinations[:])
+        queries.Setting, arguments[:]), destinations[:])
     if error != null {
         return ""
     }

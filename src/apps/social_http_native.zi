@@ -1,0 +1,264 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    coding :: #import "content_coding_native";
+    limits :: #import "server_limits";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    storage :: #import "friend_snapshots_native";
+    store :: #import "social_store_native";
+    stats :: #import "social_stats_native";
+    fields :: #import "sync_json_fields";
+    notifications :: #import "sync_hub_native";
+    queries :: #import "friend_read_queries";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    calendar :: #import "std/date_time_linux";
+    timestamps :: #import "timestamp_format";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    text :: #import "std/text_tools";
+    #import "std/vec"
+
+    #scope_file
+    FriendsPath :: "/api/v1/friends";
+    FriendPrefix :: "/api/v1/friends/";
+    RequestsPath :: "/api/v1/friends/requests";
+    RequestPrefix :: "/api/v1/friends/requests/";
+    ProfileStatsPath :: "/api/v1/profile/stats";
+    FriendStatsPath :: "/api/v1/friends/stats";
+
+    Allowed :: (route: string) -> string {
+        if route == FriendsPath {
+            return "GET, HEAD"
+        }
+        if route == RequestsPath {
+            return "DELETE, GET, HEAD, POST"
+        }
+        if route == ProfileStatsPath {
+            return "PUT"
+        }
+        if route == FriendStatsPath {
+            return "DELETE, GET, HEAD"
+        }
+        if text.TextHasPrefix(route, RequestPrefix) {
+            return "DELETE, POST"
+        }
+        return "DELETE"
+    }
+
+    TrimSlashes :: (value: string) -> string {
+        first: s64 = 0
+        end := value.count
+        while first < end && value[first] == #char "/" {
+            first += 1
+        }
+        while end > first && value[end - 1] == #char "/" {
+            end -= 1
+        }
+        return value[first:end]
+    }
+
+    Create :: (database: *void, user: string, now: string, body: []u8, output: *json.JsonDocument) -> store.Result {
+        document: json.JsonDocument
+        names: [1]string = .["target"]
+        expected: [1]json.JsonKind = .[.String]
+        nodes: [1]s32
+        if !json.JsonRead(*document, TextView(body)) || !fields.Read(*document, document.root, names[:], expected[:], nodes[:]) {
+            return store.Fail(400, "invalid json")
+        }
+        targetText: Text = json.JsonString(*document, nodes[0])
+        target := wire.TrimSpace(TextView(targetText))
+        if target == "" {
+            return store.Fail(400, "target required")
+        }
+        return store.Create(database, user, target, now, output)
+    }
+
+    Mutate :: (database: *void, user: string, now: string, route: string, verb: string,
+        body: []u8, output: *json.JsonDocument) -> store.Result {
+        if route == ProfileStatsPath {
+            return stats.Write(database, user, now, body, output)
+        }
+        if verb == "DELETE" {
+            reference := TrimSlashes(route[FriendPrefix.count:])
+            target: [64]u8
+            // The Go route strips slashes and lowercases the hex ID without trimming spaces.
+            if reference != wire.TrimSpace(reference) || !identity.NormalizeUserID(reference, target[:]) {
+                return store.Fail(404, "friend not found")
+            }
+            return store.Remove(database, user, TextView(target[:]), output)
+        }
+        if route == RequestsPath {
+            return Create(database, user, now, body, output)
+        }
+        action := wire.Cut(TrimSlashes(route[RequestPrefix.count:]), #char "/")
+        if !action.found || !identity.ValidResourceID(action.before) || (action.after != "accept" && action.after != "decline") {
+            return store.Fail(404, "friend request not found")
+        }
+        return store.Action(database, user, action.before, action.after == "accept", now, output)
+    }
+
+    NotifyFriends :: (database: *void, hub: *notifications.Hub, user: string) {
+        notifications.PublishHint(hub, user)
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        friends := sql.Prepare(database, queries.CurrentFriendsSQL, arguments[:])
+        if friends.status != sqlite.SQLITE_OK {
+            return
+        }
+        defer sqlite.SqliteFinalize(friends.value)
+        while sqlite.SqliteStep(friends.value) == sqlite.SQLITE_ROW {
+            notifications.PublishHint(hub, sql.ColumnText(friends.value, 0))
+        }
+    }
+
+    Dispatch :: (database: *void, hub: *notifications.Hub, connection: *void, user: string, now: string, route: string, verb: string,
+        body: []u8, reading: bool, output: *json.JsonDocument) -> store.Result {
+        problem := "friend request failed"
+        kind := ""
+        app := ""
+        practice := ""
+        metric := ""
+        if reading {
+            if route == FriendsPath {
+                problem = "friends failed"
+                kind = "friends.list"
+            } else if route == RequestsPath {
+                problem = "friend requests failed"
+                kind = "friends.requests"
+            } else {
+                problem = "friend stats failed"
+                app = wire.TrimSpace(http.QueryArgument(connection, "app"))
+                practice = wire.TrimSpace(http.QueryArgument(connection, "practice"))
+                metric = wire.TrimSpace(http.QueryArgument(connection, "metric"))
+                if !stats.ValidQuery(app, practice, metric) {
+                    return store.Fail(400, "invalid stats query")
+                }
+            }
+        } else if route == ProfileStatsPath {
+            problem = "profile stats failed"
+        } else if verb == "DELETE" {
+            problem = "friend remove failed"
+        }
+        begin := ifx kind != "" then "BEGIN" else "BEGIN IMMEDIATE"
+        if sqlite.SqliteExecText(database, begin) != sqlite.SQLITE_OK {
+            return store.Fail(500, problem)
+        }
+        defer store.RollbackIfActive(database)
+        result: store.Result = .{status = 200}
+        if !reading {
+            result = Mutate(database, user, now, route, verb, body, output)
+        } else if route == FriendsPath {
+            result.node = storage.FriendList(database, user, output)
+        } else if route == RequestsPath {
+            result.node = storage.RequestList(database, user, output)
+        } else {
+            result = stats.Board(database, user, app, practice, metric, now, output)
+        }
+        if result.message != "" {
+            return result
+        }
+        if result.node < 0 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return store.Fail(500, problem)
+        }
+        if reading {
+            cached := false
+            if kind != "" {
+                cached = store.Cache(database, user, kind, now, output, result.node)
+            } else {
+                board: Vec(u8)
+                if BuilderAppend(board, "leaderboard.") && BuilderAppend(board, app) && BuilderAppend(board, ".") &&
+                    BuilderAppend(board, practice) && BuilderAppend(board, ".") && BuilderAppend(board, metric) {
+                    cached = store.Cache(database, user, TextView(VecSlice(board, 0, board.count)), now, output, result.node)
+                }
+            }
+            if cached {
+                notifications.PublishHint(hub, user)
+            }
+        } else if hub != null {
+            if result.notifyFriends {
+                NotifyFriends(database, hub, user)
+            } else {
+                if result.peer[0] != 0 {
+                    peer := TextView(result.peer[:])
+                    notifications.PublishHint(hub, user)
+                    if peer != user {
+                        notifications.PublishHint(hub, peer)
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == FriendsPath || route == ProfileStatsPath || text.TextHasPrefix(route, FriendPrefix)
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return (route == RequestsPath && verb == "POST") || (route == ProfileStatsPath && verb == "PUT")
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string, body: []u8, overflow: bool) -> s32 {
+        return HandleWithHub(access, null, connection, verb, route, body, overflow)
+    }
+
+    HandleWithHub :: (access: *accounts.AccountAccess, hub: *notifications.Hub, connection: *void, verb: string,
+        route: string, body: []u8, overflow: bool) -> s32 {
+        read := (verb == "GET" || verb == "HEAD") && (route == FriendsPath || route == RequestsPath || route == FriendStatsPath)
+        remove := verb == "DELETE" && text.TextHasPrefix(route, FriendPrefix)
+        action := verb == "POST" && text.TextHasPrefix(route, RequestPrefix)
+        readsBody := ReadsBody(route, verb)
+        if !read && !remove && !action && !readsBody {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = Allowed(route)}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        settings := access.configuration
+        database := settings.database
+        now := calendar.UnixMilliseconds() / 1000
+        timestamp: [31]u8
+        length := timestamps.UTC(.{seconds = now, valid = true}, timestamp[:])
+        if length == 0 || !mutex.Lock(*access.databaseLock) {
+            return replies.ErrorReply(connection, verb, 500, "authentication failed", settings.zstdResponses)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        time := TextView(timestamp[:length])
+        authenticated := auth.Authenticate(database, connection, settings.secret, now, time, false)
+        if authenticated.status != 0 {
+            return replies.ErrorReply(connection, verb, authenticated.status, authenticated.message, settings.zstdResponses)
+        }
+        payload := body
+        decoded: Vec(u8)
+        if readsBody {
+            if overflow || body.count > settings.maximumBodyBytes {
+                return replies.ErrorReply(connection, verb, 400, "request body too large", settings.zstdResponses)
+            }
+            encoding: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+            if count < 0 {
+                return replies.ErrorReply(connection, verb, 400, "unsupported content encoding", settings.zstdResponses)
+            }
+            header := wire.TrimSpace(TextView(encoding[:count]))
+            if header != "" && !wire.MatchesToken(header, "identity") {
+                if !VecResizeBounded(decoded, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+                    return replies.ErrorReply(connection, verb, 503, "request decoder unavailable", settings.zstdResponses)
+                }
+                unpacked := coding.Decode(body, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(decoded, 0, decoded.count))
+                if unpacked.error != "" {
+                    return replies.ErrorReply(connection, verb, 400, unpacked.error, settings.zstdResponses)
+                }
+                payload = unpacked.bytes
+            }
+        }
+        document: json.JsonDocument
+        result := Dispatch(database, hub, connection, TextView(authenticated.userID[:]), time, route, verb, payload, read, *document)
+        if result.message != "" {
+            return replies.ErrorReply(connection, verb, result.status, result.message, settings.zstdResponses)
+        }
+        return replies.Reply(connection, verb, result.status, *document, result.node, settings.zstdResponses)
+    }
+}

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -19,6 +20,31 @@ import (
 func startEmbedded(root string) (int64, error) {
 	result := EmbeddedRuntime_Start(root)
 	return result.Value, result.Error
+}
+
+func TestEmbeddedNodeRequestBuffer(t *testing.T) {
+	handle, err := startEmbedded(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { EmbeddedRuntime_Stop(handle) })
+	expected := EmbeddedRuntime_Request(handle, http.MethodGet, "/healthz", "")
+	if expected.Error != nil {
+		t.Fatal(expected.Error)
+	}
+	buffer := bytes.Repeat([]byte{'!'}, len(expected.Value)+2)
+	length := EmbeddedRuntime_WriteRequest(handle, http.MethodGet, "/healthz", "", buffer)
+	if int(length) != len(expected.Value) || !bytes.Equal(buffer[:length], expected.Value) || buffer[length] != 0 || buffer[length+1] != '!' {
+		t.Fatalf("invalid embedded response write, length %d and buffer %q", length, buffer)
+	}
+	saved := bytes.Clone(buffer)
+	if EmbeddedRuntime_WriteRequest(handle, http.MethodGet, "/healthz", "", buffer[:length]) != 0 ||
+		EmbeddedRuntime_WriteRequest(-1, http.MethodGet, "/healthz", "", buffer) != 0 || !bytes.Equal(buffer, saved) {
+		t.Fatal("failed embedded response changed the output buffer")
+	}
+	if EmbeddedRuntime_ResponseCapacityAllowed(0) || !EmbeddedRuntime_ResponseCapacityAllowed(2<<20) || EmbeddedRuntime_ResponseCapacityAllowed((2<<20)+1) {
+		t.Fatal("embedded response capacity limit changed")
+	}
 }
 
 func TestEmbeddedNodePersistsIdentityAndDatabaseAcrossLifecycle(t *testing.T) {

@@ -1,0 +1,179 @@
+#if TARGET == .C && OS == .LINUX {
+    fields_json :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    protocol :: #import "protocol";
+    rules :: #import "record_page_rules";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    Span :: struct {
+        start: s64
+        end: s64
+    }
+
+    #scope_export
+    RecordFields :: struct {
+        strings: [10]Span
+        deletedAt: s64
+        schemaVersion: s64
+        freeBytes: s64
+    }
+
+    // A single buffer owns the decoded strings for the entire batch, so the
+    // records can borrow their fields once decoding has finished.
+    #scope_export
+    Request :: struct {
+        app: Text
+        user: Text
+        client: Text
+        encoding: Text
+        publicKey: Text
+        cursorCollection: Text
+        cursorID: Text
+        protocolVersion: s64
+        sinceVersion: s64
+        clientClock: s64
+        cursorVersion: s64
+        limit: s64
+        hasCursor: bool
+        contentFreeDeletions: bool
+        includeMetadata: bool
+        records: Vec(RecordFields)
+        decoded: Vec(u8)
+        count: s64
+        error: string
+    }
+
+    #scope_file
+    CopyString :: (document: *json.JsonDocument, node: s32, buffer: *Vec(u8)) -> Span {
+        start := buffer.count
+        if node < 0 { return .{start = start, end = start} }
+        if !json.JsonStringInto(document, node, buffer) { return .{start = -1} }
+        return .{start = start, end = buffer.count}
+    }
+
+    #scope_export
+    ReadRecord :: (document: *json.JsonDocument, object: s32, buffer: *Vec(u8), record: *RecordFields) -> bool {
+        fields: [13]string = .["collection", "id", "key_id", "nonce", "ciphertext", "updated_at",
+            "content_hash", "parent_id", "packed_nonce", "packed_ciphertext", "deleted_at", "schema_version", "free_bytes"]
+        types: [13]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String, .String, .String, .String,
+            .Number, .Number, .Number]
+        indices: [13]s32
+        if !fields_json.Read(document, object, fields[:], types[:], indices[:]) { return false }
+        for index: 0..9 {
+            span := CopyString(document, indices[index], buffer)
+            if span.start < 0 { return false }
+            record.strings[index] = span
+        }
+        record.deletedAt = fields_json.Number(document, indices[10])
+        record.schemaVersion = fields_json.Number(document, indices[11])
+        record.freeBytes = fields_json.Number(document, indices[12])
+        return true
+    }
+
+    #scope_file
+    Field :: (buffer: []u8, range: Span) -> string {
+        return TextView(buffer[range.start:range.end])
+    }
+
+    #scope_export
+    WireRecord :: (row: RecordFields, bytes: []u8) -> protocol.EncryptedRecord {
+        fields := row.strings
+        return .{Collection = Field(bytes, fields[0]), ID = Field(bytes, fields[1]),
+            KeyID = Field(bytes, fields[2]), Nonce = Field(bytes, fields[3]), Ciphertext = Field(bytes, fields[4]),
+            UpdatedAt = Field(bytes, fields[5]), ContentHash = Field(bytes, fields[6]), ParentID = Field(bytes, fields[7]),
+            PackedNonce = Field(bytes, fields[8]), PackedCiphertext = Field(bytes, fields[9]),
+            DeletedAt = row.deletedAt, SchemaVersion = cast(isize)row.schemaVersion, FreeBytes = row.freeBytes}
+    }
+
+    Record :: (request: *Request, index: s64) -> protocol.EncryptedRecord {
+        row := request.records[index]
+        fields := row.strings
+        bytes := VecSlice(request.decoded, 0, request.decoded.count)
+        return .{Collection = wire.TrimSpace(Field(bytes, fields[0])), ID = wire.TrimSpace(Field(bytes, fields[1])),
+            KeyID = wire.TrimSpace(Field(bytes, fields[2])), Nonce = wire.TrimSpace(Field(bytes, fields[3])),
+            Ciphertext = Field(bytes, fields[4]), UpdatedAt = wire.TrimSpace(Field(bytes, fields[5])),
+            ContentHash = wire.TrimSpace(Field(bytes, fields[6])), ParentID = wire.TrimSpace(Field(bytes, fields[7])),
+            PackedNonce = Field(bytes, fields[8]), PackedCiphertext = Field(bytes, fields[9]),
+            DeletedAt = row.deletedAt, SchemaVersion = cast(isize)row.schemaVersion, FreeBytes = row.freeBytes}
+    }
+
+    Read :: (document: *json.JsonDocument) -> Request {
+        fields: [24]string = .["app_id", "user_id_hash", "client_id", "record_encoding", "public_key",
+            "client_state_hash", "last_server_state_hash", "protocol_version", "since_server_version", "record_limit", "client_clock",
+            "encrypted_records_only", "include_metadata", "include_legacy_data", "full_sync_requested", "bootstrap",
+            "encrypted_records", "client_capabilities", "ops", "meditation_logs", "habits", "habit_days", "sessions", "social_cache"]
+        types: [24]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String,
+            .Number, .Number, .Number, .Number, .True, .True, .True, .True, .True,
+            .Array, .Array, .Array, .Array, .Array, .Array, .Array, .Array]
+        indices: [24]s32
+        if !fields_json.Read(document, document.root, fields[:], types[:], indices[:]) { return .{error = "invalid json"} }
+        invalid := "invalid encrypted record page request"
+        if json.JsonKindOf(document, indices[11]) != .True { return .{error = invalid} }
+        for index: 5..6 {
+            if indices[index] >= 0 && !json.JsonIs(document, indices[index], "") { return .{error = invalid} }
+        }
+        for index: 13..15 {
+            if json.JsonKindOf(document, indices[index]) == .True { return .{error = invalid} }
+        }
+        for index: 18..23 {
+            if json.JsonFirst(document, indices[index]) >= 0 { return .{error = invalid} }
+        }
+        result: Request
+        result.app = json.JsonString(document, indices[0])
+        result.user = json.JsonString(document, indices[1])
+        result.client = json.JsonString(document, indices[2])
+        result.encoding = json.JsonString(document, indices[3])
+        result.publicKey = json.JsonString(document, indices[4])
+        result.protocolVersion = fields_json.Number(document, indices[7])
+        result.sinceVersion = fields_json.Number(document, indices[8])
+        result.limit = fields_json.Number(document, indices[9])
+        result.clientClock = fields_json.Number(document, indices[10])
+        result.includeMetadata = json.JsonKindOf(document, indices[12]) == .True
+
+        cursorName: [1]string = .["record_cursor"]
+        cursorType: [1]json.JsonKind = .[.Object]
+        cursorIndex: [1]s32
+        if !fields_json.Read(document, document.root, cursorName[:], cursorType[:], cursorIndex[:]) { return .{error = invalid} }
+        if cursorIndex[0] >= 0 {
+            cursorFields: [3]string = .["version", "collection", "id"]
+            cursorTypes: [3]json.JsonKind = .[.Number, .String, .String]
+            cursorIndices: [3]s32
+            if !fields_json.Read(document, cursorIndex[0], cursorFields[:], cursorTypes[:], cursorIndices[:]) { return .{error = invalid} }
+            result.hasCursor = true
+            result.cursorVersion = fields_json.Number(document, cursorIndices[0])
+            result.cursorCollection = json.JsonString(document, cursorIndices[1])
+            result.cursorID = json.JsonString(document, cursorIndices[2])
+        }
+        capability := json.JsonFirst(document, indices[17])
+        while capability >= 0 {
+            kind := json.JsonKindOf(document, capability)
+            if kind != .String && kind != .Null { return .{error = "invalid json"} }
+            if json.JsonIs(document, capability, "content-free-deletions") { result.contentFreeDeletions = true }
+            capability = json.JsonNext(document, capability)
+        }
+        count := json.JsonCount(document, indices[16])
+        if count > rules.RecordPageLimit { return .{error = invalid} }
+        if !ReadRecords(document, indices[16], *result) { return .{error = "invalid encrypted record"} }
+        return result
+    }
+
+    ReadRecords :: (document: *json.JsonDocument, array: s32, result: *Request) -> bool {
+        item := json.JsonFirst(document, array)
+        while item >= 0 {
+            record: RecordFields
+            if !ReadRecord(document, item, *result.decoded, *record) || !VecPush(result.records, record) { return false }
+            item = json.JsonNext(document, item)
+        }
+        result.count = result.records.count
+        for record: result.records {
+            hash := record.strings[6]
+            bytes := VecSlice(result.decoded, hash.start, hash.end)
+            for byte, index: bytes {
+                if byte >= #char "A" && byte <= #char "Z" { bytes[index] = byte + 32 }
+            }
+        }
+        return true
+    }
+}

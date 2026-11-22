@@ -1,0 +1,66 @@
+// Built-in registrations used until the node accepts an active signed manifest.
+Inbe :: #string INBE_END
+{
+  "app_id": "inbe",
+  "display_name": "Inner Breeze",
+  "description": "Breathing, meditation, and habit data.",
+  "homepage_url": "https://inbe.waozi.xyz/",
+  "source_url": "https://github.com/waozixyz/inbe",
+  "status": "active",
+  "app_schema_version": 1,
+  "min_supported_client_version": "0.0.0",
+  "current_client_version": "next",
+  "compatibility_until": "2027-09-01",
+  "collections": [
+    {"collection_prefix":"inbe.habits","visibility":"private","schema_version":4,"description":"Released v4 encrypted habit records."},
+    {"collection_prefix":"inbe.habit_days","visibility":"private","schema_version":4,"description":"Released v4 encrypted habit-day records."},
+    {"collection_prefix":"inbe.sessions","visibility":"private","schema_version":4,"description":"Released v4 encrypted session records."},
+    {"collection_prefix":"private.inbe.v1.*","visibility":"private","schema_version":1,"description":"Future private Inbe records."},
+    {"collection_prefix":"private.inbe.v1.elist-lists","visibility":"private","schema_version":1,"description":"Encrypted Inbe EList list records."},
+    {"collection_prefix":"private.inbe.v1.elist-items","visibility":"private","schema_version":1,"description":"Encrypted Inbe EList item records."},
+    {"collection_prefix":"shared.inbe.v1.*","visibility":"shared","schema_version":1,"description":"User-grantable Inbe records."},
+    {"collection_prefix":"friends.inbe.v1.*","visibility":"friends","schema_version":1,"description":"Friend-visible Inbe records."},
+    {"collection_prefix":"public.inbe.v1.*","visibility":"public","schema_version":1,"description":"Public Inbe records."},
+    {"collection_prefix":"private.inbe.v2.lumi","visibility":"private","schema_version":2,"description":"Isolated encrypted Lumi history."}
+  ],
+  "capabilities": ["sync", "encrypted-records", "profile-stats", "leaderboard"],
+  "features": [
+    {"id":"sync.private_records","collections":["private.inbe.v1.*","inbe.habits","inbe.habit_days","inbe.sessions","private.inbe.v2.lumi"],"requires_signed_tx":true},
+    {"id":"sync.elist","collections":["private.inbe.v1.elist-lists","private.inbe.v1.elist-items"],"requires_signed_tx":true},
+    {"id":"sync.shared_records","collections":["shared.inbe.v1.*"],"requires_signed_tx":true},
+    {"id":"profile.stats"}
+  ],
+  "legacy_protocols": [
+    {"name":"inbe-typed-sync","version":5,"status":"compatibility","valid_until":"2027-09-01"},
+    {"name":"ksync-headers","version":5,"status":"compatibility","valid_until":"2027-09-01"}
+  ],
+  "token_policies": [
+    {"asset_id":"waozi:token","permission":"spend","status":"active","legacy_unsigned_until":1819756800},
+    {"asset_id":"waozi:token","permission":"purchase","status":"active","legacy_unsigned_until":1819756800}
+  ]
+}
+INBE_END;
+
+// Entity owns private account data used across apps. It grants other apps
+// access to individual collections through the normal app-grant mechanism.
+Entity :: #string ENTITY_END
+{
+  "app_id": "entity",
+  "display_name": "Entity",
+  "description": "The account's own data, shared by every app it uses.",
+  "source_url": "https://github.com/waozixyz/entity",
+  "status": "active",
+  "app_schema_version": 1,
+  "min_supported_client_version": "0.0.0",
+  "current_client_version": "next",
+  "collections": [
+    {"collection_prefix":"private.entity.v1.*","visibility":"private","schema_version":1,"description":"Private account data shared by the account's apps."}
+  ],
+  "capabilities": ["sync", "encrypted-records"],
+  "features": [
+    {"id":"sync.entity_records","collections":["private.entity.v1.*"],"requires_signed_tx":true}
+  ]
+}
+ENTITY_END;
+
+ActiveManifest :: "SELECT EXISTS(SELECT 1 FROM server_app_manifests WHERE app_id=?1 AND status='active')";

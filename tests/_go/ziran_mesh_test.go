@@ -606,7 +606,7 @@ func TestZiranMeshSharedRecordAndCountHelpersAgainstBaseline(t *testing.T) {
 			changed := item
 			reflect.ValueOf(&changed).Elem().FieldByName(field).SetString(value)
 			for _, protocol := range []int{0, 4, 5, 6} {
-				if got, want := EncryptedRecord_ValidForProtocol(changed, protocol), baselineValidEncryptedRecordForProtocol(changed, protocol); got != want {
+				if got, want := RecordValidation_ValidForProtocol(changed, protocol), baselineValidEncryptedRecordForProtocol(changed, protocol); got != want {
 					t.Fatal("record validation changed", changed, protocol, got, want)
 				}
 			}

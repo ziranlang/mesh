@@ -1,0 +1,46 @@
+tools :: #import "std/text_tools";
+
+BackupMaximumBytes :: 17664;
+BackupFirstLockSeconds :: 60;
+BackupLongestLockSeconds :: 86400;
+
+#scope_file
+BackupSealPrefix :: "waozi-account-backup-v3\nalgorithm=ML-DSA-44\nkdf=Argon2id\nmemory_kib=65536\npasses=3\nlanes=1\nsalt=";
+
+LowerHex :: (value: string, width: s64) -> bool {
+    if value.count != width { return false }
+    for byte: value {
+        if !(byte >= #char "0" && byte <= #char "9") && !(byte >= #char "a" && byte <= #char "f") { return false }
+    }
+    return true
+}
+
+#scope_export
+BackupSealValid :: (backup: string, salt: string, verifier: string) -> bool {
+    if backup.count > BackupMaximumBytes || !LowerHex(salt, 32) || !LowerHex(verifier, 64) { return false }
+    prefixEnd := BackupSealPrefix.count
+    saltEnd := prefixEnd + salt.count
+    nonceLabel := "\nnonce="
+    nonceStart := saltEnd + nonceLabel.count
+    nonceEnd := nonceStart + 24
+    cipherLabel := "\nciphertext="
+    cipherStart := nonceEnd + cipherLabel.count
+    if backup.count <= cipherStart + 32 || !tools.TextHasPrefix(backup, BackupSealPrefix) ||
+        backup[prefixEnd:saltEnd] != salt || backup[saltEnd:nonceStart] != nonceLabel ||
+        !LowerHex(backup[nonceStart:nonceEnd], 24) || backup[nonceEnd:cipherStart] != cipherLabel {
+        return false
+    }
+    sealed := backup[cipherStart:]
+    return sealed.count % 2 == 0 && LowerHex(sealed, sealed.count)
+}
+
+BackupLockSeconds :: (failures: s64) -> s64 {
+    if failures < 5 { return 0 }
+    seconds: s64 = BackupFirstLockSeconds
+    steps := failures - 5
+    while steps > 0 && seconds < BackupLongestLockSeconds {
+        seconds *= 2
+        steps -= 1
+    }
+    return ifx seconds <= BackupLongestLockSeconds then seconds else BackupLongestLockSeconds
+}

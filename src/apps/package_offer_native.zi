@@ -1,0 +1,222 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    descriptor :: #import "package_release_native";
+    stored :: #import "package_files_native";
+    fields :: #import "sync_json_fields";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    numbers :: #import "std/number_text";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    HistoryRetained :: 64;
+    FirstNamedRevision :: 28;
+
+    #scope_export
+    Interfaces :: struct {
+        host: s64
+        oldest: s64
+        module: s64
+        revision: s64
+        bucket: s64
+        format: string
+        valid: bool
+    }
+
+    Selection :: struct {
+        access: *accounts.AccountAccess
+        directory: files.FileHandle
+        app: string
+        now: s64
+        wanted: Interfaces
+    }
+
+    StoredRelease :: struct {
+        storage: stored.SmallFile
+        document: json.JsonDocument
+        valid: bool
+    }
+
+    History :: struct {
+        storage: stored.SmallFile
+        document: json.JsonDocument
+        first: s32
+        status: u32
+    }
+
+    ReadDocument :: (metadata: *stored.SmallFile, document: *json.JsonDocument) -> bool {
+        return metadata.valid && json.JsonRead(document, TextView(VecSlice(metadata.bytes, 0, metadata.bytes.count)))
+    }
+
+    #scope_file
+    Number :: (raw: string, fallback: s64, lower: s64, upper: s64) -> s64 {
+        if raw == "" { return fallback }
+        value := wire.TrimPrefix(raw, "+")
+        if value == "" || (value != raw && value[0] == #char "-") { return -1 }
+        parsed, count := numbers.IntegerPrefix(value)
+        return ifx count == value.count && parsed >= lower && parsed <= upper then parsed else -1
+    }
+
+    #scope_export
+    Wanted :: (connection: *void) -> Interfaces {
+        result: Interfaces
+        result.host = Number(http.QueryArgument(connection, "host_api"), 0, 1, 65535)
+        result.oldest = Number(http.QueryArgument(connection, "oldest_host_api"), 0, 1, 65535)
+        result.module = Number(http.QueryArgument(connection, "module_api"), 0, 1, 65535)
+        result.revision = Number(http.QueryArgument(connection, "zx"), 0, 1, 65535)
+        result.bucket = Number(http.QueryArgument(connection, "bucket"), 99, 0, 99)
+        format := http.QueryArgument(connection, "format")
+        result.format = ".zib"
+        if format == "zx" { result.format = ".zx" }
+        if format == "wasm" { result.format = ".wasm" }
+        result.valid = result.host >= 0 && result.oldest >= 0 && result.module >= 0 && result.revision >= 0 &&
+            result.bucket >= 0 && (format == "" || format == "zx" || format == "wasm") &&
+            (result.revision == 0 || format != "") && (result.host == 0 || result.oldest <= result.host)
+        return result
+    }
+
+    ReadRelease :: (directory: files.FileHandle, sequence: s64, suffix: string) -> StoredRelease {
+        digits: [24]u8
+        name: Vec(u8)
+        if !BuilderAppend(name, "release-") || !BuilderAppend(name, numbers.FormatInteger(sequence, digits[:])) ||
+            !BuilderAppend(name, suffix) { return .{} }
+        result: StoredRelease = .{storage = stored.Read(directory, TextView(VecSlice(name, 0, name.count)))}
+        result.valid = ReadDocument(*result.storage, *result.document)
+        return result
+    }
+
+    HeldBack :: (selection: *Selection, sequence: s64) -> bool {
+        metadata := stored.Read(selection.directory, "rollout.json", 4096)
+        document: json.JsonDocument
+        if !ReadDocument(*metadata, *document) { return false }
+        names: [3]string = .["sequence", "percent", "until"]
+        kinds: [3]json.JsonKind = .[.Number, .Number, .Number]
+        nodes: [3]s32
+        if !fields.Read(*document, document.root, names[:], kinds[:], nodes[:]) { return false }
+        percent := fields.Number(*document, nodes[1])
+        return fields.Number(*document, nodes[0]) == sequence && percent >= 0 && percent < 100 &&
+            fields.Number(*document, nodes[2]) > selection.now && selection.wanted.bucket >= percent
+    }
+
+    Fits :: (release: *descriptor.Release, wanted: Interfaces) -> bool {
+        return (wanted.host == 0 || release.host <= wanted.host) && release.host >= wanted.oldest &&
+            (wanted.module == 0 || release.module == wanted.module)
+    }
+
+    #scope_file
+    NamedArtifact :: (directory: files.FileHandle, hash: string, suffix: string) -> files.FileHandle {
+        name: Vec(u8)
+        if !BuilderAppend(name, hash) || !BuilderAppend(name, suffix) { return .{} }
+        return tree.OpenChildRegularFile(directory, TextView(VecSlice(name, 0, name.count)))
+    }
+
+    Revision :: (file: files.FileHandle) -> s64 {
+        header: [8]u8
+        if files.ReadAt(file, header[:], 0) != header.count || header[0] != #char "Z" ||
+            header[1] != #char "X" || header[2] != 0 || header[3] != 0 { return 0 }
+        return cast(s64)header[4] | (cast(s64)header[5] << 8) | (cast(s64)header[6] << 16) | (cast(s64)header[7] << 24)
+    }
+
+    RevisionFits :: (file: files.FileHandle, wanted: Interfaces) -> bool {
+        if wanted.revision == 0 && wanted.host == 0 && wanted.oldest == 0 { return true }
+        revision := Revision(file)
+        if wanted.revision > 0 { return revision == wanted.revision }
+        return revision > 0 && revision < FirstNamedRevision
+    }
+
+    Wasm :: (selection: *Selection, document: *json.JsonDocument, release: *descriptor.Release,
+        target: *json.JsonDocument) -> s32 {
+        web := ReadRelease(selection.directory, release.sequence, ".wasm.json")
+        if !web.valid { return -1 }
+        variant := descriptor.Parse(*web.document, web.document.root, selection.app)
+        if !variant.valid || !descriptor.SameWasmRelease(document, release, *web.document, *variant) ||
+            !descriptor.Trusted(selection.access, *web.document, *variant, selection.app, selection.now) { return -1 }
+        hash: Text = descriptor.ModuleHash(*web.document, *variant)
+        file := NamedArtifact(selection.directory, TextView(hash), ".wasm")
+        if !file.valid { return -1 }
+        defer files.CloseFile(file)
+        return descriptor.Project(target, *web.document, *variant)
+    }
+
+    #scope_export
+    Offered :: (selection: *Selection, document: *json.JsonDocument, release: *descriptor.Release,
+        target: *json.JsonDocument) -> s32 {
+        hash: Text = descriptor.ModuleHash(document, release)
+        format := selection.wanted.format
+        suffix := ifx format == ".zib" then ".zib" else ".zx"
+        file := NamedArtifact(selection.directory, TextView(hash), suffix)
+        if !file.valid { return -1 }
+        defer files.CloseFile(file)
+        if suffix == ".zx" && !RevisionFits(file, selection.wanted) { return -1 }
+        if format == ".wasm" { return Wasm(selection, document, release, target) }
+        return descriptor.Project(target, document, release)
+    }
+
+    ReadHistory :: (directory: files.FileHandle, app: string, fallback: bool) -> History {
+        // The JSON nodes borrow their input. Keep the file bytes with the document.
+        result: History = .{storage = stored.Read(directory, "history-v2.json", 262144)}
+        if !result.storage.found && fallback {
+            single: History = .{storage = stored.Read(directory, "latest-v2.json")}
+            if !ReadDocument(*single.storage, *single.document) { return .{status = 404} }
+            release := descriptor.Parse(*single.document, single.document.root, app)
+            if !release.valid || release.sequence == 9223372036854775807 { return .{status = 503} }
+            single.first = single.document.root
+            single.status = 200
+            return single
+        }
+        if !result.storage.found { return .{status = 404} }
+        if !ReadDocument(*result.storage, *result.document) { return .{status = 503} }
+        names: [1]string = .["versions"]
+        kinds: [1]json.JsonKind = .[.Array]
+        nodes: [1]s32
+        if !fields.Read(*result.document, result.document.root, names[:], kinds[:], nodes[:]) { return .{status = 503} }
+        count := json.JsonCount(*result.document, nodes[0])
+        if count < 1 || count > HistoryRetained { return .{status = 503} }
+        result.first = json.JsonFirst(*result.document, nodes[0])
+        node := result.first
+        previous: s64 = 9223372036854775807
+        while node >= 0 {
+            release := descriptor.Parse(*result.document, node, app)
+            if !release.valid || release.sequence >= previous { return .{status = 503} }
+            previous = release.sequence
+            node = json.JsonNext(*result.document, node)
+        }
+        result.status = 200
+        return result
+    }
+
+    Older :: (selection: *Selection, latest: s64, target: *json.JsonDocument) -> s32 {
+        history := ReadHistory(selection.directory, selection.app, false)
+        if history.status == 503 { return -1 }
+        if history.status == 200 {
+            node := history.first
+            while node >= 0 {
+                release := descriptor.Parse(*history.document, node, selection.app)
+                if release.sequence < latest && Fits(*release, selection.wanted) && !HeldBack(selection, release.sequence) &&
+                    descriptor.Trusted(selection.access, *history.document, *release, selection.app, selection.now) {
+                    found := Offered(selection, *history.document, *release, target)
+                    if found >= 0 { return found }
+                }
+                node = json.JsonNext(*history.document, node)
+            }
+            return -1
+        }
+        sequence := latest - 1
+        while sequence > 0 && sequence > latest - 256 {
+            older := ReadRelease(selection.directory, sequence, ".json")
+            if older.valid {
+                release := descriptor.Parse(*older.document, older.document.root, selection.app)
+                if release.valid && release.sequence == sequence && Fits(*release, selection.wanted) &&
+                    descriptor.Trusted(selection.access, *older.document, *release, selection.app, selection.now) {
+                    found := Offered(selection, *older.document, *release, target)
+                    if found >= 0 { return found }
+                }
+            }
+            sequence -= 1
+        }
+        return -1
+    }
+}

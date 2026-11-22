@@ -137,21 +137,21 @@ func TestSignedRecordPackingUploadRetainsIdentityAndScopesNegotiatedReply(t *tes
 
 func TestRecordPackingRejectsMalformedPairsAndLegacyProtocols(t *testing.T) {
 	record := EncryptedRecord{Collection: "private.pageapp.v1.records.media", ID: "valid", UpdatedAt: lifecycleFixtureTime, Nonce: "raw", Ciphertext: "raw", PackedNonce: "packed", PackedCiphertext: "packed"}
-	if !EncryptedRecord_ValidForProtocol(record, 6) || EncryptedRecord_ValidForProtocol(record, 5) {
+	if !RecordValidation_ValidForProtocol(record, 6) || RecordValidation_ValidForProtocol(record, 5) {
 		t.Fatal("protocol boundary")
 	}
 	record.PackedNonce = ""
-	if EncryptedRecord_Valid(record) {
+	if RecordValidation_Valid(record) {
 		t.Fatal("unpaired variant")
 	}
 	record.PackedNonce = "packed"
 	record.DeletedAt = 1
-	if EncryptedRecord_Valid(record) {
+	if RecordValidation_Valid(record) {
 		t.Fatal("tombstone packing")
 	}
 	record.DeletedAt = 0
 	record.PackedCiphertext = strings.Repeat("x", 262145)
-	if EncryptedRecord_Valid(record) {
+	if RecordValidation_Valid(record) {
 		t.Fatal("oversized variant")
 	}
 }

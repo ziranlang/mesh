@@ -1,0 +1,442 @@
+#if TARGET == .C && OS == .LINUX {
+    bytes :: #import "std/byte_text_linux";
+    binary :: #import "binary_codec";
+    calendar :: #import "std/date_time_linux";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    token_numbers :: #import "token_payload";
+    sha :: #import "crypto/sha256";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    PlayCredentials :: struct {
+        serviceAccount: Text
+        oauthClient: Text
+        refreshToken: Text
+        // Only a disposable test fixture supplies a literal loopback origin.
+        loopbackBase: Text
+    }
+
+    PlayCancelCheck :: #type (context: *void) -> bool;
+    PlayCancellation :: struct {
+        check: PlayCancelCheck
+        context: *void
+    }
+
+    PlayProduct :: struct {
+        packageName: string
+        productID: string
+        token: string
+    }
+
+    PlayVoid :: struct {
+        token: Text
+        order: Text
+        millis: s64
+        quantity: s64
+    }
+
+    PlayVoids :: struct {
+        events: Vec(PlayVoid)
+    }
+
+    PlayInspection :: struct {
+        quantity: s64
+        refundable: s64
+        hasRefundable: bool
+        kind: string
+        order: Text
+        binding: Text
+        reference: Text
+        purchased: bool
+        cancelledPurchase: bool
+        consumed: bool
+        status: u32
+        error: string
+    }
+
+    #scope_file
+    curl :: #system_library "curl";
+    crypto :: #system_library "crypto";
+    NewTransfer :: () -> *void #foreign curl "curl_easy_init";
+    FreeTransfer :: (transfer: *void) #foreign curl "curl_easy_cleanup";
+    SetOption :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_setopt";
+    Perform :: (transfer: *void) -> s32 #foreign curl "curl_easy_perform";
+    GetInfo :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_getinfo";
+    AddHeader :: (list: *void, header: *u8) -> *void #foreign curl "curl_slist_append";
+    FreeHeaders :: (list: *void) #foreign curl "curl_slist_free_all";
+    OpenMemory :: (buffer: *u8, count: s32) -> *void #foreign crypto "BIO_new_mem_buf";
+    FreeMemory :: (buffer: *void) -> s32 #foreign crypto "BIO_free";
+    ReadPrivateKey :: (buffer: *void, output: **void, password: *void, context: *void) -> *void #foreign crypto "PEM_read_bio_PrivateKey";
+    IsKeyType :: (key: *void, name: *u8) -> s32 #foreign crypto "EVP_PKEY_is_a";
+    FreeKey :: (key: *void) #foreign crypto "EVP_PKEY_free";
+    SHA256Algorithm :: () -> *void #foreign crypto "EVP_sha256";
+    NewDigest :: () -> *void #foreign crypto "EVP_MD_CTX_new";
+    FreeDigest :: (context: *void) #foreign crypto "EVP_MD_CTX_free";
+    SignInit :: (context: *void, keyContext: **void, digest: *void, engine: *void, key: *void) -> s32 #foreign crypto "EVP_DigestSignInit";
+    SignMessage :: (context: *void, signature: *u8, signatureBytes: *usize, message: *u8, messageBytes: usize) -> s32 #foreign crypto "EVP_DigestSign";
+
+    RawURL :: 10002;
+    Proxy :: 10004;
+    PostFields :: 10015;
+    Headers :: 10023;
+    PostSize :: 60;
+    PathAsIs :: 234;
+    Timeout :: 13;
+    NoSignal :: 99;
+    WriteCallback :: 20011;
+    WriteData :: 10001;
+    ResponseCode :: 2097154;
+    NoProgress :: 43;
+    ProgressCallback :: 20219;
+    ProgressData :: 10057;
+    Encoding :: 10102;
+    PlayProviderResponseLimit :: 1048576;
+    OAuthDefault :: "https://oauth2.googleapis.com/token";
+    APIBase :: "https://androidpublisher.googleapis.com/androidpublisher/v3";
+
+    PlayResponse :: struct {
+        body: Vec(u8)
+        status: isize
+    }
+
+    WriteHandler :: #type (data: *u8, size: usize, count: usize, context: *void) -> usize #c_call;
+    ProgressHandler :: #type (context: *void, download: s64, downloaded: s64, upload: s64, uploaded: s64) -> s32 #c_call;
+
+    Write :: (data: *u8, size: usize, count: usize, context: *void) -> usize {
+        if size == 0 || count == 0 || count > cast(usize)PlayProviderResponseLimit / size { return 0 }
+        incoming := size * count
+        result := cast(*PlayResponse)context
+        start := result.body.count
+        if !VecResizeBounded(result.body, start + cast(s64)incoming, PlayProviderResponseLimit) { return 0 }
+        for index: 0..cast(s64)incoming - 1 { result.body[start + index] = data[index] }
+        return incoming
+    }
+
+    Progress :: (context: *void, download: s64, downloaded: s64, upload: s64, uploaded: s64) -> s32 {
+        return ifx Cancelled(<<cast(*PlayCancellation)context) then 1 else 0
+    }
+
+    Loopback :: (url: string) -> bool {
+        base := "http://127.0.0.1:"
+        // Parse the port before the first path separator following the origin.
+        target := wire.TrimPrefix(url, base)
+        if target.count == url.count { return false }
+        port := wire.Cut(target, #char "/").before
+        if port.count < 1 || port.count > 5 { return false }
+        number: s64 = 0
+        for byte: port {
+            if byte < #char "0" || byte > #char "9" { return false }
+            number = number * 10 + cast(s64)(byte - #char "0")
+        }
+        return number > 0 && number <= 65535
+    }
+
+    Request :: (target: string, header: string, form: []u8, post: bool, mock: bool,
+        cancel: PlayCancellation, result: *PlayResponse) -> bool {
+        if Cancelled(cancel) || (mock && !Loopback(target)) || (!mock && wire.TrimPrefix(target, "https://").count == target.count) { return false }
+        for byte: target { if byte <= 32 || byte == 127 { return false } }
+        for byte: header { if byte < 32 || byte == 127 { return false } }
+        url: Vec(u8)
+        field: Vec(u8)
+        if !BuilderAppend(url, target) || !VecPush(url, cast(u8)0) ||
+            !BuilderAppend(field, header) || !VecPush(field, cast(u8)0) { return false }
+        transfer := NewTransfer()
+        if transfer == null { return false }
+        defer FreeTransfer(transfer)
+        headers := AddHeader(null, *field[0])
+        if headers == null { return false }
+        defer FreeHeaders(headers)
+        receive: WriteHandler = Write
+        progress: ProgressHandler = Progress
+        cancellation := cancel
+        empty: [1]u8
+        if SetOption(transfer, RawURL, *url[0]) != 0 || SetOption(transfer, Headers, headers) != 0 ||
+            SetOption(transfer, Timeout, cast(isize)20) != 0 || SetOption(transfer, NoSignal, cast(isize)1) != 0 ||
+            SetOption(transfer, PathAsIs, cast(isize)1) != 0 ||
+            SetOption(transfer, WriteCallback, receive) != 0 || SetOption(transfer, WriteData, result) != 0 ||
+            SetOption(transfer, Encoding, *empty[0]) != 0 || SetOption(transfer, NoProgress, cast(isize)0) != 0 ||
+            SetOption(transfer, ProgressCallback, progress) != 0 || SetOption(transfer, ProgressData, *cancellation) != 0 { return false }
+        if mock && SetOption(transfer, Proxy, *empty[0]) != 0 { return false }
+        if post {
+            data := ifx form.count == 0 then *empty[0] else *form[0]
+            if SetOption(transfer, PostFields, data) != 0 || SetOption(transfer, PostSize, cast(isize)form.count) != 0 { return false }
+        }
+        return Perform(transfer) == 0 && !Cancelled(cancel) && GetInfo(transfer, ResponseCode, *result.status) == 0
+    }
+
+    Escape :: (output: *Vec(u8), value: string, form: bool) -> bool {
+        hex := "0123456789ABCDEF"
+        for byte: value {
+            if (byte >= #char "a" && byte <= #char "z") || (byte >= #char "A" && byte <= #char "Z") ||
+                (byte >= #char "0" && byte <= #char "9") || byte == #char "-" || byte == #char "_" || byte == #char "." || byte == #char "~" ||
+                (!form && (byte == #char "$" || byte == #char "&" || byte == #char "+" || byte == #char ":" || byte == #char "=" || byte == #char "@")) {
+                if !VecPush(<<output, byte) { return false }
+            } else if form && byte == #char " " {
+                if !VecPush(<<output, cast(u8)(#char "+")) { return false }
+            } else if !VecPush(<<output, cast(u8)(#char "%")) || !VecPush(<<output, hex[byte >> 4]) || !VecPush(<<output, hex[byte & 15]) {
+                return false
+            }
+        }
+        return true
+    }
+
+    Parse :: (source: string, document: *json.JsonDocument) -> bool {
+        return json.JsonRead(document, source) && json.JsonKindOf(document, document.root) == .Object
+    }
+
+    String :: (document: *json.JsonDocument, name: string) -> Text {
+        return json.JsonString(document, json.JsonMember(document, document.root, name))
+    }
+
+    SignAssertion :: (account: string, target: string, pem: string, form: *Vec(u8)) -> bool {
+        if wire.TrimPrefix(wire.TrimSpace(pem), "-----BEGIN PRIVATE KEY-----").count == wire.TrimSpace(pem).count || pem.count > 65536 { return false }
+        data: Vec(u8)
+        if !BuilderAppend(data, pem) { return false }
+        memory := OpenMemory(*data[0], cast(s32)data.count)
+        if memory == null { return false }
+        defer FreeMemory(memory)
+        key := ReadPrivateKey(memory, null, null, null)
+        if key == null { return false }
+        defer FreeKey(key)
+        rsa: [4]u8 = .[82, 83, 65, 0]
+        if IsKeyType(key, *rsa[0]) != 1 { return false }
+        claims: json.JsonDocument
+        root := json.JsonNewObject(*claims)
+        now := calendar.UnixMilliseconds() / 1000
+        if !json.JsonSet(*claims, root, "iss", json.JsonNewStringCopy(*claims, account)) ||
+            !json.JsonSet(*claims, root, "aud", json.JsonNewStringCopy(*claims, target)) ||
+            !json.JsonSet(*claims, root, "scope", json.JsonNewStringCopy(*claims, "https://www.googleapis.com/auth/androidpublisher")) ||
+            !json.JsonSet(*claims, root, "iat", json.JsonNewInteger(*claims, now)) ||
+            !json.JsonSet(*claims, root, "exp", json.JsonNewInteger(*claims, now + 3600)) { return false }
+        payload: Vec(u8)
+        if !json.JsonWriteInto(*payload, *claims, root, json.JsonCompactStyle(false)) { return false }
+        header := binary.EncodeBase64("{\"alg\":\"RS256\",\"typ\":\"JWT\"}", true, false)
+        encoded := binary.EncodeBase64(TextView(VecSlice(payload, 0, payload.count)), true, false)
+        assertion: Vec(u8)
+        if header.error != "" || encoded.error != "" || !BuilderAppend(assertion, TextView(VecSlice(header.value, 0, header.value.count))) ||
+            !BuilderAppend(assertion, ".") || !BuilderAppend(assertion, TextView(VecSlice(encoded.value, 0, encoded.value.count))) { return false }
+        context := NewDigest()
+        if context == null { return false }
+        defer FreeDigest(context)
+        signature: [1024]u8
+        size := cast(usize)signature.count
+        if SignInit(context, null, SHA256Algorithm(), null, key) != 1 ||
+            SignMessage(context, *signature[0], *size, *assertion[0], cast(usize)assertion.count) != 1 || size == 0 || size > cast(usize)signature.count { return false }
+        signed := binary.EncodeBase64(TextView(signature[:cast(s64)size]), true, false)
+        return signed.error == "" && BuilderAppend(<<form, "assertion=") && Escape(form, TextView(VecSlice(assertion, 0, assertion.count)), true) &&
+            BuilderAppend(<<form, ".") && Escape(form, TextView(VecSlice(signed.value, 0, signed.value.count)), true) &&
+            BuilderAppend(<<form, "&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+    }
+
+    ExchangeToken :: (uri: string, form: []u8, mock: bool, cancel: PlayCancellation) -> Text {
+        if mock && uri == "" { return .{} }
+        result: PlayResponse
+        if !Request(ifx uri == "" then OAuthDefault else uri, "Content-Type: application/x-www-form-urlencoded",
+            form, true, mock, cancel, *result) || result.status < 200 || result.status >= 300 { return .{} }
+        token: json.JsonDocument
+        if !Parse(TextView(VecSlice(result.body, 0, result.body.count)), *token) { return .{} }
+        return String(*token, "access_token")
+    }
+
+    AccessToken :: (credentials: *PlayCredentials, cancel: PlayCancellation) -> Text {
+        service := TextView(credentials.serviceAccount)
+        mock := credentials.loopbackBase.bytes.count != 0
+        document: json.JsonDocument
+        form: Vec(u8)
+        if service != "" {
+            if !Parse(service, *document) { return .{} }
+            email: Text = String(*document, "client_email")
+            key: Text = String(*document, "private_key")
+            tokenURI: Text = String(*document, "token_uri")
+            uri := TextView(tokenURI)
+            if TextView(email) == "" || !SignAssertion(TextView(email), ifx uri == "" then OAuthDefault else uri, TextView(key), *form) { return .{} }
+            return ExchangeToken(uri, VecSlice(form, 0, form.count), mock, cancel)
+        }
+        if !Parse(TextView(credentials.oauthClient), *document) { return .{} }
+        client := json.JsonMember(*document, document.root, "web")
+        webID: Text = json.JsonString(*document, json.JsonMember(*document, client, "client_id"))
+        if TextView(webID) == "" { client = json.JsonMember(*document, document.root, "installed") }
+        id: Text = json.JsonString(*document, json.JsonMember(*document, client, "client_id"))
+        secret: Text = json.JsonString(*document, json.JsonMember(*document, client, "client_secret"))
+        configuredURI: Text = json.JsonString(*document, json.JsonMember(*document, client, "token_uri"))
+        if TextView(id) == "" || TextView(secret) == "" || !BuilderAppend(form, "client_id=") || !Escape(*form, TextView(id), true) ||
+            !BuilderAppend(form, "&client_secret=") || !Escape(*form, TextView(secret), true) ||
+            !BuilderAppend(form, "&grant_type=refresh_token&refresh_token=") || !Escape(*form, wire.TrimSpace(TextView(credentials.refreshToken)), true) { return .{} }
+        return ExchangeToken(TextView(configuredURI), VecSlice(form, 0, form.count), mock, cancel)
+    }
+
+    AuthorizedRequest :: (accessToken: string, endpoint: string, post: bool, mock: bool,
+        cancel: PlayCancellation, result: *PlayResponse) -> bool {
+        if accessToken == "" { return false }
+        header: Vec(u8)
+        if !BuilderAppend(header, "Authorization: Bearer ") || !BuilderAppend(header, accessToken) { return false }
+        empty: []u8
+        return Request(endpoint, TextView(VecSlice(header, 0, header.count)), empty, post, mock, cancel, result)
+    }
+
+    Authorized :: (credentials: *PlayCredentials, endpoint: string, consume: bool, cancel: PlayCancellation, result: *PlayResponse) -> bool {
+        token: Text = AccessToken(credentials, cancel)
+        return AuthorizedRequest(TextView(token), endpoint, consume, credentials.loopbackBase.bytes.count != 0, cancel, result)
+    }
+
+    VoidEndpoint :: (origin: string, packageName: string, since: s64, cursor: string, output: *Vec(u8)) -> bool {
+        stamp: [24]u8
+        return BuilderAppend(<<output, ifx origin == "" then APIBase else origin) && BuilderAppend(<<output, "/applications/") &&
+            Escape(output, packageName, false) &&
+            BuilderAppend(<<output, "/purchases/voidedpurchases?includeQuantityBasedPartialRefund=true&maxResults=100&startTime=") &&
+            BuilderAppend(<<output, numbers.FormatInteger(since, stamp[:])) &&
+            (cursor == "" || (BuilderAppend(<<output, "&token=") && Escape(output, cursor, true)))
+    }
+
+    DecodeVoids :: (document: *json.JsonDocument, output: *Vec(PlayVoid)) -> bool {
+        list := json.JsonMember(document, document.root, "voidedPurchases")
+        kind := json.JsonKindOf(document, list)
+        if kind == .Missing || kind == .Null { return true }
+        if kind != .Array { return false }
+        node := json.JsonFirst(document, list)
+        while node >= 0 {
+            if json.JsonKindOf(document, node) != .Object { return false }
+            token: Text = json.JsonString(document, json.JsonMember(document, node, "purchaseToken"))
+            orderNode := json.JsonMember(document, node, "orderId")
+            orderKind := json.JsonKindOf(document, orderNode)
+            if orderKind != .Missing && orderKind != .Null && orderKind != .String { return false }
+            millis: Text = json.JsonString(document, json.JsonMember(document, node, "voidedTimeMillis"))
+            timestamp := token_numbers.ParseInteger(TextView(millis))
+            if TextView(token) == "" || !timestamp.is_ok || timestamp.value <= 0 { return false }
+            quantity: s64 = 0
+            quantityNode := json.JsonMember(document, node, "voidedQuantity")
+            quantityKind := json.JsonKindOf(document, quantityNode)
+            if quantityKind != .Missing && quantityKind != .Null {
+                provided, ok := json.JsonInteger(document, quantityNode)
+                if !ok { return false }
+                quantity = provided
+            }
+            event: PlayVoid = .{token = TextCopy(TextView(token)), order = json.JsonString(document, orderNode),
+                millis = timestamp.value, quantity = quantity}
+            if !VecPush(<<output, event) { return false }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    Endpoint :: (credentials: *PlayCredentials, product: PlayProduct, consume: bool, output: *Vec(u8)) -> bool {
+        origin := TextView(credentials.loopbackBase)
+        return BuilderAppend(<<output, ifx origin == "" then APIBase else origin) && BuilderAppend(<<output, "/applications/") &&
+            Escape(output, product.packageName, false) && BuilderAppend(<<output, "/purchases/products/") && Escape(output, product.productID, false) &&
+            BuilderAppend(<<output, "/tokens/") && Escape(output, product.token, false) && (!consume || BuilderAppend(<<output, ":consume"))
+    }
+
+    #scope_export
+    Cancelled :: (cancel: PlayCancellation) -> bool { return cancel.check != null && cancel.check(cancel.context) }
+
+    Configured :: (credentials: *PlayCredentials) -> bool {
+        return credentials.serviceAccount.bytes.count != 0 || (credentials.oauthClient.bytes.count != 0 && credentials.refreshToken.bytes.count != 0)
+    }
+
+    Hash :: (value: string, output: []u8) -> bool {
+        digest := sha.Sha256Of(value)
+        result := sha.BytesToHex(*digest[0], digest.count, *output[0], output.count)
+        return result == 1
+    }
+
+    Inspect :: (credentials: *PlayCredentials, product: PlayProduct, cancel: PlayCancellation) -> PlayInspection {
+        if !Configured(credentials) { return .{status = 503, error = "payment verifier unavailable"} }
+        endpoint: Vec(u8)
+        result: PlayResponse
+        if !Endpoint(credentials, product, false, *endpoint) ||
+            !Authorized(credentials, TextView(VecSlice(endpoint, 0, endpoint.count)), false, cancel, *result) { return .{status = 503, error = "payment verifier unavailable"} }
+        if result.status < 200 || result.status >= 300 { return .{status = 400, error = "google purchase rejected"} }
+        document: json.JsonDocument
+        if !Parse(TextView(VecSlice(result.body, 0, result.body.count)), *document) { return .{status = 400, error = "invalid google purchase response"} }
+        purchase, purchaseOK := json.JsonInteger(*document, json.JsonMember(*document, document.root, "purchaseState"))
+        consumed, consumedOK := json.JsonInteger(*document, json.JsonMember(*document, document.root, "consumptionState"))
+        if !purchaseOK || !consumedOK || purchase < 0 || purchase > 2 || consumed < 0 || consumed > 1 { return .{status = 400, error = "invalid google purchase response"} }
+        answer: PlayInspection = .{quantity = 1, kind = "paid", purchased = purchase == 0, cancelledPurchase = purchase == 1, consumed = consumed == 1}
+        quantity := json.JsonMember(*document, document.root, "quantity")
+        kind := json.JsonKindOf(*document, quantity)
+        if kind != .Missing && kind != .Null {
+            value, ok := json.JsonInteger(*document, quantity)
+            if !ok { return .{status = 400, error = "invalid google purchase response"} }
+            answer.quantity = value
+        }
+        if answer.quantity < 1 || answer.quantity > 2147483647 { return .{status = 400, error = "invalid google purchase quantity"} }
+        answer.refundable = answer.quantity
+        refundable := json.JsonMember(*document, document.root, "refundableQuantity")
+        refundKind := json.JsonKindOf(*document, refundable)
+        if refundKind != .Missing && refundKind != .Null {
+            value, ok := json.JsonInteger(*document, refundable)
+            if !ok { return .{status = 400, error = "invalid google purchase response"} }
+            answer.hasRefundable = true
+            answer.refundable = value
+        }
+        if answer.quantity > 1 && !answer.hasRefundable { return .{status = 400, error = "google multi-quantity purchase missing net proof"} }
+        if answer.refundable < 0 || answer.refundable > answer.quantity { return .{status = 400, error = "invalid google refundable quantity"} }
+        purchaseType := json.JsonMember(*document, document.root, "purchaseType")
+        typeKind := json.JsonKindOf(*document, purchaseType)
+        if typeKind != .Missing && typeKind != .Null {
+            number, ok := json.JsonInteger(*document, purchaseType)
+            if !ok { return .{status = 400, error = "invalid google purchase response"} }
+            if number < 0 || number > 2 { return .{status = 400, error = "unknown google purchase type"} }
+            names: [3]string = .["test", "promo", "rewarded"]
+            answer.kind = names[number]
+        }
+        strings: [3]string = .["purchaseToken", "orderId", "obfuscatedExternalAccountId"]
+        for name: strings {
+            actual := json.JsonKindOf(*document, json.JsonMember(*document, document.root, name))
+            if actual != .Missing && actual != .Null && actual != .String { return .{status = 400, error = "invalid google purchase response"} }
+        }
+        token: Text = String(*document, "purchaseToken")
+        if TextView(token) != "" && TextView(token) != product.token { return .{status = 400, error = "google purchase token mismatch"} }
+        answer.order = String(*document, "orderId")
+        answer.binding = String(*document, "obfuscatedExternalAccountId")
+        {
+            hash: [65]u8
+            order := TextView(answer.order)
+            if order == "" && !Hash(product.token, hash[:]) { return .{status = 400, error = "invalid google purchase response"} }
+            reference: Vec(u8)
+            if !BuilderAppend(reference, product.packageName) || !BuilderAppend(reference, ":") || !BuilderAppend(reference, product.productID) ||
+                !BuilderAppend(reference, ":") || !BuilderAppend(reference, ifx order == "" then TextView(hash[:16]) else order) { return .{status = 400, error = "invalid google purchase response"} }
+            answer.reference = BuilderFinish(reference)
+        }
+        return answer
+    }
+
+    VoidedPurchases :: (credentials: *PlayCredentials, packageName: string, since: s64, cancel: PlayCancellation) -> PlayVoids {
+        if !Configured(credentials) { return .{} }
+        access: Text = AccessToken(credentials, cancel)
+        if TextView(access) == "" { return .{} }
+        origin := TextView(credentials.loopbackBase)
+        events: Vec(PlayVoid)
+        cursor: Text
+        done := false
+        for page: 0..9 {
+            endpoint: Vec(u8)
+            result: PlayResponse
+            if !VoidEndpoint(origin, packageName, since, TextView(cursor), *endpoint) ||
+                !AuthorizedRequest(TextView(access), TextView(VecSlice(endpoint, 0, endpoint.count)), false, origin != "", cancel, *result) ||
+                result.status < 200 || result.status >= 300 { return .{} }
+            document: json.JsonDocument
+            if !Parse(TextView(VecSlice(result.body, 0, result.body.count)), *document) || !DecodeVoids(*document, *events) { return .{} }
+            pagination := json.JsonMember(*document, document.root, "tokenPagination")
+            next: Text = json.JsonString(*document, json.JsonMember(*document, pagination, "nextPageToken"))
+            if TextView(next) == "" { done = true; break }
+            VecSwap(cursor.bytes, next.bytes)
+        }
+        if !done { return .{} }
+        return .{events = events}
+    }
+
+    VoidAt :: (list: *PlayVoids, index: s64) -> PlayVoid {
+        event := *list.events[index]
+        return .{token = TextCopy(TextView(event.token)), order = TextCopy(TextView(event.order)),
+            millis = event.millis, quantity = event.quantity}
+    }
+
+    Consume :: (credentials: *PlayCredentials, product: PlayProduct, cancel: PlayCancellation) -> bool {
+        endpoint: Vec(u8)
+        result: PlayResponse
+        return Endpoint(credentials, product, true, *endpoint) &&
+            Authorized(credentials, TextView(VecSlice(endpoint, 0, endpoint.count)), true, cancel, *result) && result.status >= 200 && result.status < 300
+    }
+}

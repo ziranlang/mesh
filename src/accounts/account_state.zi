@@ -3,6 +3,8 @@ ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
 timestamp :: #import "timestamp";
 errors :: #import "std/errors_go";
+queries :: #import "account_state_queries";
+session_queries :: #import "auth_session_queries";
 go_sql :: #system_library "go:database/sql";
 
 #scope_file
@@ -32,7 +34,7 @@ CurrentVersion :: (database: *sql.Database, context: ctx.Context, userID: string
     result: VersionResult
     arguments: [1]Any = .[userID]
     row := sql.QueryRow(database, context,
-        "\nSELECT server_version\nFROM server_sync_state\nWHERE user_id_hash=?1", arguments[:])
+        queries.ReadVersion, arguments[:])
     result.error = ScanVersion(row, *result.value)
     if errors.Is(result.error, sql.NoRows()) {
         result.value = 0
@@ -44,7 +46,7 @@ CurrentVersion :: (database: *sql.Database, context: ctx.Context, userID: string
 CurrentVersionTx :: (transaction: *sql.Transaction, context: ctx.Context, userID: string) -> VersionResult {
     result: VersionResult
     row := QueryVersion(transaction, context,
-        "\nSELECT server_version\nFROM server_sync_state\nWHERE user_id_hash=?1", userID)
+        queries.ReadVersion, userID)
     result.error = ScanVersion(row, *result.value)
     if errors.Is(result.error, sql.NoRows()) {
         result.value = 0
@@ -56,19 +58,19 @@ CurrentVersionTx :: (transaction: *sql.Transaction, context: ctx.Context, userID
 NextVersion :: (transaction: *sql.Transaction, context: ctx.Context, userID: string) -> VersionResult {
     result: VersionResult
     inserted := EnsureSync(transaction, context,
-        "INSERT OR IGNORE INTO server_sync_state(user_id_hash,server_version) VALUES(?1,0)", userID)
+        queries.EnsureVersion, userID)
     result.error = inserted.error
     if result.error != null {
         return result
     }
     updated := EnsureSync(transaction, context,
-        "UPDATE server_sync_state SET server_version=server_version+1 WHERE user_id_hash=?1", userID)
+        queries.AdvanceVersion, userID)
     result.error = updated.error
     if result.error != null {
         return result
     }
     row := QueryVersion(transaction, context,
-        "SELECT server_version FROM server_sync_state WHERE user_id_hash=?1", userID)
+        queries.ReadNewVersion, userID)
     result.error = ScanVersion(row, *result.value)
     return result
 }
@@ -85,7 +87,7 @@ Tombstoned :: (database: *sql.Database, context: ctx.Context, userID: string) ->
     result: TombstoneResult
     count: isize = 0
     row := QueryTombstone(database, context,
-        "SELECT EXISTS(SELECT 1 FROM server_account_tombstones WHERE user_id_hash=?1)", userID)
+        session_queries.AccountTombstoned, userID)
     result.error = ScanCount(row, *count)
     result.value = count != cast(isize)0
     return result
@@ -93,7 +95,7 @@ Tombstoned :: (database: *sql.Database, context: ctx.Context, userID: string) ->
 
 Touch :: (transaction: *sql.Transaction, context: ctx.Context, userID: string, missingUser: Error) -> Error {
     updated := UpdateSeen(transaction, context,
-        "UPDATE server_users SET last_seen_at=?2 WHERE user_id_hash=?1", userID, timestamp.CanonicalNow())
+        queries.Touch, userID, timestamp.CanonicalNow())
     if updated.error != null {
         return updated.error
     }
@@ -102,7 +104,7 @@ Touch :: (transaction: *sql.Transaction, context: ctx.Context, userID: string, m
         return missingUser
     }
     inserted := EnsureSync(transaction, context,
-        "INSERT OR IGNORE INTO server_sync_state(user_id_hash,server_version) VALUES(?1,0)", userID)
+        queries.EnsureVersion, userID)
     return inserted.error
 }
 
@@ -112,13 +114,13 @@ Upsert :: (transaction: *sql.Transaction, context: ctx.Context, userID: string, 
     arguments[1] = publicKey
     arguments[2] = timestamp.CanonicalNow()
     updated := sql.ExecTx(transaction, context,
-        "INSERT INTO server_users(user_id_hash,public_key) VALUES(?1,?2) ON CONFLICT(user_id_hash) DO UPDATE SET last_seen_at=?3",
+        queries.Upsert,
         arguments[:])
     if updated.error != null {
         return updated.error
     }
     inserted := EnsureSync(transaction, context,
-        "INSERT OR IGNORE INTO server_sync_state(user_id_hash,server_version) VALUES(?1,0)", userID)
+        queries.EnsureVersion, userID)
     return inserted.error
 }
 
@@ -131,7 +133,7 @@ Register :: (database: *sql.Database, context: ctx.Context, userID: string, publ
     arguments: [1]Any
     arguments[0] = userID
     removed := sql.ExecTx(opened.value, context,
-        "DELETE FROM server_account_tombstones WHERE user_id_hash=?1", arguments[:])
+        queries.ClearTombstone, arguments[:])
     if removed.error != null {
         return removed.error
     }
@@ -159,40 +161,40 @@ Delete :: (database: *sql.Database, context: ctx.Context, userID: string) -> Err
 DeleteTx :: (transaction: *sql.Transaction, context: ctx.Context, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     tombstone := sql.ExecTx(transaction, context,
-        "\nINSERT INTO server_account_tombstones(user_id_hash,deleted_at)\nVALUES(?1,CURRENT_TIMESTAMP)\nON CONFLICT(user_id_hash) DO UPDATE SET deleted_at=CURRENT_TIMESTAMP", arguments[:])
+        queries.WriteTombstone, arguments[:])
     if tombstone.error != null {
         return tombstone.error
     }
     disabled := sql.ExecTx(transaction, context,
-        "\nUPDATE monero_account_addresses SET disabled_at=CURRENT_TIMESTAMP\nWHERE account_id=?1 AND disabled_at=''", arguments[:])
+        queries.DisableMoneroAddresses, arguments[:])
     if disabled.error != null {
         return disabled.error
     }
     // Daily chat counts have no foreign key to the account.
     usage := sql.ExecTx(transaction, context,
-        "DELETE FROM server_chat_usage WHERE account_id=?1", arguments[:])
+        queries.DeleteChatUsage, arguments[:])
     if usage.error != null {
         return usage.error
     }
     // A password-sealed account backup has no foreign key either, so it is
     // not kept with an account on hold: it is gone with the account.
     backup := sql.ExecTx(transaction, context,
-        "DELETE FROM server_account_backups WHERE user_id_hash=?1", arguments[:])
+        queries.DeleteBackup, arguments[:])
     if backup.error != null {
         return backup.error
     }
     // Passkey copies and Google links go with the account for the same reason.
     passkeys := sql.ExecTx(transaction, context,
-        "DELETE FROM server_account_passkeys WHERE user_id_hash=?1", arguments[:])
+        queries.DeletePasskeys, arguments[:])
     if passkeys.error != null {
         return passkeys.error
     }
     google := sql.ExecTx(transaction, context,
-        "DELETE FROM server_account_google WHERE user_id_hash=?1", arguments[:])
+        queries.DeleteGoogleLinks, arguments[:])
     if google.error != null {
         return google.error
     }
     deleted := sql.ExecTx(transaction, context,
-        "DELETE FROM server_users WHERE user_id_hash=?1", arguments[:])
+        queries.DeleteUser, arguments[:])
     return deleted.error
 }

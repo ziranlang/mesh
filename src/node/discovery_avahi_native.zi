@@ -1,0 +1,84 @@
+#if TARGET == .C && OS == .LINUX {
+    c_string :: #import "std/c_string";
+
+    UnaryPointer :: #type (object: *void) -> *void #c_call;
+    Release :: #type (object: *void) #c_call;
+    State :: #type (object: *void) -> s32 #c_call;
+    PollNew :: #type () -> *void #c_call;
+    PollIterate :: #type (poll: *void, waitMilliseconds: s32) -> s32 #c_call;
+    ServerNew :: #type (pollAPI: *void, configuration: *void, callback: *void, context: *void, error: *s32) -> *void #c_call;
+    GroupNew :: #type (server: *void, callback: *void, context: *void) -> *void #c_call;
+    AddService :: #type (server: *void, group: *void, interfaceIndex: s32, protocol: s32, flags: s32,
+        instance: *u8, service: *u8, domain: *u8, host: *u8, port: u16, records: *void) -> s32 #c_call;
+    AddText :: #type (records: *void, value: *u8) -> *void #c_call;
+
+    API :: struct {
+        library: *void
+        pollNew: PollNew
+        pollGet: UnaryPointer
+        pollFree: Release
+        pollIterate: PollIterate
+        serverNew: ServerNew
+        serverFree: Release
+        serverState: State
+        groupNew: GroupNew
+        groupCommit: State
+        groupFree: Release
+        groupState: State
+        addService: AddService
+        addText: AddText
+        freeText: Release
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    dl :: #system_library "dl";
+    Load :: (path: *u8, flags: s32) -> *void #foreign dl "dlopen";
+    Symbol :: (library: *void, name: *u8) -> *void #foreign dl "dlsym";
+    Unload :: (library: *void) -> s32 #foreign dl "dlclose";
+    Copy :: (destination: *void, source: *void, length: usize) -> *void #foreign c "memcpy";
+
+    Resolve :: (library: *void, slot: *void, name: string) -> bool {
+        text: [64]u8
+        if !c_string.CopyCString(name, text[:]) { return false }
+        address := Symbol(library, *text[0])
+        if address == null { return false }
+        unused Copy(slot, cast(*void)*address, size_of(*void))
+        return true
+    }
+
+    #scope_export
+    Close :: (api: *API) {
+        if api.library != null {
+            unused Unload(api.library)
+            <<api = .{}
+        }
+    }
+
+    Open :: (api: *API) -> bool {
+        name: [32]u8
+        if !c_string.CopyCString("libavahi-core.so.7", name[:]) { return false }
+        // Resolve libavahi-common symbols through the core's dependencies.
+        library := Load(*name[0], 2) // RTLD_NOW, local symbols
+        if library == null { return false }
+        api.library = library
+        if Resolve(library, cast(*void)*api.pollNew, "avahi_simple_poll_new") &&
+            Resolve(library, cast(*void)*api.pollGet, "avahi_simple_poll_get") &&
+            Resolve(library, cast(*void)*api.pollFree, "avahi_simple_poll_free") &&
+            Resolve(library, cast(*void)*api.pollIterate, "avahi_simple_poll_iterate") &&
+            Resolve(library, cast(*void)*api.serverNew, "avahi_server_new") &&
+            Resolve(library, cast(*void)*api.serverFree, "avahi_server_free") &&
+            Resolve(library, cast(*void)*api.serverState, "avahi_server_get_state") &&
+            Resolve(library, cast(*void)*api.groupNew, "avahi_s_entry_group_new") &&
+            Resolve(library, cast(*void)*api.groupCommit, "avahi_s_entry_group_commit") &&
+            Resolve(library, cast(*void)*api.groupFree, "avahi_s_entry_group_free") &&
+            Resolve(library, cast(*void)*api.groupState, "avahi_s_entry_group_get_state") &&
+            Resolve(library, cast(*void)*api.addService, "avahi_server_add_service_strlst") &&
+            Resolve(library, cast(*void)*api.addText, "avahi_string_list_add") &&
+            Resolve(library, cast(*void)*api.freeText, "avahi_string_list_free") {
+            return true
+        }
+        Close(api)
+        return false
+    }
+}

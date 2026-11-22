@@ -1,0 +1,134 @@
+#if TARGET == .C && OS == .LINUX {
+    avahi :: #import "discovery_avahi_native";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    c_string :: #import "std/c_string";
+    sockets :: #import "std/socket_linux";
+    stdio :: #import "std/stdio";
+    thread :: #import "std/thread_linux";
+    utf8 :: #import "std/utf8";
+    #import "std/vec"
+
+    Worker :: struct {
+        api: avahi.API
+        poll: *void
+        server: *void
+        group: *void
+        thread: thread.Thread
+        stopFD: s32
+        active: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (fds: *sockets.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+
+    Service :: "_daochi._tcp";
+    Domain :: "local.";
+    AnyInterface :: -1;
+    AnyProtocol :: -1;
+    ServerCollision :: 3;
+    GroupCollision :: 3;
+    WakeFlags :: 0x80800; // EFD_CLOEXEC | EFD_NONBLOCK
+
+    Instance :: (displayName: string, nodeID: string, output: []u8) -> bool {
+        label := wire.TrimSpace(displayName)
+        if label == "" { label = "Mesh Node" }
+        if label.count + 13 > 63 || !utf8.Valid(label) { return false }
+        for byte: label {
+            if byte == 0 { return false }
+        }
+        formatted: Vec(u8)
+        return BuilderAppend(formatted, label) && BuilderAppend(formatted, " ") && BuilderAppend(formatted, nodeID[:12]) &&
+            c_string.CopyCString(TextView(VecSlice(formatted, 0, formatted.count)), output)
+    }
+
+    Register :: (worker: *Worker, instance: *u8, port: u16, nodeID: string) -> bool {
+        service: [16]u8
+        domain: [8]u8
+        if !c_string.CopyCString(Service, service[:]) || !c_string.CopyCString(Domain, domain[:]) { return false }
+        id: Vec(u8)
+        if !BuilderAppend(id, "id=") || !BuilderAppend(id, nodeID) { return false }
+        values: [4]string = .[TextView(VecSlice(id, 0, id.count)), "protocol=6", "trust=pairing-required", "path=/api/v1/node"]
+        records: *void = null
+        defer { worker.api.freeText(records) }
+        for value: values {
+            text: [68]u8
+            if !c_string.CopyCString(value, text[:]) { return false }
+            added := worker.api.addText(records, *text[0])
+            if added == null { return false }
+            records = added
+        }
+        worker.group = worker.api.groupNew(worker.server, null, null)
+        if worker.group == null { return false }
+        return worker.api.addService(worker.server, worker.group, AnyInterface, AnyProtocol, 0,
+            instance, *service[0], *domain[0], null, port, records) == 0 && worker.api.groupCommit(worker.group) == 0
+    }
+
+    Release :: (worker: *Worker) {
+        // Withdraw the service while the sockets are still open. Avahi flushes
+        // pending goodbye records when freeing the server's interfaces.
+        if worker.group != null { worker.api.groupFree(worker.group) }
+        if worker.server != null { worker.api.serverFree(worker.server) }
+        if worker.poll != null { worker.api.pollFree(worker.poll) }
+        avahi.Close(*worker.api)
+        <<worker = .{}
+    }
+
+    Run :: (context: *void) {
+        worker := cast(*Worker)context
+        stop: sockets.LinuxPollFd = .{fd = worker.stopFD, events = 1}
+        while Poll(*stop, 1, 0) == 0 {
+            if worker.api.pollIterate(worker.poll, 250) != 0 ||
+                worker.api.serverState(worker.server) >= ServerCollision || worker.api.groupState(worker.group) >= GroupCollision {
+                unused stdio.PrintError("LAN discovery stopped: multicast DNS registration failed\n")
+                return
+            }
+        }
+    }
+
+    #scope_export
+    // Call after the HTTP listener starts. Port zero is deliberately advisory:
+    // the Go service does not announce listeners configured with ephemeral ports.
+    // The configured host is handled by the HTTP listener; DNS-SD uses all
+    // eligible multicast interfaces, as in the Go zeroconf registration.
+    Start :: (worker: *Worker, enabled: bool, configuredPort: u16, displayName: string, nodeID: string) -> string {
+        if !enabled { return "" }
+        if worker.active { return "LAN discovery is already running" }
+        if configuredPort == 0 { return "LAN discovery requires a fixed TCP port" }
+        if !identity.ValidUserID(nodeID) { return "LAN discovery requires a valid node identity" }
+        instance: [64]u8
+        if !Instance(displayName, nodeID, instance[:]) { return "invalid LAN discovery instance name" }
+        if !avahi.Open(*worker.api) { return "LAN discovery unavailable: libavahi-core.so.7 could not be loaded" }
+        defer {
+            if !worker.active { Release(worker) }
+        }
+        worker.poll = worker.api.pollNew()
+        if worker.poll == null { return "LAN discovery unavailable: could not open the event loop" }
+        worker.server = worker.api.serverNew(worker.api.pollGet(worker.poll), null, null, null, null)
+        if worker.server == null { return "LAN discovery unavailable: could not open multicast DNS sockets" }
+        if !Register(worker, *instance[0], configuredPort, nodeID) {
+            return "LAN discovery unavailable: could not register the Mesh service"
+        }
+        worker.stopFD = EventFD(0, WakeFlags)
+        if worker.stopFD < 0 { return "LAN discovery unavailable: could not allocate a stop signal" }
+        if !thread.ThreadStart(*worker.thread, Run, cast(*void)worker) {
+            unused CloseFD(worker.stopFD)
+            return "LAN discovery unavailable: could not start the worker"
+        }
+        worker.active = true
+        return ""
+    }
+
+    // Start and Stop are owned by the server lifecycle on the same thread.
+    Stop :: (worker: *Worker) {
+        if !worker.active { return }
+        unused Signal(worker.stopFD, 1)
+        thread.ThreadWait(*worker.thread)
+        unused CloseFD(worker.stopFD)
+        Release(worker)
+    }
+}

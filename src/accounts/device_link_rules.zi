@@ -1,0 +1,23 @@
+LINK_ID_LENGTH :: 32
+// A sealed account key and its envelope fit well inside this limit.
+LINK_DATA_MAX :: 16384
+LINK_ENTRIES_MAX :: 4096
+
+// A link ID is 32 lowercase hexadecimal characters: 128 random bits.
+IDValid :: (value: string) -> bool {
+    if value.count != LINK_ID_LENGTH {
+        return false
+    }
+    for byte: value {
+        digit := byte >= cast(u8)48 && byte <= cast(u8)57
+        letter := byte >= cast(u8)97 && byte <= cast(u8)102
+        if !digit && !letter {
+            return false
+        }
+    }
+    return true
+}
+
+SlotValid :: (slot: string) -> bool {
+    return slot == "request" || slot == "response"
+}

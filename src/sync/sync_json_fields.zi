@@ -1,0 +1,47 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+    wire :: #import "wire_text";
+
+    Read :: (document: *json.JsonDocument, object: s32, names: []string, expected: []json.JsonKind,
+        found: []s32) -> bool {
+        for index: 0..found.count - 1 { found[index] = -1 }
+        kind := json.JsonKindOf(document, object)
+        if kind == .Null || kind == .Missing { return true }
+        if kind != .Object { return false }
+        node := json.JsonFirst(document, object)
+        while node >= 0 {
+            fieldKind := json.JsonKindOf(document, node)
+            if fieldKind != .Null {
+                name: Text = json.JsonKey(document, node)
+                key := TextView(name)
+                for field, index: names {
+                    if field == "" || !wire.MatchesToken(key, field) { continue }
+                    wanted := expected[index]
+                    if fieldKind != wanted && !(wanted == .True && fieldKind == .False) { return false }
+                    if wanted == .Number {
+                        unusedNumber, valid := json.JsonInteger(document, node)
+                        unused unusedNumber
+                        if !valid { return false }
+                    }
+                    found[index] = node
+                    break
+                }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    Number :: (document: *json.JsonDocument, node: s32) -> s64 {
+        value, valid := json.JsonInteger(document, node)
+        return ifx valid then value else 0
+    }
+
+    StringField :: (document: *json.JsonDocument, root: s32, name: string) -> Text {
+        return json.JsonString(document, json.JsonMember(document, root, name))
+    }
+
+    SetString :: (document: *json.JsonDocument, root: s32, name: string, value: string) -> bool {
+        return json.JsonSet(document, root, name, json.JsonNewStringCopy(document, value))
+    }
+}

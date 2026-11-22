@@ -1,0 +1,304 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_state_native";
+    accountSQL :: #import "account_state_queries";
+    binary :: #import "binary_codec";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    policy :: #import "mesh_policy_native";
+    protocol :: #import "protocol";
+    quota :: #import "storage_usage_rules";
+    request :: #import "record_request_native";
+    sha :: #import "crypto/sha256";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    storage :: #import "storage_allowance_native";
+    time :: #import "timestamp_value";
+    timestamps :: #import "typed_write_native";
+    validation :: #import "record_validation";
+    wire :: #import "wire_text";
+    writer :: #import "record_write_native";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    Result :: struct {
+        applied: s64
+        usedBytes: s64
+        limit: s64
+        error: string
+    }
+
+    #scope_file
+    ImportFailed :: "mesh record import failed";
+    MinimumTime :: "0001-01-01T00:00:00.000000000Z";
+    UserSQL :: #string SQL_END
+INSERT INTO server_users(user_id_hash,public_key,created_at,last_seen_at)
+VALUES(?1,?2,?3,?4)
+ON CONFLICT(user_id_hash) DO UPDATE SET
+    last_seen_at=max(server_users.last_seen_at,excluded.last_seen_at)
+SQL_END;
+    RecordSQL :: #string SQL_END
+SELECT key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes
+FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 AND id=?3
+SQL_END;
+    DeleteSQL :: #string SQL_END
+DELETE FROM server_encrypted_records
+WHERE user_id_hash=?1 AND collection=?2 AND id=?3 AND (updated_at<=?4 OR updated_at>?5)
+SQL_END;
+
+    Change :: struct {
+        sequence: s64
+        order: s64
+        userOffset: s64
+        values: [6]s32
+        deletion: bool
+    }
+
+    Quota :: struct {
+        userOffset: s64
+        used: s64
+        limit: s64
+        tombstoned: bool
+    }
+
+    Quotas :: struct {
+        offsets: HashMap(string, s64)
+        entries: Vec(Quota)
+    }
+
+    c :: #system_library "c";
+    Compare :: #type (left: *Change, right: *Change) -> s32 #c_call;
+    Sort :: (base: *Change, count: usize, stride: usize, compare: Compare) #foreign c "qsort";
+
+    CompareChange :: (left: *Change, right: *Change) -> s32 {
+        if left.sequence < right.sequence { return -1 }
+        if left.sequence > right.sequence { return 1 }
+        if left.order < right.order { return -1 }
+        return ifx left.order > right.order then 1 else 0
+    }
+
+    ReadChanges :: (document: *json.JsonDocument, list: s32, deletion: bool, filters: *json.JsonDocument, allowed: s32,
+        changes: *Vec(Change), users: *Vec(u8)) -> string {
+        recordNames: [6]string = .["user_id_hash", "mesh_version", "public_key", "created_at", "last_seen_at", "record"]
+        recordKinds: [6]json.JsonKind = .[.String, .Number, .String, .String, .String, .Object]
+        deleteNames: [6]string = .["user_id_hash", "mesh_version", "collection", "id", "deleted_at", ""]
+        deleteKinds: [6]json.JsonKind = .[.String, .Number, .String, .String, .String, .Missing]
+        item := json.JsonFirst(document, list)
+        while item >= 0 {
+            values: [6]s32
+            names := ifx deletion then deleteNames[:] else recordNames[:]
+            kinds := ifx deletion then deleteKinds[:] else recordKinds[:]
+            if !fields.Read(document, item, names, kinds, values[:]) { return "invalid mesh change" }
+            user: Text = json.JsonString(document, values[0])
+            account := TextView(user)
+            if !identity.ValidUserID(account) {
+                return ifx deletion then "invalid mesh deletion user_id_hash" else "invalid mesh user_id_hash"
+            }
+            if json.JsonCount(filters, allowed) == 0 || policy.Includes(filters, allowed, account, false) {
+                change: Change = .{sequence = fields.Number(document, values[1]), order = changes.count,
+                    userOffset = users.count, values = values, deletion = deletion}
+                if !BuilderAppend(<<users, account) || !VecPush(<<changes, change) { return ImportFailed }
+            }
+            item = json.JsonNext(document, item)
+        }
+        return ""
+    }
+
+    AccountQuota :: (database: *void, cache: *Quotas, account: string, offset: s64,
+        now: s64, baseline: s64, plansEnabled: bool, output: *Quota) -> bool {
+        index: s64 = 0
+        if HashMapGet(*cache.offsets, account, *index) {
+            <<output = cache.entries[index]
+            return true
+        }
+        deleted := accounts.Tombstoned(database, account)
+        if deleted.status != sqlite.SQLITE_OK { return false }
+        if deleted.value != 0 {
+            <<output = .{userOffset = offset, tombstoned = true}
+        } else {
+            maximum := storage.Allowance(database, account, now, baseline, plansEnabled)
+            if maximum.status != sqlite.SQLITE_OK { return false }
+            args: [1]sql.Argument = .[sql.TextArg(account)]
+            used := sql.ReadInteger(database, quota.UsageSQL, args[:])
+            if used.status != sqlite.SQLITE_OK { return false }
+            <<output = .{userOffset = offset, used = used.value, limit = maximum.value}
+        }
+        index = cache.entries.count
+        if !VecPush(cache.entries, <<output) { return false }
+        HashMapSet(*cache.offsets, account, index)
+        return true
+    }
+
+    CompareText :: (left: string, right: string) -> s32 {
+        length := ifx left.count < right.count then left.count else right.count
+        index: s64 = 0
+        while index < length {
+            if left[index] != right[index] { return ifx left[index] < right[index] then -1 else 1 }
+            index += 1
+        }
+        if left.count < right.count { return -1 }
+        return ifx left.count > right.count then 1 else 0
+    }
+
+    WinsTie :: (record: protocol.EncryptedRecord, row: *void) -> bool {
+        deleted := sqlite.SqliteColumnInt64(row, 4)
+        if (record.DeletedAt != 0) != (deleted != 0) { return record.DeletedAt != 0 }
+        hash := sql.ColumnText(row, 5)
+        same := record.ContentHash != "" && record.ContentHash == hash && record.KeyID == sql.ColumnText(row, 0) &&
+            record.SchemaVersion == cast(isize)sqlite.SqliteColumnInt64(row, 6) &&
+            record.ParentID == sql.ColumnText(row, 7) && record.DeletedAt == deleted
+        free := sqlite.SqliteColumnInt64(row, 8)
+        if same && ((record.FreeBytes > 0 && free == 0) || (record.FreeBytes == 0 && free > 0)) { return record.FreeBytes > 0 }
+        order := CompareText(record.ContentHash, hash)
+        if order != 0 { return order > 0 }
+        return CompareText(record.Ciphertext, sql.ColumnText(row, 2)) > 0
+    }
+
+    IsNewer :: (database: *void, account: string, record: protocol.EncryptedRecord,
+        updated: time.TimestampValue, latest: time.TimestampValue) -> sql.IntegerResult {
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(record.Collection), sql.TextArg(record.ID)]
+        row := sql.Prepare(database, RecordSQL, args[:])
+        if row.status != sqlite.SQLITE_OK { return .{status = row.status} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{value = 1} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        current := time.Parse(sql.ColumnText(row.value, 3))
+        floor := time.Parse(MinimumTime)
+        if !current.valid { current = floor }
+        incoming := ifx updated.valid then updated else floor
+        if time.Before(latest, current) || time.Before(current, incoming) { return .{value = 1} }
+        if time.Before(incoming, current) { return .{} }
+        return .{value = ifx WinsTie(record, row.value) then 1 else 0}
+    }
+
+    Delete :: (database: *void, account: string, collection: string, id: string, deletedAt: string,
+        now: string, cutoff: string) -> Result {
+        if !identity.ValidNamespace(wire.TrimSpace(collection)) || !identity.ValidEncryptedRecordID(wire.TrimSpace(id)) {
+            return .{error = "invalid mesh deletion target"}
+        }
+        buffer: [31]u8
+        normalized := timestamps.NormalizeTime(deletedAt, "", now, buffer[:])
+        deleted := ifx CompareText(normalized, cutoff) > 0 then cutoff else normalized
+        args: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(collection), sql.TextArg(id), sql.TextArg(deleted), sql.TextArg(cutoff)]
+        if sql.Execute(database, DeleteSQL, args[:]) != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+        count := cast(s64)sqlite.SqliteChanges(database)
+        if count > 0 {
+            version := accounts.NextVersion(database, account)
+            if version.status != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+        }
+        return .{applied = count}
+    }
+
+    Apply :: (database: *void, account: string, change: Change, input: *json.JsonDocument,
+        filters: *json.JsonDocument, filter: s32, cache: *Quotas, now: time.TimestampValue,
+        latest: time.TimestampValue, current: string, cutoff: string, baseline: s64, plansEnabled: bool) -> Result {
+        first: Text = json.JsonString(input, change.values[2])
+        second: Text = json.JsonString(input, change.values[3])
+        third: Text = json.JsonString(input, change.values[4])
+        if change.deletion {
+            collection := TextView(first)
+            allowed := policy.AllowsCollection(database, filters, filter, collection)
+            if allowed < 0 { return .{error = ImportFailed} }
+            if allowed == 0 { return .{} }
+            snapshot: Quota
+            if !AccountQuota(database, cache, account, change.userOffset, now.seconds, baseline, plansEnabled, *snapshot) {
+                return .{error = ImportFailed}
+            }
+            if snapshot.tombstoned { return .{} }
+            return Delete(database, account, collection, TextView(second), TextView(third), current, cutoff)
+        }
+        encodedKey := wire.TrimSpace(TextView(first))
+        if encodedKey == "" || encodedKey.count % 2 != 0 || !binary.IsHex(encodedKey) {
+            return .{error = "invalid mesh public_key"}
+        }
+        key := binary.DecodeBinaryField(encodedKey)
+        if key.error != "" || key.value.count == 0 { return .{error = "invalid mesh public_key"} }
+        bytes := VecSlice(key.value, 0, key.value.count)
+        digest := sha.Sha256Of(TextView(bytes))
+        hex: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *hex[0], hex.count) != 1 ||
+            TextView(hex[:64]) != account { return .{error = "public key hash mismatch"} }
+        decoded: Vec(u8)
+        row: request.RecordFields
+        if !request.ReadRecord(input, change.values[5], *decoded, *row) { return .{error = "invalid mesh encrypted record"} }
+        record := request.WireRecord(row, VecSlice(decoded, 0, decoded.count))
+        if !validation.ValidForProtocol(record, 5) { return .{error = "invalid mesh encrypted record"} }
+        allowed := policy.AllowsCollection(database, filters, filter, record.Collection)
+        if allowed < 0 { return .{error = ImportFailed} }
+        if allowed == 0 { return .{} }
+        snapshot: Quota
+        if !AccountQuota(database, cache, account, change.userOffset, now.seconds, baseline, plansEnabled, *snapshot) {
+            return .{error = ImportFailed}
+        }
+        if snapshot.tombstoned { return .{} }
+        createdAt: [31]u8
+        seenAt: [31]u8
+        created := timestamps.NormalizeTime(TextView(second), "", current, createdAt[:])
+        seen := timestamps.NormalizeTime(TextView(third), created, current, seenAt[:])
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.BlobArg(bytes), sql.TextArg(created), sql.TextArg(seen)]
+        if sql.Execute(database, UserSQL, args[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, accountSQL.EnsureVersion, args[:1]) != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+        stamp := time.Parse(record.UpdatedAt)
+        updated := ifx stamp.valid && time.Before(latest, stamp) then latest else stamp
+        newer := IsNewer(database, account, record, updated, latest)
+        if newer.status != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+        if newer.value == 0 { return .{} }
+        written := writer.Write(database, account, record, 0, latest, cutoff)
+        if written.status != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+        return .{applied = written.applied}
+    }
+
+    #scope_export
+    Import :: (database: *void, filters: *json.JsonDocument, filter: s32, input: *json.JsonDocument,
+        records: s32, deletions: s32, milliseconds: s64, baseline: s64, plansEnabled: bool) -> Result {
+        if !policy.Includes(filters, json.JsonMember(filters, filter, "data"), "encrypted_records", true) { return .{} }
+        authorized := json.JsonMember(filters, filter, "accounts")
+        changes: Vec(Change)
+        users: Vec(u8)
+        {
+            problem := ReadChanges(input, records, false, filters, authorized, *changes, *users)
+            if problem != "" { return .{error = problem} }
+        }
+        {
+            problem := ReadChanges(input, deletions, true, filters, authorized, *changes, *users)
+            if problem != "" { return .{error = problem} }
+        }
+        if changes.count == 0 { return .{} }
+        ordered := VecSlice(changes, 0, changes.count)
+        compare: Compare = CompareChange
+        Sort(*ordered[0], cast(usize)ordered.count, size_of(Change), compare)
+        keys := VecSlice(users, 0, users.count)
+        cache: Quotas
+        defer HashMapFree(*cache.offsets)
+        now: time.TimestampValue = .{seconds = milliseconds / 1000,
+            nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = milliseconds >= 0}
+        latest := now
+        latest.seconds += 300
+        current: [31]u8
+        cutoff: [31]u8
+        nowLength := format.UTC(now, current[:])
+        cutoffLength := format.UTC(latest, cutoff[:])
+        if nowLength == 0 || cutoffLength == 0 { return .{error = ImportFailed} }
+        applied: s64 = 0
+        for change: ordered {
+            offset := change.userOffset
+            result := Apply(database, TextView(keys[offset:offset + 64]), change, input, filters, filter, *cache,
+                now, latest, TextView(current[:nowLength]), TextView(cutoff[:cutoffLength]), baseline, plansEnabled)
+            if result.error != "" { return result }
+            applied += result.applied
+        }
+        for snapshot: VecSlice(cache.entries, 0, cache.entries.count) {
+            if snapshot.limit <= 0 { continue }
+            offset := snapshot.userOffset
+            args: [1]sql.Argument = .[sql.TextArg(TextView(keys[offset:offset + 64]))]
+            used := sql.ReadInteger(database, quota.UsageSQL, args[:])
+            if used.status != sqlite.SQLITE_OK { return .{error = ImportFailed} }
+            if quota.Exceeds(snapshot.used, used.value, snapshot.limit) {
+                return .{error = "account storage limit reached", usedBytes = snapshot.used, limit = snapshot.limit}
+            }
+        }
+        return .{applied = applied}
+    }
+}

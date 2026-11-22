@@ -1,0 +1,41 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Cursor :: struct {
+        sequence: s64
+        valid: bool
+    }
+
+    Decode :: (raw: string) -> Cursor {
+        value := wire.TrimSpace(raw)
+        if value == "" { return .{valid = true} }
+        decoded := binary.DecodeBase64(value, true, false)
+        document: json.JsonDocument
+        if decoded.error != "" || !json.JsonRead(*document, TextView(VecSlice(decoded.value, 0, decoded.value.count))) {
+            return .{}
+        }
+        names: [5]string = .["seq", "updated_at", "user_id_hash", "collection", "id"]
+        kinds: [5]json.JsonKind = .[.Number, .String, .String, .String, .String]
+        parts: [5]s32
+        if !fields.Read(*document, document.root, names[:], kinds[:], parts[:]) { return .{} }
+        return .{sequence = fields.Number(*document, parts[0]), valid = true}
+    }
+
+    Encode :: (sequence: s64) -> Text {
+        cursor: json.JsonDocument
+        root := json.JsonNewObject(*cursor)
+        if sequence != 0 && !json.JsonSet(*cursor, root, "seq", json.JsonNewInteger(*cursor, sequence)) { return .{} }
+        empty: [4]string = .["updated_at", "user_id_hash", "collection", "id"]
+        for name: empty {
+            if !fields.SetString(*cursor, root, name, "") { return .{} }
+        }
+        body: Text = json.JsonWrite(*cursor, root, json.JsonCompactStyle(false))
+        encoded := binary.EncodeBase64(TextView(body), true, false)
+        if encoded.error != "" { return .{} }
+        return TextCopy(TextView(VecSlice(encoded.value, 0, encoded.value.count)))
+    }
+}

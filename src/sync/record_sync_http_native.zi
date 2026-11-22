@@ -1,0 +1,192 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    bearer :: #import "http_auth_native";
+    transport :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    output :: #import "sync_response_native";
+    replies :: #import "http_json_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    sync :: #import "record_sync_native";
+    encrypted :: #import "encrypted_sync_native";
+    typed_input :: #import "typed_request_native";
+    typed :: #import "typed_sync_native";
+    notifications :: #import "sync_hub_native";
+    scopes :: #import "identity";
+    rates :: #import "rate_limit_native";
+    friends :: #import "friend_snapshots_native";
+    protocol :: #import "protocol";
+    limits :: #import "server_limits";
+    format :: #import "timestamp_format";
+    time :: #import "timestamp_value";
+    wire :: #import "wire_text";
+    mutex :: #import "std/mutex_linux";
+    clock :: #import "std/timer";
+    calendar :: #import "std/date_time_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    Reply :: (connection: *void, status: u32, document: *json.JsonDocument, root: s32, zstd: bool) -> s32 {
+        return replies.Reply(connection, "POST", status, document, root, zstd)
+    }
+
+    ErrorReply :: (connection: *void, status: u32, message: string, zstd: bool) -> s32 {
+        return replies.ErrorReply(connection, "POST", status, message, zstd)
+    }
+
+    Metadata :: (settings: access.Configuration, document: *json.JsonDocument, root: s32, user: string) -> bool {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        profile := sql.Prepare(settings.database, "SELECT COALESCE(alias,''),profile_icon FROM server_users WHERE user_id_hash=?1", arguments[:])
+        if profile.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(profile.value)
+        if sqlite.SqliteStep(profile.value) != sqlite.SQLITE_ROW ||
+            !output.TextField(document, root, "account_alias", sql.ColumnText(profile.value, 0)) ||
+            !output.IntegerField(document, root, "profile_icon", sqlite.SqliteColumnInt64(profile.value, 1)) { return false }
+        return output.AttachCapabilities(document, root, settings.zstdRequests)
+    }
+
+    WriteResult :: (settings: access.Configuration, lock: *mutex.Mutex, connection: *void, user: string, auditTime: string, result: *sync.RecordSyncResult) -> s32 {
+        zstd := settings.zstdResponses
+        if result.databaseError != sqlite.SQLITE_OK {
+            unused mutex.Unlock(lock)
+            return ErrorReply(connection, 500, "record sync failed", zstd)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if result.status == 413 {
+            unused mutex.Unlock(lock)
+            if !output.TextField(*document, root, "error", result.error) || !output.TextField(*document, root, "code", "storage_full") ||
+                !output.Storage(*document, root, result.usedBytes, result.limitBytes) { return 0 }
+            return Reply(connection, 413, *document, root, zstd)
+        }
+        if result.status != 0 {
+            unused mutex.Unlock(lock)
+            return ErrorReply(connection, result.status, result.error, zstd)
+        }
+        if !output.TextField(*document, root, "status", "ok") || !output.BooleanField(*document, root, "encrypted_records_only", true) ||
+            !output.BooleanField(*document, root, "changes_complete", !result.page.more) ||
+            !output.IntegerField(*document, root, "protocol_version", result.protocolVersion) || !output.IntegerField(*document, root, "latest_protocol", result.protocolVersion) ||
+            !output.IntegerField(*document, root, "min_supported_protocol", protocol.MinSupportedProtocol) ||
+            !output.IntegerField(*document, root, "server_latest_protocol", protocol.LatestProtocol) ||
+            !output.IntegerField(*document, root, "server_version", result.serverVersion) || !output.IntegerField(*document, root, "server_clock", result.serverVersion) ||
+            !output.Storage(*document, root, result.usedBytes, result.limitBytes) {
+            unused mutex.Unlock(lock)
+            return 0
+        }
+        if result.page.more {
+            cursor := json.JsonNewObject(*document)
+            if !output.IntegerField(*document, cursor, "version", result.page.cursor.version) ||
+                !output.TextField(*document, cursor, "collection", TextView(result.page.cursor.collection)) ||
+                !output.TextField(*document, cursor, "id", TextView(result.page.cursor.id)) ||
+                !json.JsonSet(*document, root, "record_cursor", cursor) {
+                unused mutex.Unlock(lock)
+                return 0
+            }
+        }
+        changes := json.JsonNewObject(*document)
+        counts := json.JsonNewObject(*document)
+        if changes < 0 || counts < 0 {
+            unused mutex.Unlock(lock)
+            return 0
+        }
+        sections: [4]string = .["habits", "habit_days", "sessions", "meditation_logs"]
+        for section: sections {
+            if !json.JsonSet(*document, changes, section, json.JsonNewArray(*document)) ||
+                !output.IntegerField(*document, counts, section, 0) {
+                unused mutex.Unlock(lock)
+                return 0
+            }
+        }
+        metadata := result.includeMetadata && !result.page.more
+        social := ifx metadata then friends.Build(settings.database, user, auditTime, *document) else json.JsonNewArray(*document)
+        if social < 0 || (metadata && !Metadata(settings, *document, root, user)) ||
+            (result.packageSequence > 0 && !output.IntegerField(*document, root, "package_sequence", result.packageSequence)) {
+            unused mutex.Unlock(lock)
+            return ErrorReply(connection, 500, "record metadata failed", zstd)
+        }
+        // Release the SQLite mutex before copying record trees, serializing JSON,
+        // and running Zstandard/gzip compression over the HTTP response.
+        unused mutex.Unlock(lock)
+        records := *result.page.records
+        if json.JsonCount(records, records.root) > 0 &&
+            !json.JsonSet(*document, changes, "encrypted_records", json.JsonCopy(*document, records, records.root)) { return 0 }
+        if !json.JsonSet(*document, changes, "social_cache", social) || !output.IntegerField(*document, counts, "social_cache", 0) ||
+            (result.applied != 0 && !output.IntegerField(*document, counts, "encrypted_records", result.applied)) ||
+            !json.JsonSet(*document, root, "changes", changes) || !json.JsonSet(*document, root, "applied", counts) { return 0 }
+        return Reply(connection, 200, *document, root, zstd)
+    }
+
+    Payload :: (state: *access.AccountAccess, hub: *notifications.Hub, connection: *void, path: string, bytes: []u8) -> s32 {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(bytes)) { return ErrorReply(connection, 400, "invalid json", state.configuration.zstdResponses) }
+        if encrypted.IsEnvelope(*document) { return encrypted.Handle(state, hub, connection, bytes) }
+        request := typed_input.Read(*document)
+        if !request.valid { return ErrorReply(connection, 400, "invalid json", state.configuration.zstdResponses) }
+        if !request.recordsOnly {
+            return typed.Handle(state, hub, connection, *document, *request,
+                .{signedTransaction = transport.Header(connection, "X-Mesh-Tx"), path = path, body = bytes})
+        }
+        settings := state.configuration
+        header := bearer.UserHeader(connection)
+        account: [64]u8
+        if header.value == "" { return ErrorReply(connection, 400, "missing X-Mesh-User", settings.zstdResponses) }
+        if !scopes.NormalizeUserID(header.value, account[:]) { return ErrorReply(connection, 400, "invalid user_id_hash", settings.zstdResponses) }
+        token := bearer.Bearer(connection)
+        if token == "" { return ErrorReply(connection, 401, "bearer token required", settings.zstdResponses) }
+        milliseconds := calendar.UnixMilliseconds()
+        if milliseconds < 0 || !mutex.Lock(*state.databaseLock) { return ErrorReply(connection, 500, "record sync failed", settings.zstdResponses) }
+        now: time.TimestampValue = .{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
+        audit: [31]u8
+        length := format.UTC(now, audit[:])
+        if length == 0 {
+            unused mutex.Unlock(*state.databaseLock)
+            return ErrorReply(connection, 500, "record sync failed", settings.zstdResponses)
+        }
+        user := TextView(account[:])
+        authenticated := bearer.Authenticate(settings.database, connection, settings.secret, now.seconds, TextView(audit[:length]), false)
+        if authenticated.status != 0 {
+            unused mutex.Unlock(*state.databaseLock)
+            return ErrorReply(connection, authenticated.status, authenticated.message, settings.zstdResponses)
+        }
+        key: Vec(u8)
+        if !BuilderAppend(key, "sync:user:") || !BuilderAppend(key, user) {
+            unused mutex.Unlock(*state.databaseLock)
+            return 0
+        }
+        if !rates.Allow(*state.limiter, TextView(VecSlice(key, 0, key.count)), 300, 60000, clock.MonotonicMilliseconds()) {
+            unused mutex.Unlock(*state.databaseLock)
+            return ErrorReply(connection, 429, "rate limit exceeded", settings.zstdResponses)
+        }
+        result := sync.ReceiveDocument(.{database = settings.database, databasePath = settings.path, tokenSecret = settings.secret, verify = settings.verify,
+            storageLimit = settings.accountStorageLimit, storagePlansEnabled = settings.storagePlansEnabled}, user,
+            .{bearer = token, signedTransaction = transport.Header(connection, "X-Mesh-Tx"), path = path, body = bytes, now = now}, *document)
+        if hub != null && result.status == 0 && result.databaseError == sqlite.SQLITE_OK && result.applied > 0 {
+            notifications.Publish(hub, user, result.serverVersion)
+        }
+        return WriteResult(settings, *state.databaseLock, connection, user, TextView(audit[:length]), *result)
+    }
+
+    #scope_export
+    Handle :: (state: *access.AccountAccess, hub: *notifications.Hub, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        if method != "POST" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            body: []u8
+            return transport.WriteWithHeaders(connection, 405, "", body, headers[:])
+        }
+        settings := state.configuration
+        if overflow || input.count > settings.maximumBodyBytes { return ErrorReply(connection, 400, "request body too large", settings.zstdResponses) }
+        encoding: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if count < 0 { return ErrorReply(connection, 400, "unsupported content encoding", settings.zstdResponses) }
+        header := TextView(encoding[:count])
+        if header == "" || wire.MatchesToken(wire.TrimSpace(header), "identity") { return Payload(state, hub, connection, path, input) }
+        buffer: Vec(u8)
+        if !VecResizeBounded(buffer, settings.maximumBodyBytes, settings.maximumBodyBytes) {
+            return ErrorReply(connection, 503, "request decoder unavailable", settings.zstdResponses)
+        }
+        payload := coding.Decode(input, header, settings.zstdRequests, settings.maximumBodyBytes, VecSlice(buffer, 0, buffer.count))
+        if payload.error != "" { return ErrorReply(connection, 400, payload.error, settings.zstdResponses) }
+        return Payload(state, hub, connection, path, payload.bytes)
+    }
+}

@@ -1,0 +1,31 @@
+binary :: #import "binary_codec";
+
+#scope_export
+// Persisted identifiers accept both cases and any UUID version or variant.
+IsCanonical :: (id: string) -> bool {
+    return id.count == 36 && id[8] == 45 && id[13] == 45 &&
+        id[18] == 45 && id[23] == 45 && binary.IsHex(id[:8]) &&
+        binary.IsHex(id[9:13]) && binary.IsHex(id[14:18]) &&
+        binary.IsHex(id[19:23]) && binary.IsHex(id[24:])
+}
+
+// Format a version 4 UUID from entropy supplied by the caller.
+Version4 :: (entropy: [16]u8) -> [36]u8 {
+    bytes := entropy
+    bytes[6] = (bytes[6] & cast(u8)0x0f) | cast(u8)0x40
+    bytes[8] = (bytes[8] & cast(u8)0x3f) | cast(u8)0x80
+    alphabet: string = "0123456789abcdef"
+    output: [36]u8
+    offset: s64 = 0
+    for index: 0..15 {
+        if index == 4 || index == 6 || index == 8 || index == 10 {
+            output[offset] = 45
+            offset += 1
+        }
+        byte := bytes[index]
+        output[offset] = alphabet[byte >> cast(u8)4]
+        output[offset + 1] = alphabet[byte & cast(u8)0x0f]
+        offset += 2
+    }
+    return output
+}

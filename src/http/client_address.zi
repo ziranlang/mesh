@@ -1,15 +1,15 @@
 network :: #import "std/net_go";
+addresses :: #import "network_address";
 http :: #import "std/http_go";
-go_strings :: #system_library "go:strings";
+wire_text :: #import "wire_text";
+text :: #import "std/text_tools";
 go_http :: #system_library "go:net/http";
 
 #scope_file
-Split :: (value: string, separator: string) -> []string #foreign go_strings;
-TrimSpace :: (value: string) -> string #foreign go_strings;
 HeaderValues :: (header: http.Header, name: string) -> []string #foreign go_http "Header.Values";
 
 ValidAddress :: (value: string) -> string {
-    ip := network.ParseIP(TrimSpace(value))
+    ip := network.ParseIP(wire_text.TrimSpace(value))
     if network.ValidIP(ip) {
         return network.FormatIP(ip)
     }
@@ -24,13 +24,13 @@ LastForwardedFor :: (values: []string) -> string {
     if values.count == 0 {
         return ""
     }
-    parts := Split(values[values.count - 1], ",")
-    return ValidAddress(parts[parts.count - 1])
+    final := values[values.count - 1]
+    return ValidAddress(final[text.TextFindLast(final, ",") + 1:])
 }
 
 IsLoopbackHost :: (host: string) -> bool {
     ip := network.ParseIP(host)
-    return network.ValidIP(ip) && network.IsLoopback(ip)
+    return addresses.Classify(cast([]u8)ip) == addresses.AddressClass.Loopback
 }
 
 FromRequest :: (request: *http.Request) -> string {
@@ -40,7 +40,7 @@ FromRequest :: (request: *http.Request) -> string {
     if parsed.error != null {
         host = remote
     }
-    host = TrimSpace(host)
+    host = wire_text.TrimSpace(host)
     if IsLoopbackHost(host) {
         headers := http.Headers(request)
         // Cloudflare replaces any client-sent CF-Connecting-IP with the

@@ -1,0 +1,48 @@
+#import "std/vec"
+
+#scope_file
+Canonical :: "CASE WHEN length(alias)=length(CAST(alias AS BLOB)) THEN lower(trim(alias,char(9,10,11,12,13,32))) ELSE alias END";
+Ranked :: #string SQL
+WITH named AS (
+ SELECT user_id_hash,alias,created_at,rowid AS insertion_order,
+ CASE WHEN length(alias)=length(CAST(alias AS BLOB))
+ THEN lower(trim(alias,char(9,10,11,12,13,32))) ELSE alias END AS canonical
+ FROM server_users WHERE alias IS NOT NULL
+), ranked AS (
+ SELECT *, ROW_NUMBER() OVER (
+ PARTITION BY canonical ORDER BY COALESCE(julianday(created_at),0),insertion_order) AS position,
+ FIRST_VALUE(user_id_hash) OVER (
+ PARTITION BY canonical ORDER BY COALESCE(julianday(created_at),0),insertion_order) AS keeper
+ FROM named WHERE canonical<>''
+)
+SQL;
+Audit :: #string SQL
+CREATE TABLE IF NOT EXISTS server_alias_case_collisions (
+ account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ previous_alias TEXT NOT NULL,
+ normalized_alias TEXT NOT NULL,
+ retained_account_id TEXT NOT NULL,
+ account_created_at TEXT NOT NULL,
+ cleared_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ PRIMARY KEY(account_id,previous_alias)
+)
+SQL;
+Archive :: "INSERT OR IGNORE INTO server_alias_case_collisions(account_id,previous_alias,normalized_alias,retained_account_id,account_created_at) SELECT user_id_hash,alias,canonical,keeper,created_at FROM ranked WHERE position>1";
+Clear :: "UPDATE server_users SET alias=NULL WHERE user_id_hash IN (SELECT user_id_hash FROM ranked WHERE position>1)";
+
+// The name is case-insensitive; its chosen display capitals are retained.
+Normalize :: "UPDATE server_users SET alias=NULLIF(trim(alias,char(9,10,11,12,13,32)),'') WHERE alias IS NOT NULL AND length(alias)=length(CAST(alias AS BLOB))";
+
+#scope_export
+Build :: () -> Vec(u8) {
+    sql: Vec(u8)
+    parts: [15]string = .[
+        Audit, ";\n", Ranked, "\n", Archive, ";\n", Ranked, "\n", Clear, ";\n", Normalize, ";\n",
+        "CREATE UNIQUE INDEX IF NOT EXISTS server_users_alias_case_unique ON server_users(",
+        Canonical, ") WHERE alias IS NOT NULL AND alias<>'';"
+    ]
+    for part: parts {
+        if !BuilderAppend(sql, part) { return .{} }
+    }
+    return sql
+}

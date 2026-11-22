@@ -1,0 +1,213 @@
+#if TARGET == .C && OS == .LINUX {
+    authorization :: #import "authorization_native";
+    keys :: #import "device_signature_native";
+    binary :: #import "binary_codec";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    sha :: #import "crypto/sha256";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    http :: #import "http_server_native";
+    #import "std/vec"
+
+    Environment :: struct {
+        database: *void
+        node: string
+        audience: string
+        now: s64
+    }
+
+    Request :: struct {
+        method: string
+        path: string
+        target: string
+        proof: string
+        credential: string
+        user: string
+        body: []u8
+    }
+
+    Principal :: struct {
+        grant: authorization.Grant
+        expiresAt: s64
+        failure: authorization.Failure
+    }
+
+    IssueResult :: struct {
+        root: s32
+        failure: authorization.Failure
+    }
+
+    VerifyKeyProof :: (publicKey: string, message: []u8, signature: string) -> bool {
+        if !authorization.HexID(publicKey, 64) || !authorization.HexID(signature, 128) { return false }
+        key := binary.DecodeBinaryField(publicKey)
+        proof := binary.DecodeBinaryField(signature)
+        return key.error == "" && proof.error == "" && keys.Verify(VecSlice(key.value, 0, key.value.count),
+            message, VecSlice(proof.value, 0, proof.value.count))
+    }
+
+    // Preserve the Mesh header's precedence over the deployed Daochi spelling.
+    Header :: (connection: *void, name: string, legacy: string) -> string {
+        value := http.Header(connection, name)
+        return ifx value == "" then http.Header(connection, legacy) else value
+    }
+
+    #scope_file
+    CredentialPrefix :: "Delegate ds1.";
+
+    QueryAllowed :: (path: string, query: string) -> bool {
+        if path == "/api/v1/delegated/ws" {
+            value := wire.TrimPrefix(query, "collection=")
+            return value.count < query.count && identity.ValidEncryptedHierarchyCollection(value)
+        }
+        if path == "/api/v1/tokens/purchases/telegram/catalog" || path == "/api/v1/tokens/purchases/telegram/balance" {
+            value := wire.TrimPrefix(query, "app_id=")
+            return value.count < query.count && identity.ValidNamespace(value)
+        }
+        return query == ""
+    }
+
+    #scope_export
+    // Called in the same write transaction as the authorized read or mutation.
+    AuthenticateTx :: (environment: Environment, request: Request) -> Principal {
+        invalid: authorization.Failure = .{status = 401, message = "invalid delegate request proof"}
+        if request.proof.count == 0 || request.proof.count > 4096 { return .{failure = invalid} }
+        database := environment.database
+        if sqlite.SqliteGetAutocommit(database) { return .{failure = .{status = 500, message = "authentication failed"}} }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, request.proof) { return .{failure = invalid} }
+        names: [16]string = .["version", "grant_id", "session_id", "account_id", "app_id", "client_id", "node_id", "audience", "challenge",
+            "method", "path", "query", "body_sha256", "expires_at", "nonce", "signature"]
+        kinds: [16]json.JsonKind = .[.Number, .String, .String, .String, .String, .String, .String, .String, .String,
+            .String, .String, .String, .String, .Number, .String, .String]
+        indices: [16]s32
+        if !authorization.ReadFields(*document, document.root, names[:], kinds[:], indices[:]) { return .{failure = invalid} }
+        values: Vec(Text)
+        for index: 0..15 {
+            if !VecPush(values, json.JsonString(*document, indices[index])) { return .{failure = invalid} }
+        }
+        actual: [16]string
+        for index: 0..15 { actual[index] = TextView(values[index]) }
+        now := environment.now
+        expiresAt := authorization.Integer(*document, indices[13])
+        queryIndex: s64 = 0
+        while queryIndex < request.target.count && request.target[queryIndex] != #char "?" { queryIndex += 1 }
+        query := ifx queryIndex < request.target.count then request.target[queryIndex + 1:] else ""
+        digest: [65]u8
+        if authorization.Integer(*document, indices[0]) != 1 || !authorization.HexID(actual[1], 32) ||
+            !authorization.HexID(actual[2], 32) || !authorization.HexID(actual[14], 32) || actual[6] != environment.node ||
+            actual[7] != environment.audience || expiresAt <= now || expiresAt > now + 60 || actual[9] != request.method ||
+            actual[10] != request.path || request.target[:queryIndex] != request.path || query != actual[11] ||
+            !QueryAllowed(request.path, query) || !authorization.Digest(TextView(request.body), digest[:]) || actual[12] != TextView(digest[:64]) {
+            return .{failure = invalid}
+        }
+        if request.credential.count != CredentialPrefix.count + 32 || wire.TrimPrefix(request.credential, CredentialPrefix) != actual[2] {
+            return .{failure = .{status = 401, message = "delegate session required"}}
+        }
+        arguments: [3]sql.Argument = .[sql.TextArg(actual[2]), sql.TextArg(actual[1]), sql.IntArg(now)]
+        row := sql.Prepare(database, "SELECT challenge,expires_at FROM server_authorization_sessions WHERE session_id=?1 AND grant_id=?2 AND expires_at>?3", arguments[:])
+        unavailable: authorization.Failure = .{status = 500, message = "authentication failed"}
+        if row.status != sqlite.SQLITE_OK { return .{failure = unavailable} }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE { return .{failure = .{status = 401, message = "delegate session expired"}} }
+        if step != sqlite.SQLITE_ROW { return .{failure = unavailable} }
+        sessionExpires := sqlite.SqliteColumnInt64(row.value, 1)
+        if actual[8] != sql.ColumnText(row.value, 0) || expiresAt > sessionExpires {
+            return .{failure = .{status = 401, message = "delegate session mismatch"}}
+        }
+        active := authorization.ActiveGrant(database, actual[1], environment.node, environment.audience, now)
+        if active.failure.status != 0 { return .{failure = active.failure} }
+        grant := active.grant
+        digits: [24]u8
+        actual[0] = "1"
+        actual[13] = numbers.FormatInteger(expiresAt, digits[:])
+        message: Vec(u8)
+        if actual[3] != TextView(grant.account) || actual[4] != TextView(grant.app) || actual[5] != TextView(grant.client) ||
+            !BuilderAppend(message, "daochi-delegate-request-v1\n") || !authorization.AppendLines(*message, actual[:15]) ||
+            !VerifyKeyProof(TextView(grant.signingKey), VecSlice(message, 0, message.count), actual[15]) {
+            return .{failure = .{status = 401, message = "delegate signature rejected"}}
+        }
+        if request.user != "" && request.user != TextView(grant.account) {
+            return .{failure = .{status = 401, message = "delegate account mismatch"}}
+        }
+        if sql.Execute(database, "DELETE FROM server_authorization_nonces WHERE expires_at<?1", arguments[2:]) != sqlite.SQLITE_OK {
+            return .{failure = unavailable}
+        }
+        arguments[0] = sql.TextArg(actual[1])
+        arguments[1] = sql.TextArg(actual[14])
+        arguments[2] = sql.IntArg(expiresAt)
+        if sql.Execute(database, "INSERT INTO server_authorization_nonces(grant_id,nonce,expires_at) VALUES(?1,?2,?3) ON CONFLICT(grant_id,nonce) DO NOTHING", arguments[:]) != sqlite.SQLITE_OK {
+            return .{failure = unavailable}
+        }
+        if sqlite.SqliteChanges(database) != 1 { return .{failure = .{status = 409, message = "delegate request replayed"}} }
+        return .{grant = grant, expiresAt = sessionExpires}
+    }
+
+    ChallengeTx :: (environment: Environment, grantID: string, response: *json.JsonDocument) -> IssueResult {
+        failed: authorization.Failure = .{status = 503, message = "session challenge unavailable"}
+        active := authorization.ActiveGrant(environment.database, grantID, environment.node, environment.audience, environment.now)
+        if active.failure.status != 0 { return .{failure = active.failure} }
+        nonce: [33]u8
+        if !authorization.Nonce(nonce[:]) { return .{failure = failed} }
+        challenge := TextView(nonce[:32])
+        expiresAt := environment.now + 90
+        cutoff: [1]sql.Argument = .[sql.IntArg(environment.now)]
+        arguments: [3]sql.Argument = .[sql.TextArg(challenge), sql.TextArg(grantID), sql.IntArg(expiresAt)]
+        if sql.Execute(environment.database, "DELETE FROM server_authorization_challenges WHERE expires_at<?1", cutoff[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(environment.database, "INSERT INTO server_authorization_challenges(challenge,grant_id,expires_at) VALUES(?1,?2,?3)", arguments[:]) != sqlite.SQLITE_OK {
+            return .{failure = failed}
+        }
+        root := json.JsonNewObject(response)
+        if !authorization.PutText(response, root, "grant_id", grantID) || !authorization.PutText(response, root, "challenge", challenge) ||
+            !authorization.PutText(response, root, "node_id", environment.node) || !authorization.PutText(response, root, "audience", environment.audience) ||
+            !authorization.PutInt(response, root, "expires_at", expiresAt) { return .{failure = failed} }
+        return .{root = root}
+    }
+
+    IssueTx :: (environment: Environment, grantID: string, challenge: string, signature: string, response: *json.JsonDocument) -> IssueResult {
+        failed: authorization.Failure = .{status = 503, message = "session unavailable"}
+        database := environment.database
+        arguments: [3]sql.Argument = .[sql.TextArg(challenge), sql.TextArg(grantID), sql.IntArg(environment.now)]
+        if sql.Execute(database, "UPDATE server_authorization_challenges SET consumed_at=?3 WHERE challenge=?1 AND grant_id=?2 AND consumed_at=0 AND expires_at>?3", arguments[:]) != sqlite.SQLITE_OK {
+            return .{failure = failed}
+        }
+        if sqlite.SqliteChanges(database) != 1 { return .{failure = .{status = 409, message = "session challenge expired or reused"}} }
+        active := authorization.ActiveGrant(database, grantID, environment.node, environment.audience, environment.now)
+        if active.failure.status != 0 { return .{failure = active.failure} }
+        expires := sql.ReadInteger(database, "SELECT expires_at FROM server_authorization_challenges WHERE challenge=?1 AND grant_id=?2", arguments[:2])
+        digits: [24]u8
+        fields: [6]string = .["daochi-session-v1", grantID, challenge, environment.node, environment.audience,
+            numbers.FormatInteger(expires.value, digits[:])]
+        message: Vec(u8)
+        if expires.status != sqlite.SQLITE_OK || !expires.found || !authorization.AppendLines(*message, fields[:]) ||
+            !VerifyKeyProof(TextView(active.grant.signingKey), VecSlice(message, 0, message.count), signature) {
+            return .{failure = .{status = 401, message = "session key proof rejected"}}
+        }
+        owner: [1]sql.Argument = .[sql.TextArg(TextView(active.grant.account))]
+        row := sql.Prepare(database, "SELECT lower(hex(public_key)) FROM server_users WHERE user_id_hash=?1", owner[:])
+        if row.status != sqlite.SQLITE_OK { return .{failure = failed} }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW { return .{failure = failed} }
+        sessionID: [33]u8
+        sessionChallenge: [33]u8
+        if !authorization.Nonce(sessionID[:]) || !authorization.Nonce(sessionChallenge[:]) { return .{failure = failed} }
+        id := TextView(sessionID[:32])
+        proof := TextView(sessionChallenge[:32])
+        expiry := ifx environment.now + 300 < active.grant.expiresAt then environment.now + 300 else active.grant.expiresAt
+        session: [4]sql.Argument = .[sql.TextArg(id), sql.TextArg(grantID), sql.TextArg(proof), sql.IntArg(expiry)]
+        if sql.Execute(database, "INSERT INTO server_authorization_sessions(session_id,grant_id,challenge,expires_at) VALUES(?1,?2,?3,?4)", session[:]) != sqlite.SQLITE_OK {
+            return .{failure = failed}
+        }
+        root := json.JsonNewObject(response)
+        credential := json.JsonNewObject(response)
+        if !authorization.PutText(response, credential, "session_id", id) || !authorization.PutText(response, credential, "grant_id", grantID) ||
+            !authorization.PutText(response, credential, "challenge", proof) || !authorization.PutInt(response, credential, "expires_at", expiry) ||
+            !json.JsonSet(response, root, "credential", credential) ||
+            !json.JsonSet(response, root, "grant", authorization.GrantJSON(response, *active.grant)) ||
+            !authorization.PutText(response, root, "owner_public_key", sql.ColumnText(row.value, 0)) { return .{failure = failed} }
+        return .{root = root}
+    }
+}

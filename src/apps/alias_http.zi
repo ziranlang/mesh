@@ -5,6 +5,7 @@ auth :: #import "http_auth";
 body :: #import "http_body";
 strict :: #import "strict_json";
 identity :: #import "identity";
+account_alias :: #import "account_alias";
 response :: #import "response";
 http :: #import "std/http_go";
 url :: #import "std/url_go";
@@ -24,7 +25,7 @@ Handle :: (accounts: service.Accounts, writer: http.ResponseWriter, request: *ht
         return
     }
     if http.Method(request) == "GET" {
-        alias := identity.NormalizeAccountAlias(url.Value(url.Query(http.RequestURL(request)), "alias"))
+        alias := account_alias.NormalizeAccountAlias(url.Value(url.Query(http.RequestURL(request)), "alias"))
         quoted := pricing.Price(accounts.database, http.Context(request), user.value, alias,
             accounts.configuration.PremiumAliasesEnabled)
         if quoted.error != null {
@@ -42,7 +43,7 @@ Handle :: (accounts: service.Accounts, writer: http.ResponseWriter, request: *ht
         return
     }
     claimed := pricing.Claim(accounts.database, http.Context(request),
-        accounts.configuration.WaoziIssuerPrivateKey, user.value, identity.NormalizeAccountAlias(command.alias),
+        accounts.configuration.WaoziIssuerPrivateKey, user.value, account_alias.NormalizeAccountAlias(command.alias),
         accounts.configuration.PremiumAliasesEnabled, command.price_units, command.request_id)
     if claimed.error != null {
         status := pricing.Status(claimed.error)

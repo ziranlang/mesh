@@ -1,0 +1,125 @@
+#if TARGET == .C && OS == .LINUX {
+    gzip :: #import "std/gzip_linux";
+    zstd :: #import "compression/zstd_native";
+    preferences :: #import "encoding_preferences";
+    transport :: #import "http_server_native";
+    #import "std/vec"
+
+    // The caller sets separate limits for bytes received and decoded bytes.
+    // Only a successful result borrows the input or output as a body.
+    DecodedBody :: struct {
+        bytes: []u8
+        error: string
+    }
+
+    Decode :: (input: []u8, header: string, zstdEnabled: bool, wireLimit: s64,
+        output: []u8) -> DecodedBody {
+        if input.count > wireLimit {
+            return .{error = "request body too large"}
+        }
+        encoding := preferences.Request(header)
+        if encoding == .Identity {
+            if input.count > output.count {
+                return .{error = "request body too large"}
+            }
+            return .{bytes = input}
+        }
+        if encoding == .Gzip {
+            count := gzip.GzipDecompressMembers(input, output)
+            if count < 0 {
+                return .{error = "invalid or oversized gzip body"}
+            }
+            return .{bytes = output[:count]}
+        }
+        if encoding == .Zstd && zstdEnabled {
+            decoded := zstd.ZstdDecodeFrames(input, output, cast(u64)preferences.MaxZstdWindow)
+            if decoded.problem != .None {
+                return .{error = "invalid or oversized zstd body"}
+            }
+            return .{bytes = output[:decoded.count]}
+        }
+        return .{error = "unsupported content encoding"}
+    }
+
+    EncodeBound :: (encoding: string, count: s64) -> s64 {
+        if encoding == "gzip" {
+            return gzip.GzipBound(count)
+        }
+        if encoding == "zstd" {
+            bound := zstd.ZstdEncodeBound(count)
+            if bound.problem == .None {
+                return bound.count
+            }
+        }
+        return -1
+    }
+
+    Encode :: (encoding: string, input: []u8, output: []u8) -> s64 {
+        if encoding == "gzip" {
+            return gzip.GzipCompress(input, output, 1)
+        }
+        if encoding != "zstd" {
+            return -1
+        }
+        state := zstd.ZstdOpenEncoder(1, preferences.ResponseZstdWindowLog)
+        if state.problem != .None {
+            return -1
+        }
+        defer zstd.ZstdFreeEncoder(*state.encoder)
+        wrote := zstd.ZstdWriteEncoder(*state.encoder, input, output)
+        if wrote.problem != .None || !wrote.done {
+            return -1
+        }
+        ended := zstd.ZstdFinishEncoder(*state.encoder, output[wrote.written:])
+        if ended.problem != .None || !ended.done {
+            return -1
+        }
+        return wrote.written + ended.written
+    }
+
+    #scope_file
+    ResponseError :: (connection: *void, status: u32, message: string,
+        vary: []transport.HeaderValue) -> s32 {
+        body: Vec(u8)
+        if !BuilderAppend(body, message) {
+            return 0
+        }
+        return transport.WriteWithHeaders(connection, status, "application/json", VecSlice(body, 0, body.count), vary)
+    }
+
+    #scope_export
+    WriteJSON :: (connection: *void, method: string, status: u32, body: []u8, zstdEnabled: bool) -> s32 {
+        varyHeader: [1]transport.HeaderValue = .[.{name = "Vary", value = "Accept-Encoding"}]
+        vary := varyHeader[:]
+        if method == "HEAD" || status == 204 || status == 304 {
+            empty: []u8
+            return transport.WriteWithHeaders(connection, status, "", empty, vary)
+        }
+        accepted: [preferences.MaximumHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Accept-Encoding", accepted[:])
+        encoding := ""
+        if count >= 0 {
+            encoding = preferences.Select(TextView(accepted[:count]), zstdEnabled)
+        }
+        if encoding == "" {
+            return ResponseError(connection, 406, "{\"error\":\"no acceptable content encoding\"}\n", vary)
+        }
+        if status == 206 && !preferences.AcceptsIdentity(TextView(accepted[:count])) {
+            return ResponseError(connection, 406, "{\"error\":\"partial response requires identity encoding\"}\n", vary)
+        }
+        if status == 206 || encoding == "identity" {
+            return transport.WriteWithHeaders(connection, status, "application/json", body, vary)
+        }
+        packed: Vec(u8)
+        size := EncodeBound(encoding, body.count)
+        if size <= 0 || !VecResizeBounded(packed, size, size) {
+            return ResponseError(connection, 503, "{\"error\":\"response encoder unavailable\"}\n", vary)
+        }
+        written := Encode(encoding, body, VecSlice(packed, 0, size))
+        if written < 0 {
+            return ResponseError(connection, 503, "{\"error\":\"response encoder unavailable\"}\n", vary)
+        }
+        headers: [2]transport.HeaderValue = .[varyHeader[0], .{name = "Content-Encoding", value = encoding}]
+        return transport.WriteWithHeaders(connection, status, "application/json", VecSlice(packed, 0, written), headers[:])
+    }
+}

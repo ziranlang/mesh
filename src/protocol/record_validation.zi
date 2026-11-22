@@ -1,0 +1,61 @@
+#import "protocol"
+identity :: #import "identity";
+wire_text :: #import "wire_text";
+text :: #import "std/text_tools";
+
+#scope_file
+ValidMetadata :: (item: EncryptedRecord) -> bool {
+    if item.FreeBytes < 0 || item.FreeBytes > 524288 {
+        return false
+    }
+    hash := wire_text.TrimSpace(item.ContentHash)
+    parent := wire_text.TrimSpace(item.ParentID)
+    if hash != "" && !identity.ValidUserID(hash) {
+        return false
+    }
+    if parent != "" && !identity.ValidEncryptedRecordID(parent) {
+        return false
+    }
+    return item.SchemaVersion >= cast(isize)0 && item.SchemaVersion <= cast(isize)65535
+}
+
+#scope_export
+Valid :: (item: EncryptedRecord) -> bool {
+    if !identity.ValidNamespace(wire_text.TrimSpace(item.Collection)) ||
+        !identity.ValidEncryptedRecordID(wire_text.TrimSpace(item.ID)) {
+        return false
+    }
+    if wire_text.TrimSpace(item.UpdatedAt) == "" {
+        return false
+    }
+    if item.DeletedAt == 0 && wire_text.TrimSpace(item.Ciphertext) == "" {
+        return false
+    }
+    if (item.PackedNonce == "") != (item.PackedCiphertext == "") ||
+        item.PackedNonce.count > 256 || item.PackedCiphertext.count > 262144 ||
+        (item.DeletedAt != 0 && item.PackedCiphertext != "") {
+        return false
+    }
+    return item.Ciphertext.count <= 262144 && item.Nonce.count <= 256 &&
+        item.KeyID.count <= 128 && ValidMetadata(item)
+}
+
+ValidForProtocol :: (item: EncryptedRecord, version: isize) -> bool {
+    if !Valid(item) {
+        return false
+    }
+    if version < cast(isize)6 && item.PackedCiphertext != "" {
+        return false
+    }
+    if version >= cast(isize)5 {
+        return identity.ValidEncryptedHierarchyCollection(item.Collection) ||
+            identity.ValidLegacyEncryptedCollection(item.Collection)
+    }
+    return true
+}
+
+// Entity data already supported content-free deletions on released clients.
+ReadableByLegacy :: (item: EncryptedRecord) -> bool {
+    bare := item.DeletedAt != 0 && item.Nonce == "" && item.Ciphertext == ""
+    return !bare || text.TextHasPrefix(item.Collection, "private.entity.")
+}

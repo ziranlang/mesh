@@ -1,0 +1,243 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    binary :: #import "binary_codec";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    response :: #import "http_json_native";
+    sha :: #import "crypto/sha256";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    strict :: #import "strict_json_native";
+    wire :: #import "wire_text";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    #scope_file
+    Route :: "/api/v1/rewards/migration";
+    Collection :: "private.entity.v1.game-progress";
+    RecordID :: "fd65a3d7ac3d5ceb2d4d96cc5224a740";
+    ProgressSchema :: "entity.game-progress.v1";
+    ReadFrozen :: "SELECT ciphertext FROM game_legacy_snapshots WHERE account_id=?1";
+    ReadMigrated :: "SELECT COUNT(*) FROM game_legacy_progress WHERE account_id=?1";
+    InsertProgress :: "INSERT INTO game_legacy_progress(account_id,unlocked,completed,snapshot,migrated_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";
+
+    crypto :: #system_library "crypto";
+    NewCipherContext :: () -> *void #foreign crypto "EVP_CIPHER_CTX_new";
+    FreeCipherContext :: (context: *void) #foreign crypto "EVP_CIPHER_CTX_free";
+    Cipher :: () -> *void #foreign crypto "EVP_chacha20_poly1305";
+    DecryptInit :: (context: *void, cipher: *void, engine: *void, key: *u8, nonce: *u8) -> s32 #foreign crypto "EVP_DecryptInit_ex";
+    DecryptUpdate :: (context: *void, output: *u8, length: *s32, input: *u8, count: s32) -> s32 #foreign crypto "EVP_DecryptUpdate";
+    DecryptFinal :: (context: *void, output: *u8, length: *s32) -> s32 #foreign crypto "EVP_DecryptFinal_ex";
+    CipherControl :: (context: *void, operation: s32, length: s32, buffer: *void) -> s32 #foreign crypto "EVP_CIPHER_CTX_ctrl";
+    Cleanse :: (bytes: *u8, size: usize) #foreign crypto "OPENSSL_cleanse";
+    SetTag :: 0x11;
+
+    Wipe :: (bytes: []u8) {
+        if bytes.count > 0 { Cleanse(*bytes[0], cast(usize)bytes.count) }
+    }
+
+    // An opening subkey can authenticate only the frozen nonce and its AAD.
+    Open :: (key: []u8, nonce: []u8, sealed: []u8, aad: []u8, plaintext: []u8) -> bool {
+        shortNonce: [12]u8
+        for index: 0..7 { shortNonce[4 + index] = nonce[16 + index] }
+        context := NewCipherContext()
+        if context == null { return false }
+        defer FreeCipherContext(context)
+        count := cast(s32)(sealed.count - 16)
+        length: s32
+        if DecryptInit(context, Cipher(), null, *key[0], *shortNonce[0]) != 1 ||
+            DecryptUpdate(context, null, *length, *aad[0], cast(s32)aad.count) != 1 ||
+            DecryptUpdate(context, *plaintext[0], *length, *sealed[0], count) != 1 || length != count ||
+            CipherControl(context, SetTag, 16, cast(*void)(*sealed[count])) != 1 {
+            return false
+        }
+        return DecryptFinal(context, *plaintext[count], *length) == 1 && length == 0
+    }
+
+    InvalidField :: -2;
+
+    // Existing records were decoded with Go's struct rules. Known fields may
+    // use case-folded names. Null leaves their previous value unchanged.
+    LegacyField :: (document: *json.JsonDocument, object: s32, field: string, expected: json.JsonKind) -> s32 {
+        if json.JsonKindOf(document, object) != .Object { return InvalidField }
+        selected: s32 = -1
+        node := json.JsonFirst(document, object)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            if wire.MatchesToken(TextView(name), field) {
+                kind := json.JsonKindOf(document, node)
+                if kind != .Null {
+                    if kind != expected { return InvalidField }
+                    selected = node
+                }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return selected
+    }
+
+    FieldIs :: (document: *json.JsonDocument, object: s32, field: string, expected: string) -> bool {
+        return json.JsonIs(document, LegacyField(document, object, field, .String), expected)
+    }
+
+    ReadNonce :: (account: string, document: *json.JsonDocument, target: []u8) -> bool {
+        aad := LegacyField(document, document.root, "aad", .Object)
+        if LegacyField(document, document.root, "ciphertext", .String) == InvalidField { return false }
+        if !FieldIs(document, document.root, "profile", "daochi-record-v1") ||
+            !FieldIs(document, document.root, "alg", "xchacha20poly1305") ||
+            !FieldIs(document, document.root, "key_id", "entity-v1") ||
+            !FieldIs(document, aad, "account_id", account) || !FieldIs(document, aad, "app_id", "entity") ||
+            !FieldIs(document, aad, "collection", Collection) || !FieldIs(document, aad, "id", RecordID) ||
+            !FieldIs(document, aad, "schema", ProgressSchema) { return false }
+        nonceText: Text = json.JsonString(document, LegacyField(document, document.root, "nonce", .String))
+        nonce := binary.DecodeBase64(TextView(nonceText), true, false)
+        if nonce.error != "" || nonce.value.count != 24 { return false }
+        for byte, index: VecSlice(nonce.value, 0, 24) { target[index] = byte }
+        return true
+    }
+
+    ImportProgress :: (database: *void, account: string, now: s64, snapshot: string, keyHex: string, nonce: []u8, encodedSealed: string) -> bool {
+        if keyHex.count != 64 || !binary.IsHex(keyHex) { return false }
+        key := binary.DecodeBinaryField(keyHex)
+        keyBytes := VecSlice(key.value, 0, key.value.count)
+        defer Wipe(keyBytes)
+        if key.error != "" || keyBytes.count != 32 { return false }
+        sealed := binary.DecodeBase64(encodedSealed, true, false)
+        if sealed.error != "" || sealed.value.count < 17 || sealed.value.count > 146448 { return false }
+        // Every field apart from the hex account ID is a vetted constant. Match
+        // the old Go encoder's compact JSON byte order for the authenticated AAD.
+        aad: Vec(u8)
+        if !BuilderAppend(aad, "{\"account_id\":\"") || !BuilderAppend(aad, account) ||
+            !BuilderAppend(aad, "\",\"app_id\":\"entity\",\"collection\":\"") || !BuilderAppend(aad, Collection) ||
+            !BuilderAppend(aad, "\",\"id\":\"") || !BuilderAppend(aad, RecordID) ||
+            !BuilderAppend(aad, "\",\"schema\":\"") || !BuilderAppend(aad, ProgressSchema) || !BuilderAppend(aad, "\"}") {
+            return false
+        }
+        clear: Vec(u8)
+        if !VecResizeBounded(clear, sealed.value.count, 146448) { return false }
+        bytes := VecSlice(clear, 0, clear.count)
+        defer Wipe(bytes)
+        opened := Open(keyBytes, nonce, VecSlice(sealed.value, 0, sealed.value.count),
+            VecSlice(aad, 0, aad.count), bytes)
+        Wipe(keyBytes)
+        if !opened { return false }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(bytes[:bytes.count - 16])) || json.JsonKindOf(*document, document.root) != .Object ||
+            !FieldIs(*document, document.root, "game", "shovey.classic") { return false }
+        unlocked, valid := json.JsonInteger(*document, LegacyField(*document, document.root, "unlocked", .Number))
+        markNode := LegacyField(*document, document.root, "completed", .String)
+        if !valid || unlocked < 1 || unlocked > 4096 || markNode == InvalidField { return false }
+        marksText: Text = json.JsonString(*document, markNode)
+        marks := TextView(marksText)
+        if marks.count > 4096 { return false }
+        for mark: marks {
+            if mark != #char "0" && mark != #char "1" { return false }
+        }
+        arguments: [5]sql.Argument = .[sql.TextArg(account), sql.IntArg(unlocked), sql.TextArg(marks), sql.TextArg(snapshot), sql.IntArg(now)]
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        return sql.Execute(database, InsertProgress, arguments[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Reply :: (connection: *void, method: string, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"}]
+        if method == "HEAD" {
+            empty: []u8
+            return http.WriteWithHeaders(connection, status, "application/json", empty, headers[:])
+        }
+        return response.ReplyWithHeaders(connection, status, document, root, headers[:])
+    }
+
+    Single :: (connection: *void, method: string, status: u32, name: string, value: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, name, json.JsonNewString(*document, value)) { return 0 }
+        return Reply(connection, method, status, *document, root)
+    }
+
+    SnapshotError :: (connection: *void, method: string) -> s32 {
+        if method == "POST" { return Single(connection, method, 403, "error", "legacy progress proof refused") }
+        return Single(connection, method, 503, "error", "legacy progress unavailable")
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool { return path == Route }
+
+    ReadsBody :: (path: string, method: string) -> bool { return Handles(path) && method == "POST" }
+
+    BodyLimit :: 1024;
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        if method != "GET" && method != "HEAD" && method != "POST" {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD, POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if !mutex.Lock(*access.databaseLock) { return SnapshotError(connection, method) }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := signing.Now()
+        if !now.valid { return SnapshotError(connection, method) }
+        actor := auth.Authenticate(database, connection, access.configuration.secret, now.seconds, "", false)
+        if actor.status != 0 { return response.ErrorReply(connection, method, actor.status, actor.message, access.configuration.zstdResponses) }
+        account := TextView(actor.userID[:])
+        command: json.JsonDocument
+        fields: [2]s32
+        body: response.Body
+        defer Wipe(VecSlice(body.scratch, 0, body.scratch.count))
+        if method == "POST" {
+            loaded := response.Decode(connection, input, overflow || input.count > BodyLimit, BodyLimit, access.configuration.zstdRequests, *body)
+            if loaded.status != 0 { return Single(connection, method, 400, "error", "invalid progress migration") }
+            raw := ifx loaded.decoded then VecSlice(body.scratch, 0, loaded.length) else input
+            names: [2]string = .["snapshot", "key"]
+            if !strict.ReadStringFields(*command, raw, names[:], fields[:]) {
+                return Single(connection, method, 400, "error", "invalid progress migration")
+            }
+        }
+        arguments: [1]sql.Argument = .[sql.TextArg(account)]
+        migrated := sql.ReadInteger(database, ReadMigrated, arguments[:])
+        if !migrated.found { return SnapshotError(connection, method) }
+        if migrated.value != 0 { return Single(connection, method, 200, "status", "done") }
+        frozen := sql.Prepare(database, ReadFrozen, arguments[:])
+        if frozen.status != sqlite.SQLITE_OK { return SnapshotError(connection, method) }
+        defer sqlite.SqliteFinalize(frozen.value)
+        status := sqlite.SqliteStep(frozen.value)
+        if status == sqlite.SQLITE_DONE && method != "POST" { return Single(connection, method, 200, "status", "missing") }
+        if status != sqlite.SQLITE_ROW { return SnapshotError(connection, method) }
+        ciphertext := sql.ColumnText(frozen.value, 0)
+        if ciphertext.count < 1 || ciphertext.count > 262144 { return SnapshotError(connection, method) }
+        decoded := binary.DecodeBase64(ciphertext, true, false)
+        envelope: json.JsonDocument
+        nonce: [24]u8
+        snapshot: [65]u8
+        if decoded.error != "" || !json.JsonRead(*envelope, TextView(VecSlice(decoded.value, 0, decoded.value.count))) ||
+            !ReadNonce(account, *envelope, nonce[:]) || !signing.HashHex(ciphertext, snapshot[:]) {
+            return SnapshotError(connection, method)
+        }
+        digest := TextView(snapshot[:64])
+        if method == "POST" {
+            if sqlite.SqliteReset(frozen.value) != sqlite.SQLITE_OK { return SnapshotError(connection, method) }
+            key: Vec(u8)
+            defer Wipe(VecSlice(key, 0, key.count))
+            sealed: Text = json.JsonString(*envelope, LegacyField(*envelope, envelope.root, "ciphertext", .String))
+            if !json.JsonIs(*command, fields[0], digest) || !json.JsonStringInto(*command, fields[1], *key) ||
+                !ImportProgress(database, account, now.seconds, digest, TextView(VecSlice(key, 0, key.count)), nonce[:], TextView(sealed)) {
+                return SnapshotError(connection, method)
+            }
+            return Single(connection, method, 200, "status", "done")
+        }
+        nonceHex: [49]u8
+        if sha.BytesToHex(*nonce[0], 24, *nonceHex[0], nonceHex.count) != 1 { return SnapshotError(connection, method) }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "status", json.JsonNewString(*document, "available")) ||
+            !json.JsonSet(*document, root, "snapshot", json.JsonNewString(*document, digest)) ||
+            !json.JsonSet(*document, root, "ciphertext", json.JsonNewString(*document, ciphertext)) ||
+            !json.JsonSet(*document, root, "nonce_hex", json.JsonNewString(*document, TextView(nonceHex[:48]))) { return 0 }
+        return Reply(connection, method, 200, *document, root)
+    }
+}

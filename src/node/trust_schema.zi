@@ -1,0 +1,219 @@
+Schema :: #string SQL_END
+
+CREATE TABLE IF NOT EXISTS trusted_node_peers (
+    node_id TEXT PRIMARY KEY,
+    public_key BLOB NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    addresses_json TEXT NOT NULL DEFAULT '[]',
+    space_id TEXT NOT NULL DEFAULT '',
+    policy_json TEXT NOT NULL DEFAULT '{}',
+    trusted_at TEXT NOT NULL,
+    revoked_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS consumed_pairing_invites (
+    invite_id TEXT PRIMARY KEY,
+    consumed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS issued_pairing_invites (
+    invite_id TEXT PRIMARY KEY,
+    signature TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    completed_node_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS node_request_nonces (
+    node_id TEXT NOT NULL,
+    nonce TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(node_id, nonce)
+);
+CREATE TABLE IF NOT EXISTS trust_spaces (
+    space_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    authority_public_key BLOB NOT NULL,
+    authority_private_key BLOB NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS name_claims (
+    space_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    services_json TEXT NOT NULL DEFAULT '[]',
+    signature TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(space_id, name)
+);
+CREATE INDEX IF NOT EXISTS node_request_nonces_expiry
+    ON node_request_nonces(expires_at);
+SQL_END;
+
+ListPeersQuery :: #string SQL_END
+SELECT node_id,public_key,display_name,addresses_json,space_id,policy_json,trusted_at
+FROM trusted_node_peers
+WHERE revoked_at=''
+ORDER BY display_name,node_id
+SQL_END;
+
+PeerKeyQuery :: "SELECT public_key FROM trusted_node_peers WHERE node_id=?1 AND revoked_at=''";
+PeerPolicyQuery :: "SELECT policy_json FROM trusted_node_peers WHERE node_id=?1 AND revoked_at=''";
+ExpireNoncesSQL :: "DELETE FROM node_request_nonces WHERE expires_at<?1";
+InsertNonceSQL :: #string SQL_END
+INSERT INTO node_request_nonces(node_id,nonce,expires_at) VALUES(?1,?2,?3)
+ON CONFLICT(node_id,nonce) DO NOTHING
+SQL_END;
+
+CollectionAppQuery :: #string SQL_END
+SELECT app_id FROM server_app_collections
+WHERE CASE WHEN substr(collection_prefix,-1)='*'
+    THEN substr(?1,1,length(collection_prefix)-1)=substr(collection_prefix,1,length(collection_prefix)-1)
+    ELSE collection_prefix=?1 END
+ORDER BY length(collection_prefix)-(substr(collection_prefix,-1)='*') DESC,app_id,collection_prefix
+LIMIT 1
+SQL_END;
+
+ConsumedInviteQuery :: "SELECT EXISTS(SELECT 1 FROM consumed_pairing_invites WHERE invite_id=?1)";
+
+ConsumeInviteSQL :: "INSERT INTO consumed_pairing_invites(invite_id,consumed_at) VALUES(?1,?2)";
+
+UpsertPeerSQL :: #string SQL_END
+
+INSERT INTO trusted_node_peers(
+    node_id,public_key,display_name,addresses_json,space_id,policy_json,trusted_at
+) VALUES(?1,?2,?3,?4,?5,?6,?7)
+ON CONFLICT(node_id) DO UPDATE SET
+    public_key=excluded.public_key,
+    display_name=excluded.display_name,
+    addresses_json=excluded.addresses_json,
+    space_id=excluded.space_id,
+    policy_json=excluded.policy_json,
+    trusted_at=excluded.trusted_at,
+    revoked_at=''
+SQL_END;
+
+IssueInviteSQL :: #string SQL_END
+
+INSERT INTO issued_pairing_invites(invite_id,signature,expires_at,created_at)
+VALUES(?1,?2,?3,?4)
+SQL_END;
+
+IssuedInviteQuery :: #string SQL_END
+
+SELECT signature,expires_at,completed_node_id
+FROM issued_pairing_invites
+WHERE invite_id=?1
+SQL_END;
+
+CompleteInviteSQL :: #string SQL_END
+
+UPDATE issued_pairing_invites
+SET completed_node_id=?1
+WHERE invite_id=?2 AND completed_node_id=''
+SQL_END;
+
+CreateSpaceSQL :: #string SQL_END
+
+INSERT INTO trust_spaces(
+    space_id,display_name,authority_public_key,authority_private_key,created_at
+) VALUES(?1,?2,?3,?4,?5)
+SQL_END;
+
+ImportSpaceSQL :: #string SQL_END
+INSERT INTO trust_spaces(space_id,display_name,authority_public_key,authority_private_key,created_at)
+VALUES(?1,?2,?3,'',?4)
+ON CONFLICT(space_id) DO NOTHING
+SQL_END;
+
+PrivateAuthorityQuery :: #string SQL_END
+
+SELECT authority_private_key FROM trust_spaces
+WHERE space_id=?1
+SQL_END;
+
+CurrentSequenceQuery :: #string SQL_END
+
+SELECT sequence FROM name_claims
+WHERE space_id=?1 AND name=?2
+SQL_END;
+
+ClaimHistoryQuery :: #string SQL_END
+SELECT sequence,signature FROM name_claims
+WHERE space_id=?1 AND name=?2
+SQL_END;
+
+StoreClaimSQL :: #string SQL_END
+
+INSERT INTO name_claims(
+    space_id,name,node_id,sequence,expires_at,services_json,signature,updated_at
+) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+ON CONFLICT(space_id,name) DO UPDATE SET
+    node_id=excluded.node_id,
+    sequence=excluded.sequence,
+    expires_at=excluded.expires_at,
+    services_json=excluded.services_json,
+    signature=excluded.signature,
+    updated_at=excluded.updated_at
+SQL_END;
+
+ResolveClaimQuery :: #string SQL_END
+
+SELECT space_id,name,node_id,sequence,expires_at,services_json,signature
+FROM name_claims
+WHERE space_id=?1 AND name=?2
+SQL_END;
+
+PublicAuthorityQuery :: #string SQL_END
+
+SELECT authority_public_key FROM trust_spaces
+WHERE space_id=?1
+SQL_END;
+
+ExportSpaceQuery :: #string SQL_END
+
+SELECT space_id,display_name,authority_public_key
+FROM trust_spaces
+WHERE space_id=?1
+SQL_END;
+
+ExportNamesQuery :: #string SQL_END
+
+SELECT space_id,name,node_id,sequence,expires_at,services_json,signature
+FROM name_claims
+WHERE space_id=?1
+ORDER BY name
+SQL_END;
+
+ExportAppsSQL :: #string SQL_END
+SELECT app_id,manifest_json,manifest_signature,approval_signature
+FROM server_app_manifests
+ORDER BY app_id
+SQL_END;
+
+ExportRecordsSQL :: #string SQL_END
+SELECT e.seq,e.op,e.user_id_hash,e.collection,e.record_id,e.deleted_at,
+       r.id,r.key_id,r.nonce,r.ciphertext,r.updated_at,r.deleted_at,
+       r.content_hash,r.schema_version,r.parent_id,r.free_bytes,u.public_key,u.created_at,u.last_seen_at
+FROM server_mesh_changes e
+LEFT JOIN server_encrypted_records r
+  ON e.op!='delete' AND r.user_id_hash=e.user_id_hash AND r.collection=e.collection AND r.id=e.record_id
+LEFT JOIN server_users u ON u.user_id_hash=e.user_id_hash
+WHERE e.seq>?1
+ORDER BY e.seq
+SQL_END;
+
+LoadCursorSQL :: "SELECT cursor FROM node_sync_cursors WHERE peer_key=?1";
+
+SaveCursorSQL :: #string SQL_END
+INSERT INTO node_sync_cursors(peer_key,cursor,updated_at)
+VALUES(?1,?2,CURRENT_TIMESTAMP)
+ON CONFLICT(peer_key) DO UPDATE SET
+    cursor=excluded.cursor,
+    updated_at=CURRENT_TIMESTAMP
+SQL_END;
+
+NextPairedPeerQuery :: #string SQL_END
+SELECT node_id,addresses_json,policy_json FROM trusted_node_peers
+WHERE revoked_at='' AND node_id>?1
+ORDER BY node_id LIMIT 1
+SQL_END;

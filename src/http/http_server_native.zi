@@ -1,0 +1,404 @@
+#if TARGET == .C && OS == .LINUX {
+    bytes :: #import "std/byte_text_linux";
+    files :: #import "std/file_linux";
+    c_string :: #import "std/c_string";
+    sockets :: #import "std/socket_linux";
+    limits :: #import "server_limits";
+    policy :: #import "http_policy_native";
+    ascii :: #import "std/text";
+    wire :: #import "wire_text";
+
+    RequestHandler :: #type (context: *void, connection: *void, path: *u8, method: *u8,
+        version: *u8, upload: *u8, uploadSize: *usize, request: **void) -> s32 #c_call;
+    RequestCompletion :: #type (context: *void, connection: *void, request: **void,
+        reason: s32) #c_call;
+    UpgradeHandler :: #type (context: *void, connection: *void, request: *void,
+        buffered: *u8, count: usize, fd: s32, upgrade: *void) #c_call;
+    PeerAddress :: struct {
+        bytes: [16]u8
+        count: s64
+    }
+
+    HeaderValue :: struct {
+        name: string
+        value: string
+    }
+
+    #scope_file
+    mhd :: #system_library "microhttpd";
+    c :: #system_library "c";
+
+    PollInThread :: 8;
+    ThreadPerConnection :: 4;
+    UseEpoll :: 512;
+    UseIPv6 :: 16;
+    UseDualStack :: 2064;
+    NoListenSocket :: 256;
+    InterThreadControl :: 1024;
+    AllowUpgrade :: 32768;
+    OptionEnd :: 0;
+    OptionMemory :: 1;
+    OptionConnectionLimit :: 2;
+    OptionIdleTimeout :: 3;
+    OptionRequestCompletion :: 4;
+    OptionBindAddress :: 6;
+    OptionUriLog :: 7;
+    OptionThreadPoolSize :: 14;
+    OptionConnectionNotification :: 27;
+    ConnectionStarted :: 0;
+    DaemonBindPort :: 6;
+    ConnectionClientAddress :: 2;
+    ConnectionSocketContext :: 7;
+    RequestHeaderSize :: 10;
+    ResponseStatusInfo :: 11;
+    RequestHeaders :: 1;
+    RequestArguments :: 8;
+    ResponseCopiesBuffer :: 2;
+    CloseUpgradeAction :: 0;
+    AddressFamilyIPv4 :: 2;
+    AddressFamilyIPv6 :: 10;
+
+    IPv6SocketAddress :: struct {
+        family: u16
+        port: u16
+        flowInfo: u32
+        address: [16]u8
+        scope: u32
+    }
+
+    StartDaemon :: (flags: u32, port: u16, accept: *void, acceptContext: *void,
+        handler: RequestHandler, context: *void, arguments: ..any) -> *void #foreign mhd "MHD_start_daemon";
+    StopDaemon :: (daemon: *void) #foreign mhd "MHD_stop_daemon";
+    AddConnection :: (daemon: *void, fd: s32, address: *void, length: u32) -> s32 #foreign mhd "MHD_add_connection";
+    GetPort :: (daemon: *void, kind: s32, arguments: ..any) -> *u16 #foreign mhd "MHD_get_daemon_info";
+    GetConnectionInfo :: (connection: *void, kind: s32, arguments: ..any) -> *void #foreign mhd "MHD_get_connection_info";
+    Lookup :: (connection: *void, kind: s32, name: *u8) -> *u8 #foreign mhd "MHD_lookup_connection_value";
+    HeaderIterator :: #type (context: *void, kind: s32, key: *u8, value: *u8) -> s32 #c_call;
+    ConnectionNotification :: #type (context: *void, connection: *void, storage: **void, event: s32) #c_call;
+    UriLogger :: #type (context: *void, uri: *u8, connection: *void) -> *void #c_call;
+    GetValues :: (connection: *void, kind: s32, iterator: HeaderIterator,
+        context: *void) -> s32 #foreign mhd "MHD_get_connection_values";
+    CopyResponse :: (size: usize, buffer: *u8, mode: s32) -> *void #foreign mhd "MHD_create_response_from_buffer";
+    FileResponse :: (size: u64, fd: s32) -> *void #foreign mhd "MHD_create_response_from_fd64";
+    UpgradeResponse :: (handler: UpgradeHandler, context: *void) -> *void #foreign mhd "MHD_create_response_for_upgrade";
+    AddHeader :: (response: *void, name: *u8, value: *u8) -> s32 #foreign mhd "MHD_add_response_header";
+    Queue :: (connection: *void, status: u32, response: *void) -> s32 #foreign mhd "MHD_queue_response";
+    DestroyResponse :: (response: *void) #foreign mhd "MHD_destroy_response";
+    UpgradeAction :: (handle: *void, action: s32, arguments: ..any) -> s32 #foreign mhd "MHD_upgrade_action";
+    NetworkPort :: (port: u16) -> u16 #foreign c "htons";
+    NetworkAddress :: (address: u32) -> u32 #foreign c "htonl";
+    Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+    Free :: (pointer: *void) #foreign c "free";
+    BoundedLength :: (text: *u8, maximum: usize) -> usize #foreign c "strnlen";
+
+    CapturedTarget :: struct {
+        data: *u8
+        count: usize
+    }
+
+    TargetForConnection :: (connection: *void) -> *CapturedTarget {
+        stored := cast(**void)GetConnectionInfo(connection, ConnectionSocketContext)
+        return ifx stored == null then null else cast(*CapturedTarget)(<<stored)
+    }
+
+    TrackConnection :: (context: *void, connection: *void, storage: **void, event: s32) {
+        if event == ConnectionStarted {
+            <<storage = Allocate(1, size_of(CapturedTarget))
+            return
+        }
+        target := cast(*CapturedTarget)(<<storage)
+        if target != null {
+            Free(cast(*void)target.data)
+            Free(cast(*void)target)
+            <<storage = null
+        }
+    }
+
+    // MHD may reject headers before it invokes the access handler. The socket
+    // notification still releases the copy in that case.
+    CaptureTarget :: (context: *void, uri: *u8, connection: *void) -> *void {
+        target := TargetForConnection(connection)
+        if target == null { return null }
+        Free(cast(*void)target.data)
+        <<target = .{}
+        if uri == null { return null }
+        length := BoundedLength(uri, cast(usize)limits.MaxHeaderBytes + 1)
+        if length == 0 || length > cast(usize)limits.MaxHeaderBytes { return null }
+        data := cast(*u8)Allocate(length, 1)
+        if data == null { return null }
+        for index: 0..cast(s64)length - 1 {
+            data[index] = uri[index]
+        }
+        target.data = data
+        target.count = length
+        return null
+    }
+
+    SetHeader :: (response: *void, name: string, value: string) -> bool {
+        key: [128]u8
+        text: [512]u8
+        if name.count >= key.count || value.count >= text.count ||
+            !c_string.CopyCString(name, key[:]) || !c_string.CopyCString(value, text[:]) {
+            return false
+        }
+        return AddHeader(response, *key[0], *text[0]) != 0
+    }
+
+    HeaderCollection :: struct {
+        name: string
+        target: []u8
+        count: s64
+        found: bool
+    }
+
+    CollectHeader :: (context: *void, kind: s32, key: *u8, value: *u8) -> s32 {
+        headers := cast(*HeaderCollection)context
+        name := bytes.TextFromCString(key)
+        if name.count != headers.name.count || !ascii.StartsWithFoldASCII(name, headers.name) {
+            return 1
+        }
+        text := bytes.TextFromCString(value)
+        separator := ifx headers.found then cast(s64)1 else cast(s64)0
+        if separator + text.count > headers.target.count - headers.count {
+            headers.count = -1
+            return 0
+        }
+        if headers.found {
+            headers.target[headers.count] = #char ","
+            headers.count += 1
+        }
+        headers.found = true
+        for byte: text {
+            headers.target[headers.count] = byte
+            headers.count += 1
+        }
+        return 1
+    }
+
+    StartBound :: (address: *void, familyFlags: u32, port: u16, maximumConnections: u32,
+        context: *void, handler: RequestHandler, completed: RequestCompletion) -> *void {
+        flags := cast(u32)(PollInThread | ThreadPerConnection | InterThreadControl | AllowUpgrade) | familyFlags
+        onConnection: ConnectionNotification = TrackConnection
+        onUri: UriLogger = CaptureTarget
+        return StartDaemon(flags, port, null, null, handler, context,
+            OptionBindAddress, address,
+            OptionMemory, cast(usize)(limits.MaxHeaderBytes + 4096),
+            OptionConnectionLimit, maximumConnections,
+            OptionIdleTimeout, cast(u32)(limits.IdleTimeoutMilliseconds / 1000),
+            OptionRequestCompletion, completed, context,
+            OptionConnectionNotification, onConnection, null,
+            OptionUriLog, onUri, null,
+            OptionEnd)
+    }
+
+    #scope_export
+    // The handler and its context must stay valid until Stop returns. Requests
+    // on separate connections run concurrently. MicroHTTPD owns the sockets.
+    Start :: (ip: [4]u8, port: u16, maximumConnections: u32, context: *void, handler: RequestHandler,
+        completed: RequestCompletion) -> *void {
+        host := (cast(u32)ip[0] << 24) | (cast(u32)ip[1] << 16) | (cast(u32)ip[2] << 8) | cast(u32)ip[3]
+        address: sockets.LinuxSocketAddress = .{
+            family = AddressFamilyIPv4,
+            port = NetworkPort(port),
+            address = NetworkAddress(host)
+        }
+        return StartBound(cast(*void)(*address), 0, port, maximumConnections, context, handler, completed)
+    }
+
+    StartIPv6 :: (ip: [16]u8, scope: u32, port: u16, maximumConnections: u32, context: *void,
+        handler: RequestHandler, completed: RequestCompletion) -> *void {
+        address: IPv6SocketAddress = .{
+            family = AddressFamilyIPv6,
+            port = NetworkPort(port),
+            address = ip,
+            scope = scope
+        }
+        return StartBound(cast(*void)(*address), UseIPv6, port, maximumConnections, context, handler, completed)
+    }
+
+    StartAny :: (port: u16, maximumConnections: u32, context: *void, handler: RequestHandler,
+        completed: RequestCompletion) -> *void {
+        address: IPv6SocketAddress = .{family = AddressFamilyIPv6, port = NetworkPort(port)}
+        return StartBound(cast(*void)(*address), UseDualStack, port, maximumConnections, context, handler, completed)
+    }
+
+    // Only descriptors handed in by the host can reach this daemon.
+    StartPrivate :: (context: *void, handler: RequestHandler, completed: RequestCompletion) -> *void {
+        flags := cast(u32)(PollInThread | InterThreadControl | NoListenSocket)
+        return StartDaemon(flags, 0, null, null, handler, context,
+            OptionMemory, cast(usize)(limits.MaxHeaderBytes + 4096),
+            OptionConnectionLimit, cast(u32)2,
+            OptionIdleTimeout, cast(u32)(limits.IdleTimeoutMilliseconds / 1000),
+            OptionRequestCompletion, completed, context,
+            OptionEnd)
+    }
+
+    // MHD takes ownership of fd even on failure. The descriptor came from a
+    // private socket pair, so pass the operator's synthetic loopback address.
+    ConnectPrivate :: (daemon: *void, fd: s32) -> bool {
+        address: sockets.LinuxSocketAddress = .{family = AddressFamilyIPv4, port = NetworkPort(1),
+            address = NetworkAddress(0x7f000001)}
+        return AddConnection(daemon, fd, cast(*void)(*address), 16) == 1
+    }
+
+    BoundPort :: (daemon: *void) -> u16 {
+        if daemon == null {
+            return 0
+        }
+        port := GetPort(daemon, DaemonBindPort)
+        if port == null {
+            return 0
+        }
+        return <<port
+    }
+
+    Stop :: (daemon: *void) {
+        if daemon != null {
+            StopDaemon(daemon)
+        }
+    }
+
+    RemoteAddress :: (connection: *void) -> PeerAddress {
+        entry := cast(**void)GetConnectionInfo(connection, ConnectionClientAddress)
+        if entry == null || <<entry == null { return .{} }
+        address := <<entry
+        family := <<(cast(*u16)address)
+        result: PeerAddress
+        if family == AddressFamilyIPv4 {
+            // IPv4 network-order bytes start after the two 16-bit fields.
+            source := bytes.BytesFromPointer(cast(*u8)address, 8)
+            for index: 0..3 { result.bytes[index] = source[index + 4] }
+            result.count = 4
+        } else if family == AddressFamilyIPv6 {
+            socket := cast(*IPv6SocketAddress)address
+            result.bytes = socket.address
+            result.count = 16
+        }
+        return result
+    }
+
+    HeaderTooLarge :: (connection: *void) -> bool {
+        size := cast(*usize)GetConnectionInfo(connection, RequestHeaderSize)
+        return size != null && <<size > cast(usize)limits.MaxHeaderBytes
+    }
+
+    #scope_file
+    RequestValue :: (connection: *void, kind: s32, name: string) -> string {
+        key: [128]u8
+        if name.count >= key.count || !c_string.CopyCString(name, key[:]) {
+            return ""
+        }
+        return bytes.TextFromCString(Lookup(connection, kind, *key[0]))
+    }
+
+    #scope_export
+    // Borrow the original path and query during dispatch. An empty string
+    // means the transport could not retain a complete target.
+    RequestTarget :: (connection: *void) -> string {
+        target := TargetForConnection(connection)
+        if target == null { return "" }
+        return TextView(bytes.BytesFromPointer(target.data, cast(u64)target.count))
+    }
+
+    // Zero indicates that MicroHTTPD has no queued response status.
+    ResponseStatus :: (connection: *void) -> u32 {
+        result := cast(*u32)GetConnectionInfo(connection, ResponseStatusInfo)
+        if result == null { return 0 }
+        return <<result
+    }
+
+    // These values borrow MicroHTTPD's request storage.
+    Header :: (connection: *void, name: string) -> string {
+        return RequestValue(connection, RequestHeaders, name)
+    }
+
+    QueryArgument :: (connection: *void, name: string) -> string {
+        return RequestValue(connection, RequestArguments, name)
+    }
+
+    // Preserve field order and empty duplicates when joining list headers.
+    // A negative count signals that the complete field could not fit.
+    JoinHeader :: (connection: *void, name: string, target: []u8) -> s64 {
+        fields: HeaderCollection = .{name = name, target = target}
+        if GetValues(connection, RequestHeaders, CollectHeader, cast(*void)(*fields)) < 0 {
+            return -1
+        }
+        return fields.count
+    }
+
+    Write :: (connection: *void, status: u32, contentType: string, body: []u8) -> s32 {
+        headers: []HeaderValue
+        return WriteWithHeaders(connection, status, contentType, body, headers)
+    }
+
+    WriteWithHeaders :: (connection: *void, status: u32, contentType: string,
+        body: []u8, headers: []HeaderValue) -> s32 {
+        data: *u8 = null
+        if body.count > 0 {
+            data = *body[0]
+        }
+        response := CopyResponse(cast(usize)body.count, data, ResponseCopiesBuffer)
+        if response == null {
+            return 0
+        }
+        defer DestroyResponse(response)
+        return QueueWithHeaders(connection, status, contentType, response, headers)
+    }
+
+    // Ownership transfers even if the response cannot be queued.
+    WriteFile :: (connection: *void, status: u32, contentType: string, file: files.FileHandle,
+        count: s64, headers: []HeaderValue) -> s32 {
+        if !file.valid { return 0 }
+        if count < 0 {
+            unused files.CloseFile(file)
+            return 0
+        }
+        response := FileResponse(cast(u64)count, file.fd)
+        if response == null {
+            unused files.CloseFile(file)
+            return 0
+        }
+        defer DestroyResponse(response)
+        return QueueWithHeaders(connection, status, contentType, response, headers)
+    }
+
+    #scope_file
+    QueueWithHeaders :: (connection: *void, status: u32, contentType: string, response: *void, headers: []HeaderValue) -> s32 {
+        if contentType != "" && !SetHeader(response, "Content-Type", contentType) {
+            return 0
+        }
+        originBytes: [512]u8
+        count := JoinHeader(connection, "Origin", originBytes[:])
+        origin: string
+        if count >= 0 {
+            field := TextView(originBytes[:count])
+            if !wire.Cut(field, #char ",").found {
+                origin = field
+            }
+        }
+        if !policy.Apply(response, origin, headers, SetHeader) {
+            return 0
+        }
+        return Queue(connection, status, response)
+    }
+
+    #scope_export
+    Upgrade :: (connection: *void, accept: string, protocol: string, context: *void, handler: UpgradeHandler) -> s32 {
+        response := UpgradeResponse(handler, context)
+        if response == null {
+            return 0
+        }
+        defer DestroyResponse(response)
+        if !SetHeader(response, "Upgrade", "websocket") || !SetHeader(response, "Sec-WebSocket-Accept", accept) {
+            return 0
+        }
+        if protocol != "" && !SetHeader(response, "Sec-WebSocket-Protocol", protocol) {
+            return 0
+        }
+        return Queue(connection, 101, response)
+    }
+
+    CloseUpgrade :: (handle: *void) {
+        UpgradeAction(handle, CloseUpgradeAction)
+    }
+}

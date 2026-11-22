@@ -1,0 +1,33 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    statements :: #import "sqlite_statement_native";
+    queries :: #import "account_key_queries";
+    codec :: #import "codec";
+
+    Key :: struct {
+        bytes: [codec.mlDSA44PublicKeySize]u8
+        count: s64
+        found: bool
+        status: s32
+    }
+
+    Read :: (database: *void, user: string) -> Key {
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        prepared := statements.Prepare(database, queries.PublicKey, arguments[:])
+        if prepared.status != sqlite.SQLITE_OK { return .{status = prepared.status} }
+        defer sqlite.SqliteFinalize(prepared.value)
+        status := sqlite.SqliteStep(prepared.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        result: Key
+        pointer := sqlite.SqliteColumnBlob(prepared.value, 0)
+        count := cast(s64)sqlite.SqliteColumnBytes(prepared.value, 0)
+        if pointer == null && count > 0 { return .{status = sqlite.SQLITE_NOMEM} }
+        result.found = true
+        result.count = count
+        if count <= codec.mlDSA44PublicKeySize {
+            for index: 0..count - 1 { result.bytes[index] = pointer[index] }
+        }
+        return result
+    }
+}

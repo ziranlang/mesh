@@ -1,0 +1,166 @@
+records :: #import "storage_record_usage";
+fragments :: #import "sql_fragments";
+#import "std/vec"
+
+#scope_file
+CountedTable :: struct {
+    name: string
+    owner: string
+    size: string
+}
+
+// A list owns its invitations and permissions. Its BEFORE DELETE trigger
+// accounts for those children before SQLite cascades them: after the parent
+// row is gone, their own triggers cannot find an owner and subtract nothing.
+ListSize :: #string SQL_END
+LENGTH(ROW.id)+LENGTH(ROW.title)+LENGTH(ROW.items)+
+(SELECT COALESCE(SUM(LENGTH(id)+LENGTH(target)+LENGTH(status)),0) FROM server_list_invitations WHERE list_id=ROW.id)+
+(SELECT COALESCE(SUM(LENGTH(access)),0) FROM server_list_permissions WHERE list_id=ROW.id)
+SQL_END;
+
+Tables: [10]CountedTable = .[
+.{"server_encrypted_records", "ROW.user_id_hash", "record"},
+    .{"server_encrypted_payloads", "ROW.user_id_hash", "LENGTH(ROW.client_id)+LENGTH(ROW.payload_json)"},
+    // A blob in the account's trash is kept for a while but costs nothing.
+    .{"server_blobs", "ROW.user_id_hash", "CASE WHEN ROW.trashed_at<>0 THEN 0 ELSE ROW.size END"},
+    .{"server_shared_lists", "ROW.owner", "list"},
+    .{"server_list_invitations", "(SELECT owner FROM server_shared_lists WHERE id=ROW.list_id)", "LENGTH(ROW.id)+LENGTH(ROW.target)+LENGTH(ROW.status)"},
+    .{"server_list_permissions", "(SELECT owner FROM server_shared_lists WHERE id=ROW.list_id)", "LENGTH(ROW.access)"},
+    .{"server_list_commands", "ROW.user_id", "LENGTH(ROW.request_id)+LENGTH(ROW.body)"},
+    .{"server_publications", "ROW.author", "LENGTH(ROW.id)+LENGTH(ROW.format)+LENGTH(ROW.title)+LENGTH(ROW.document)"},
+.{"server_record_packing", "ROW.user_id_hash", "packing"},
+.{"game_completions", "ROW.account_id", "0"}
+];
+
+Definition :: #string SQL_END
+CREATE TABLE IF NOT EXISTS server_storage_usage (
+    user_id_hash TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    used_bytes INTEGER NOT NULL DEFAULT 0 CHECK(used_bytes>=0)
+);
+CREATE TABLE IF NOT EXISTS server_storage_usage_version (
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    version INTEGER NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS server_storage_usage_account_insert
+AFTER INSERT ON server_users
+BEGIN
+    INSERT INTO server_storage_usage(user_id_hash,used_bytes) VALUES(NEW.user_id_hash,0);
+END;
+SQL_END;
+
+Triggers :: #string SQL_END
+CREATE TRIGGER IF NOT EXISTS server_storage_usage_TABLE_insert
+AFTER INSERT ON TABLE
+BEGIN
+    UPDATE server_storage_usage SET used_bytes=used_bytes+(NEW_SIZE) WHERE user_id_hash=NEW_OWNER;
+END;
+CREATE TRIGGER IF NOT EXISTS server_storage_usage_TABLE_before_update
+BEFORE UPDATE ON TABLE
+BEGIN
+    UPDATE server_storage_usage SET used_bytes=used_bytes-(OLD_SIZE) WHERE user_id_hash=OLD_OWNER;
+END;
+CREATE TRIGGER IF NOT EXISTS server_storage_usage_TABLE_after_update
+AFTER UPDATE ON TABLE
+BEGIN
+    UPDATE server_storage_usage SET used_bytes=used_bytes+(NEW_SIZE) WHERE user_id_hash=NEW_OWNER;
+END;
+CREATE TRIGGER IF NOT EXISTS server_storage_usage_TABLE_delete
+BEFORE DELETE ON TABLE
+BEGIN
+    UPDATE server_storage_usage SET used_bytes=used_bytes-(OLD_SIZE) WHERE user_id_hash=OLD_OWNER;
+END;
+SQL_END;
+
+
+TableSize :: (table: CountedTable) -> Vec(u8) {
+    if table.size == "record" { return records.RecordSizeSQL() }
+    if table.size == "packing" { return records.PackingSizeSQL() }
+    output: Vec(u8)
+    size := ifx table.size == "list" then ListSize else table.size
+    if !BuilderAppend(output, size) { return .{} }
+    return output
+}
+
+AppendScan :: (output: *Vec(u8), account: string) -> bool {
+    if !BuilderAppend(<<output, "SELECT ") { return false }
+    for table, index: Tables {
+        counted := TableSize(table)
+        if counted.count == 0 { return false }
+        size := TextView(VecSlice(counted, 0, counted.count))
+        if table.name == "server_shared_lists" {
+            // The scan counts child tables separately.
+            size = "LENGTH(ROW.id)+LENGTH(ROW.title)+LENGTH(ROW.items)"
+        }
+        rowSize := fragments.Replace(size, "ROW", "item")
+        owner := fragments.Replace(table.owner, "ROW", "item")
+        if rowSize.count == 0 || owner.count == 0 { return false }
+        fields: [4]fragments.Replacement = .[
+            .{marker = "SIZE", value = TextView(VecSlice(rowSize, 0, rowSize.count))}, .{marker = "TABLE", value = table.name},
+            .{marker = "OWNER", value = TextView(VecSlice(owner, 0, owner.count))}, .{marker = "ACCOUNT", value = account}
+        ]
+        term := "(SELECT COALESCE(SUM(SIZE),0) FROM TABLE AS item WHERE OWNER=ACCOUNT)"
+        if (index > 0 && !BuilderAppend(<<output, "+")) || !fragments.Append(output, term, fields[:]) {
+            return false
+        }
+    }
+    return true
+}
+
+BackfillPrefix :: "INSERT INTO server_storage_usage(user_id_hash,used_bytes) SELECT account.user_id_hash,(";
+BackfillSuffix :: ") FROM server_users AS account WHERE true ON CONFLICT(user_id_hash) DO UPDATE SET used_bytes=excluded.used_bytes";
+ReconcilePrefix :: "INSERT INTO server_storage_usage(user_id_hash,used_bytes) SELECT user_id_hash,(";
+ReconcileSuffix :: ") FROM server_users WHERE user_id_hash=?1 ON CONFLICT(user_id_hash) DO UPDATE SET used_bytes=excluded.used_bytes";
+
+#scope_export
+Version :: 5;
+ExistingTables :: "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('server_storage_usage','server_storage_usage_version')";
+ExistingVersion :: "SELECT COALESCE(MAX(version),0) FROM server_storage_usage_version";
+WriteVersion :: "INSERT INTO server_storage_usage_version(singleton,version) VALUES(1,?1) ON CONFLICT(singleton) DO UPDATE SET version=excluded.version";
+
+Build :: () -> Vec(u8) {
+    output: Vec(u8)
+    if !BuilderAppend(output, Definition) { return .{} }
+    for table: Tables {
+        counted := TableSize(table)
+        if counted.count == 0 { return .{} }
+        size := TextView(VecSlice(counted, 0, counted.count))
+        newOwner := fragments.Replace(table.owner, "ROW", "NEW")
+        oldOwner := fragments.Replace(table.owner, "ROW", "OLD")
+        newSize := fragments.Replace(size, "ROW", "NEW")
+        oldSize := fragments.Replace(size, "ROW", "OLD")
+        if newOwner.count == 0 || oldOwner.count == 0 || newSize.count == 0 || oldSize.count == 0 { return .{} }
+        fields: [5]fragments.Replacement = .[
+            .{marker = "TABLE", value = table.name}, .{marker = "NEW_OWNER", value = TextView(VecSlice(newOwner, 0, newOwner.count))},
+            .{marker = "OLD_OWNER", value = TextView(VecSlice(oldOwner, 0, oldOwner.count))}, .{marker = "NEW_SIZE", value = TextView(VecSlice(newSize, 0, newSize.count))},
+            .{marker = "OLD_SIZE", value = TextView(VecSlice(oldSize, 0, oldSize.count))}
+        ]
+        if !fragments.Append(*output, Triggers, fields[:]) { return .{} }
+    }
+    return output
+}
+
+DropTriggers :: () -> Vec(u8) {
+    output: Vec(u8)
+    suffixes: [4]string = .["_insert;\n", "_before_update;\n", "_after_update;\n", "_delete;\n"]
+    for table: Tables {
+        for suffix: suffixes {
+            if !BuilderAppend(output, "DROP TRIGGER IF EXISTS server_storage_usage_") ||
+                !BuilderAppend(output, table.name) || !BuilderAppend(output, suffix) { return .{} }
+        }
+    }
+    return output
+}
+
+Backfill :: () -> Vec(u8) {
+    output: Vec(u8)
+    if !BuilderAppend(output, BackfillPrefix) || !AppendScan(*output, "account.user_id_hash") ||
+        !BuilderAppend(output, BackfillSuffix) { return .{} }
+    return output
+}
+
+Reconcile :: () -> Vec(u8) {
+    output: Vec(u8)
+    if !BuilderAppend(output, ReconcilePrefix) || !AppendScan(*output, "?1") ||
+        !BuilderAppend(output, ReconcileSuffix) { return .{} }
+    return output
+}

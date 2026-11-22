@@ -1,0 +1,167 @@
+sqlite :: #import "sqlite/SQLite";
+sql :: #import "sqlite_statement_native";
+schema :: #import "sqlite_schema";
+startup :: #import "store_startup_native";
+stdio :: #import "std/stdio_linux";
+signing :: #import "token_signing_native";
+issuer :: #import "token_issuer_native";
+ledger :: #import "token_ledger_native";
+writes :: #import "token_writes_native";
+
+#scope_file
+LedgerFixtureAccount :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+StarsFixtureAccount :: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+LedgerFixtureTime :: "2026-11-20T12:00:00Z";
+
+Exec :: (database: *void, statement: string) -> bool {
+    return sqlite.SqliteExecText(database, statement) == sqlite.SQLITE_OK
+}
+
+ExpectInteger :: (database: *void, statement: string, text: string, expected: s64) -> bool {
+    arguments: [1]sql.Argument = .[sql.TextArg(text)]
+    result := sql.ReadInteger(database, statement, arguments[:])
+    return result.found && result.value == expected
+}
+
+ExpectLot :: (database: *void, id: string, title: string, units: s64) -> bool {
+    arguments: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(title)]
+    result := sql.ReadInteger(database, "SELECT remaining FROM token_allocations WHERE receipt_id=?1 AND source_receipt_id=?1 AND app_id=?2", arguments[:])
+    return result.found && result.value == units
+}
+
+Credit :: (database: *void, signer: *issuer.Issuer, input: signing.Event) -> writes.EventResult {
+    return writes.CreditPayment(database, signer, input.source, input.reference, input, LedgerFixtureTime)
+}
+
+Google :: (database: *void, signer: *issuer.Issuer) -> bool {
+    google: signing.Event = .{account = LedgerFixtureAccount, app = "inbe", kind = "credit", amount = 100, source = "google_play", reference = "inbe-native-fixture"}
+    other: signing.Event = .{account = LedgerFixtureAccount, app = "shovey", kind = "credit", amount = 40, source = "google_play", reference = "shovey-native-fixture"}
+    shared: signing.Event = .{account = LedgerFixtureAccount, kind = "credit", amount = 30, source = "admin", reference = "shared-native-fixture"}
+    if writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.inbe", google.app, google.amount) == "" ||
+        !Exec(database, "BEGIN IMMEDIATE") { return false }
+    defer writes.Rollback(database)
+    if Credit(database, signer, google).status == 200 ||
+        writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.inbe", google.app, google.amount) != "" ||
+        writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.inbe", google.app, google.amount) != "" ||
+        writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.other", google.app, google.amount) == "" ||
+        writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.inbe", other.app, google.amount) == "" ||
+        writes.BindGoogleOrigin(database, google.reference, StarsFixtureAccount, "xyz.waozi.inbe", google.app, google.amount) == "" ||
+        writes.BindGoogleOrigin(database, google.reference, google.account, "xyz.waozi.inbe", google.app, google.amount + 1) == "" ||
+        writes.BindGoogleOrigin(database, other.reference, other.account, "xyz.waozi.shovey", other.app, other.amount) != "" {
+        return false
+    }
+    first := Credit(database, signer, google)
+    alternate := Credit(database, signer, other)
+    general := Credit(database, signer, shared)
+    repeated := Credit(database, signer, google)
+    wrongTitle := google
+    wrongTitle.app = "shovey"
+    if first.status != 200 || !first.created || alternate.status != 200 || general.status != 200 ||
+        repeated.status != 200 || repeated.created || TextView(repeated.id[:]) != TextView(first.id[:]) ||
+        Credit(database, signer, wrongTitle).status == 200 || !Exec(database, "COMMIT") { return false }
+    firstID := TextView(first.id[:])
+    alternateID := TextView(alternate.id[:])
+    generalID := TextView(general.id[:])
+    if !ExpectLot(database, firstID, "inbe", 100) || !ExpectLot(database, alternateID, "shovey", 40) ||
+        !ExpectLot(database, generalID, "", 30) || !Exec(database, "BEGIN IMMEDIATE") { return false }
+    debit: signing.Event = .{account = LedgerFixtureAccount, app = "inbe", kind = "debit", amount = -100, source = "spend", reference = "fixture_spend"}
+    spent := writes.SpendEvent(database, signer, debit, LedgerFixtureTime, "google-fixture-spend")
+    if spent.status != 200 || !ExpectLot(database, firstID, "inbe", 0) || !Exec(database, "COMMIT") { return false }
+
+    debit.source = "google_play"
+    debit.reference = google.reference
+    debit.amount = -25
+    if !Exec(database, "BEGIN IMMEDIATE") ||
+        writes.RefundGooglePlay(database, signer, debit, LedgerFixtureTime, alternateID).status == 200 { return false }
+    writes.Rollback(database)
+    if !Exec(database, "CREATE TRIGGER fail_refund_audit BEFORE INSERT ON token_allocation_debits BEGIN SELECT RAISE(FAIL,'injected audit failure'); END") ||
+        !Exec(database, "BEGIN IMMEDIATE") || writes.RefundGooglePlay(database, signer, debit, LedgerFixtureTime, firstID).status == 200 { return false }
+    writes.Rollback(database)
+    if !ExpectLot(database, firstID, "inbe", 0) ||
+        !ExpectInteger(database, "SELECT COUNT(*) FROM token_ledger WHERE account_id=?1", LedgerFixtureAccount, 4) ||
+        !Exec(database, "DROP TRIGGER fail_refund_audit") || !Exec(database, "BEGIN IMMEDIATE") { return false }
+    part := writes.RefundGooglePlay(database, signer, debit, LedgerFixtureTime, firstID)
+    debit.amount = -75
+    rest := writes.RefundGooglePlay(database, signer, debit, LedgerFixtureTime, firstID)
+    if part.status != 200 || rest.status != 200 || !Exec(database, "COMMIT") { return false }
+    debit.amount = -1
+    if !Exec(database, "BEGIN IMMEDIATE") || writes.RefundGooglePlay(database, signer, debit, LedgerFixtureTime, firstID).status == 200 { return false }
+    writes.Rollback(database)
+    pools := ledger.ReadPools(database, LedgerFixtureAccount, "shovey")
+    return pools.ok && pools.shared == 30 && pools.spendable == 70 &&
+        ExpectLot(database, firstID, "inbe", -100) && ExpectLot(database, alternateID, "shovey", 40) &&
+        ExpectLot(database, generalID, "", 30) &&
+        ExpectInteger(database, "SELECT SUM(units) FROM token_allocation_debits WHERE credit_receipt_id=?1", firstID, 200) &&
+        ExpectInteger(database, "SELECT COUNT(*) FROM token_ledger WHERE account_id=?1", LedgerFixtureAccount, 6)
+}
+
+Stars :: (database: *void, signer: *issuer.Issuer) -> bool {
+    payment: signing.Event = .{account = StarsFixtureAccount, app = "inbe", kind = "credit", amount = 80, source = "telegram_stars", reference = "42:native-fixture"}
+    shared: signing.Event = .{account = StarsFixtureAccount, kind = "credit", amount = 30, source = "admin", reference = "stars-shared-fixture"}
+    spend: signing.Event = .{account = StarsFixtureAccount, app = "shovey", kind = "debit", amount = -80, source = "spend", reference = "fixture_spend"}
+    if !Exec(database, "BEGIN IMMEDIATE") { return false }
+    defer writes.Rollback(database)
+    paid := Credit(database, signer, payment)
+    general := Credit(database, signer, shared)
+    used := writes.SpendEvent(database, signer, spend, LedgerFixtureTime, "stars-fixture-spend")
+    if paid.status != 200 || general.status != 200 || used.status != 200 || !Exec(database, "COMMIT") { return false }
+    paidID := TextView(paid.id[:])
+    generalID := TextView(general.id[:])
+    if !ExpectLot(database, paidID, "", 0) || !ExpectLot(database, generalID, "", 30) || !Exec(database, "BEGIN IMMEDIATE") { return false }
+    wrong := payment
+    wrong.amount -= 1
+    if writes.RefundPayment(database, signer, payment.source, payment.reference, wrong, LedgerFixtureTime).status == 200 { return false }
+    refund := writes.RefundPayment(database, signer, payment.source, payment.reference, payment, LedgerFixtureTime)
+    replay := writes.RefundPayment(database, signer, payment.source, payment.reference, payment, LedgerFixtureTime)
+    wrong.app = "shovey"
+    wrong.amount = payment.amount
+    if refund.status != 200 || !refund.created || replay.status != 200 || replay.created || TextView(refund.id[:]) != TextView(replay.id[:]) ||
+        writes.RefundPayment(database, signer, payment.source, payment.reference, wrong, LedgerFixtureTime).status == 200 ||
+        !Exec(database, "COMMIT") { return false }
+    pools := ledger.ReadPools(database, StarsFixtureAccount, "inbe")
+    return pools.ok && pools.shared == -50 && pools.spendable == 0 && ExpectLot(database, paidID, "", -80) &&
+        ExpectLot(database, generalID, "", 30) &&
+        ExpectInteger(database, "SELECT SUM(units) FROM token_allocation_debits WHERE credit_receipt_id=?1", paidID, 160) &&
+        ExpectInteger(database, "SELECT COUNT(*) FROM token_ledger WHERE account_id=?1", StarsFixtureAccount, 4)
+}
+
+HistoricalGoogle :: (database: *void, signer: *issuer.Issuer) -> bool {
+    credit: signing.Event = .{account = StarsFixtureAccount, app = "inbe", kind = "credit", amount = 90, source = "google_play", reference = "package:product:order"}
+    if !Exec(database, "BEGIN IMMEDIATE") ||
+        writes.BindGoogleOrigin(database, credit.reference, credit.account, "xyz.waozi.inbe", credit.app, credit.amount) != "" { return false }
+    defer writes.Rollback(database)
+    paid := Credit(database, signer, credit)
+    if paid.status != 200 || !Exec(database, "UPDATE token_allocation_migration SET historical_ledger_seq=(SELECT MAX(ledger_seq) FROM token_ledger)") ||
+        !Exec(database, "DELETE FROM token_allocations WHERE provider_payment_id='package:product:order'") ||
+        !Exec(database, "DELETE FROM token_google_origins WHERE payment_id='package:product:order'") || !Exec(database, "COMMIT") { return false }
+    credit.kind = "debit"
+    credit.amount = -90
+    if !Exec(database, "BEGIN IMMEDIATE") { return false }
+    refund := writes.RefundGooglePlay(database, signer, credit, LedgerFixtureTime, TextView(paid.id[:]))
+    return refund.status == 200 && Exec(database, "COMMIT") &&
+        ExpectInteger(database, "SELECT units FROM token_allocation_debits WHERE debit_receipt_id=?1 AND credit_receipt_id=''", TextView(refund.id[:]), 90)
+}
+
+Failure :: (name: string) -> s32 {
+    unused stdio.PrintError(name)
+    unused stdio.PrintError("\n")
+    return 1
+}
+
+#scope_export
+Main :: () -> s32 {
+    opened := schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return Failure("open SQLite") }
+    defer sqlite.SqliteClose(opened.database)
+    if startup.InitializeFeatures(opened.database) != sqlite.SQLITE_OK { return Failure("initialize SQLite features") }
+    signer: issuer.Issuer
+    seed: [32]u8
+    empty: []u8
+    if !issuer.Open(*signer, empty, seed[:]) { return Failure("load fixture issuer") }
+    defer issuer.Close(*signer)
+    if !Google(opened.database, *signer) { return Failure("Google Play scoped credit, refund and rollback") }
+    if !Stars(opened.database, *signer) { return Failure("Telegram Stars shared refund and replay") }
+    if !HistoricalGoogle(opened.database, *signer) { return Failure("historical Google Play shared refund") }
+    unused stdio.WriteOutput("Native payment ledger tests passed\n")
+    return 0
+}

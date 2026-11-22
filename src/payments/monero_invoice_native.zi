@@ -1,0 +1,177 @@
+#if TARGET == .C && OS == .LINUX {
+    wallet :: #import "monero_wallet_native";
+    rpc :: #import "monero_rpc_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    issuer :: #import "token_issuer_native";
+    signing :: #import "token_signing_native";
+    ledger :: #import "token_ledger_native";
+    writes :: #import "token_writes_native";
+    timestamp :: #import "timestamp_value";
+    numbers :: #import "std/number_text";
+    parser :: #import "token_payload";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Invoice :: struct {
+        id: Text
+        app: Text
+        product: Text
+        asset: Text
+        state: Text
+        address: Text
+        expires: Text
+        payment: Text
+        receipt: Text
+        atomic: s64
+        tokens: s64
+        index: s64
+        found: bool
+        corrupt: bool
+    }
+
+    Product :: struct { atomic: s64; tokens: s64; }
+
+    #scope_file
+    InvoiceSQL :: #string SQL
+SELECT id,app_id,status,product_id,asset_id,token_units,provider_amount,provider_address,provider_ref,provider_payment_id,expires_at,receipt_id
+FROM token_payment_intents
+WHERE account_id=?1 AND id=?2 AND provider='monero'
+SQL;
+    InsertSQL :: #string SQL
+INSERT INTO token_payment_intents(id,provider,account_id,app_id,product_id,asset_id,token_units,
+    provider_amount,provider_address,provider_ref,status,expires_at)
+SELECT ?1,'monero',?2,?3,?4,?5,?6,?7,?8,?9,'pending',?10
+WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?2)
+AND NOT EXISTS(SELECT 1 FROM monero_account_addresses WHERE address=?8 OR address_index=CAST(?9 AS INTEGER))
+AND NOT EXISTS(SELECT 1 FROM token_payment_intents WHERE provider='monero' AND (provider_address=?8 OR provider_ref=?9))
+SQL;
+    ClaimSQL :: #string SQL
+UPDATE token_payment_intents SET status='paid',provider_payment_id=?3,updated_at=CURRENT_TIMESTAMP
+WHERE account_id=?1 AND id=?2 AND provider='monero' AND status=?4 AND receipt_id=''
+SQL;
+    BindReceiptSQL :: #string SQL
+UPDATE token_payment_intents SET receipt_id=?4
+WHERE account_id=?1 AND id=?2 AND provider='monero' AND status='paid' AND provider_payment_id=?3 AND receipt_id=''
+SQL;
+    ExpireSQL :: #string SQL
+UPDATE token_payment_intents SET status='expired',updated_at=CURRENT_TIMESTAMP
+WHERE account_id=?1 AND id=?2 AND provider='monero' AND status='pending' AND receipt_id=''
+SQL;
+
+    TextIs :: (document: *json.JsonDocument, root: s32, key: string, expected: string) -> bool {
+        actual: Text = json.JsonString(document, json.JsonMember(document, root, key))
+        return TextView(actual) == expected
+    }
+
+    #scope_export
+    FindProduct :: (catalog: []u8, product: string) -> Product {
+        parsed: json.JsonDocument
+        if !json.JsonRead(*parsed, TextView(catalog)) { return .{} }
+        products := json.JsonMember(*parsed, parsed.root, "products")
+        item := json.JsonFirst(*parsed, products)
+        while item >= 0 {
+            if TextIs(*parsed, item, "product_id", product) {
+                atomic, validAtomic := json.JsonInteger(*parsed, json.JsonMember(*parsed, item, "monero_atomic_amount"))
+                tokens, validTokens := json.JsonInteger(*parsed, json.JsonMember(*parsed, item, "token_units"))
+                if validAtomic && validTokens && atomic > 0 && tokens > 0 { return .{atomic = atomic, tokens = tokens} }
+                break
+            }
+            item = json.JsonNext(*parsed, item)
+        }
+        return .{}
+    }
+
+    Load :: (database: *void, account: string, id: string) -> Invoice {
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(id)]
+        query := sql.Prepare(database, InvoiceSQL, args[:])
+        if query.status != sqlite.SQLITE_OK { return .{corrupt = true} }
+        defer sqlite.SqliteFinalize(query.value)
+        row := sqlite.SqliteStep(query.value)
+        if row == sqlite.SQLITE_DONE { return .{} }
+        if row != sqlite.SQLITE_ROW { return .{corrupt = true} }
+        index := parser.ParseInteger(sql.ColumnText(query.value, 8))
+        if !index.is_ok || index.value < 0 { return .{corrupt = true} }
+        return .{id = TextCopy(sql.ColumnText(query.value, 0)), app = TextCopy(sql.ColumnText(query.value, 1)),
+            state = TextCopy(sql.ColumnText(query.value, 2)), product = TextCopy(sql.ColumnText(query.value, 3)),
+            asset = TextCopy(sql.ColumnText(query.value, 4)), tokens = sqlite.SqliteColumnInt64(query.value, 5),
+            atomic = sqlite.SqliteColumnInt64(query.value, 6), address = TextCopy(sql.ColumnText(query.value, 7)),
+            index = index.value, payment = TextCopy(sql.ColumnText(query.value, 9)), expires = TextCopy(sql.ColumnText(query.value, 10)),
+            receipt = TextCopy(sql.ColumnText(query.value, 11)), found = true}
+    }
+
+    Write :: (database: *void, account: string, invoice: *Invoice, document: *json.JsonDocument) -> s32 {
+        root := json.JsonNewObject(document)
+        if !ledger.PutText(document, root, "id", TextView(invoice.id)) || !ledger.PutText(document, root, "app_id", TextView(invoice.app), true) ||
+            !ledger.PutText(document, root, "status", TextView(invoice.state)) || !ledger.PutText(document, root, "product_id", TextView(invoice.product)) ||
+            !ledger.PutText(document, root, "asset_id", TextView(invoice.asset)) || !ledger.PutInt(document, root, "token_units", invoice.tokens) ||
+            !ledger.PutInt(document, root, "atomic_amount", invoice.atomic) || !ledger.PutText(document, root, "address", TextView(invoice.address)) ||
+            !ledger.PutInt(document, root, "address_index", invoice.index, true) || !ledger.PutText(document, root, "payment_id", TextView(invoice.payment), true) ||
+            !ledger.PutText(document, root, "expires_at", TextView(invoice.expires)) { return -1 }
+        receiptID := TextView(invoice.receipt)
+        if receiptID != "" {
+            receipt := ledger.Receipt(database, receiptID, document)
+            if receipt.status != 200 || !TextIs(document, receipt.node, "account_id", account) ||
+                !json.JsonSet(document, root, "receipt", receipt.node) { return -1 }
+        }
+        return root
+    }
+
+    Insert :: (database: *void, account: string, id: string, app: string, product: string, price: Product,
+        address: *wallet.Allocation) -> bool {
+        now := signing.Now()
+        if !now.valid || now.seconds > wallet.MaximumInteger - 2700 { return false }
+        now.seconds += 2700
+        time: [31]u8
+        expiry := signing.WireTime(now, true, time[:])
+        if expiry == "" { return false }
+        digits: [24]u8
+        args: [10]sql.Argument = .[sql.TextArg(id), sql.TextArg(account), sql.TextArg(app), sql.TextArg(product),
+            sql.TextArg(ledger.AssetID), sql.IntArg(price.tokens), sql.IntArg(price.atomic), sql.TextArg(TextView(address.address)),
+            sql.TextArg(numbers.FormatInteger(address.index, digits[:])), sql.TextArg(expiry)]
+        return sql.Execute(database, InsertSQL, args[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    // Apply a completely confirmed wallet proof and its ledger credit as one unit.
+    Credit :: (database: *void, configuration: wallet.Configuration, account: string, invoice: *Invoice, payment: string, now: timestamp.TimestampValue) -> bool {
+        if payment == "" || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        id := TextView(invoice.id)
+        expected := TextView(invoice.state)
+        if expected != "pending" && expected != "expired" { return false }
+        claim: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(payment), sql.TextArg(expected)]
+        if sql.Execute(database, ClaimSQL, claim[:]) != sqlite.SQLITE_OK { return false }
+        if sqlite.SqliteChanges(database) == 0 { return true }
+        text: [31]u8
+        at := signing.WireTime(now, false, text[:])
+        if at == "" { return false }
+        credit := writes.CreditPayment(database, configuration.signer, "monero", payment, .{account = account,
+            app = TextView(invoice.app), kind = "credit", amount = invoice.tokens, source = "monero", reference = payment}, at)
+        if credit.status != 200 { return false }
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(payment), sql.TextArg(TextView(credit.id[:]))]
+        if sql.Execute(database, BindReceiptSQL, args[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 { return false }
+        return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    // Keep the shared connection unlocked while waiting for wallet RPC.
+    Reconcile :: (database: *void, databaseLock: *mutex.Mutex, configuration: wallet.Configuration,
+        account: string, invoice: *Invoice, cancel: rpc.Cancellation, partial: *bool) -> bool {
+        if configuration.signer == null || issuer.Status(configuration.signer) != "ok" { return false }
+        proof := wallet.InspectInvoice(configuration, invoice.index, cancel)
+        if !proof.ok || rpc.Cancelled(cancel) { return false }
+        now := signing.Now()
+        expiry := timestamp.Parse(TextView(invoice.expires))
+        expired := expiry.valid && now.valid && (now.seconds > expiry.seconds ||
+            (now.seconds == expiry.seconds && now.nanoseconds > expiry.nanoseconds))
+        paid := invoice.atomic > 0 && proof.confirmed >= invoice.atomic
+        if partial != null { <<partial = !paid && proof.seen > 0 }
+        if !paid && (!expired || TextView(invoice.state) != "pending") { return true }
+        if !mutex.Lock(databaseLock) { return false }
+        defer mutex.Unlock(databaseLock)
+        if rpc.Cancelled(cancel) { return false }
+        if paid { return Credit(database, configuration, account, invoice, TextView(proof.payment), now) }
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(invoice.id))]
+        return sql.Execute(database, ExpireSQL, args[:]) == sqlite.SQLITE_OK
+    }
+}

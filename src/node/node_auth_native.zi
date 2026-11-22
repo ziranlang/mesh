@@ -1,0 +1,152 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    keys :: #import "device_signature_native";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    memory :: #import "std/byte_text_linux";
+    numbers :: #import "std/number_text";
+    policy :: #import "mesh_policy_native";
+    schema :: #import "trust_schema";
+    secure :: #import "std/constant_time";
+    sha :: #import "crypto/sha256";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Authorization :: struct {
+        nodeID: string
+        status: u32
+        error: string
+    }
+
+    CheckPolicy :: (database: *void, id: string, requested: *json.JsonDocument, filters: s32, exporting: bool) -> Authorization {
+        arguments: [1]sql.Argument = .[sql.TextArg(id)]
+        row := sql.Prepare(database, schema.PeerPolicyQuery, arguments[:])
+        failure: Authorization = .{status = 500, error = "peer policy lookup failed"}
+        denied: Authorization = .{status = 403, error = "requested mesh policy exceeds paired scope"}
+        if row.status != sqlite.SQLITE_OK { return failure }
+        defer sqlite.SqliteFinalize(row.value)
+        selected := sqlite.SqliteStep(row.value)
+        if selected == sqlite.SQLITE_DONE { return denied }
+        if selected != sqlite.SQLITE_ROW { return failure }
+        raw: json.JsonDocument
+        approved: json.JsonDocument
+        if !json.JsonRead(*raw, sql.ColumnText(row.value, 0)) { return failure }
+        root := policy.Policy(*approved, *raw, raw.root)
+        if root < 0 { return failure }
+        if !policy.ValidInbound(*approved, root) ||
+            !policy.AllowsOperation(*approved, root, requested, filters, exporting) { return denied }
+        return .{}
+    }
+
+    RequestMessage :: (node: string, timestamp: string, nonce: string, path: string, body: []u8, message: *Vec(u8)) -> bool {
+        digest := sha.Sha256Of(TextView(body))
+        hash: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *hash[0], hash.count) != 1 { return false }
+        parts: [7]string = .["daochi-node-request-v1", node, timestamp, nonce, "POST", path, TextView(hash[:64])]
+        for part: parts {
+            if !BuilderAppend(<<message, part) || !BuilderAppend(<<message, "\n") { return false }
+        }
+        return true
+    }
+
+    #scope_file
+    WindowSeconds :: 300;
+    StoreFailure :: "node authentication unavailable";
+
+    Token :: struct {
+        node: string
+        secret: string
+    }
+
+    TokenParts :: (value: string) -> Token {
+        cut := wire.Cut(wire.TrimSpace(value), 58)
+        if !cut.found { return .{} }
+        id := wire.TrimSpace(cut.before)
+        secret := wire.TrimSpace(cut.after)
+        if secret == "" || !identity.ValidUserID(id) { return .{} }
+        return .{node = id, secret = secret}
+    }
+
+    Header :: (connection: *void, name: string, legacy: string) -> string {
+        value := transport.Header(connection, name)
+        return ifx value == "" then transport.Header(connection, legacy) else value
+    }
+
+    TokenAuthorization :: (connection: *void, configured: string, lanOnly: bool) -> Authorization {
+        if lanOnly { return .{status = 401, error = "LAN mesh requires signed peer identity"} }
+        if wire.TrimSpace(configured) == "" { return .{status = 503, error = "node sync disabled"} }
+        expected := TokenParts(configured)
+        if expected.node == "" { return .{status = 503, error = "identity-bound node token required"} }
+        raw := wire.TrimSpace(Header(connection, "X-Mesh-Node-Token", "X-Ksync-Node-Token"))
+        if raw == "" {
+            authorization := wire.TrimSpace(transport.Header(connection, "Authorization"))
+            cut := wire.Cut(authorization, 32)
+            if cut.found && wire.MatchesToken(cut.before, "bearer") { raw = cut.after }
+        }
+        candidate := TokenParts(raw)
+        if candidate.node == "" || !secure.ConstantTimeTextEqual(expected.node, candidate.node) ||
+            !secure.ConstantTimeTextEqual(expected.secret, candidate.secret) {
+            return .{status = 401, error = "invalid node token"}
+        }
+        return .{nodeID = candidate.node}
+    }
+
+    Verify :: (database: *void, node: string, message: []u8, signature: []u8) -> string {
+        args: [1]sql.Argument = .[sql.TextArg(node)]
+        row := sql.Prepare(database, schema.PeerKeyQuery, args[:])
+        if row.status != sqlite.SQLITE_OK { return StoreFailure }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return "node is not paired" }
+        if status != sqlite.SQLITE_ROW { return StoreFailure }
+        pointer := sqlite.SqliteColumnBlob(row.value, 0)
+        if pointer == null || sqlite.SqliteColumnBytes(row.value, 0) != 32 { return "stored peer key is invalid" }
+        key := memory.BytesFromPointer(cast(*u8)pointer, 32)
+        return ifx keys.Verify(key, message, signature) then "" else "invalid node signature"
+    }
+
+    Signed :: (database: *void, connection: *void, node: string, path: string, body: []u8, now: s64) -> Authorization {
+        nonce := wire.TrimSpace(Header(connection, "X-Mesh-Node-Nonce", "X-Daochi-Node-Nonce"))
+        if !identity.ValidUserID(node) || nonce == "" || nonce.count > 128 { return .{status = 401, error = "invalid node authentication"} }
+        timestampText := wire.TrimSpace(Header(connection, "X-Mesh-Node-Time", "X-Daochi-Node-Time"))
+        timestamp, read := numbers.IntegerPrefix(timestampText)
+        if read == 0 || read != timestampText.count { return .{status = 401, error = "invalid node authentication time"} }
+        if timestamp < now - WindowSeconds || timestamp > now + WindowSeconds {
+            return .{status = 401, error = "expired node authentication"}
+        }
+        signature := binary.DecodeBase64(Header(connection, "X-Mesh-Node-Signature", "X-Daochi-Node-Signature"), true, false)
+        if signature.error != "" || signature.value.count != 64 { return .{status = 401, error = "invalid node signature"} }
+        message: Vec(u8)
+        if !RequestMessage(node, timestampText, nonce, path, body, *message) {
+            return .{status = 500, error = StoreFailure}
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return .{status = 500, error = StoreFailure} }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        problem := Verify(database, node, VecSlice(message, 0, message.count),
+            VecSlice(signature.value, 0, signature.value.count))
+        if problem != "" { return .{status = 401, error = problem} }
+        expire: [1]sql.Argument = .[sql.IntArg(now)]
+        insert: [3]sql.Argument = .[sql.TextArg(node), sql.TextArg(nonce), sql.IntArg(timestamp + WindowSeconds)]
+        if sql.Execute(database, schema.ExpireNoncesSQL, expire[:]) != sqlite.SQLITE_OK { return .{status = 500, error = StoreFailure} }
+        written := sql.Execute(database, schema.InsertNonceSQL, insert[:])
+        if written != sqlite.SQLITE_OK { return .{status = 500, error = StoreFailure} }
+        if sqlite.SqliteChanges(database) != 1 { return .{status = 401, error = "node request replayed"} }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{status = 500, error = StoreFailure}
+        }
+        return .{nodeID = node}
+    }
+
+    #scope_export
+    Authorize :: (database: *void, connection: *void, path: string, body: []u8, token: string,
+        lanOnly: bool, now: s64) -> Authorization {
+        node := wire.TrimSpace(Header(connection, "X-Mesh-Node-ID", "X-Daochi-Node-ID"))
+        if node == "" { return TokenAuthorization(connection, token, lanOnly) }
+        return Signed(database, connection, node, path, body, now)
+    }
+}

@@ -14,6 +14,7 @@ signing :: #import "signing";
 identity :: #import "identity";
 node :: #import "node_identity";
 policy :: #import "mesh_policy";
+schema :: #import "trust_schema";
 #import "std/map_go"
 go_sql :: #system_library "go:database/sql";
 go_hex :: #system_library "go:encoding/hex";
@@ -118,7 +119,7 @@ UpsertTrustedPeer :: (context: ctx.Context, transaction: *sql.Transaction, invit
     if policyJSON.error != null {
         return policyJSON.error
     }
-    written := UpsertPeer(transaction, context, UpsertPeerSQL, invite.NodeID, cast([]u8)publicKey,
+    written := UpsertPeer(transaction, context, schema.UpsertPeerSQL, invite.NodeID, cast([]u8)publicKey,
         invite.DisplayName, text.FromBytes(addresses.value), invite.SpaceID,
         text.FromBytes(policyJSON.value), time.CanonicalNow())
     return written.error
@@ -197,7 +198,7 @@ ImportNameClaim :: (context: ctx.Context, transaction: *sql.Transaction, claim: 
 
 #scope_export
 EnsureSchema :: (database: *sql.Database, context: ctx.Context) -> Error {
-    result := DatabaseExec(database, context, Schema)
+    result := DatabaseExec(database, context, schema.Schema)
     return result.error
 }
 
@@ -209,7 +210,7 @@ TrustPeer :: (database: *sql.Database, context: ctx.Context, invite: PairingInvi
     transaction := begun.value
     RollbackAtReturn(transaction)
     consumed: isize = 0
-    row := TransactionQueryOne(transaction, context, ConsumedInviteQuery, invite.InviteID)
+    row := TransactionQueryOne(transaction, context, schema.ConsumedInviteQuery, invite.InviteID)
     error := ScanInteger(row, *consumed)
     if error != null {
         return error
@@ -217,7 +218,7 @@ TrustPeer :: (database: *sql.Database, context: ctx.Context, invite: PairingInvi
     if consumed != 0 {
         return errors.New("pairing invite already consumed")
     }
-    inserted := TransactionExecTwo(transaction, context, ConsumeInviteSQL, invite.InviteID, time.CanonicalNow())
+    inserted := TransactionExecTwo(transaction, context, schema.ConsumeInviteSQL, invite.InviteID, time.CanonicalNow())
     if inserted.error != null {
         return inserted.error
     }
@@ -229,7 +230,7 @@ TrustPeer :: (database: *sql.Database, context: ctx.Context, invite: PairingInvi
 }
 
 RecordIssuedPairingInvite :: (database: *sql.Database, context: ctx.Context, invite: PairingInvite) -> Error {
-    written := IssueInvite(database, context, IssueInviteSQL, invite.InviteID,
+    written := IssueInvite(database, context, schema.IssueInviteSQL, invite.InviteID,
         invite.Signature, invite.ExpiresAt, time.CanonicalNow())
     return written.error
 }
@@ -244,7 +245,7 @@ CompleteIssuedPairing :: (database: *sql.Database, context: ctx.Context, invite:
     storedSignature := ""
     expiresAt: s64 = 0
     completedNodeID := ""
-    row := TransactionQueryOne(transaction, context, IssuedInviteQuery, invite.InviteID)
+    row := TransactionQueryOne(transaction, context, schema.IssuedInviteQuery, invite.InviteID)
     error := ScanIssuedInvite(row, *storedSignature, *expiresAt, *completedNodeID)
     if errors.Is(error, sql.NoRows()) {
         return errors.New("pairing invite was not issued by this node")
@@ -264,7 +265,7 @@ CompleteIssuedPairing :: (database: *sql.Database, context: ctx.Context, invite:
         }
         return errors.New("pairing invite already completed by another node")
     }
-    written := TransactionExecTwo(transaction, context, CompleteInviteSQL, acceptance.NodeID, invite.InviteID)
+    written := TransactionExecTwo(transaction, context, schema.CompleteInviteSQL, acceptance.NodeID, invite.InviteID)
     if written.error != null {
         return written.error
     }
@@ -292,7 +293,7 @@ CompleteIssuedPairing :: (database: *sql.Database, context: ctx.Context, invite:
 TrustedPeerPolicy :: (database: *sql.Database, context: ctx.Context, nodeID: string) -> PolicyResult {
     result: PolicyResult
     policyJSON := ""
-    row := DatabaseQueryOne(database, context, PolicyQuery, nodeID)
+    row := DatabaseQueryOne(database, context, schema.PeerPolicyQuery, nodeID)
     error := ScanString(row, *policyJSON)
     if errors.Is(error, sql.NoRows()) {
         return result
@@ -313,7 +314,7 @@ TrustedPeerPolicy :: (database: *sql.Database, context: ctx.Context, nodeID: str
 
 ListTrustedPeers :: (database: *sql.Database, context: ctx.Context) -> PeersResult {
     result: PeersResult
-    queried := DatabaseRows(database, context, ListPeersQuery)
+    queried := DatabaseRows(database, context, schema.ListPeersQuery)
     if queried.error != null {
         result.error = queried.error
         return result
@@ -355,7 +356,7 @@ CreateTrustSpace :: (database: *sql.Database, context: ctx.Context, displayName:
         return result
     }
     result.value = signing.SHA256Hex(cast([]u8)generated.publicKey)
-    written := CreateSpace(database, context, CreateSpaceSQL, result.value, displayName,
+    written := CreateSpace(database, context, schema.CreateSpaceSQL, result.value, displayName,
         cast([]u8)generated.publicKey, cast([]u8)generated.privateKey, time.CanonicalNow())
     result.error = written.error
     return result
@@ -365,7 +366,7 @@ SignAndStoreNameClaim :: (database: *sql.Database, context: ctx.Context, claim: 
     result: ClaimResult
     result.value = claim
     privateKey: []u8
-    row := DatabaseQueryOne(database, context, PrivateAuthorityQuery, claim.SpaceID)
+    row := DatabaseQueryOne(database, context, schema.PrivateAuthorityQuery, claim.SpaceID)
     result.error = ScanBytes(row, *privateKey)
     if result.error != null {
         return result
@@ -375,7 +376,7 @@ SignAndStoreNameClaim :: (database: *sql.Database, context: ctx.Context, claim: 
         return result
     }
     currentSequence: s64 = 0
-    current := DatabaseQueryTwo(database, context, CurrentSequenceQuery, claim.SpaceID, claim.Name)
+    current := DatabaseQueryTwo(database, context, schema.CurrentSequenceQuery, claim.SpaceID, claim.Name)
     error := ScanSequence(current, *currentSequence)
     if error != null && !errors.Is(error, sql.NoRows()) {
         result.error = error
@@ -391,7 +392,7 @@ SignAndStoreNameClaim :: (database: *sql.Database, context: ctx.Context, claim: 
     signature := keys.Sign(cast(keys.PrivateKey)privateKey, node.NameClaimMessage(result.value))
     encoded := codec.EncodeBase64(text.FromBytes(signature), true, false)
     result.value.Signature = encoded.value
-    written := StoreClaim(database, context, StoreClaimSQL, claim.SpaceID, claim.Name, claim.NodeID,
+    written := StoreClaim(database, context, schema.StoreClaimSQL, claim.SpaceID, claim.Name, claim.NodeID,
         result.value.Sequence, claim.ExpiresAt, text.FromBytes(services.value), result.value.Signature, time.CanonicalNow())
     result.error = written.error
     return result
@@ -400,7 +401,7 @@ SignAndStoreNameClaim :: (database: *sql.Database, context: ctx.Context, claim: 
 ResolveNameClaim :: (database: *sql.Database, context: ctx.Context, spaceID: string, name: string) -> ClaimResult {
     result: ClaimResult
     servicesJSON := ""
-    row := DatabaseQueryTwo(database, context, ResolveClaimQuery, spaceID, name)
+    row := DatabaseQueryTwo(database, context, schema.ResolveClaimQuery, spaceID, name)
     error := ScanClaim(row, *result.value.SpaceID, *result.value.Name, *result.value.NodeID,
         *result.value.Sequence, *result.value.ExpiresAt, *servicesJSON, *result.value.Signature)
     if errors.Is(error, sql.NoRows()) {
@@ -419,7 +420,7 @@ ResolveNameClaim :: (database: *sql.Database, context: ctx.Context, spaceID: str
         return result
     }
     publicKey: []u8
-    authority := DatabaseQueryOne(database, context, PublicAuthorityQuery, spaceID)
+    authority := DatabaseQueryOne(database, context, schema.PublicAuthorityQuery, spaceID)
     result.error = ScanBytes(authority, *publicKey)
     if result.error != null {
         return result
@@ -444,7 +445,7 @@ ExportMeshNames :: (database: *sql.Database, context: ctx.Context, meshPolicy: N
     for spaceID: meshPolicy.Spaces {
         space: MeshTrustSpace
         publicKey: []u8
-        row := DatabaseQueryOne(database, context, ExportSpaceQuery, spaceID)
+        row := DatabaseQueryOne(database, context, schema.ExportSpaceQuery, spaceID)
         error := ScanSpace(row, *space.SpaceID, *space.DisplayName, *publicKey)
         if errors.Is(error, sql.NoRows()) {
             continue
@@ -455,7 +456,7 @@ ExportMeshNames :: (database: *sql.Database, context: ctx.Context, meshPolicy: N
         }
         space.AuthorityPublicKey = EncodeHex(publicKey)
         spaces = AppendSpace(spaces, space)
-        queried := DatabaseRowsOne(database, context, ExportNamesQuery, spaceID)
+        queried := DatabaseRowsOne(database, context, schema.ExportNamesQuery, spaceID)
         if queried.error != null {
             result.error = queried.error
             return result
@@ -562,155 +563,6 @@ ValidateServices :: (services: []ServiceRecord) -> Error {
 }
 
 #scope_file
-Schema :: #string SQL_END
-
-CREATE TABLE IF NOT EXISTS trusted_node_peers (
-    node_id TEXT PRIMARY KEY,
-    public_key BLOB NOT NULL,
-    display_name TEXT NOT NULL DEFAULT '',
-    addresses_json TEXT NOT NULL DEFAULT '[]',
-    space_id TEXT NOT NULL DEFAULT '',
-    policy_json TEXT NOT NULL DEFAULT '{}',
-    trusted_at TEXT NOT NULL,
-    revoked_at TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS consumed_pairing_invites (
-    invite_id TEXT PRIMARY KEY,
-    consumed_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS issued_pairing_invites (
-    invite_id TEXT PRIMARY KEY,
-    signature TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    completed_node_id TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS node_request_nonces (
-    node_id TEXT NOT NULL,
-    nonce TEXT NOT NULL,
-    expires_at INTEGER NOT NULL,
-    PRIMARY KEY(node_id, nonce)
-);
-CREATE TABLE IF NOT EXISTS trust_spaces (
-    space_id TEXT PRIMARY KEY,
-    display_name TEXT NOT NULL,
-    authority_public_key BLOB NOT NULL,
-    authority_private_key BLOB NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS name_claims (
-    space_id TEXT NOT NULL,
-    name TEXT NOT NULL,
-    node_id TEXT NOT NULL,
-    sequence INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    services_json TEXT NOT NULL DEFAULT '[]',
-    signature TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY(space_id, name)
-);
-CREATE INDEX IF NOT EXISTS node_request_nonces_expiry
-    ON node_request_nonces(expires_at);
-SQL_END;
-
-ConsumedInviteQuery :: "SELECT EXISTS(SELECT 1 FROM consumed_pairing_invites WHERE invite_id=?1)";
-ConsumeInviteSQL :: "INSERT INTO consumed_pairing_invites(invite_id,consumed_at) VALUES(?1,?2)";
-UpsertPeerSQL :: #string SQL_END
-
-INSERT INTO trusted_node_peers(
-    node_id,public_key,display_name,addresses_json,space_id,policy_json,trusted_at
-) VALUES(?1,?2,?3,?4,?5,?6,?7)
-ON CONFLICT(node_id) DO UPDATE SET
-    public_key=excluded.public_key,
-    display_name=excluded.display_name,
-    addresses_json=excluded.addresses_json,
-    space_id=excluded.space_id,
-    policy_json=excluded.policy_json,
-    trusted_at=excluded.trusted_at,
-    revoked_at=''
-SQL_END;
-IssueInviteSQL :: #string SQL_END
-
-INSERT INTO issued_pairing_invites(invite_id,signature,expires_at,created_at)
-VALUES(?1,?2,?3,?4)
-SQL_END;
-IssuedInviteQuery :: #string SQL_END
-
-SELECT signature,expires_at,completed_node_id
-FROM issued_pairing_invites
-WHERE invite_id=?1
-SQL_END;
-CompleteInviteSQL :: #string SQL_END
-
-UPDATE issued_pairing_invites
-SET completed_node_id=?1
-WHERE invite_id=?2 AND completed_node_id=''
-SQL_END;
-PolicyQuery :: #string SQL_END
-
-SELECT policy_json FROM trusted_node_peers
-WHERE node_id=?1 AND revoked_at=''
-SQL_END;
-ListPeersQuery :: #string SQL_END
-
-SELECT node_id,public_key,display_name,addresses_json,space_id,policy_json,trusted_at
-FROM trusted_node_peers
-WHERE revoked_at=''
-ORDER BY display_name,node_id
-SQL_END;
-CreateSpaceSQL :: #string SQL_END
-
-INSERT INTO trust_spaces(
-    space_id,display_name,authority_public_key,authority_private_key,created_at
-) VALUES(?1,?2,?3,?4,?5)
-SQL_END;
-PrivateAuthorityQuery :: #string SQL_END
-
-SELECT authority_private_key FROM trust_spaces
-WHERE space_id=?1
-SQL_END;
-CurrentSequenceQuery :: #string SQL_END
-
-SELECT sequence FROM name_claims
-WHERE space_id=?1 AND name=?2
-SQL_END;
-StoreClaimSQL :: #string SQL_END
-
-INSERT INTO name_claims(
-    space_id,name,node_id,sequence,expires_at,services_json,signature,updated_at
-) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-ON CONFLICT(space_id,name) DO UPDATE SET
-    node_id=excluded.node_id,
-    sequence=excluded.sequence,
-    expires_at=excluded.expires_at,
-    services_json=excluded.services_json,
-    signature=excluded.signature,
-    updated_at=excluded.updated_at
-SQL_END;
-ResolveClaimQuery :: #string SQL_END
-
-SELECT space_id,name,node_id,sequence,expires_at,services_json,signature
-FROM name_claims
-WHERE space_id=?1 AND name=?2
-SQL_END;
-PublicAuthorityQuery :: #string SQL_END
-
-SELECT authority_public_key FROM trust_spaces
-WHERE space_id=?1
-SQL_END;
-ExportSpaceQuery :: #string SQL_END
-
-SELECT space_id,display_name,authority_public_key
-FROM trust_spaces
-WHERE space_id=?1
-SQL_END;
-ExportNamesQuery :: #string SQL_END
-
-SELECT space_id,name,node_id,sequence,expires_at,services_json,signature
-FROM name_claims
-WHERE space_id=?1
-ORDER BY name
-SQL_END;
 ExistingAuthorityQuery :: #string SQL_END
 
 SELECT authority_public_key FROM trust_spaces

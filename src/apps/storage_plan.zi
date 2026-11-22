@@ -63,21 +63,6 @@ SnapshotTx :: (transaction: *sql.Transaction, context: ctx.Context, user: string
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS server_storage_plans (
- user_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- period TEXT NOT NULL CHECK(period IN ('monthly','yearly')), expires_at INTEGER NOT NULL,
- size TEXT NOT NULL DEFAULT '1gb'
-);
-CREATE TABLE IF NOT EXISTS server_storage_purchases (
- user_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- request_id TEXT NOT NULL, period TEXT NOT NULL, expires_at INTEGER NOT NULL,
- receipt_id TEXT NOT NULL, size TEXT NOT NULL DEFAULT '1gb', PRIMARY KEY(user_id,request_id)
-);
-SQL;
-}
-
 // The sizes a plan can buy. Zero for an unknown size.
 SizeBytes :: (size: string) -> s64 {
     if size == "1gb" {

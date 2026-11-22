@@ -1,0 +1,306 @@
+#if TARGET == .C && OS == .LINUX {
+    canonical :: #import "canonical_json_native";
+    binary :: #import "binary_codec";
+    claim :: #import "name_claim_native";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    keys :: #import "device_signature_native";
+    oqs :: #import "oqs/Oqs";
+    policy :: #import "mesh_policy_native";
+    random :: #import "std/random_linux";
+    rules :: #import "name_rules";
+    schema :: #import "trust_schema";
+    secure :: #import "std/constant_time";
+    sha :: #import "crypto/sha256";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    #import "std/vec"
+
+    Result :: struct {
+        node: s32
+        expiry: s64
+        failed: bool
+    }
+
+    ClaimRow :: struct {
+        node: s32
+        services: s32
+        expiry: s64
+    }
+
+    ImportResult :: struct {
+        applied: s64
+        error: string
+    }
+
+    #scope_file
+    WriteFailed :: "name claim could not be stored";
+
+    ID :: (public: []u8, output: []u8) -> bool {
+        digest := sha.Sha256Of(TextView(public))
+        return output.count == 65 && sha.BytesToHex(*digest[0], digest.count, *output[0], output.count) == 1
+    }
+
+    Timestamp :: (milliseconds: s64, output: []u8) -> s64 {
+        return format.UTC(.{seconds = milliseconds / 1000,
+            nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = milliseconds >= 0}, output)
+    }
+
+    ReadKey :: (database: *void, query: string, space: string, output: []u8) -> bool {
+        arguments: [1]sql.Argument = .[sql.TextArg(space)]
+        row := sql.Prepare(database, query, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW ||
+            sqlite.SqliteColumnBytes(row.value, 0) != output.count { return false }
+        bytes := cast(*u8)sqlite.SqliteColumnBlob(row.value, 0)
+        if bytes == null { return false }
+        for index: 0..output.count - 1 { output[index] = bytes[index] }
+        return true
+    }
+
+    ReadClaim :: (document: *json.JsonDocument, row: *void, snapshot: bool) -> ClaimRow {
+        failed: ClaimRow = .{node = -1}
+        source: json.JsonDocument
+        if !json.JsonRead(*source, sql.ColumnText(row, 5)) { return failed }
+        services := claim.ReadServices(document, *source, source.root, false)
+        if services.error != "" || services.node < 0 { return failed }
+        expiry := sqlite.SqliteColumnInt64(row, 4)
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "version", json.JsonNewInteger(document, 1)) ||
+            !fields.SetString(document, root, "space_id", sql.ColumnText(row, 0)) ||
+            !fields.SetString(document, root, "name", sql.ColumnText(row, 1)) ||
+            !fields.SetString(document, root, "node_id", sql.ColumnText(row, 2)) ||
+            !json.JsonSet(document, root, "sequence", json.JsonNewInteger(document, sqlite.SqliteColumnInt64(row, 3))) ||
+            !json.JsonSet(document, root, "expires_at", json.JsonNewInteger(document, expiry)) ||
+            !fields.SetString(document, root, "signature", sql.ColumnText(row, 6)) { return failed }
+        // An explicitly empty list is signed as [] and an absent list as
+        // null. Preserve that distinction when replicating signed claims.
+        include := json.JsonCount(document, services.node) > 0 || (snapshot && json.JsonKindOf(document, services.node) == .Array)
+        if include && !json.JsonSet(document, root, "services", services.node) { return failed }
+        return .{node = root, services = services.node, expiry = expiry}
+    }
+
+    ExportNames :: (database: *void, document: *json.JsonDocument, arguments: []sql.Argument, names: s32) -> bool {
+        rows := sql.Prepare(database, schema.ExportNamesQuery, arguments)
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { return true }
+            if status != sqlite.SQLITE_ROW { return false }
+            name := ReadClaim(document, rows.value, true)
+            if name.node < 0 || !json.JsonAppend(document, names, name.node) { return false }
+        }
+        return false
+    }
+
+    ImportSpace :: (database: *void, input: *json.JsonDocument, nodes: []s32, id: string, now: string) -> string {
+        encoded: Text = json.JsonString(input, nodes[2])
+        raw := TextView(encoded)
+        if raw.count != 64 || !binary.IsHex(raw) { return "invalid mesh trust-space public key" }
+        decoded := binary.DecodeBinaryField(raw)
+        if decoded.error != "" || decoded.value.count != 32 { return "invalid mesh trust-space public key" }
+        public := VecSlice(decoded.value, 0, decoded.value.count)
+        keyID: [65]u8
+        if !ID(public, keyID[:]) || TextView(keyID[:64]) != id { return "mesh trust-space ID does not match authority key" }
+        display: Text = json.JsonString(input, nodes[1])
+        bindings: [4]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(display)), sql.BlobArg(public), sql.TextArg(now)]
+        if sql.Execute(database, schema.ImportSpaceSQL, bindings[:]) != sqlite.SQLITE_OK { return "mesh trust-space import failed" }
+        existing: [32]u8
+        if !ReadKey(database, schema.PublicAuthorityQuery, id, existing[:]) ||
+            !secure.ConstantTimeEqual(public, existing[:]) { return "trust-space authority fork detected" }
+        return ""
+    }
+
+    ImportClaim :: (database: *void, input: *json.JsonDocument, nodes: []s32, space: string, now: string) -> ImportResult {
+        name: Text = json.JsonString(input, nodes[2])
+        node: Text = json.JsonString(input, nodes[3])
+        signature: Text = json.JsonString(input, nodes[6])
+        sequence := fields.Number(input, nodes[4])
+        expiry := fields.Number(input, nodes[5])
+        if fields.Number(input, nodes[0]) != 1 || !identity.ValidUserID(space) ||
+            !identity.ValidUserID(TextView(node)) || !rules.Valid(TextView(name)) || sequence <= 0 {
+            return .{error = "invalid mesh name claim"}
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !fields.SetString(*document, root, "space_id", space) ||
+            !fields.SetString(*document, root, "name", TextView(name)) ||
+            !fields.SetString(*document, root, "node_id", TextView(node)) ||
+            !fields.SetString(*document, root, "signature", TextView(signature)) ||
+            !json.JsonSet(*document, root, "sequence", json.JsonNewInteger(*document, sequence)) ||
+            !json.JsonSet(*document, root, "expires_at", json.JsonNewInteger(*document, expiry)) {
+            return .{error = "mesh name import failed"}
+        }
+        services := claim.ReadServices(*document, input, nodes[7], true)
+        if services.error != "" { return .{error = services.error} }
+        encoded: Vec(u8)
+        public: [32]u8
+        id: [65]u8
+        if !ReadKey(database, schema.PublicAuthorityQuery, space, public[:]) ||
+            !ID(public[:], id[:]) || TextView(id[:64]) != space { return .{error = "mesh name claim has no trusted authority"} }
+        if !canonical.Encode(*document, services.node, *encoded) { return .{error = "mesh name import failed"} }
+        serviceJSON := TextView(VecSlice(encoded, 0, encoded.count))
+        if !claim.Verify(*document, root, serviceJSON, public[:]) { return .{error = "invalid mesh name claim signature"} }
+        lookup: [2]sql.Argument = .[sql.TextArg(space), sql.TextArg(TextView(name))]
+        previous := sql.Prepare(database, schema.ClaimHistoryQuery, lookup[:])
+        if previous.status != sqlite.SQLITE_OK { return .{error = "mesh name import failed"} }
+        {
+            defer sqlite.SqliteFinalize(previous.value)
+            found := sqlite.SqliteStep(previous.value)
+            if found == sqlite.SQLITE_ROW {
+                current := sqlite.SqliteColumnInt64(previous.value, 0)
+                if current > sequence { return .{} }
+                if current == sequence {
+                    if sql.ColumnText(previous.value, 1) == TextView(signature) { return .{} }
+                    return .{error = "namespace history fork detected"}
+                }
+            } else if found != sqlite.SQLITE_DONE { return .{error = "mesh name import failed"} }
+        }
+        args: [8]sql.Argument = .[lookup[0], lookup[1], sql.TextArg(TextView(node)), sql.IntArg(sequence),
+            sql.IntArg(expiry), sql.TextArg(serviceJSON), sql.TextArg(TextView(signature)), sql.TextArg(now)]
+        if sql.Execute(database, schema.StoreClaimSQL, args[:]) != sqlite.SQLITE_OK { return .{error = "mesh name import failed"} }
+        return .{applied = 1}
+    }
+
+    #scope_export
+    Create :: (database: *void, name: string, now: s64, id: []u8) -> bool {
+        private: [64]u8
+        defer oqs.Cleanse(private[:])
+        if !random.FillSecure(private[:32]) || !keys.DerivePublic(private[:32], private[32:]) ||
+            !ID(private[32:], id) { return false }
+        stamp: [40]u8
+        length := Timestamp(now, stamp[:])
+        if length <= 0 { return false }
+        bindings: [5]sql.Argument = .[sql.TextArg(TextView(id[:64])), sql.TextArg(name), sql.BlobArg(private[32:]),
+            sql.BlobArg(private[:]), sql.TextArg(TextView(stamp[:length]))]
+        return sql.Execute(database, schema.CreateSpaceSQL, bindings[:]) == sqlite.SQLITE_OK
+    }
+
+    Register :: (database: *void, document: *json.JsonDocument, root: s32, services: s32, now: s64) -> string {
+        spaceText: Text = fields.StringField(document, root, "space_id")
+        name: Text = fields.StringField(document, root, "name")
+        node: Text = fields.StringField(document, root, "node_id")
+        expiry := fields.Number(document, json.JsonMember(document, root, "expires_at"))
+        space := TextView(spaceText)
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return WriteFailed }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        private: [64]u8
+        defer oqs.Cleanse(private[:])
+        if !ReadKey(database, schema.PrivateAuthorityQuery, space, private[:]) {
+            return "namespace authority is not available on this node"
+        }
+        public: [32]u8
+        id: [65]u8
+        storedPublic: [32]u8
+        if !keys.DerivePublic(private[:32], public[:]) || !secure.ConstantTimeEqual(public[:], private[32:]) ||
+            !ReadKey(database, schema.PublicAuthorityQuery, space, storedPublic[:]) ||
+            !secure.ConstantTimeEqual(public[:], storedPublic[:]) || !ID(public[:], id[:]) || TextView(id[:64]) != space {
+            return "namespace authority is not available on this node"
+        }
+        lookup: [2]sql.Argument = .[sql.TextArg(space), sql.TextArg(TextView(name))]
+        current := sql.ReadInteger(database, schema.CurrentSequenceQuery, lookup[:])
+        if current.status != sqlite.SQLITE_OK || current.value < 0 || current.value == 9223372036854775807 { return WriteFailed }
+        sequence := current.value + 1
+        if !json.JsonSet(document, root, "sequence", json.JsonNewInteger(document, sequence)) { return WriteFailed }
+        encoded: Vec(u8)
+        if !canonical.Encode(document, services, *encoded) { return WriteFailed }
+        serviceJSON := TextView(VecSlice(encoded, 0, encoded.count))
+        if !claim.Sign(document, root, serviceJSON, private[:32]) { return WriteFailed }
+        signature: Text = fields.StringField(document, root, "signature")
+        stamp: [40]u8
+        length := Timestamp(now, stamp[:])
+        if length <= 0 { return WriteFailed }
+        args: [8]sql.Argument = .[lookup[0], lookup[1], sql.TextArg(TextView(node)), sql.IntArg(sequence),
+            sql.IntArg(expiry), sql.TextArg(serviceJSON), sql.TextArg(TextView(signature)), sql.TextArg(TextView(stamp[:length]))]
+        if sql.Execute(database, schema.StoreClaimSQL, args[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return WriteFailed }
+        return ""
+    }
+
+    Resolve :: (database: *void, document: *json.JsonDocument, space: string, name: string, now: s64) -> Result {
+        failed: Result = .{node = -1, failed = true}
+        args: [2]sql.Argument = .[sql.TextArg(space), sql.TextArg(name)]
+        row := sql.Prepare(database, schema.ResolveClaimQuery, args[:])
+        if row.status != sqlite.SQLITE_OK { return failed }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{node = -1} }
+        if status != sqlite.SQLITE_ROW { return failed }
+        found := ReadClaim(document, row.value, false)
+        if found.node < 0 { return failed }
+        if found.expiry <= now { return .{node = -1} }
+        public: [32]u8
+        id: [65]u8
+        encoded: Vec(u8)
+        if !ReadKey(database, schema.PublicAuthorityQuery, space, public[:]) ||
+            !ID(public[:], id[:]) || TextView(id[:64]) != space ||
+            !canonical.Encode(document, found.services, *encoded) ||
+            !claim.Verify(document, found.node, TextView(VecSlice(encoded, 0, encoded.count)), public[:]) { return failed }
+        return .{node = found.node, expiry = found.expiry}
+    }
+
+    Export :: (database: *void, document: *json.JsonDocument, spaces: s32, names: s32, id: string) -> bool {
+        args: [1]sql.Argument = .[sql.TextArg(id)]
+        row := sql.Prepare(database, schema.ExportSpaceQuery, args[:])
+        if row.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return true }
+        if status != sqlite.SQLITE_ROW { return false }
+        bytes := cast(*u8)sqlite.SqliteColumnBlob(row.value, 2)
+        key: [65]u8
+        if bytes == null || sqlite.SqliteColumnBytes(row.value, 2) != 32 ||
+            sha.BytesToHex(bytes, 32, *key[0], key.count) != 1 { return false }
+        space := json.JsonNewObject(document)
+        return fields.SetString(document, space, "space_id", sql.ColumnText(row.value, 0)) &&
+            fields.SetString(document, space, "display_name", sql.ColumnText(row.value, 1)) &&
+            fields.SetString(document, space, "authority_public_key", TextView(key[:64])) &&
+            json.JsonAppend(document, spaces, space) && ExportNames(database, document, args[:], names)
+    }
+
+    // The caller owns the transaction covering the incoming batch.
+    Import :: (database: *void, filter: *json.JsonDocument, root: s32, input: *json.JsonDocument,
+        spaces: s32, claims: s32, now: s64) -> ImportResult {
+        if !policy.Includes(filter, json.JsonMember(filter, root, "data"), "names", true) { return .{} }
+        authorized := json.JsonMember(filter, root, "spaces")
+        stamp: [40]u8
+        length := Timestamp(now, stamp[:])
+        if length == 0 { return .{error = "mesh name import failed"} }
+        current := TextView(stamp[:length])
+        applied: s64 = 0
+        spaceNames: [3]string = .["space_id", "display_name", "authority_public_key"]
+        spaceKinds: [3]json.JsonKind = .[.String, .String, .String]
+        item := json.JsonFirst(input, spaces)
+        while item >= 0 {
+            nodes: [3]s32
+            if !fields.Read(input, item, spaceNames[:], spaceKinds[:], nodes[:]) { return .{error = "invalid mesh trust space"} }
+            id: Text = json.JsonString(input, nodes[0])
+            if policy.Includes(filter, authorized, TextView(id), false) {
+                problem := ImportSpace(database, input, nodes[:], TextView(id), current)
+                if problem != "" { return .{error = problem} }
+            }
+            item = json.JsonNext(input, item)
+        }
+        claimNames: [8]string = .["version", "space_id", "name", "node_id", "sequence", "expires_at", "signature", "services"]
+        claimKinds: [8]json.JsonKind = .[.Number, .String, .String, .String, .Number, .Number, .String, .Array]
+        item = json.JsonFirst(input, claims)
+        while item >= 0 {
+            nodes: [8]s32
+            if !fields.Read(input, item, claimNames[:], claimKinds[:], nodes[:]) { return .{error = "invalid mesh name claim"} }
+            id: Text = json.JsonString(input, nodes[1])
+            if policy.Includes(filter, authorized, TextView(id), false) {
+                result := ImportClaim(database, input, nodes[:], TextView(id), current)
+                if result.error != "" { return result }
+                applied += result.applied
+            }
+            item = json.JsonNext(input, item)
+        }
+        return .{applied = applied}
+    }
+}

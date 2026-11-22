@@ -1,0 +1,345 @@
+codec :: #import "binary_codec";
+paths :: #import "path_name";
+encodings :: #import "encoding_preferences";
+identity :: #import "identity";
+tokens :: #import "token_payload";
+token_wire :: #import "token_wire";
+token_hmac :: #import "token_hmac_native";
+scope :: #import "scope";
+records :: #import "record_validation";
+frames :: #import "websocket_frame";
+handshake :: #import "websocket_handshake";
+schema :: #import "schema_sql";
+inspection :: #import "inspect_queries";
+storage_queries :: #import "storage_queries";
+inspect_text :: #import "inspect_text";
+network :: #import "network_address";
+habit :: #import "habit_id_text";
+ready :: #import "readiness";
+timestamp :: #import "timestamp_value";
+#import "protocol"
+#import "std/vec"
+
+#scope_file
+TokenWireChecks :: () -> bool {
+    key: [4]u8 = .[0, 255, 66, 35]
+    payload: [13]u8 = .[115, 105, 103, 110, 101, 100, 0, 116, 111, 107, 101, 110, 255]
+    signed := token_wire.Sign(key[:], TextView(payload[:]), token_hmac.Compute)
+    encoded := signed.value
+    token := TextView(VecSlice(encoded, 0, encoded.count))
+    if signed.error != "" || token != "c2lnbmVkAHRva2Vu_w.DJsLIfIoiZYkI4xNKi4pCrDLhUGzYujbU3dcNHdki6E" { return false }
+
+    verified := token_wire.Verify(key[:], token, token_hmac.Compute)
+    decoded := verified.value
+    if verified.error != "" || TextView(VecSlice(decoded, 0, decoded.count)) != TextView(payload[:]) { return false }
+    tampered := token_wire.Verify(key[:], "c2lnbmVkAHRva2Vu_w.AJsLIfIoiZYkI4xNKi4pCrDLhUGzYujbU3dcNHdki6E", token_hmac.Compute)
+    malformed := token_wire.Verify(key[:], "a.b.c", token_hmac.Compute)
+    return tampered.error == "invalid token signature" && malformed.error == "invalid token"
+}
+
+ExpectDecode :: (input: string, expected: string, error: string) -> bool {
+    decoded := codec.DecodeBinaryField(input)
+    problem := decoded.error
+    bytes := decoded.value
+    return problem == error && TextView(VecSlice(bytes, 0, bytes.count)) == expected
+}
+
+FrameRoundtrip :: (length: u64, expectedHeaderBytes: s64) -> bool {
+    encoded := frames.Encode(2, length)
+    prefix := frames.ReadPrefix(encoded.bytes[0], encoded.bytes[1], false)
+    header := frames.ReadLength(prefix, encoded.bytes[2:encoded.count])
+    return encoded.count == expectedHeaderBytes && header.error == "" &&
+        header.opcode == 2 && !header.masked && header.length == length
+}
+
+HeaderInput :: struct {
+    bytes: []u8
+    read: s64
+}
+
+ReadHeaderBytes :: (context: *void, output: []u8) -> bool {
+    source := cast(*HeaderInput)context
+    if output.count > source.bytes.count - source.read { return false }
+    for index: 0..output.count - 1 {
+        output[index] = source.bytes[source.read + index]
+    }
+    source.read += output.count
+    return true
+}
+
+HeaderReads :: () -> bool {
+    // A masked frame with a two-byte length, four-byte mask and payload.
+    wire: [9]u8 = .[129, 254, 0, 126, 11, 22, 33, 44, 55]
+    source: HeaderInput = .{bytes = wire[:]}
+    frame := frames.ReadFrameHeader(cast(*void)*source, ReadHeaderBytes, true)
+    if frame.readFailed || frame.header.error != "" || frame.header.length != 126 ||
+        frame.header.opcode != 1 || source.read != 8 || frame.mask[0] != 11 || frame.mask[3] != 44 {
+        return false
+    }
+    source = .{bytes = wire[:7]}
+    truncated := frames.ReadFrameHeader(cast(*void)*source, ReadHeaderBytes, true)
+    if !truncated.readFailed || source.read != 4 { return false }
+
+    wire[1] = 126
+    source = .{bytes = wire[:]}
+    rejected := frames.ReadFrameHeader(cast(*void)*source, ReadHeaderBytes, true)
+    return !rejected.readFailed && rejected.header.error == "websocket client frame not masked" && source.read == 2
+}
+
+StorageStatements :: () -> bool {
+    tables := schema.Tables()
+    upgrades := schema.Upgrades()
+    indexes := schema.Indexes()
+    summary := inspection.SummaryTables()
+    user := inspection.UserTables()
+    doctor := inspection.DoctorTables()
+    count := storage_queries.CountQuery(doctor[0], storage_queries.UserFilter)
+    line := inspect_text.CountLine(doctor[0], true, -9)
+    return tables[0].count > 0 && tables[8].count > 0 &&
+        upgrades[0].count > 0 && upgrades[37].count > 0 &&
+        indexes[0].count > 0 && indexes[17].count > 0 &&
+        summary[0] == "server_users" && summary[8] == "server_sync_audit" &&
+        user[5] == "server_encrypted_records" && doctor[8] == "server_sync_audit" &&
+        TextView(VecSlice(count, 0, count.count)) == "SELECT COUNT(*) FROM server_habits WHERE user_id_hash=?1" &&
+        TextView(VecSlice(line, 0, line.count)) == "server_habits                -9\n"
+}
+
+ReadinessChecks :: () -> bool {
+    input: ready.ReadinessInputs = .{
+        databaseAvailable = true, persistentTokenSecret = true, verifierAvailable = true,
+        issuerStatus = "read_only"
+    }
+    initial := ready.Evaluate(input)
+    if initial.status != 200 || initial.state != "ok" || initial.issuer != "read_only" ||
+        initial.directPurchases != "" { return false }
+    input.directPurchasesEnabled = true
+    if ready.Evaluate(input).directPurchases != "issuer_private_key_missing" { return false }
+    input.issuerStatus = "ok"
+    if ready.Evaluate(input).directPurchases != "monero_rate_or_product_missing" { return false }
+    input.moneroRateOrProduct = true
+    if ready.Evaluate(input).directPurchases != "monero_wallet_rpc_missing" { return false }
+    input.moneroWalletConfigured = true
+    if ready.Evaluate(input).status != 200 || ready.Evaluate(input).directPurchases != "ok" { return false }
+    input.databaseAvailable = false
+    input.persistentTokenSecret = false
+    input.verifierAvailable = false
+    failed := ready.Evaluate(input)
+    body := ready.Body(failed)
+    return failed.status == 503 && failed.state == "not_ready" && failed.database == "unavailable" &&
+        failed.tokenSecret == "ephemeral" && failed.verifier == "missing" && failed.directPurchases == "ok" &&
+        TextView(VecSlice(body, 0, body.count)) ==
+            "{\"checks\":{\"database\":\"unavailable\",\"token_direct_purchases\":\"ok\",\"token_issuer\":\"ok\",\"token_secret\":\"ephemeral\",\"verifier\":\"missing\"},\"status\":\"not_ready\"}\n"
+}
+
+#scope_export
+Main :: () -> s32 {
+    if !TokenWireChecks() { return 30 }
+    if encodings.Request("\u2003GZIP\t") != encodings.RequestCoding.Gzip ||
+        encodings.Request("ZsTd") != encodings.RequestCoding.Zstd ||
+        encodings.Request("IDENTITY") != encodings.RequestCoding.Identity ||
+        encodings.Request(" ") != encodings.RequestCoding.Identity ||
+        encodings.Request("zſtd") != encodings.RequestCoding.Unsupported ||
+        encodings.Request("gzip,zstd") != encodings.RequestCoding.Unsupported ||
+        encodings.Request("gzip;q=1") != encodings.RequestCoding.Unsupported { return 29 }
+    if !ReadinessChecks() { return 27 }
+    if !HeaderReads() { return 26 }
+    accepted := handshake.AcceptKey("dGhlIHNhbXBsZSBub25jZQ==")
+    if TextView(VecSlice(accepted, 0, accepted.count)) != "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" {
+        return 25
+    }
+    reply := handshake.UpgradeReply("dGhlIHNhbXBsZSBub25jZQ==", "inbe-sync-v1, mesh-sync-v1")
+    if TextView(VecSlice(reply, 0, reply.count)) !=
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Protocol: mesh-sync-v1\r\n\r\n" {
+        return 28
+    }
+    if !handshake.UpgradeRequested("Webſocket", "keep-alive,\u2003UPGRADE") ||
+        handshake.UpgradeRequested(" websocket", "upgrade") ||
+        handshake.UpgradeRequested("websocket", "upgraded") ||
+        handshake.SelectProtocol("inbe-sync-v1, \u2003mesh-sync-v1") != "mesh-sync-v1" ||
+        handshake.SelectProtocol("MESH-SYNC-V1, ksync-sync-v1") != "ksync-sync-v1" ||
+        handshake.BearerToken("Bearer.invalid, bearer., \u2003bearer.secret, bearer.later") != "secret" ||
+        !handshake.ValidKey("dGhlIHNhbXBs\r\nZSBub25jZQ==") ||
+        handshake.ValidKey("dGhlIHNhbXBsZSBub25jZQ") {
+        return 24
+    }
+    local: [16]u8 = .[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 169, 254, 0, 1]
+    private: [4]u8 = .[172, 31, 0, 1]
+    public: [4]u8 = .[172, 32, 0, 1]
+    ipv6: [16]u8
+    ipv6[15] = 1
+    if network.Classify(local[:]) != network.AddressClass.LinkLocal ||
+        network.Classify(private[:]) != network.AddressClass.Private ||
+        network.Classify(public[:]) != network.AddressClass.Other ||
+        network.Classify(ipv6[:]) != network.AddressClass.Loopback ||
+        network.Classify(local[:15]) != network.AddressClass.Other {
+        return 23
+    }
+    privateMask: [4]u8 = .[255, 240, 0, 0]
+    broadMask: [4]u8 = .[255, 224, 0, 0]
+    if !network.IsLocalRange(private[:], privateMask[:]) ||
+        network.IsLocalRange(private[:], broadMask[:]) ||
+        network.IsLocalRange(public[:], privateMask[:]) ||
+        network.IsLocalRange(private[:], privateMask[:3]) {
+        return 25
+    }
+    if !paths.Valid("shovey.classic") || !paths.Valid("release-v2.json") ||
+        paths.Valid("") || paths.Valid(".") || paths.Valid("..") || paths.Valid("a/../b") ||
+        paths.Valid("a\\b") || paths.Valid("a\0b") {
+        return 1
+    }
+
+    hex_bytes: [2]u8 = .[0, 255]
+    url_bytes: [2]u8 = .[251, 255]
+    invalid_utf8: [5]u8 = .[90, 109, 57, 118, 255]
+    if !ExpectDecode("\u2003\t00ff\u00a0", TextView(hex_bytes[:]), "") ||
+        !ExpectDecode("\u3000Z\r\ng==\u0085", "f", "") ||
+        !ExpectDecode("-_8=", TextView(url_bytes[:]), "") ||
+        !ExpectDecode("\u2029\u202f", "", "empty binary field") ||
+        !ExpectDecode("Zm9v\u200b", "", "field is neither hex nor base64") ||
+        !ExpectDecode(TextView(invalid_utf8[:]), "", "field is neither hex nor base64") ||
+        !ExpectDecode("Zm9vZ===", "", "field is neither hex nor base64") {
+        return 2
+    }
+
+    encoded := codec.EncodeBase64(TextView(url_bytes[:]), true, false)
+    problem := encoded.error
+    bytes := encoded.value
+    if problem != "" || TextView(VecSlice(bytes, 0, bytes.count)) != "-_8" {
+        return 3
+    }
+
+    if encodings.Select("GZIP;Q=0.5,zstd", true) != "zstd" ||
+        encodings.Select("GZIP;Q=0.5,zstd", false) != "gzip" ||
+        encodings.Select("\u2003zſtd\u00a0;Q=0.8", true) != "zstd" ||
+        encodings.Select("zstd;q=0, zstd;q=1, *;q=0", true) != "" ||
+        encodings.Select("gzip;q=1.001,zstd;q=0.2", true) != "zstd" ||
+        encodings.AcceptsGzip("*;q=1,gzip;q=0") || encodings.AcceptsIdentity("*;q=0") {
+        return 4
+    }
+
+    if !identity.ValidEncryptedHierarchyCollection("\u2003account.v1.settings\u00a0") ||
+        !identity.ValidEncryptedHierarchyCollection("private.inbe.v4.records.history") ||
+        identity.ValidEncryptedHierarchyCollection("account.v1.settings.history") ||
+        identity.ValidEncryptedHierarchyCollection("private.inbe.v4.records.") ||
+        identity.ValidEncryptedHierarchyCollection("private.inbe.v4..records") {
+        return 5
+    }
+
+    legacy := tokens.Parse("v1\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n-9223372036854775808\nextra")
+    current := tokens.Parse("v2\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n8\n2\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n")
+    if legacy.error != "" || legacy.value.version != "v1" || legacy.value.expiresAt != -9223372036854775807 - 1 ||
+        current.error != "" || current.value.version != "v2" || current.value.issuedAt != 2 ||
+        current.value.expiresAt != 8 || current.value.sessionID.count != 64 ||
+        tokens.ParseInteger("9223372036854775808").is_ok {
+        return 6
+    }
+    session: [32]u8
+    session[0] = 10
+    session[31] = 255
+    user_id := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    v2_payload := tokens.FormatV2(user_id, -9223372036854775807 - 1, 9223372036854775807, session)
+    if v2_payload.count != 174 || TextView(v2_payload.bytes[:v2_payload.count]) !=
+        "v2\naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n-9223372036854775808\n9223372036854775807\n0a000000000000000000000000000000000000000000000000000000000000ff\n" {
+        return 21
+    }
+    if !scope.ValidCollectionPrefix("\u2003private.inbe.v4.records.*\u2003") ||
+        !scope.ValidCollectionPrefix("public.inbe.v4.*") ||
+        scope.ValidCollectionPrefix("private.inbe.v4..*") ||
+        scope.ValidCollectionPrefix("account.v1.settings.*") ||
+        scope.CollectionOwnerApp("inbe.habit_days") != "inbe" ||
+        scope.CollectionOwnerApp("friends.app.v1.records") != "app" ||
+        !scope.CollectionMatchesPrefix("private.app.v1.records.one", "private.app.v1.records.*") ||
+        scope.CollectionMatchesPrefix("private.app.v1.records", "private.app.v1.records.*") ||
+        scope.CollectionMatchesPrefix("private.APP.v1.records.one", "private.app.v1.records.*") {
+        return 7
+    }
+    pattern := scope.LikePatternForCollectionPrefix("private.app_name.v1.rec%\\ords.*")
+    if TextView(VecSlice(pattern, 0, pattern.count)) != "private.app\\_name.v1.rec\\%\\\\ords.%" {
+        return 8
+    }
+    record: EncryptedRecord = .{
+        Collection = "private.inbe.v4.records",
+        ID = "item",
+        UpdatedAt = "2026-01-01T00:00:00Z",
+        Ciphertext = "sealed",
+        PackedNonce = "nonce",
+        PackedCiphertext = "packed"
+    }
+    if !records.ValidForProtocol(record, 6) || records.ValidForProtocol(record, 5) {
+        return 9
+    }
+    record.DeletedAt = 1
+    if records.Valid(record) {
+        return 10
+    }
+    record.PackedNonce = ""
+    record.PackedCiphertext = ""
+    record.Ciphertext = ""
+    if !records.ValidForProtocol(record, 5) || records.ReadableByLegacy(record) {
+        return 11
+    }
+    record.Collection = "private.entity.v1.records"
+    if !records.ReadableByLegacy(record) {
+        return 12
+    }
+    record.FreeBytes = 524289
+    if records.Valid(record) {
+        return 13
+    }
+    if !FrameRoundtrip(125, 2) || !FrameRoundtrip(126, 4) ||
+        !FrameRoundtrip(65535, 4) || !FrameRoundtrip(65536, 10) ||
+        !FrameRoundtrip(1048576, 10) {
+        return 14
+    }
+    empty: [0]u8
+    control := frames.ReadLength(frames.ReadPrefix(9, 0, false), empty[:])
+    fragmented := frames.ReadLength(frames.ReadPrefix(1, 0, false), empty[:])
+    if control.error != "websocket invalid control frame" ||
+        fragmented.error != "websocket fragmented frames unsupported" ||
+        frames.ReadPrefix(129, 0, true).error != "websocket client frame not masked" {
+        return 15
+    }
+    oversized: [8]u8 = .[0, 0, 0, 0, 0, 16, 0, 1]
+    lengthPrefix := frames.ReadPrefix(130, 127, false)
+    if frames.ReadLength(lengthPrefix, oversized[:]).error != "websocket frame too large" {
+        return 16
+    }
+    oversized[0] = 128
+    if frames.ReadLength(lengthPrefix, oversized[:]).error != "websocket invalid length" {
+        return 17
+    }
+    payload: [5]u8 = .[0, 1, 2, 3, 4]
+    mask: [4]u8 = .[8, 9, 10, 11]
+    frames.Unmask(payload[:], mask)
+    if payload[0] != 8 || payload[1] != 8 || payload[2] != 8 || payload[3] != 8 || payload[4] != 12 {
+        return 18
+    }
+    if !StorageStatements() {
+        return 19
+    }
+    warnings: Vec(u8)
+    counts: inspect_text.WarningCounts = .{legacy_clients = 2, queued_payloads = 1000, payload_bytes = 67108865}
+    ends := inspect_text.AppendWarnings(*warnings, counts)
+    if ends[0] != 10 || ends[2] != ends[1] || ends[4] != warnings.count ||
+        TextView(VecSlice(warnings, 0, warnings.count)) !=
+        "\nWarnings\n- 2 legacy clients below protocol 5 seen recently\n- 67108865 encrypted payload bytes stored; check account quota/retention\n" {
+        return 22
+    }
+    entropy: [16]u8 = .[0, 17, 34, 51, 68, 85, 102, 119, 255, 153, 170, 187, 204, 221, 238, 255]
+    generated := habit.Version4(entropy)
+    id := TextView(generated[:])
+    if id != "00112233-4455-4677-bf99-aabbccddeeff" || !habit.IsCanonical(id) ||
+        !habit.IsCanonical("00112233-4455-F677-FF99-AABBCCDDEEFF") ||
+        habit.IsCanonical("00112233-4455-4677-bf99-aabbccddeefg") ||
+        habit.IsCanonical("00112233_4455-4677-bf99-aabbccddeeff") {
+        return 20
+    }
+    left := timestamp.Parse("1970-01-01T00:29:59.999999999+00:30")
+    right := timestamp.Parse("1970-01-01 00:00:00")
+    if !left.valid || !right.valid || left.seconds != -1 || left.nanoseconds != 999999999 ||
+        right.seconds != 0 || !timestamp.Before(left, right) || timestamp.Before(right, left) ||
+        timestamp.Parse("1900-02-29T00:00:00Z").valid {
+        return 23
+    }
+    return 0
+}

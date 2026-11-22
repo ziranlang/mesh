@@ -1,0 +1,77 @@
+#if TARGET == .C && OS == .LINUX {
+    identity :: #import "identity";
+    issuer :: #import "token_issuer_native";
+    ledger :: #import "token_ledger_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    sql :: #import "sqlite_statement_native";
+    #import "std/vec"
+
+    Gift :: struct {
+        id: [32]u8
+        balance: s64
+        status: u32
+        error: string
+    }
+
+    #scope_file
+    Unavailable :: "gift unavailable";
+
+    Matches :: (database: *void, receipt: string, event: signing.Event) -> bool {
+        values: [9]sql.Argument = .[sql.TextArg(receipt), sql.TextArg(event.account), sql.TextArg(ledger.AssetID),
+            sql.TextArg(ledger.IssuerID), sql.TextArg(event.app), sql.TextArg(event.kind), sql.IntArg(event.amount),
+            sql.TextArg(event.source), sql.TextArg(event.reference)]
+        found := sql.ReadInteger(database, "SELECT 1 FROM token_ledger WHERE receipt_id=?1 AND account_id=?2 AND asset_id=?3 AND issuer_id=?4 AND app_id=?5 AND event_type=?6 AND amount_delta=?7 AND source_type=?8 AND source_ref=?9", values[:])
+        return found.found
+    }
+
+    #scope_export
+    // Both receipts and their idempotency records use the caller's transaction.
+    Send :: (database: *void, signer: *issuer.Issuer, sender: string, recipient: string, units: s64,
+        requestID: string, at: string) -> Gift {
+        if !identity.ValidUserID(sender) || !identity.ValidUserID(recipient) || sender == recipient ||
+            units <= 0 || !identity.ValidClientID(requestID) {
+            return .{status = 400, error = "invalid gift"}
+        }
+        key: Vec(u8)
+        payment: Vec(u8)
+        if !BuilderAppend(key, "gift:") || !BuilderAppend(key, requestID) ||
+            !BuilderAppend(payment, sender) || !BuilderAppend(payment, ":") || !BuilderAppend(payment, requestID) {
+            return .{status = 503, error = Unavailable}
+        }
+        debit: signing.Event = .{account = sender, app = "inbe", kind = "debit", amount = -units, source = "gift", reference = recipient}
+        spent := writes.SpendEvent(database, signer, debit, at, TextView(VecSlice(key, 0, key.count)))
+        if spent.error == "insufficient balance" {
+            return .{status = 402, error = "not enough Dew"}
+        }
+        if spent.status == 409 {
+            return .{status = 409, error = "gift request id reused"}
+        }
+        if spent.status != 200 {
+            return .{status = 503, error = Unavailable}
+        }
+        if !Matches(database, TextView(spent.id[:]), debit) {
+            return .{status = 409, error = "gift request id reused"}
+        }
+        if spent.created {
+            people: [2]sql.Argument = .[sql.TextArg(sender), sql.TextArg(recipient)]
+            friendship := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM server_friendships WHERE (user_id_a=?1 AND user_id_b=?2) OR (user_id_a=?2 AND user_id_b=?1))", people[:])
+            if !friendship.found {
+                return .{status = 503, error = Unavailable}
+            }
+            if friendship.value == 0 {
+                return .{status = 403, error = "friendship required"}
+            }
+        }
+        credit: signing.Event = .{account = recipient, app = "inbe", kind = "credit", amount = units, source = "gift", reference = sender}
+        credited := writes.CreditPayment(database, signer, "gift-v1", TextView(VecSlice(payment, 0, payment.count)), credit, at)
+        if credited.status != 200 || spent.created != credited.created || !Matches(database, TextView(credited.id[:]), credit) {
+            return .{status = 503, error = Unavailable}
+        }
+        balance := ledger.Balance(database, sender)
+        if !balance.found {
+            return .{status = 503, error = Unavailable}
+        }
+        return .{id = spent.id, balance = balance.value, status = 200}
+    }
+}

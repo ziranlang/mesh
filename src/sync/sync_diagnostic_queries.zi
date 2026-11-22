@@ -1,0 +1,5 @@
+CountTables: [11]string = .[
+    "server_habits", "server_habit_days", "server_sessions", "server_session_rounds",
+    "server_meditation_logs", "server_social_snapshots", "server_encrypted_records",
+    "server_sync_ops", "server_clients", "server_encrypted_payloads", "server_sync_audit"
+];

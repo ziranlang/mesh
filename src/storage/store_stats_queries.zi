@@ -1,0 +1,5 @@
+CollectionStorageSQL :: "\nSELECT collection,\n       COUNT(*),\n       COALESCE(SUM(LENGTH(collection)+LENGTH(id)+LENGTH(key_id)+LENGTH(nonce)+LENGTH(ciphertext)+LENGTH(content_hash)+LENGTH(parent_id)),0)\nFROM server_encrypted_records\nGROUP BY collection\nORDER BY collection";
+
+PayloadStorageSQL :: "\nSELECT COUNT(*), COALESCE(SUM(LENGTH(client_id)+LENGTH(payload_json)),0)\nFROM server_encrypted_payloads";
+
+PageBytesSQL :: "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()";

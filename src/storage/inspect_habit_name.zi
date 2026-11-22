@@ -1,0 +1,55 @@
+#if TARGET == .C {
+    utf8 :: #import "std/utf8";
+    unicode :: #import "std/unicode";
+    #import "std/vec"
+
+    #scope_file
+    AppendHex :: (output: *Vec(u8), value: u32, digits: s32) {
+        hex := "0123456789abcdef"
+        shift := (digits - 1) * 4
+        while shift >= 0 {
+            VecPush(<<output, hex[(value >> cast(u32)shift) & 15])
+            shift -= 4
+        }
+    }
+
+    #scope_export
+    // Preserve the CLI's quoted habit names, including malformed UTF-8.
+    Quote :: (value: string) -> Vec(u8) {
+        output: Vec(u8)
+        BuilderAppend(output, "\"")
+        at: s64 = 0
+        while at < value.count {
+            end := at + 4
+            if end > value.count {
+                end = value.count
+            }
+            rune := utf8.Decode(value[at:end], 0)
+            point := rune.value
+            after := at + rune.after
+            if !rune.valid || point < 32 || point == 127 {
+                if rune.valid && point >= 7 && point <= 13 {
+                    VecPush(output, #char "\\")
+                    VecPush(output, "abtnvfr"[point - 7])
+                } else {
+                    BuilderAppend(output, "\\x")
+                    AppendHex(*output, cast(u32)value[at], 2)
+                }
+            } else if unicode.IsPrintable(point) {
+                if point == 34 || point == 92 {
+                    VecPush(output, #char "\\")
+                }
+                BuilderAppend(output, value[at:after])
+            } else if point < 65536 {
+                BuilderAppend(output, "\\u")
+                AppendHex(*output, point, 4)
+            } else {
+                BuilderAppend(output, "\\U")
+                AppendHex(*output, point, 8)
+            }
+            at = after
+        }
+        BuilderAppend(output, "\"")
+        return output
+    }
+}

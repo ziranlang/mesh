@@ -1,0 +1,276 @@
+#if TARGET == .C && OS == .LINUX {
+    rpc :: #import "monero_rpc_native";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    random :: #import "std/random_linux";
+    sha :: #import "crypto/sha256";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Configuration :: struct {
+        wallet: rpc.Wallet
+        signer: *issuer.Issuer
+        directPurchases: bool
+        network: string
+        rateAtomic: s64
+        rateTokens: s64
+        minimumAtomic: s64
+        confirmations: s64
+    }
+
+    Transfer :: struct {
+        id: [128]u8
+        idLength: s64
+        amount: s64
+        height: s64
+        confirmations: s64
+        account: s64
+        address: s64
+        unlockTime: s64
+        locked: bool
+        doubleSpend: bool
+        incoming: bool
+    }
+
+    Allocation :: struct {
+        address: Text
+        index: s64
+        valid: bool
+    }
+
+    TransferQuery :: struct {
+        account: s64
+        address: s64
+        minHeight: s64
+        useAddress: bool
+        useHeight: bool
+        incoming: bool
+        pool: bool
+        pending: bool
+    }
+
+    TransferBatch :: struct { items: Vec(Transfer); ok: bool; }
+
+    InvoiceProof :: struct {
+        payment: Text
+        seen: s64
+        confirmed: s64
+        ok: bool
+    }
+
+    MaximumInteger :: 9223372036854775807;
+
+    #scope_file
+    Integer :: (document: *json.JsonDocument, node: s32, name: string) -> s64 {
+        number, valid := json.JsonInteger(document, json.JsonMember(document, node, name))
+        return ifx valid then number else 0
+    }
+
+    Boolean :: (document: *json.JsonDocument, node: s32, name: string) -> bool {
+        value, valid := json.JsonBool(document, json.JsonMember(document, node, name))
+        return valid && value
+    }
+
+    AppendTransfer :: (document: *json.JsonDocument, root: s32, key: string, output: *Vec(Transfer)) -> bool {
+        list := json.JsonMember(document, root, key)
+        if list < 0 || json.JsonKindOf(document, list) == .Null { return true }
+        if json.JsonKindOf(document, list) != .Array { return false }
+        node := json.JsonFirst(document, list)
+        while node >= 0 {
+            id: Text = json.JsonString(document, json.JsonMember(document, node, "txid"))
+            value := TextView(id)
+            amount := Integer(document, node, "amount")
+            if identity.ValidID(value, 1, 128) && amount > 0 {
+                indices := json.JsonMember(document, node, "subaddr_index")
+                transfer: Transfer = .{idLength = value.count, amount = amount,
+                    height = Integer(document, node, "height"), confirmations = Integer(document, node, "confirmations"),
+                    account = Integer(document, indices, "major"), address = Integer(document, indices, "minor"),
+                    unlockTime = Integer(document, node, "unlock_time"), locked = Boolean(document, node, "locked"),
+                    doubleSpend = Boolean(document, node, "double_spend_seen"), incoming = key == "in"}
+                for byte, index: value { transfer.id[index] = byte }
+                if !VecPush(<<output, transfer) { return false }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    Less :: (a: string, b: string) -> bool {
+        size := ifx a.count < b.count then a.count else b.count
+        for byte, index: a[:size] {
+            if byte != b[index] { return byte < b[index] }
+        }
+        return a.count < b.count
+    }
+
+    #scope_export
+    ValidRate :: (configuration: Configuration) -> bool { return configuration.rateAtomic > 0 && configuration.rateTokens > 0 }
+    Minimum :: (configuration: Configuration) -> s64 { return ifx configuration.minimumAtomic > 0 then configuration.minimumAtomic else 1 }
+    Confirmations :: (configuration: Configuration) -> s64 { return ifx configuration.confirmations > 0 then configuration.confirmations else 10 }
+    Finality :: (configuration: Configuration) -> s64 {
+        threshold := Confirmations(configuration)
+        return ifx threshold > MaximumInteger - 60 then MaximumInteger else threshold + 60
+    }
+
+    Usable :: (configuration: Configuration, transfer: Transfer) -> bool {
+        return transfer.confirmations >= Confirmations(configuration) && transfer.unlockTime == 0 && !transfer.locked && !transfer.doubleSpend
+    }
+
+    Network :: (configuration: Configuration) -> string {
+        name := wire.TrimSpace(configuration.network)
+        if wire.MatchesToken(name, "testnet") { return "testnet" }
+        if wire.MatchesToken(name, "stagenet") { return "stagenet" }
+        return "mainnet"
+    }
+
+    // Floor the exact ratio and reject unrepresentable results. The quotient
+    // and remainder of the product are tracked separately during doubling.
+    Units :: (amount: s64, atomic: s64, units: s64) -> s64 {
+        if amount <= 0 || atomic <= 0 || units <= 0 { return 0 }
+        divisor := cast(u64)atomic
+        add := cast(u64)(units / atomic)
+        addRemainder := cast(u64)(units % atomic)
+        bits := cast(u64)amount
+        quotient: u64
+        remainder: u64
+        while bits > 0 {
+            if bits % 2 != 0 {
+                remainder += addRemainder
+                carry := remainder / divisor
+                remainder %= divisor
+                if add + carry > cast(u64)MaximumInteger - quotient { return 0 }
+                quotient += add + carry
+            }
+            bits >>= 1
+            if bits > 0 {
+                addRemainder *= 2
+                carry := addRemainder / divisor
+                addRemainder %= divisor
+                if add > (cast(u64)MaximumInteger - carry) / 2 { return 0 }
+                add = 2 * add + carry
+            }
+        }
+        return cast(s64)quotient
+    }
+
+    NewID :: (encoded: []u8) -> bool {
+        raw: [16]u8
+        return encoded.count >= 33 && random.FillSecure(raw[:]) && sha.BytesToHex(*raw[0], raw.count, *encoded[0], encoded.count) == 1
+    }
+
+    PaymentID :: (id: string, account: s64, address: s64, prefix: string) -> Text {
+        a: [24]u8
+        b: [24]u8
+        output: Vec(u8)
+        if !BuilderAppend(output, prefix) || !BuilderAppend(output, id) || !BuilderAppend(output, ":") ||
+            !BuilderAppend(output, numbers.FormatInteger(account, a[:])) || !BuilderAppend(output, ":") ||
+            !BuilderAppend(output, numbers.FormatInteger(address, b[:])) { return .{} }
+        return BuilderFinish(output)
+    }
+
+    CreateAddress :: (configuration: Configuration, prefix: string, id: string, cancel: rpc.Cancellation) -> Allocation {
+        label: Vec(u8)
+        if !BuilderAppend(label, prefix) || !BuilderAppend(label, id) { return .{} }
+        request: json.JsonDocument
+        root := json.JsonNewObject(*request)
+        if !json.JsonSet(*request, root, "account_index", json.JsonNewInteger(*request, 0)) ||
+            !json.JsonSet(*request, root, "label", json.JsonNewString(*request, TextView(VecSlice(label, 0, label.count)))) { return .{} }
+        response: rpc.Reply
+        node := rpc.Request(configuration.wallet, "create_address", *request, root, cancel, *response)
+        if node < 0 { return .{} }
+        document := *response.document
+        value: Text = json.JsonString(document, json.JsonMember(document, node, "address"))
+        index, present := json.JsonInteger(document, json.JsonMember(document, node, "address_index"))
+        if !present || index < 0 || TextView(value) == "" { return .{} }
+        return .{address = value, index = index, valid = true}
+    }
+
+    Height :: (configuration: Configuration, cancel: rpc.Cancellation) -> s64 {
+        parameters: json.JsonDocument
+        root := json.JsonNewObject(*parameters)
+        response: rpc.Reply
+        node := rpc.Request(configuration.wallet, "get_height", *parameters, root, cancel, *response)
+        document := *response.document
+        height, valid := json.JsonInteger(document, json.JsonMember(document, node, "height"))
+        return ifx valid && height > 0 then height else -1
+    }
+
+    GetTransfers :: (configuration: Configuration, query: TransferQuery, cancel: rpc.Cancellation, output: *Vec(Transfer)) -> bool {
+        parameters: json.JsonDocument
+        root := json.JsonNewObject(*parameters)
+        if !json.JsonSet(*parameters, root, "account_index", json.JsonNewInteger(*parameters, query.account)) { return false }
+        if query.incoming && !json.JsonSet(*parameters, root, "in", json.JsonNewBool(*parameters, true)) { return false }
+        if query.pool && !json.JsonSet(*parameters, root, "pool", json.JsonNewBool(*parameters, true)) { return false }
+        if query.pending && (!json.JsonSet(*parameters, root, "pending", json.JsonNewBool(*parameters, true)) ||
+            !json.JsonSet(*parameters, root, "failed", json.JsonNewBool(*parameters, false))) { return false }
+        if query.useHeight && (!json.JsonSet(*parameters, root, "filter_by_height", json.JsonNewBool(*parameters, true)) ||
+            !json.JsonSet(*parameters, root, "min_height", json.JsonNewInteger(*parameters, query.minHeight))) { return false }
+        if query.useAddress {
+            indices := json.JsonNewArray(*parameters)
+            if !json.JsonAppend(*parameters, indices, json.JsonNewInteger(*parameters, query.address)) ||
+                !json.JsonSet(*parameters, root, "subaddr_indices", indices) { return false }
+        }
+        response: rpc.Reply
+        node := rpc.Request(configuration.wallet, "get_transfers", *parameters, root, cancel, *response)
+        if node < 0 { return false }
+        // Pending spends are never invoice payments. A deposit scan requests
+        // pending rows separately when it scans the whole wallet account.
+        document := *response.document
+        return (!query.pool || AppendTransfer(document, node, "pool", output)) &&
+            (!query.incoming || AppendTransfer(document, node, "in", output)) &&
+            (!query.pending || query.useAddress || AppendTransfer(document, node, "pending", output))
+    }
+
+    LoadTransfers :: (configuration: Configuration, query: TransferQuery, cancel: rpc.Cancellation) -> TransferBatch {
+        batch: TransferBatch
+        batch.ok = GetTransfers(configuration, query, cancel, *batch.items)
+        return batch
+    }
+
+    Entries :: (batch: *TransferBatch) -> []Transfer { return VecSlice(batch.items, 0, batch.items.count) }
+
+    InspectInvoice :: (configuration: Configuration, address: s64, cancel: rpc.Cancellation) -> InvoiceProof {
+        entries: Vec(Transfer)
+        if !GetTransfers(configuration, .{address = address, useAddress = true, incoming = true, pool = true, pending = true}, cancel, *entries) { return .{} }
+        selected: Vec(Transfer)
+        seen: s64
+        confirmed: s64
+        for transfer: VecSlice(entries, 0, entries.count) {
+            if transfer.account != 0 || transfer.address != address { continue }
+            id := TextView(transfer.id[:transfer.idLength])
+            index: s64 = 0
+            duplicate := false
+            {
+                sorted := VecSlice(selected, 0, selected.count)
+                while index < sorted.count {
+                    item := sorted[index]
+                    candidate := TextView(item.id[:item.idLength])
+                    if candidate == id { duplicate = true; break }
+                    if Less(id, candidate) { break }
+                    index += 1
+                }
+            }
+            if duplicate { continue }
+            if seen > MaximumInteger - transfer.amount || !VecPush(selected, transfer) { return .{} }
+            seen += transfer.amount
+            if Usable(configuration, transfer) { confirmed += transfer.amount }
+            sorted := VecSlice(selected, 0, selected.count)
+            position := sorted.count - 1
+            while position > index {
+                sorted[position] = sorted[position - 1]
+                position -= 1
+            }
+            sorted[index] = transfer
+        }
+        if selected.count == 0 { return .{ok = true} }
+        joined: Vec(u8)
+        for item, index: VecSlice(selected, 0, selected.count) {
+            if (index > 0 && !BuilderAppend(joined, "+")) || !BuilderAppend(joined, TextView(item.id[:item.idLength])) { return .{} }
+        }
+        reference: Text = PaymentID(TextView(VecSlice(joined, 0, joined.count)), 0, address, "")
+        if TextView(reference) == "" { return .{} }
+        return .{payment = reference, seen = seen, confirmed = confirmed, ok = true}
+    }
+}

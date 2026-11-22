@@ -15,7 +15,7 @@ sql :: #import "std/sql_go";
 ed :: #import "std/ed25519_go";
 clock :: #import "std/time_go";
 text :: #import "std/text_go";
-strings :: #system_library "go:strings";
+wire_text :: #import "wire_text";
 builtin :: #system_library "go:builtin";
 
 IssuerResult :: struct {
@@ -31,7 +31,6 @@ TokenAuthorizationResult :: struct {
 #scope_file
 PrivateLength :: (value: ed.PrivateKey) -> isize #foreign builtin "len";
 PublicLength :: (value: ed.PublicKey) -> isize #foreign builtin "len";
-TrimSpace :: (value: string) -> string #foreign strings;
 
 #scope_export
 IssuerStatus :: (configuration: config.Config) -> string {
@@ -71,7 +70,7 @@ ShortHash :: (value: string) -> string {
 
 Authorize :: (database: *sql.Database, context: ctx.Context, request: *http.Request, body: []u8, accountID: string, appID: string, assetID: string, permission: string, verify: auth.VerifySignature, replayError: Error) -> TokenAuthorizationResult {
     result: TokenAuthorizationResult
-    hasSignature := TrimSpace(wire.Value(http.Headers(request), "X-Mesh-Tx")) != ""
+    hasSignature := wire_text.TrimSpace(wire.Value(http.Headers(request), "X-Mesh-Tx")) != ""
     if hasSignature {
         header := signed.ReadHeader(request)
         result.authentication = header.authentication

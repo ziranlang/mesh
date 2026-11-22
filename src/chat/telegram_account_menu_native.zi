@@ -1,0 +1,152 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    authorization :: #import "authorization_native";
+    calendar :: #import "std/date_time_linux";
+    entries :: #import "telegram_account_store_native";
+    json :: #import "std/json_document";
+    lumi :: #import "lumi_telegram_store_native";
+    mutex :: #import "std/mutex_linux";
+    network :: #import "network_scope_native";
+    numbers :: #import "std/number_text";
+    sqlite :: #import "sqlite/SQLite";
+    telegram :: #import "telegram_transport_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    ValidDNSName :: (name: string) -> bool {
+        if name.count == 0 || name.count > 253 {
+            return false
+        }
+        length: s64
+        previous: u8
+        for byte: name {
+            if byte == #char "." {
+                if length == 0 || previous == #char "-" {
+                    return false
+                }
+                length = 0
+            } else {
+                letter := (byte >= #char "a" && byte <= #char "z") || (byte >= #char "A" && byte <= #char "Z")
+                digit := byte >= #char "0" && byte <= #char "9"
+                if !(letter || digit || byte == #char "-") || (length == 0 && byte == #char "-") || length == 63 {
+                    return false
+                }
+                length += 1
+            }
+            previous = byte
+        }
+        return previous != #char "-"
+    }
+
+    ValidPort :: (value: string) -> bool {
+        if value.count == 0 || value.count > 5 {
+            return false
+        }
+        for byte: value {
+            if byte < #char "0" || byte > #char "9" {
+                return false
+            }
+        }
+        port, consumed := numbers.IntegerPrefix(value)
+        return consumed == value.count && port > 0 && port <= 65535
+    }
+
+    ValidAuthority :: (authority: string) -> bool {
+        if authority.count == 0 {
+            return false
+        }
+        if authority[0] == #char "[" {
+            bracket := wire.Cut(authority[1:], #char "]")
+            if !bracket.found || network.ParseIP(bracket.before).count != 16 {
+                return false
+            }
+            port := bracket.after
+            return port == "" || (port[0] == #char ":" && ValidPort(port[1:]))
+        }
+        host := wire.Cut(authority, #char ":")
+        return ValidDNSName(host.before) && (!host.found || ValidPort(host.after))
+    }
+
+    CanvasValid :: (canvas: string) -> bool {
+        prefix := "https://"
+        hostAndPath := wire.TrimPrefix(canvas, prefix)
+        if hostAndPath.count == canvas.count || canvas.count > 2013 {
+            return false
+        }
+        for byte: canvas {
+            if byte < 33 || byte > 126 || byte == #char "%" || byte == #char "\\" || byte == #char "#" || byte == #char "?" {
+                return false
+            }
+        }
+        return ValidAuthority(wire.Cut(hostAndPath, #char "/").before)
+    }
+
+    MenuIDs :: struct {
+        values: [3][33]u8
+    }
+
+    IssueMenu :: (access: *accounts.AccountAccess, node: string, audience: string, bot: s64,
+        sender: s64, requestID: string, ids: *MenuIDs) -> bool {
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        now := calendar.UnixMilliseconds() / 1000
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer lumi.Rollback(database)
+        if requestID != "" && !entries.RequestEligible(database, requestID, sender, node, audience, now) {
+            return false
+        }
+        modes: [3]string = .["create", "restore", "connect"]
+        for mode, index: modes {
+            if !entries.Issue(database, ids.values[index][:], mode, node, audience, bot, sender, now) {
+                return false
+            }
+        }
+        return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    Send :: (access: *accounts.AccountAccess, connection: *void, bot: telegram.Configuration,
+        canvas: string, sender: s64, requestID: string, node: string, audience: string) -> bool {
+        unused connection
+        botID := telegram.BotID(bot.token)
+        if sender <= 0 || sender > 4503599627370495 || botID <= 0 || !authorization.HexID(node, 64) ||
+            audience == "" || !CanvasValid(canvas) || (requestID != "" && !authorization.HexID(requestID, 32)) {
+            return false
+        }
+        ids: MenuIDs
+        if !IssueMenu(access, node, audience, botID, sender, requestID, *ids) {
+            return false
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        markup := json.JsonNewObject(*document)
+        keyboard := json.JsonNewArray(*document)
+        labels: [3]string = .["Create account", "Restore account", "Connect existing account"]
+        for label, index: labels {
+            id := ifx index == 2 && requestID != "" then requestID else TextView(ids.values[index][:32])
+            url: Vec(u8)
+            row := json.JsonNewArray(*document)
+            button := json.JsonNewObject(*document)
+            web := json.JsonNewObject(*document)
+            if !BuilderAppend(url, canvas) || !BuilderAppend(url, "?r=") || !BuilderAppend(url, id) ||
+                !authorization.PutText(*document, web, "url", TextView(VecSlice(url, 0, url.count))) ||
+                !authorization.PutText(*document, button, "text", label) || !json.JsonSet(*document, button, "web_app", web) ||
+                !json.JsonAppend(*document, row, button) || !json.JsonAppend(*document, keyboard, row) {
+                return false
+            }
+        }
+        explanation := "Create or restore your account on your device. Your private owner key stays there. Connect an existing account by approving access in Inbe. Never send private keys or recovery passphrases in this chat. App actions need an active Inbe session and are handled by Inbe."
+        if !authorization.PutInt(*document, root, "chat_id", sender) ||
+            !authorization.PutText(*document, root, "text", explanation) ||
+            !json.JsonSet(*document, markup, "inline_keyboard", keyboard) || !json.JsonSet(*document, root, "reply_markup", markup) {
+            return false
+        }
+        return telegram.Accepted(bot, "sendMessage", *document, root)
+    }
+}

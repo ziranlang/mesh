@@ -1,5 +1,6 @@
 #import "std/go_types"
 sql :: #import "std/sql_go";
+queries :: #import "state_hash_queries";
 ctx :: #import "std/context_go";
 io :: #import "std/io_go";
 native :: #system_library "go:database/sql";
@@ -35,7 +36,7 @@ WriteRecords :: (writer: io.Writer, pattern: string, collection: string, id: str
 Habits :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\nSELECT id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at\nFROM server_habits\nWHERE user_id_hash=?1\nORDER BY id", arguments[:])
+        queries.HabitsSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -58,7 +59,7 @@ Habits :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
         if error != null {
             return error
         }
-        WriteHabits(writer, "habit\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%d\t%s\n",
+        WriteHabits(writer, queries.HabitsFormat,
             id, name, colorR, colorG, colorB, syncMode, syncActivity, counterEnabled, sortOrder, deletedAt, updatedAt)
     }
     return sql.RowsError(rows)
@@ -67,7 +68,7 @@ Habits :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
 HabitDays :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\nSELECT habit_id,local_date,completed,count,updated_at\nFROM server_habit_days\nWHERE user_id_hash=?1\nORDER BY habit_id,local_date", arguments[:])
+        queries.HabitDaysSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -84,7 +85,7 @@ HabitDays :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, 
         if error != null {
             return error
         }
-        WriteHabitDays(writer, "habit_day\t%s\t%d\t%d\t%d\t%s\n",
+        WriteHabitDays(writer, queries.HabitDaysFormat,
             habitID, localDate, completed, count, updatedAt)
     }
     return sql.RowsError(rows)
@@ -93,7 +94,7 @@ HabitDays :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, 
 Sessions :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\n\tSELECT id,started_at,local_date,topic,activity,source,rounds_hash,\n\t       mood_before,mood_after,energy,stress,note,tags,deleted_at,updated_at\n\tFROM server_sessions\n\tWHERE user_id_hash=?1\n\tORDER BY id", arguments[:])
+        queries.SessionsSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -121,7 +122,7 @@ Sessions :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, u
         if error != null {
             return error
         }
-        WriteSessions(writer, "session\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%d\t%s\n",
+        WriteSessions(writer, queries.SessionsFormat,
             id, startedAt, localDate, topic, activity, source, roundsHash, moodBefore, moodAfter, energy, stress, note, tags, deletedAt, updatedAt)
         sessionIDs = AppendString(sessionIDs, id)
     }
@@ -145,7 +146,7 @@ Sessions :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, u
 Rounds :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string, sessionID: string) -> Error {
     arguments: [2]Any = .[userID, sessionID]
     queried := sql.Query(database, context,
-        "\nSELECT round_index,breaths,hold_seconds\nFROM server_session_rounds\nWHERE user_id_hash=?1 AND session_id=?2\nORDER BY round_index", arguments[:])
+        queries.RoundsSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -160,7 +161,7 @@ Rounds :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
         if error != null {
             return error
         }
-        WriteRounds(writer, "round\t%s\t%d\t%d\t%d\n",
+        WriteRounds(writer, queries.RoundsFormat,
             sessionID, roundIndex, breaths, holdSeconds)
     }
     return sql.RowsError(rows)
@@ -169,7 +170,7 @@ Rounds :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
 Meditations :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\nSELECT id,session_id,duration_seconds,completed_at\nFROM server_meditation_logs\nWHERE user_id_hash=?1\nORDER BY id", arguments[:])
+        queries.MeditationsSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -185,7 +186,7 @@ Meditations :: (database: *sql.Database, context: ctx.Context, writer: io.Writer
         if error != null {
             return error
         }
-        WriteMeditations(writer, "meditation_log\t%s\t%s\t%d\t%s\n",
+        WriteMeditations(writer, queries.MeditationsFormat,
             id, sessionID, durationSeconds, completedAt)
     }
     return sql.RowsError(rows)
@@ -194,7 +195,7 @@ Meditations :: (database: *sql.Database, context: ctx.Context, writer: io.Writer
 Social :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\nSELECT kind,json,updated_at\nFROM server_social_snapshots\nWHERE user_id_hash=?1\nORDER BY kind", arguments[:])
+        queries.SocialSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -209,7 +210,7 @@ Social :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
         if error != null {
             return error
         }
-        WriteSocial(writer, "social_cache\t%s\t%s\t%s\n",
+        WriteSocial(writer, queries.SocialFormat,
             kind, payload, updatedAt)
     }
     return sql.RowsError(rows)
@@ -218,7 +219,7 @@ Social :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, use
 Records :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, userID: string) -> Error {
     arguments: [1]Any = .[userID]
     queried := sql.Query(database, context,
-        "\nSELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id\nFROM server_encrypted_records\nWHERE user_id_hash=?1\nORDER BY collection,id", arguments[:])
+        queries.RecordsSQL, arguments[:])
     if queried.error != null {
         return queried.error
     }
@@ -240,7 +241,7 @@ Records :: (database: *sql.Database, context: ctx.Context, writer: io.Writer, us
         if error != null {
             return error
         }
-        WriteRecords(writer, "encrypted_record\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%d\t%s\n",
+        WriteRecords(writer, queries.RecordsFormat,
             collection, id, keyID, nonce, ciphertext, updatedAt, deletedAt, contentHash, schemaVersion, parentID)
     }
     return sql.RowsError(rows)

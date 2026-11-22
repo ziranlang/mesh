@@ -1,0 +1,72 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+sets :: #import "sets";
+text :: #import "std/text_go";
+go_rand :: #system_library "go:math/rand";
+go_reflect :: #system_library "go:reflect";
+go_strings :: #system_library "go:strings";
+builtin :: #system_library "go:builtin";
+
+#scope_file
+Random :: #type #foreign go_rand "Rand";
+Source :: #type #foreign go_rand "Source";
+NewSource :: (seed: s64) -> Source #foreign go_rand;
+NewRandom :: (source: Source) -> *Random #foreign go_rand "New";
+RandomIndex :: (rng: *Random, limit: isize) -> isize #foreign go_rand "(*Rand).Intn";
+AllocateBytes :: (count: isize) -> []u8 #foreign builtin "make";
+Split :: (value: string, separator: string) -> []string #foreign go_strings;
+TrimSpace :: (value: string) -> string #foreign go_strings;
+ToLower :: (value: string) -> string #foreign go_strings;
+Equal :: (left: Any, right: Any) -> bool #foreign go_reflect "DeepEqual";
+
+Check :: (test: *testing.Test, raw: string) {
+    values := Split(raw, ",")
+    environment: sets.StringSet
+    normalized: sets.StringSet
+    MapInit(environment)
+    MapInit(normalized)
+    for value: values {
+        item := TrimSpace(value)
+        if item != "" {
+            MapSet(environment, item, true)
+            MapSet(normalized, ToLower(item), true)
+        }
+    }
+    got_environment := sets.FromEnvironment(raw)
+    if !Equal(got_environment, environment) {
+        arguments: [3]Any = .[raw, got_environment, environment]
+        testing.Fatalf(test, "environment set %q: got %#v, want %#v", arguments[:])
+    }
+    got_normalized := sets.Normalize(values)
+    if !Equal(got_normalized, normalized) {
+        arguments: [3]Any = .[raw, got_normalized, normalized]
+        testing.Fatalf(test, "normalized set %q: got %#v, want %#v", arguments[:])
+    }
+}
+
+#scope_export
+#program_export "TestZiranStringSets"
+ZiranStringSets :: (test: *testing.Test) {
+    cases: [5]string = .["", ",,,", " A,a,A , B ", "\t app \r\n,other", "\u2003雪\u00a0,Σ,İ,K"]
+    for input: cases { Check(test, input) }
+    malformed: [14]u8 = .[98, 97, 100, 255, 44, 32, 98, 97, 100, 255, 44, 32, 254, 32]
+    Check(test, text.FromBytes(malformed[:]))
+
+    rng := NewRandom(NewSource(827))
+    alphabet: [15]u8 = .[32, 65, 97, 66, 98, 44, 9, 13, 10, 95, 45, 46, 0, 255, 254]
+    for sample: 1..1000 {
+        data := AllocateBytes(RandomIndex(rng, cast(isize)100))
+        index: s64 = 0
+        while index < data.count {
+            data[index] = alphabet[RandomIndex(rng, cast(isize)alphabet.count)]
+            index += 1
+        }
+        Check(test, text.FromBytes(data))
+    }
+    none: []string
+    empty: sets.StringSet
+    MapInit(empty)
+    if !Equal(sets.Normalize(none), empty) {
+        testing.Fatal(test, "nil input must return an allocated empty set")
+    }
+}

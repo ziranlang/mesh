@@ -1,0 +1,215 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    client :: #import "peer_http_native";
+    fields :: #import "sync_json_fields";
+    identity :: #import "node_identity_native";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    network :: #import "network_scope_native";
+    policy :: #import "mesh_policy_native";
+    proof :: #import "pairing_proof_native";
+    reply :: #import "http_json_native";
+    sha :: #import "crypto/sha256";
+    store :: #import "pairing_store_native";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Settings :: struct {
+        admin: string
+        baseURL: string
+        displayName: string
+        local: *identity.Identity
+        scope: *network.Scope
+    }
+
+    #scope_file
+    InvitePath :: "/api/v1/node/pairing/invites";
+    AcceptPath :: "/api/v1/node/pairing/accept";
+    CompletePath :: "/api/v1/node/pairing/complete";
+    IssueFailure :: "pairing invite creation failed";
+
+    Error :: (connection: *void, status: u32, message: string, zstd: bool) -> s32 {
+        return reply.ErrorReply(connection, "POST", status, message, zstd)
+    }
+
+    BaseAddress :: (document: *json.JsonDocument, base: string) -> s32 {
+        address := wire.TrimSpace(base)
+        end := address.count
+        while end > 0 && address[end - 1] == 47 { end -= 1 }
+        array := json.JsonNewArray(document)
+        if !json.JsonAppend(document, array, json.JsonNewStringCopy(document, address[:end])) { return -1 }
+        return array
+    }
+
+    LocalProof :: (document: *json.JsonDocument, root: s32, settings: Settings,
+        id: string, name: string, addresses: s32) -> bool {
+        public: [65]u8
+        nonce: [33]u8
+        return proof.RandomHex(nonce[:]) &&
+            sha.BytesToHex(*settings.local.public[0], settings.local.public.count, *public[0], public.count) == 1 &&
+            json.JsonSet(document, root, "version", json.JsonNewInteger(document, 1)) &&
+            fields.SetString(document, root, "invite_id", id) &&
+            fields.SetString(document, root, "node_id", TextView(settings.local.id[:64])) &&
+            fields.SetString(document, root, "public_key", TextView(public[:64])) &&
+            fields.SetString(document, root, "display_name", ifx name == "" then settings.displayName else name) &&
+            json.JsonSet(document, root, "addresses", addresses) &&
+            fields.SetString(document, root, "nonce", TextView(nonce[:32]))
+    }
+
+    Create :: (access: *accounts.AccountAccess, connection: *void, input: *json.JsonDocument, settings: Settings, now: s64) -> s32 {
+        zstd := access.configuration.zstdResponses
+        names: [5]string = .["display_name", "addresses", "space_id", "expires_in_seconds", "policy"]
+        kinds: [5]json.JsonKind = .[.String, .Array, .String, .Number, .Object]
+        locations: [5]s32
+        if !fields.Read(input, input.root, names[:], kinds[:], locations[:]) {
+            return Error(connection, 400, "invalid pairing invite request", zstd)
+        }
+        requested := fields.Number(input, locations[3])
+        if requested > proof.MaximumLifetime { return Error(connection, 400, "pairing invite expiry exceeds 24 hours", zstd) }
+        lifetime := ifx requested > 0 then requested else 600
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        direction: Text = fields.StringField(input, locations[4], "direction")
+        normalized := policy.Direction(TextView(direction))
+        selected := policy.Policy(*document, input, locations[4], normalized)
+        if selected < 0 { return Error(connection, 400, "invalid pairing invite request", zstd) }
+        if !policy.Valid(*document, selected) { return Error(connection, 400, "explicit pairing policy required", zstd) }
+        addresses := ifx json.JsonCount(input, locations[1]) == 0 then BaseAddress(*document, settings.baseURL) else policy.StringList(*document, input, locations[1])
+        if addresses < 0 { return Error(connection, 400, "invalid pairing invite request", zstd) }
+        inviteID: [33]u8
+        display: Text = json.JsonString(input, locations[0])
+        spaceText: Text = json.JsonString(input, locations[2])
+        space := wire.TrimSpace(TextView(spaceText))
+        if !proof.RandomHex(inviteID[:]) ||
+            !LocalProof(*document, root, settings, TextView(inviteID[:32]), wire.TrimSpace(TextView(display)), addresses) ||
+            (space != "" && !fields.SetString(*document, root, "space_id", space)) ||
+            !json.JsonSet(*document, root, "expires_at", json.JsonNewInteger(*document, now + lifetime)) ||
+            !json.JsonSet(*document, root, "policy", selected) {
+            return Error(connection, 500, IssueFailure, zstd)
+        }
+        problem := proof.AddressProblem(*document, root)
+        if problem != "" { return Error(connection, 400, problem, zstd) }
+        if !proof.Sign(*document, root, false, "", settings.local.seed[:]) ||
+            !mutex.Lock(*access.databaseLock) { return Error(connection, 500, IssueFailure, zstd) }
+        saved := store.RecordInvite(access.configuration.database, *document, root)
+        mutex.Unlock(*access.databaseLock)
+        if !saved { return Error(connection, 500, IssueFailure, zstd) }
+        return reply.Reply(connection, "POST", 200, *document, root, zstd)
+    }
+
+    Paired :: (connection: *void, id: string, zstd: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !fields.SetString(*document, root, "node_id", id) || !fields.SetString(*document, root, "status", "paired") { return 0 }
+        return reply.Reply(connection, "POST", 200, *document, root, zstd)
+    }
+
+    Complete :: (access: *accounts.AccountAccess, connection: *void, input: *json.JsonDocument, settings: Settings, now: s64) -> s32 {
+        zstd := access.configuration.zstdResponses
+        names: [2]string = .["invite", "acceptance"]
+        kinds: [2]json.JsonKind = .[.Object, .Object]
+        locations: [2]s32
+        if !fields.Read(input, input.root, names[:], kinds[:], locations[:]) {
+            return Error(connection, 400, "invalid pairing completion", zstd)
+        }
+        document: json.JsonDocument
+        invite := proof.Normalize(*document, input, locations[0], false)
+        acceptance := proof.Normalize(*document, input, locations[1], true)
+        if invite < 0 || acceptance < 0 { return Error(connection, 400, "invalid pairing completion", zstd) }
+        verified := proof.Verify(*document, invite, false, "", "", now)
+        if verified.error != "" { return Error(connection, 400, verified.error, zstd) }
+        inviter: Text = fields.StringField(*document, invite, "node_id")
+        local := TextView(settings.local.id[:64])
+        if TextView(inviter) != local { return Error(connection, 400, "pairing invite belongs to another node", zstd) }
+        inviteID: Text = fields.StringField(*document, invite, "invite_id")
+        invitation: Text = fields.StringField(*document, invite, "signature")
+        accepted := proof.Verify(*document, acceptance, true, TextView(inviteID), TextView(invitation), now)
+        if accepted.error != "" { return Error(connection, 400, accepted.error, zstd) }
+        peer: Text = fields.StringField(*document, acceptance, "node_id")
+        if TextView(peer) == local { return Error(connection, 400, "cannot pair a node with itself", zstd) }
+        if !mutex.Lock(*access.databaseLock) { return Error(connection, 500, "could not record pairing", zstd) }
+        problem := store.Trust(access.configuration.database, *document, invite, acceptance, accepted.public[:], true)
+        mutex.Unlock(*access.databaseLock)
+        if problem != "" { return Error(connection, 409, problem, zstd) }
+        return Paired(connection, TextView(peer), zstd)
+    }
+
+    CompleteRemote :: (document: *json.JsonDocument, invite: s32, acceptance: s32, settings: Settings) -> bool {
+        root := json.JsonNewObject(document)
+        if !json.JsonSet(document, root, "invite", invite) || !json.JsonSet(document, root, "acceptance", acceptance) { return false }
+        bytes: Vec(u8)
+        if !json.JsonWriteInto(*bytes, document, root, json.JsonCompactStyle(false)) { return false }
+        item := json.JsonFirst(document, json.JsonMember(document, invite, "addresses"))
+        while item >= 0 {
+            address: Text = json.JsonString(document, item)
+            if client.Post(settings.scope, TextView(address), CompletePath, VecSlice(bytes, 0, bytes.count)) { return true }
+            item = json.JsonNext(document, item)
+        }
+        return false
+    }
+
+    Accept :: (access: *accounts.AccountAccess, connection: *void, input: *json.JsonDocument, settings: Settings, now: s64) -> s32 {
+        zstd := access.configuration.zstdResponses
+        document: json.JsonDocument
+        invite := proof.Normalize(*document, input, input.root, false)
+        if invite < 0 { return Error(connection, 400, "invalid pairing invite", zstd) }
+        verified := proof.Verify(*document, invite, false, "", "", now)
+        if verified.error != "" { return Error(connection, 400, verified.error, zstd) }
+        peer: Text = fields.StringField(*document, invite, "node_id")
+        if TextView(peer) == TextView(settings.local.id[:64]) { return Error(connection, 400, "cannot pair a node with itself", zstd) }
+        inviteID: Text = fields.StringField(*document, invite, "invite_id")
+        invitation: Text = fields.StringField(*document, invite, "signature")
+        acceptance := json.JsonNewObject(*document)
+        addresses := BaseAddress(*document, settings.baseURL)
+        if !LocalProof(*document, acceptance, settings, TextView(inviteID), "", addresses) ||
+            !json.JsonSet(*document, acceptance, "accepted_at", json.JsonNewInteger(*document, now)) {
+            return Error(connection, 500, "could not create pairing acceptance", zstd)
+        }
+        if proof.AddressProblem(*document, acceptance) != "" {
+            return Error(connection, 400, "this node needs a reachable MESH_BASE_URL", zstd)
+        }
+        if !proof.Sign(*document, acceptance, true, TextView(invitation), settings.local.seed[:]) {
+            return Error(connection, 500, "could not create pairing acceptance", zstd)
+        }
+        if !CompleteRemote(*document, invite, acceptance, settings) {
+            return Error(connection, 502, "could not complete pairing with inviter", zstd)
+        }
+        if !mutex.Lock(*access.databaseLock) { return Error(connection, 500, "could not record pairing", zstd) }
+        problem := store.Trust(access.configuration.database, *document, invite, invite, verified.public[:], false)
+        mutex.Unlock(*access.databaseLock)
+        if problem != "" { return Error(connection, 409, problem, zstd) }
+        return Paired(connection, TextView(peer), zstd)
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool {
+        return path == InvitePath || path == AcceptPath || path == CompletePath
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string,
+        settings: Settings, body: []u8, overflow: bool) -> s32 {
+        if method != "POST" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        zstd := access.configuration.zstdResponses
+        if path != CompletePath {
+            authorized := auth.LocalOperator(connection, settings.admin)
+            if authorized.status != 0 { return Error(connection, authorized.status, authorized.problem, zstd) }
+        }
+        input: reply.Body
+        {
+            loaded := reply.Read(connection, body, overflow, access.configuration.maximumBodyBytes, access.configuration.zstdRequests,
+                *input, path == InvitePath)
+            if loaded.status != 0 { return Error(connection, loaded.status, loaded.error, zstd) }
+        }
+        now := calendar.UnixMilliseconds() / 1000
+        if path == InvitePath { return Create(access, connection, *input.document, settings, now) }
+        if path == CompletePath { return Complete(access, connection, *input.document, settings, now) }
+        return Accept(access, connection, *input.document, settings, now)
+    }
+}

@@ -1,0 +1,182 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    canonical :: #import "canonical_json_native";
+    client :: #import "peer_http_native";
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    keys :: #import "device_signature_native";
+    policy :: #import "mesh_policy_native";
+    sha :: #import "crypto/sha256";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    random :: #import "std/random_linux";
+    sort :: #import "std/sort";
+    #import "std/vec"
+
+    Proof :: struct {
+        public: [32]u8
+        error: string
+    }
+
+    MaximumLifetime :: 86400;
+
+    RandomHex :: (output: []u8) -> bool {
+        bytes: [16]u8
+        return output.count >= 33 && random.FillSecure(bytes[:]) &&
+            sha.BytesToHex(*bytes[0], bytes.count, *output[0], output.count) == 1
+    }
+
+    #scope_file
+    AppendAddresses :: (document: *json.JsonDocument, node: s32, output: *Vec(u8)) -> bool {
+        storage: Vec(u8)
+        offsets: Vec(s64)
+        item := json.JsonFirst(document, node)
+        while item >= 0 {
+            if !VecPush(offsets, storage.count) || !json.JsonStringInto(document, item, *storage) { return false }
+            item = json.JsonNext(document, item)
+        }
+        if !VecPush(offsets, storage.count) { return false }
+        edges := VecSlice(offsets, 0, offsets.count)
+        bytes := VecSlice(storage, 0, storage.count)
+        addresses: Vec(string)
+        index: s64 = 0
+        while index + 1 < edges.count {
+            if !VecPush(addresses, TextView(bytes[edges[index]:edges[index + 1]])) { return false }
+            index += 1
+        }
+        values := VecSlice(addresses, 0, addresses.count)
+        sort.SortText(values)
+        for value, position: values {
+            if position > 0 && !BuilderAppend(<<output, ",") { return false }
+            if !BuilderAppend(<<output, value) { return false }
+        }
+        return BuilderAppend(<<output, "\n")
+    }
+
+    Message :: (document: *json.JsonDocument, root: s32, acceptance: bool,
+        inviteSignature: string, output: *Vec(u8)) -> bool {
+        context := ifx acceptance then "daochi-pairing-invite-v1-acceptance" else "daochi-pairing-invite-v1"
+        if !BuilderAppend(<<output, context) || !BuilderAppend(<<output, "\n1\n") { return false }
+        names: [4]string = .["invite_id", "node_id", "public_key", "display_name"]
+        for name: names {
+            value: Text = fields.StringField(document, root, name)
+            if !BuilderAppend(<<output, TextView(value)) || !BuilderAppend(<<output, "\n") { return false }
+        }
+        if !AppendAddresses(document, json.JsonMember(document, root, "addresses"), output) { return false }
+        if !acceptance {
+            space: Text = fields.StringField(document, root, "space_id")
+            if !BuilderAppend(<<output, TextView(space)) || !BuilderAppend(<<output, "\n") { return false }
+        }
+        timeField := ifx acceptance then "accepted_at" else "expires_at"
+        time := fields.Number(document, json.JsonMember(document, root, timeField))
+        timeText: [24]u8
+        nonce: Text = fields.StringField(document, root, "nonce")
+        if !BuilderAppend(<<output, numbers.FormatInteger(time, timeText[:])) || !BuilderAppend(<<output, "\n") ||
+            !BuilderAppend(<<output, TextView(nonce)) || !BuilderAppend(<<output, "\n") { return false }
+        policyBytes: Vec(u8)
+        proofInput := inviteSignature
+        if !acceptance {
+            if !canonical.Encode(document, json.JsonMember(document, root, "policy"), *policyBytes) { return false }
+            proofInput = TextView(VecSlice(policyBytes, 0, policyBytes.count))
+        }
+        digest := sha.Sha256Of(proofInput)
+        encoded: [65]u8
+        return sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) == 1 &&
+            BuilderAppend(<<output, TextView(encoded[:64])) && BuilderAppend(<<output, "\n")
+    }
+
+    #scope_export
+    Normalize :: (output: *json.JsonDocument, source: *json.JsonDocument, node: s32, acceptance: bool) -> s32 {
+        timeField := ifx acceptance then "accepted_at" else "expires_at"
+        spaceField := ifx acceptance then "" else "space_id"
+        policyField := ifx acceptance then "" else "policy"
+        names: [11]string = .["version", "invite_id", "node_id", "public_key", "display_name", "addresses",
+            spaceField, timeField, "nonce", policyField, "signature"]
+        kinds: [11]json.JsonKind = .[.Number, .String, .String, .String, .String, .Array, .String, .Number, .String, .Object, .String]
+        found: [11]s32
+        if !fields.Read(source, node, names[:], kinds[:], found[:]) { return -1 }
+        result := json.JsonNewObject(output)
+        for name, index: names {
+            if name == "" { continue }
+            field := found[index]
+            child: s32
+            if kinds[index] == .Number {
+                child = json.JsonNewInteger(output, fields.Number(source, field))
+            } else if name == "addresses" {
+                child = ifx field < 0 then json.JsonNewNull(output) else policy.StringList(output, source, field)
+            } else if name == "policy" {
+                child = policy.Policy(output, source, field)
+            } else {
+                value: Text = json.JsonString(source, field)
+                if name == "space_id" && TextView(value) == "" { continue }
+                child = json.JsonNewStringCopy(output, TextView(value))
+            }
+            if !json.JsonSet(output, result, name, child) { return -1 }
+        }
+        return result
+    }
+
+    AddressProblem :: (document: *json.JsonDocument, root: s32) -> string {
+        item := json.JsonFirst(document, json.JsonMember(document, root, "addresses"))
+        if item < 0 { return "at least one reachable address is required" }
+        while item >= 0 {
+            address: Text = json.JsonString(document, item)
+            if !client.ValidAddress(TextView(address)) { return "invalid pairing address" }
+            item = json.JsonNext(document, item)
+        }
+        return ""
+    }
+
+    Sign :: (document: *json.JsonDocument, root: s32, acceptance: bool, inviteSignature: string, seed: []u8) -> bool {
+        message: Vec(u8)
+        signature: [64]u8
+        if !Message(document, root, acceptance, inviteSignature, *message) ||
+            !keys.Sign(seed, VecSlice(message, 0, message.count), signature[:]) { return false }
+        encoded := binary.EncodeBase64(TextView(signature[:]), true, false)
+        return encoded.error == "" && fields.SetString(document, root, "signature", TextView(VecSlice(encoded.value, 0, encoded.value.count)))
+    }
+
+    Verify :: (document: *json.JsonDocument, root: s32, acceptance: bool, requiredInviteID: string,
+        inviteSignature: string, now: s64) -> Proof {
+        invalid := ifx acceptance then "invalid pairing acceptance" else "invalid pairing invite"
+        inviteID: Text = fields.StringField(document, root, "invite_id")
+        nodeID: Text = fields.StringField(document, root, "node_id")
+        nonce: Text = fields.StringField(document, root, "nonce")
+        if fields.Number(document, json.JsonMember(document, root, "version")) != 1 ||
+            TextView(inviteID) == "" || TextView(nonce) == "" || !identity.ValidUserID(TextView(nodeID)) ||
+            (acceptance && TextView(inviteID) != requiredInviteID) { return .{error = invalid} }
+        if acceptance {
+            time := fields.Number(document, json.JsonMember(document, root, "accepted_at"))
+            if time < now - 300 || time > now + 300 { return .{error = "pairing acceptance time is outside the allowed window"} }
+            problem := AddressProblem(document, root)
+            if problem != "" { return .{error = problem} }
+        } else {
+            time := fields.Number(document, json.JsonMember(document, root, "expires_at"))
+            if time <= now || time > now + MaximumLifetime { return .{error = "pairing invite expired or too far in the future"} }
+        }
+        key: Text = fields.StringField(document, root, "public_key")
+        publicText := TextView(key)
+        if publicText.count != 64 || !binary.IsHex(publicText) {
+            return .{error = ifx acceptance then "invalid pairing acceptance public key" else "invalid pairing public key"}
+        }
+        public := binary.DecodeBinaryField(publicText)
+        if public.error != "" || public.value.count != 32 { return .{error = invalid} }
+        bytes := VecSlice(public.value, 0, public.value.count)
+        digest := sha.Sha256Of(TextView(bytes))
+        encoded: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) != 1 || TextView(encoded[:64]) != TextView(nodeID) {
+            return .{error = ifx acceptance then "pairing acceptance node ID does not match public key" else "pairing node ID does not match public key"}
+        }
+        signed: Text = fields.StringField(document, root, "signature")
+        signature := binary.DecodeBase64(TextView(signed), true, false)
+        message: Vec(u8)
+        if signature.error != "" || signature.value.count != 64 || !Message(document, root, acceptance, inviteSignature, *message) ||
+            !keys.Verify(bytes, VecSlice(message, 0, message.count), VecSlice(signature.value, 0, signature.value.count)) {
+            return .{error = ifx acceptance then "invalid pairing acceptance signature" else "invalid pairing signature"}
+        }
+        result: Proof
+        for index: 0..31 { result.public[index] = bytes[index] }
+        if !acceptance { result.error = AddressProblem(document, root) }
+        return result
+    }
+}

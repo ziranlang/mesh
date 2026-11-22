@@ -1,0 +1,248 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    scan :: #import "std/json_scan";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    CopyString :: (source: *json.JsonDocument, node: s32, dest: *json.JsonDocument, object: s32, key: string,
+        required: bool = false) -> bool {
+        value: Text = json.JsonString(source, node)
+        text := TextView(value)
+        if text == "" && !required {
+            return true
+        }
+        return fields.SetString(dest, object, key, text)
+    }
+
+    CopyFunction :: (source: *json.JsonDocument, node: s32, dest: *json.JsonDocument, object: s32) -> bool {
+        keys: [4]string = .["name", "arguments", "description", "parameters"]
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .Missing]
+        members: [4]s32
+        if !ReadObject(source, node, keys[:], kinds[:], members[:]) {
+            return false
+        }
+        if !CopyString(source, members[0], dest, object, "name", true) ||
+            !CopyString(source, members[1], dest, object, "arguments") ||
+            !CopyString(source, members[2], dest, object, "description") {
+            return false
+        }
+        return members[3] < 0 || json.JsonSet(dest, object, "parameters", json.JsonCopy(dest, source, members[3]))
+    }
+
+    CopyTool :: (source: *json.JsonDocument, node: s32, dest: *json.JsonDocument, object: s32, call: bool) -> bool {
+        keys: [3]string = .["type", "function", ifx call then "id" else ""]
+        kinds: [3]json.JsonKind = .[.String, .Object, .String]
+        members: [3]s32
+        if !fields.Read(source, node, keys[:], kinds[:], members[:]) ||
+            !CopyString(source, members[0], dest, object, "type", true) {
+            return false
+        }
+        if call && !CopyString(source, members[2], dest, object, "id", true) {
+            return false
+        }
+        function := json.JsonNewObject(dest)
+        return CopyFunction(source, members[1], dest, function) && json.JsonSet(dest, object, "function", function)
+    }
+
+    #scope_export
+    // Like the common Go-struct reader, with .Missing for a RawMessage field.
+    ReadObject :: (source: *json.JsonDocument, node: s32, keys: []string, kinds: []json.JsonKind, members: []s32) -> bool {
+        for index: 0..members.count - 1 {
+            members[index] = -1
+        }
+        kind := json.JsonKindOf(source, node)
+        if kind == .Missing || kind == .Null {
+            return true
+        }
+        if kind != .Object {
+            return false
+        }
+        member := json.JsonFirst(source, node)
+        while member >= 0 {
+            key: Text = json.JsonKey(source, member)
+            actual := json.JsonKindOf(source, member)
+            for expected, index: keys {
+                if !wire.MatchesToken(TextView(key), expected) {
+                    continue
+                }
+                wanted := kinds[index]
+                if actual == .Null && wanted != .Missing {
+                    break
+                }
+                if wanted != .Missing && wanted != actual {
+                    return false
+                }
+                members[index] = member
+                break
+            }
+            member = json.JsonNext(source, member)
+        }
+        return true
+    }
+
+    // Keep only the fields that belong to the public chat message contract.
+    CopyMessage :: (source: *json.JsonDocument, node: s32, dest: *json.JsonDocument, object: s32) -> bool {
+        keys: [4]string = .["role", "content", "tool_call_id", "tool_calls"]
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .Array]
+        members: [4]s32
+        if !fields.Read(source, node, keys[:], kinds[:], members[:]) ||
+            !CopyString(source, members[0], dest, object, "role", true) ||
+            !CopyString(source, members[1], dest, object, "content") ||
+            !CopyString(source, members[2], dest, object, "tool_call_id") {
+            return false
+        }
+        calls := json.JsonCount(source, members[3])
+        if calls == 0 {
+            return true
+        }
+        array := json.JsonNewArray(dest)
+        call := json.JsonFirst(source, members[3])
+        while call >= 0 {
+            item := json.JsonNewObject(dest)
+            if !CopyTool(source, call, dest, item, true) || !json.JsonAppend(dest, array, item) {
+                return false
+            }
+            call = json.JsonNext(source, call)
+        }
+        return json.JsonSet(dest, object, "tool_calls", array)
+    }
+
+    // The original value size matters for context and tool parameter limits.
+    RawMember :: (data: string, object: s32, name: string) -> scan.JsonRange {
+        result: scan.JsonRange = .{start = -1, end = -1}
+        if object < 0 || object >= data.count || data[object] != #char "{" {
+            return result
+        }
+        cursor := scan.Space(data, object + 1)
+        while cursor < data.count && data[cursor] != #char "}" {
+            key := scan.ReadString(data, cursor)
+            if !key.valid {
+                break
+            }
+            colon := scan.Space(data, key.after)
+            start := scan.Space(data, colon + 1)
+            end := scan.ValueEnd(data, start, 0)
+            if end < start {
+                break
+            }
+            decoded := scan.ReadStringValue(data, cursor, 80)
+            if decoded.valid && wire.MatchesToken(TextView(VecSlice(decoded.value, 0, decoded.value.count)), name) {
+                result = .{start = start, end = end}
+            }
+            cursor = scan.Space(data, end)
+            if cursor >= data.count || data[cursor] != #char "," {
+                break
+            }
+            cursor = scan.Space(data, cursor + 1)
+        }
+        return result
+    }
+
+    ValidateMessages :: (document: *json.JsonDocument, first: s32) -> bool {
+        hasUser := false
+        message := first
+        while message >= 0 {
+            roleText: Text = fields.StringField(document, message, "role")
+            contentText: Text = fields.StringField(document, message, "content")
+            replyIDText: Text = fields.StringField(document, message, "tool_call_id")
+            role := TextView(roleText)
+            content := TextView(contentText)
+            replyID := TextView(replyIDText)
+            calls := json.JsonMember(document, message, "tool_calls")
+            count := json.JsonCount(document, calls)
+            maximum := ifx role == "tool" then 98304 else 4096
+            if content.count > maximum || replyID.count > 128 || count > 4 {
+                return false
+            }
+            if role == "user" {
+                hasUser = true
+                if wire.TrimSpace(content) == "" || count != 0 || replyID != "" {
+                    return false
+                }
+            } else if role == "tool" {
+                if replyID == "" || count != 0 {
+                    return false
+                }
+            } else if role != "assistant" || replyID != "" {
+                return false
+            }
+            call := json.JsonFirst(document, calls)
+            while call >= 0 {
+                function := json.JsonMember(document, call, "function")
+                id: Text = fields.StringField(document, call, "id")
+                name: Text = fields.StringField(document, function, "name")
+                arguments: Text = fields.StringField(document, function, "arguments")
+                if !json.JsonIs(document, json.JsonMember(document, call, "type"), "function") ||
+                    TextView(id).count == 0 || TextView(id).count > 128 || TextView(name).count == 0 ||
+                    TextView(name).count > 64 || TextView(arguments).count > 65536 {
+                    return false
+                }
+                call = json.JsonNext(document, call)
+            }
+            message = json.JsonNext(document, message)
+        }
+        return hasUser
+    }
+
+    // Validates a tool catalog and writes only the supported tool fields.
+    CopyTools :: (source: *json.JsonDocument, list: s32, raw: string, dest: *json.JsonDocument, result: s32) -> bool {
+        positions: [64]scan.JsonRange
+        count := json.JsonCount(source, list)
+        if count == 0 {
+            return true
+        }
+        if count > positions.count || scan.ArrayRanges(raw, 0, positions[:]) != count {
+            return false
+        }
+        tool := json.JsonFirst(source, list)
+        for index: 0..count - 1 {
+            object := json.JsonNewObject(dest)
+            if !CopyTool(source, tool, dest, object, false) ||
+                !json.JsonIs(dest, json.JsonMember(dest, object, "type"), "function") {
+                return false
+            }
+            function := json.JsonMember(dest, object, "function")
+            name: Text = fields.StringField(dest, function, "name")
+            description: Text = fields.StringField(dest, function, "description")
+            original := RawMember(raw, positions[index].start, "function")
+            parameters := RawMember(raw, original.start, "parameters")
+            if TextView(name).count == 0 || TextView(name).count > 64 || TextView(description).count > 1024 ||
+                (json.JsonMember(dest, function, "parameters") >= 0 && parameters.start < 0) ||
+                parameters.end - parameters.start > 4096 || !json.JsonAppend(dest, result, object) {
+                return false
+            }
+            tool = json.JsonNext(source, tool)
+        }
+        return true
+    }
+
+    Offers :: (document: *json.JsonDocument, tools: s32, name: string) -> bool {
+        tool := json.JsonFirst(document, tools)
+        while tool >= 0 {
+            function := json.JsonMember(document, tool, "function")
+            if json.JsonIs(document, json.JsonMember(document, function, "name"), name) {
+                return true
+            }
+            tool = json.JsonNext(document, tool)
+        }
+        return false
+    }
+
+    ValidReplyTool :: (document: *json.JsonDocument, call: s32, payload: *json.JsonDocument, tools: s32) -> bool {
+        function := json.JsonMember(document, call, "function")
+        name: Text = fields.StringField(document, function, "name")
+        id: Text = fields.StringField(document, call, "id")
+        arguments: Text = fields.StringField(document, function, "arguments")
+        text := wire.TrimSpace(TextView(arguments))
+        limit := ifx TextView(name) == "report_feedback" then 65536 else 4096
+        if !Offers(payload, tools, TextView(name)) ||
+            !json.JsonIs(document, json.JsonMember(document, call, "type"), "function") ||
+            TextView(id).count == 0 || TextView(id).count > 128 || text.count == 0 || text.count > limit {
+            return false
+        }
+        object: json.JsonDocument
+        return json.JsonRead(*object, text) && json.JsonKindOf(*object, object.root) == .Object
+    }
+}

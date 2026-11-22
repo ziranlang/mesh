@@ -1,0 +1,102 @@
+// Server-owned attribution and prices for Entity's existing game shop.
+wire :: #import "wire_text";
+integers :: #import "token_payload";
+
+ShopProduct :: struct {
+    app: string
+    key: string
+    units: s64
+}
+
+Title :: (action: string) -> string {
+    product := Product(action)
+    if product.app != "" {
+        return product.app
+    }
+    if action == "wurm.coins" {
+        return "wurm"
+    }
+    if action == "shovey.coins" {
+        return "shovey"
+    }
+    return ""
+}
+Product :: (action: string) -> ShopProduct {
+    p: ShopProduct
+    if action == "wurm.mint" {
+        p = .{"wurm", "skin-wurm-mint-v2", 10000000}
+    }
+    else if action == "wurm.berry" {
+        p = .{"wurm", "skin-wurm-berry-v2", 20000000}
+    }
+    else if action == "wurm.rose" {
+        p = .{"wurm", "skin-wurm-rose-v2", 30000000}
+    }
+    else if action == "wurm.lunar-dragon" {
+        p = .{"wurm", "skin-wurm-lunar-dragon-v1", 50000000}
+    }
+    else if action == "wurm.mountains" {
+        p = .{"wurm", "stage-wurm-mountains-v1", 20000000}
+    }
+    else if action == "choano.pearl" {
+        p = .{"choano", "decoration-choano-pearl-v1", 10000000}
+    }
+    else if action == "choano.flower" {
+        p = .{"choano", "decoration-choano-flower-v1", 20000000}
+    }
+    else if action == "choano.wizard" {
+        p = .{"choano", "decoration-choano-wizard-v1", 30000000}
+    }
+    else if action == "shovey.night" {
+        p = .{"shovey", "skin-shovey-night-v1", 10000000}
+    }
+    else if action == "shovey.crystal" {
+        p = .{"shovey", "skin-shovey-crystal-v1", 30000000}
+    }
+    return p
+}
+
+Validate :: (app: string, action: string, key: string, amount: s64, metadata: string) -> string {
+    product := Product(action)
+    if action == "wurm.coins" || action == "shovey.coins" {
+        prefix := wire.Cut(key, #char "-")
+        title := wire.Cut(prefix.after, #char "-")
+        pack := wire.Cut(title.after, #char "-")
+        serial := wire.Cut(pack.after, #char "-")
+        if prefix.before != "coins" || !serial.found || serial.after != "v1" {
+            return "invalid shop coin key"
+        }
+        product.app = ifx action == "wurm.coins" then "wurm" else "shovey"
+        if title.before != product.app {
+            return "shop title mismatch"
+        }
+        if pack.before == "1" {
+            product.units = 2000000
+        } else if pack.before == "2" {
+            product.units = 5000000
+        } else if pack.before == "3" {
+            product.units = 10000000
+        } else {
+            return "unknown shop coin pack"
+        }
+        if product.app == "shovey" {
+            product.units *= 5
+        }
+        sequence := integers.ParseInteger(serial.before)
+        if !sequence.is_ok || sequence.value <= 0 || serial.before[0] < #char "1" || serial.before[0] > #char "9" {
+            return "invalid shop coin sequence"
+        }
+        product.key = key
+    }
+    if product.app == "" {
+        if wire.TrimPrefix(action, "wurm.").count != action.count || wire.TrimPrefix(action, "shovey.").count != action.count ||
+            wire.TrimPrefix(action, "choano.").count != action.count {
+            return "unknown shop product"
+        }
+        return ""
+    }
+    if app != product.app || amount != product.units || key != product.key || metadata != "" {
+        return "shop product title, price or key mismatch"
+    }
+    return ""
+}

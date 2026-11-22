@@ -1,112 +1,18 @@
-#import "codec"
-#import "std/vec"
 #import "identity"
-#import "std/hmac_sha256_go"
-#import "std/constant_time"
 #import "std/random_go"
+#import "std/vec"
 clock :: #import "std/time_go";
-
-go_hex :: #system_library "go:encoding/hex";
-
-go_strings :: #system_library "go:strings";
-Split :: (value: string, separator: string) -> []string #foreign go_strings "Split";
-Join :: (values: []string, separator: string) -> string #foreign go_strings "Join";
-EncodeHex :: (value: []u8) -> string #foreign go_hex "EncodeToString";
-
-AuthTokenMetadata :: struct {
-    userID: string
-    sessionID: string
-    issuedAt: s64
-    expiresAt: s64
-    version: string
-}
-
-AuthTokenMetadataResult :: struct {
-    value: AuthTokenMetadata
-    error: string
-}
+payload_rules :: #import "token_payload";
+wire :: #import "token_wire";
+hmac :: #import "token_hmac_go";
 
 AuthTokenResult :: struct {
     value: string
     error: string
 }
 
-ParsedInteger :: struct {
-    value: s64
-    is_ok: bool
-}
-
-DecimalText :: (value: s64) -> AuthTokenResult {
-    result: AuthTokenResult
-    result.error = "token allocation failed"
-    remaining: u64 = cast(u64)value
-    negative: bool = value < 0
-    if negative {
-        remaining = cast(u64)0 - remaining
-    }
-    digits: [20]u8
-    start: s64 = 20
-    while true {
-        start -= 1
-        digits[start] = cast(u8)(cast(u64)48 + remaining % cast(u64)10)
-        remaining /= cast(u64)10
-        if remaining == cast(u64)0 {
-            break
-        }
-    }
-    output: Vec(u8)
-    if negative {
-        if !VecPush(output, cast(u8)45) {
-            return result
-        }
-    }
-    while start < 20 {
-        if !VecPush(output, digits[start]) {
-            return result
-        }
-        start += 1
-    }
-    result.value = BuilderFinish(output)
-    result.error = ""
-    return result
-}
-
-ParseInteger :: (text: string) -> ParsedInteger {
-    result: ParsedInteger
-    if text.count == 0 {
-        return result
-    }
-    negative: bool = text[0] == cast(u8)45
-    start: s64 = 0
-    if negative || text[0] == cast(u8)43 {
-        start = 1
-    }
-    if start == text.count {
-        return result
-    }
-    limit: u64 = cast(u64)9223372036854775807
-    if negative {
-        limit += cast(u64)1
-    }
-    value: u64 = cast(u64)0
-    while start < text.count {
-        byte: u8 = text[start]
-        if byte < cast(u8)48 || byte > cast(u8)57 {
-            return result
-        }
-        digit: u64 = cast(u64)(byte - cast(u8)48)
-        if value > (limit - digit) / cast(u64)10 {
-            return result
-        }
-        value = value * cast(u64)10 + digit
-        start += 1
-    }
-    result.value = cast(s64)value
-    if negative {
-        result.value = cast(s64)0 - result.value
-    }
-    result.is_ok = true
-    return result
+ParseInteger :: (text: string) -> payload_rules.ParsedInteger {
+    return payload_rules.ParseInteger(text)
 }
 
 // Clock and duration policy stay explicit at the caller until the service
@@ -117,35 +23,21 @@ IssueAuthToken :: (secret: []u8, userID: string, expiresAt: s64) -> AuthTokenRes
         result.error = "invalid token input"
         return result
     }
-    expiry: AuthTokenResult = DecimalText(expiresAt)
-    if expiry.error != "" {
-        return expiry
-    }
     sessionBytes: [32]u8
     filled := Fill(sessionBytes[:])
     if filled.error != null {
         result.error = "secure session allocation failed"
         return result
     }
-    issued: AuthTokenResult = DecimalText(clock.Unix(clock.Now()))
-    if issued.error != "" {
-        return issued
-    }
-    parts: [6]string = .["v2", userID, expiry.value, issued.value, EncodeHex(sessionBytes[:]), ""]
-    payload: string = Join(parts[:], "\n")
-    mac: DigestResult = HMACSHA256(secret, payload)
-    if mac.error != "" {
-        result.error = mac.error
+    formatted := payload_rules.FormatV2(userID, expiresAt, clock.Unix(clock.Now()), sessionBytes)
+    if formatted.count == 0 {
+        result.error = "invalid token input"
         return result
     }
-    encodedPayload: BinaryField = EncodeBase64(payload, true, false)
-    encodedMAC: BinaryField = EncodeBase64(mac.value, true, false)
-    if encodedPayload.error != "" || encodedMAC.error != "" {
-        result.error = "token allocation failed"
-        return result
-    }
-    tokenParts: [2]string = .[encodedPayload.value, encodedMAC.value]
-    result.value = Join(tokenParts[:], ".")
+    signed := wire.Sign(secret, TextView(formatted.bytes[:formatted.count]), hmac.Compute)
+    if signed.error != "" { return .{error = signed.error} }
+    bytes := signed.value
+    result.value = BuilderFinish(bytes)
     return result
 }
 
@@ -164,63 +56,9 @@ VerifyAuthToken :: (secret: []u8, token: string, now: s64) -> AuthTokenResult {
     return result
 }
 
-InspectAuthToken :: (secret: []u8, token: string) -> AuthTokenMetadataResult {
-    result: AuthTokenMetadataResult
-    parts: []string = Split(token, ".")
-    if parts.count != 2 || secret.count == 0 {
-        result.error = "invalid token"
-        return result
-    }
-    payload: BinaryField = DecodeBase64(parts[0], true, false)
-    if payload.error != "" {
-        result.error = "invalid token payload"
-        return result
-    }
-    signature: BinaryField = DecodeBase64(parts[1], true, false)
-    if signature.error != "" {
-        result.error = "invalid token signature"
-        return result
-    }
-    mac: DigestResult = HMACSHA256(secret, payload.value)
-    if mac.error != "" {
-        result.error = mac.error
-        return result
-    }
-    if !ConstantTimeTextEqual(signature.value, mac.value) {
-        result.error = "invalid token signature"
-        return result
-    }
-    fields: []string = Split(payload.value, "\n")
-    if fields.count >= 4 && fields[0] == "v1" {
-        if !ValidUserID(fields[1]) {
-            result.error = "invalid token payload"
-            return result
-        }
-        expiresAt := ParseInteger(fields[2])
-        if !expiresAt.is_ok {
-            result.error = "token expired"
-            return result
-        }
-        result.value.userID = fields[1]
-        result.value.expiresAt = expiresAt.value
-        result.value.version = "v1"
-        return result
-    }
-    if fields.count != 6 || fields[5] != "" || fields[0] != "v2" || !ValidUserID(fields[1]) ||
-        !IsHex(fields[4]) || fields[4].count != 64 {
-        result.error = "invalid token payload"
-        return result
-    }
-    expiresAt := ParseInteger(fields[2])
-    issuedAt := ParseInteger(fields[3])
-    if !expiresAt.is_ok || !issuedAt.is_ok || issuedAt.value <= 0 {
-        result.error = "invalid token payload"
-        return result
-    }
-    result.value.userID = fields[1]
-    result.value.sessionID = fields[4]
-    result.value.issuedAt = issuedAt.value
-    result.value.expiresAt = expiresAt.value
-    result.value.version = "v2"
-    return result
+InspectAuthToken :: (secret: []u8, token: string) -> payload_rules.AuthTokenMetadataResult {
+    payload := wire.Verify(secret, token, hmac.Compute)
+    if payload.error != "" { return .{error = payload.error} }
+    bytes := payload.value
+    return payload_rules.Parse(BuilderFinish(bytes))
 }

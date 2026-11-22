@@ -1,0 +1,8 @@
+// Selectors 0–11 are Mesh defaults, 41–65 and 124–126 are Kryon profile
+// pictures, and 127–129 are Entity's abstract pictures.
+ValidIcon :: (value: s64) -> bool {
+    return (value >= 0 && value <= 11) || (value >= 41 && value <= 65) ||
+        (value >= 124 && value <= 129)
+}
+
+SetIconSQL :: "UPDATE server_users SET profile_icon=?2,last_seen_at=?3 WHERE user_id_hash=?1";

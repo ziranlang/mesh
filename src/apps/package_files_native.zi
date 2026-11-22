@@ -1,0 +1,55 @@
+#if TARGET == .C && OS == .LINUX {
+    files :: #import "std/file_linux";
+    tree :: #import "std/file_tree_linux";
+    binary :: #import "binary_codec";
+    #import "std/vec"
+
+    SmallFile :: struct {
+        bytes: Vec(u8)
+        found: bool
+        valid: bool
+        tooLarge: bool
+    }
+
+    #scope_file
+    NoEntry :: 2;
+
+    #scope_export
+    MetadataLimit :: 65536;
+
+    Open :: (databasePath: string, app: string) -> files.FileHandle {
+        if databasePath == "" { return .{} }
+        directory: Vec(u8)
+        if !BuilderAppend(directory, databasePath) || !BuilderAppend(directory, ".packages") { return .{} }
+        root := tree.OpenDirectoryHandle(TextView(VecSlice(directory, 0, directory.count)))
+        if !root.valid { return .{} }
+        defer files.CloseFile(root)
+        return tree.OpenChildDirectory(root, app)
+    }
+
+    Read :: (directory: files.FileHandle, name: string, limit: s64 = MetadataLimit) -> SmallFile {
+        status: s32
+        file := tree.OpenChildRegularFile(directory, name, *status)
+        if !file.valid { return .{found = status != NoEntry} }
+        defer files.CloseFile(file)
+        size := files.FileSize(file)
+        result: SmallFile = .{found = true, tooLarge = size > limit}
+        if size < 0 || !VecResizeBounded(result.bytes, size, limit) { return result }
+        at: s64 = 0
+        while at < size {
+            read := files.ReadAt(file, VecSlice(result.bytes, at, size), at)
+            if read <= 0 { return result }
+            at += read
+        }
+        result.valid = files.FileSize(file) == size
+        return result
+    }
+
+    LowerHash :: (hash: string) -> bool {
+        if hash.count != 64 { return false }
+        for byte: hash {
+            if byte >= #char "A" && byte <= #char "F" { return false }
+        }
+        return binary.IsHex(hash)
+    }
+}

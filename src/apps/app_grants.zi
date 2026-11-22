@@ -1,4 +1,6 @@
+queries :: #import "app_grant_queries";
 #import "std/go_types"
+#import "std/vec"
 #import "protocol"
 apps :: #import "app_store";
 accounts :: #import "account_state";
@@ -130,13 +132,13 @@ Create :: (database: *sql.Database, context: ctx.Context, userID: string, reques
     if result.error != null {
         return result
     }
-    written := InsertGrant(transaction, context, GrantInsertSQL, generated.value,
+    written := InsertGrant(transaction, context, queries.GrantInsertSQL, generated.value,
         userID, request.SourceAppID, request.TargetAppID, request.CollectionPrefix, request.Permission)
     result.error = written.error
     if written.error != null {
         return result
     }
-    audited := InsertCreateAudit(transaction, context, CreateAuditSQL, generated.value, userID, AuditJSON(request))
+    audited := InsertCreateAudit(transaction, context, queries.CreateAuditSQL, generated.value, userID, AuditJSON(request))
     result.error = audited.error
     if audited.error != null {
         return result
@@ -150,7 +152,7 @@ Create :: (database: *sql.Database, context: ctx.Context, userID: string, reques
 
 ByID :: (database: *sql.Database, context: ctx.Context, userID: string, id: string) -> GrantResult {
     result: GrantResult
-    row := QueryTwo(database, context, GrantByIDSQL, userID, id)
+    row := QueryTwo(database, context, queries.GrantByIDSQL, userID, id)
     result.error = ScanGrant(row, *result.value.ID, *result.value.UserIDHash,
         *result.value.SourceAppID, *result.value.TargetAppID, *result.value.CollectionPrefix,
         *result.value.Permission, *result.value.Status, *result.value.CreatedAt,
@@ -160,7 +162,7 @@ ByID :: (database: *sql.Database, context: ctx.Context, userID: string, id: stri
 
 List :: (database: *sql.Database, context: ctx.Context, userID: string) -> GrantsResult {
     result: GrantsResult
-    queried := QueryRows(database, context, GrantListSQL, userID)
+    queried := QueryRows(database, context, queries.GrantListSQL, userID)
     result.error = queried.error
     if queried.error != null {
         return result
@@ -190,7 +192,7 @@ Revoke :: (database: *sql.Database, context: ctx.Context, userID: string, id: st
     }
     transaction := begun.value
     RollbackAtReturn(transaction)
-    revoked := RevokeGrant(transaction, context, GrantRevokeSQL, userID, id)
+    revoked := RevokeGrant(transaction, context, queries.GrantRevokeSQL, userID, id)
     if revoked.error != null {
         return revoked.error
     }
@@ -198,7 +200,7 @@ Revoke :: (database: *sql.Database, context: ctx.Context, userID: string, id: st
     if affected.error != null || cast(isize)affected.value == cast(isize)0 {
         return sql.NoRows()
     }
-    audited := InsertRevokeAudit(transaction, context, RevokeAuditSQL, id, userID)
+    audited := InsertRevokeAudit(transaction, context, queries.RevokeAuditSQL, id, userID)
     if audited.error != null {
         return audited.error
     }
@@ -234,7 +236,7 @@ AuthorizedRecords :: (database: *sql.Database, context: ctx.Context, userID: str
     }
     if source != target {
         count: isize = 0
-        row := QueryScope(database, context, AuthorizedScopeSQL, userID, source, target, prefix)
+        row := QueryScope(database, context, queries.AuthorizedScopeSQL, userID, source, target, prefix)
         result.error = ScanCount(row, *count)
         if result.error != null {
             return result
@@ -250,7 +252,7 @@ AuthorizedRecords :: (database: *sql.Database, context: ctx.Context, userID: str
 Visibility :: (database: *sql.Database, context: ctx.Context, appID: string, prefix: string) -> CollectionVisibilityResult {
     result: CollectionVisibilityResult
     value := ""
-    row := QueryTwo(database, context, VisibilitySQL, appID, prefix)
+    row := QueryTwo(database, context, queries.VisibilitySQL, appID, prefix)
     error := ScanVisibility(row, *value)
     if errors.Is(error, sql.NoRows()) {
         return result
@@ -270,10 +272,15 @@ Records :: (database: *sql.Database, context: ctx.Context, userID: string, prefi
     if HasSuffix(prefix, ".*") {
         // SQLite's LIKE ignores case while app IDs do not, so the exact
         // prefix check keeps "AUTH" from reading "auth" records.
-        queried = QueryPrefixRows(database, context, PrefixRecordsSQL, userID,
-            scope.LikePatternForCollectionPrefix(prefix), TrimSuffix(prefix, "*"))
+        pattern := scope.LikePatternForCollectionPrefix(prefix)
+        if pattern.count == 0 {
+            result.error = errors.New("collection pattern allocation failed")
+            return result
+        }
+        queried = QueryPrefixRows(database, context, queries.PrefixRecordsSQL, userID,
+            BuilderFinish(pattern), TrimSuffix(prefix, "*"))
     } else {
-        queried = QueryRecordRows(database, context, ExactRecordsSQL, userID, prefix)
+        queried = QueryRecordRows(database, context, queries.ExactRecordsSQL, userID, prefix)
     }
     result.error = queried.error
     if queried.error != null {
@@ -296,41 +303,3 @@ Records :: (database: *sql.Database, context: ctx.Context, userID: string, prefi
     result.error = sql.RowsError(rows)
     return result
 }
-
-#scope_file
-GrantInsertSQL :: #string SQL_END
-INSERT INTO server_app_grants(id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status)
-VALUES(?1,?2,?3,?4,?5,?6,'active')
-SQL_END;
-GrantByIDSQL :: #string SQL_END
-SELECT id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status,created_at,updated_at,revoked_at
-FROM server_app_grants WHERE user_id_hash=?1 AND id=?2
-SQL_END;
-GrantListSQL :: #string SQL_END
-SELECT id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status,created_at,updated_at,revoked_at
-FROM server_app_grants WHERE user_id_hash=?1 ORDER BY updated_at DESC,id
-SQL_END;
-GrantRevokeSQL :: #string SQL_END
-UPDATE server_app_grants
-SET status='revoked', revoked_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
-WHERE user_id_hash=?1 AND id=?2 AND status='active'
-SQL_END;
-CreateAuditSQL :: "INSERT INTO server_app_grant_audit(grant_id,user_id_hash,action,payload_json) VALUES(?1,?2,'create',?3)";
-RevokeAuditSQL :: "INSERT INTO server_app_grant_audit(grant_id,user_id_hash,action) VALUES(?1,?2,'revoke')";
-AuthorizedScopeSQL :: #string SQL_END
-SELECT EXISTS(
- SELECT 1 FROM server_app_grants
- WHERE user_id_hash=?1 AND source_app_id=?2 AND target_app_id=?3
-   AND collection_prefix=?4 AND permission='read' AND status='active'
-)
-SQL_END;
-VisibilitySQL :: "SELECT visibility FROM server_app_collections WHERE app_id=?1 AND collection_prefix=?2";
-ExactRecordsSQL :: #string SQL_END
-SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes
-FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 ORDER BY collection,id
-SQL_END;
-PrefixRecordsSQL :: #string SQL_END
-SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes
-FROM server_encrypted_records WHERE user_id_hash=?1 AND collection LIKE ?2 ESCAPE '\'
-  AND substr(collection,1,length(?3))=?3 ORDER BY collection,id
-SQL_END;

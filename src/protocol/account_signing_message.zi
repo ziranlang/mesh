@@ -1,0 +1,23 @@
+#import "std/vec"
+
+#scope_file
+AppendHex :: (output: *Vec(u8), bytes: []u8) -> bool {
+    alphabet := "0123456789abcdef"
+    for byte: bytes {
+        if !VecPush(<<output, alphabet[byte >> cast(u8)4]) ||
+            !VecPush(<<output, alphabet[byte & 15]) { return false }
+    }
+    return true
+}
+
+#scope_export
+Canonical :: (context: string, nonce: []u8, upperMethod: string, path: string, digest: [32]u8) -> Vec(u8) {
+    output: Vec(u8)
+    parts: [3]string = .[context, upperMethod, path]
+    for part: parts {
+        if !BuilderAppend(output, part) || !BuilderAppend(output, "\n") { return .{} }
+    }
+    if !AppendHex(*output, digest[:]) || !BuilderAppend(output, "\n") ||
+        !AppendHex(*output, nonce) || !BuilderAppend(output, "\n") { return .{} }
+    return output
+}

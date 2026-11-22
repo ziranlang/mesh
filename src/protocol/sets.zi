@@ -1,8 +1,7 @@
 #import "std/map_go"
 
+wire_text :: #import "wire_text";
 go_strings :: #system_library "go:strings";
-Split :: (value: string, separator: string) -> []string #foreign go_strings;
-TrimSpace :: (value: string) -> string #foreign go_strings;
 ToLower :: (value: string) -> string #foreign go_strings;
 
 StringSet :: Map(string, bool)
@@ -10,12 +9,14 @@ StringSet :: Map(string, bool)
 FromEnvironment :: (raw: string) -> StringSet {
     result: StringSet
     MapInit(result)
-    values := Split(raw, ",")
-    for value: values {
-        item := TrimSpace(value)
+    remaining := raw
+    while remaining != "" {
+        part := wire_text.Cut(remaining, #char ",")
+        item := wire_text.TrimSpace(part.before)
         if item != "" {
             MapSet(result, item, true)
         }
+        remaining = part.after
     }
     return result
 }
@@ -24,7 +25,7 @@ Normalize :: (values: []string) -> StringSet {
     result: StringSet
     MapInit(result)
     for value: values {
-        item := ToLower(TrimSpace(value))
+        item := ToLower(wire_text.TrimSpace(value))
         if item != "" {
             MapSet(result, item, true)
         }

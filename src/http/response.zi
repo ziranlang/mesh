@@ -3,6 +3,7 @@ http :: #import "std/http_go";
 io :: #import "std/io_go";
 json :: #import "std/json_go";
 coding :: #import "content_coding";
+wire_text :: #import "wire_text";
 strings :: #system_library "go:strings";
 native_http :: #system_library "go:net/http";
 builtin :: #system_library "go:builtin";
@@ -12,21 +13,21 @@ ErrorResponse :: struct {
     message: string #go_tag "json:\"error\""
 }
 Join :: (values: []string, separator: string) -> string #foreign strings;
-Split :: (value: string, separator: string) -> []string #foreign strings;
-Trim :: (value: string) -> string #foreign strings "TrimSpace";
-EqualFold :: (left: string, right: string) -> bool #foreign strings;
 DeleteHeader :: (headers: http.Header, name: string) #foreign native_http "Header.Del";
 HeaderValues :: (headers: http.Header, name: string) -> []string #foreign native_http "Header.Values";
 EncoderCleanup :: #type (lease: *coding.EncoderLease) -> void;
+WriteBytes :: (writer: http.ResponseWriter, body: []u8) #foreign native_http "ResponseWriter.Write";
 ReleaseAtReturn :: (callback: EncoderCleanup, lease: *coding.EncoderLease) #go_defer #foreign builtin "call";
 
 VaryEncoding :: (headers: http.Header) {
-    vary := Join(HeaderValues(headers, "Vary"), ", ")
-    for item: Split(vary, ",") {
-        if Trim(item) == "*" || EqualFold(Trim(item), "Accept-Encoding") {
+    entries := HeaderValues(headers, "Vary")
+    for entry: entries {
+        if wire_text.ContainsToken(entry, "*", wire_text.MatchesToken) ||
+            wire_text.ContainsToken(entry, "accept-encoding", wire_text.MatchesToken) {
             return
         }
     }
+    vary := Join(entries, ", ")
     if vary == "" {
         http.SetHeader(headers, "Vary", "Accept-Encoding")
     } else {
@@ -40,6 +41,12 @@ JSON :: (writer: http.ResponseWriter, status: isize, value: Any) {
     http.SetHeader(http.ResponseHeaders(writer), "Content-Type", "application/json")
     http.WriteHeader(writer, status)
     json.Encode(json.NewEncoder(cast(io.Writer)writer), value)
+}
+
+JSONBytes :: (writer: http.ResponseWriter, status: isize, body: []u8) {
+    http.SetHeader(http.ResponseHeaders(writer), "Content-Type", "application/json")
+    http.WriteHeader(writer, status)
+    WriteBytes(writer, body)
 }
 
 // Stream through a bounded reusable encoder without another account-sized

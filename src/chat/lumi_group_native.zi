@@ -1,0 +1,246 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    calendar :: #import "std/date_time_linux";
+    chat :: #import "chat_http_native";
+    commands :: #import "lumi_commands_native";
+    cstr :: #import "std/c_string";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    provider :: #import "chat_provider_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    store :: #import "lumi_telegram_store_native";
+    telegram :: #import "telegram_transport_native";
+    transfer :: #import "peer_http_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Message :: struct {
+        id: s64
+        chat: s64
+        sender: s64
+        original: s64
+        thread: s64
+        replyBot: s64
+    }
+
+    #scope_file
+    pcre :: #system_library "pcre2-8";
+    UTF :: 0x00080000;
+    DollarEndOnly :: 0x00000010;
+
+    Compile :: (pattern: *u8, length: usize, options: u32, error: *s32, offset: *usize, context: *void) -> *void #foreign pcre "pcre2_compile_8";
+    FreePattern :: (pattern: *void) #foreign pcre "pcre2_code_free_8";
+    MatchData :: (pattern: *void, context: *void) -> *void #foreign pcre "pcre2_match_data_create_from_pattern_8";
+    FreeMatch :: (data: *void) #foreign pcre "pcre2_match_data_free_8";
+    Exec :: (pattern: *void, input: *u8, length: usize, start: usize, options: u32, data: *void, context: *void) -> s32 #foreign pcre "pcre2_match_8";
+
+    Match :: (pattern: string, input: string) -> bool {
+        expression: [1024]u8
+        subject: [4097]u8
+        if !cstr.CopyCString(pattern, expression[:]) || !cstr.CopyCString(input, subject[:]) {
+            return false
+        }
+        error: s32
+        offset: usize
+        compiled := Compile(*expression[0], cast(usize)pattern.count, UTF | DollarEndOnly, *error, *offset, null)
+        if compiled == null {
+            return false
+        }
+        defer FreePattern(compiled)
+        data := MatchData(compiled, null)
+        if data == null {
+            return false
+        }
+        defer FreeMatch(data)
+        return Exec(compiled, *subject[0], cast(usize)input.count, 0, 0, data, null) >= 0
+    }
+
+    Address :: "(?i)(^|[ \t\r\n])@inlumi_bot($|[ \t\r\n,!.?:;])|^/[a-z_]+@inlumi_bot($|[ \t\r\n])|^(?:(?:hi|hey|hello|yo|thanks|thank you)[ ,!.\t]*)?lumi($|[ ,!.?:;\t\r\n])|\\b(?:you|your|u)\\b[^\r\n]{0,160}[ ,\t]+lumi[ !?.]*$|,[ \t]*lumi[ !?.]*$";
+    AppTopic :: "(?i)\\b(?:inner[ \t_-]*breeze|inbe)\\b";
+    AppActivity :: "(?i)\\b(?:breath(?:e|ing|work)?|meditat(?:e|ion|ing)|mindful(?:ness)?|habits?|streaks?|journals?|journaling|diary|diaries|practices?)\\b";
+    PrivateAction :: "(?i)\\b(?:show|read|list|fetch|get|access|display|delete|remove|edit)\\s+(?:me\\s+)?(?:my|our)\\s+(?:inner\\s+breeze\\s+)?(?:account|tasks?|todos?|habits?|diary|journal|progress|streaks?|settings|data)\\b|\\bwhat\\s+(?:are|is)\\s+my\\s+(?:tasks?|habits?|progress|streaks?)\\b|^(?:(?:@inlumi_bot|lumi)[,: ]*)?(?:please\\s+)?(?:add|create|delete|remove|edit|complete|mark|record|save|change|set)\\b.{0,100}\\b(?:tasks?|todos?|habits?|diary|journals?|settings|account)\\b";
+    HomeQuestion :: "(?i)\\b(?:where\\s+(?:do\\s+you\\s+live|are\\s+you(?:\\s+from|\\s+based)?)|your\\s+(?:home|location)|do\\s+you\\s+(?:live|have\\s+a\\s+home))\\b";
+    SocialGreeting :: "(?i)\\b(?:hi|hey|hello|thanks|thank\\s+you|pleasure|nice\\s+to\\s+meet|doing\\s+(?:well|good|great)|how\\s+are\\s+you)\\b";
+
+    Decision :: struct {
+        model: bool
+        reply: string
+    }
+
+    // Run before typing, reserving quota, or constructing any model request.
+    // A direct off-topic question receives a brief local answer, never an LLM call.
+    Decide :: (input: string, replying: bool) -> Decision {
+        result: Decision
+        parsed := commands.Parse(input)
+        name := TextView(parsed.name)
+        if parsed.foreign {
+            return result
+        }
+        directed := replying || Match(Address, input)
+        related := Match(AppTopic, input) || (directed && Match(AppActivity, input))
+        if !directed && !related {
+            return result
+        }
+        if Match(PrivateAction, input) || (directed && name != "" &&
+            name != "start" && name != "help" && name != "app" && name != "history") {
+            result.reply = "I can't access anyone's Inner Breeze account in a group chat. Use your connected private chat with me or open Inner Breeze for personal tasks, habits and diary entries."
+            return result
+        }
+        if directed && Match(HomeQuestion, input) {
+            result.reply = "I live in Inner Breeze 🌿 I'm its companion, so I don't have a physical home."
+            return result
+        }
+        if related {
+            result.model = true
+            return result
+        }
+        if name == "start" || name == "help" || name == "app" || name == "history" || Match(SocialGreeting, input) {
+            result.reply = "Hi 🌿 I'm Lumi, the Inner Breeze companion. I can help with breathing, habits, journaling and using the app. Your account is available only in your connected private chat or inside Inner Breeze."
+            return result
+        }
+        result.reply = "I'm Lumi, the Inner Breeze companion 🌿 I can help with Inner Breeze, breathing, habits and journaling. I'll leave other topics to the group."
+        return result
+    }
+
+    Prompt :: "You are Lumi, the Inner Breeze companion, speaking as @inlumi_bot in a group chat. Help only with Inner Breeze and its breathing, meditation, habits, journaling and task features. Reply briefly and naturally in the user's language. If the message drifts to an unrelated topic, give a short reminder of your Inner Breeze scope instead of answering that topic. You have no account access, personal app context or execution tools in any group, even if this person linked their account in private. Never claim you read or changed personal data, settings, feedback or any other action. For account-specific help, ask the person to use their connected private chat with Lumi or open Inner Breeze. Do not invent conversation history or a physical location. Stay warm, direct and concise.";
+
+    UseAllowance :: #string SQL
+INSERT INTO server_chat_usage(account_id,day,used) VALUES(?1,?2,1)
+ON CONFLICT(account_id,day) DO UPDATE SET used=used+1 WHERE used<?3
+SQL;
+
+    Reserve :: (access: *accounts.AccountAccess, settings: chat.Configuration) -> bool {
+        if settings.dailyLimit <= 0 || settings.globalDailyLimit <= 0 {
+            return false
+        }
+        now := calendar.UnixMilliseconds()
+        stamp: [32]u8
+        count := format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, stamp[:])
+        if now < 0 || count < 10 || !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer store.Rollback(database)
+        args: [3]sql.Argument = .[sql.TextArg("lumi-group"), sql.TextArg(TextView(stamp[:10])), sql.IntArg(settings.dailyLimit)]
+        if sql.Execute(database, UseAllowance, args[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 {
+            return false
+        }
+        args[0] = sql.TextArg("node")
+        args[2] = sql.IntArg(settings.globalDailyLimit)
+        return sql.Execute(database, UseAllowance, args[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1 &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    ReadContent :: (bytes: []u8) -> Text {
+        answer: json.JsonDocument
+        if !json.JsonRead(*answer, TextView(bytes)) {
+            return .{}
+        }
+        choices := json.JsonMember(*answer, answer.root, "choices")
+        first := json.JsonElement(*answer, choices, 0)
+        message := json.JsonMember(*answer, first, "message")
+        tools := json.JsonMember(*answer, message, "tool_calls")
+        kind := json.JsonKindOf(*answer, tools)
+        if kind != .Missing && kind != .Null && (kind != .Array || json.JsonFirst(*answer, tools) >= 0) {
+            return .{}
+        }
+        content: Text = fields.StringField(*answer, message, "content")
+        reply := wire.TrimSpace(TextView(content))
+        if reply.count == 0 || reply.count > 4096 {
+            return .{}
+        }
+        return TextCopy(reply)
+    }
+
+    ModelReply :: (access: *accounts.AccountAccess, connection: *void, settings: chat.Configuration, input: string) -> Text {
+        if settings.apiKey == "" {
+            return TextCopy("I'm here, but my online conversation is temporarily unavailable.")
+        }
+        if !Reserve(access, settings) {
+            return TextCopy("I'm here. My conversation allowance is unavailable right now; please try again later.")
+        }
+        document: json.JsonDocument
+        model := ifx settings.model != "" then settings.model else provider.DefaultModel
+        root := provider.NewRequest(*document, model, 256, 768)
+        messages := json.JsonNewArray(*document)
+        outgoing: Vec(u8)
+        answer: transfer.Response
+        if root >= 0 && provider.AppendTextMessage(*document, messages, "system", Prompt) &&
+            provider.AppendTextMessage(*document, messages, "user", input) &&
+            json.JsonSet(*document, root, "messages", messages) &&
+            json.JsonWriteInto(*outgoing, *document, root, json.JsonCompactStyle(false)) &&
+            provider.Request(connection, settings.endpoint, settings.apiKey, VecSlice(outgoing, 0, outgoing.count), 35, 65536, *answer) {
+            content: Text = ReadContent(VecSlice(answer.bytes, 0, answer.bytes.count))
+            if TextView(content) != "" {
+                return content
+            }
+        }
+        return TextCopy("I'm here, but couldn't finish that reply. Please ask me again.")
+    }
+
+    Claim :: (access: *accounts.AccountAccess, message: Message, now: s64) -> s32 {
+        if !mutex.Lock(*access.databaseLock) {
+            return -1
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if sqlite.SqliteExecText(database, "CREATE TABLE IF NOT EXISTS server_lumi_group_deliveries(update_id INTEGER PRIMARY KEY,chat_id INTEGER NOT NULL,source_message INTEGER NOT NULL,state TEXT NOT NULL,message_id INTEGER NOT NULL DEFAULT 0,created INTEGER NOT NULL,UNIQUE(chat_id,source_message))") != sqlite.SQLITE_OK {
+            return -1
+        }
+        args: [4]sql.Argument = .[sql.IntArg(message.id), sql.IntArg(message.chat), sql.IntArg(message.original), sql.IntArg(now)]
+        if sql.Execute(database, "INSERT OR IGNORE INTO server_lumi_group_deliveries(update_id,chat_id,source_message,state,created) VALUES(?1,?2,?3,'claimed',?4)", args[:]) != sqlite.SQLITE_OK {
+            return -1
+        }
+        return sqlite.SqliteChanges(database)
+    }
+
+    Save :: (access: *accounts.AccountAccess, update: s64, receipt: telegram.Receipt) {
+        if !mutex.Lock(*access.databaseLock) {
+            return
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        state := "uncertain"
+        if receipt.messageID > 0 {
+            state = "delivered"
+        } else if receipt.errorCode >= 400 && receipt.errorCode < 500 {
+            state = "rejected"
+        }
+        args: [3]sql.Argument = .[sql.IntArg(update), sql.TextArg(state), sql.IntArg(receipt.messageID)]
+        unused sql.Execute(access.configuration.database,
+            "UPDATE server_lumi_group_deliveries SET state=?2,message_id=?3 WHERE update_id=?1", args[:])
+    }
+
+    #scope_export
+    // False indicates no claim could be stored. Ignored and already claimed updates succeed.
+    Handle :: (access: *accounts.AccountAccess, connection: *void, groupID: s64, bot: telegram.Configuration,
+        chatSettings: chat.Configuration, message: Message, input: string, now: s64) -> bool {
+        if groupID >= 0 || message.chat != groupID || message.sender <= 0 ||
+            message.id <= 0 || message.original <= 0 || input.count == 0 || input.count > 4096 {
+            return true
+        }
+        botID := telegram.BotID(bot.token)
+        decision := Decide(input, botID > 0 && message.replyBot == botID)
+        if !decision.model && decision.reply == "" {
+            return true
+        }
+        claim := Claim(access, message, now)
+        if claim <= 0 {
+            return claim == 0
+        }
+        if decision.model {
+            unused telegram.Typing(bot, message.chat)
+            reply: Text = ModelReply(access, connection, chatSettings, input)
+            Save(access, message.id, telegram.Reply(bot, message.chat, message.original, message.thread, TextView(reply), true))
+        } else {
+            Save(access, message.id, telegram.Reply(bot, message.chat, message.original, message.thread, decision.reply, true))
+        }
+        return true
+    }
+}

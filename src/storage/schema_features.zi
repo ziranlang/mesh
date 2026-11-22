@@ -1,0 +1,275 @@
+// Feature tables and triggers initialized by both storage backends.
+core :: #import "schema_sql";
+
+#scope_export
+TelegramAccountEntries :: #string SQL_ENTRY
+CREATE TABLE IF NOT EXISTS server_telegram_account_entries (
+    entry_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    bot_id INTEGER NOT NULL,
+    telegram_id INTEGER NOT NULL,
+    challenge TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    account_id TEXT NOT NULL DEFAULT '',
+    client_id TEXT NOT NULL DEFAULT '',
+    signing_key TEXT NOT NULL DEFAULT '',
+    encryption_key TEXT NOT NULL DEFAULT '',
+    init_digest TEXT NOT NULL DEFAULT '',
+    verified_at INTEGER NOT NULL DEFAULT 0,
+    bound_at INTEGER NOT NULL DEFAULT 0,
+    consumed_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS server_telegram_account_entries_expiry
+ON server_telegram_account_entries(expires_at);
+CREATE TABLE IF NOT EXISTS server_telegram_init_replays (
+    digest TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_telegram_entry_nonces (
+    entry_id TEXT NOT NULL REFERENCES server_telegram_account_entries(entry_id) ON DELETE CASCADE,
+    nonce TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(entry_id,nonce)
+);
+SQL_ENTRY;
+
+SharedLists :: #string SQL
+CREATE TABLE IF NOT EXISTS server_shared_lists (
+ id TEXT PRIMARY KEY, owner TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ title TEXT NOT NULL, items TEXT NOT NULL, revision INTEGER NOT NULL, deleted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS server_list_invitations (
+ id TEXT PRIMARY KEY, list_id TEXT NOT NULL REFERENCES server_shared_lists(id) ON DELETE CASCADE,
+ target TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ status TEXT NOT NULL CHECK(status IN ('pending','accepted','declined')),
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(list_id,target)
+);
+CREATE INDEX IF NOT EXISTS server_list_invitations_target ON server_list_invitations(target,status);
+CREATE TABLE IF NOT EXISTS server_list_permissions (
+ list_id TEXT NOT NULL, target TEXT NOT NULL,
+ access TEXT NOT NULL CHECK(access IN ('owner','editor','viewer')),
+ PRIMARY KEY(list_id,target),
+ FOREIGN KEY(list_id,target) REFERENCES server_list_invitations(list_id,target) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS server_list_commands (
+ user_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ request_id TEXT NOT NULL, body TEXT NOT NULL, PRIMARY KEY(user_id,request_id)
+);
+SQL;
+
+#scope_file
+Publications :: #string SQL
+CREATE TABLE IF NOT EXISTS server_publications (
+ id TEXT PRIMARY KEY,
+ author TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ format TEXT NOT NULL, title TEXT NOT NULL,
+ visibility TEXT NOT NULL CHECK(visibility IN ('public','friends','private')),
+ levels INTEGER NOT NULL DEFAULT 0, document TEXT NOT NULL,
+ created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS server_publications_author ON server_publications(author,updated_at);
+CREATE INDEX IF NOT EXISTS server_publications_recent ON server_publications(visibility,format,updated_at);
+SQL;
+
+StoragePlans :: #string SQL
+CREATE TABLE IF NOT EXISTS server_storage_plans (
+ user_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ period TEXT NOT NULL CHECK(period IN ('monthly','yearly')), expires_at INTEGER NOT NULL,
+ size TEXT NOT NULL DEFAULT '1gb'
+);
+CREATE TABLE IF NOT EXISTS server_storage_purchases (
+ user_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ request_id TEXT NOT NULL, period TEXT NOT NULL, expires_at INTEGER NOT NULL,
+ receipt_id TEXT NOT NULL, size TEXT NOT NULL DEFAULT '1gb', PRIMARY KEY(user_id,request_id)
+);
+SQL;
+
+Unlocks :: #string SQL
+CREATE TABLE IF NOT EXISTS account_unlocks (
+ account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ product TEXT NOT NULL, receipt_id TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id,product)
+);
+SQL;
+
+TokenRescales :: #string SQL
+CREATE TABLE IF NOT EXISTS token_rescales (
+ provider TEXT PRIMARY KEY, factor INTEGER NOT NULL, accounts INTEGER NOT NULL,
+ units_before INTEGER NOT NULL, units_after INTEGER NOT NULL,
+ intents INTEGER NOT NULL, deposits INTEGER NOT NULL,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+SQL;
+
+ExchangeRates :: #string SQL
+CREATE TABLE IF NOT EXISTS exchange_rates (
+ pair TEXT PRIMARY KEY, usd_cents INTEGER NOT NULL CHECK(usd_cents > 0),
+ updated_at INTEGER NOT NULL, sources TEXT NOT NULL
+);
+SQL;
+
+GameEvidence :: #string SQL
+CREATE TABLE IF NOT EXISTS game_maps (
+ game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL, map TEXT NOT NULL,
+ created_at INTEGER NOT NULL, PRIMARY KEY(game,level,map_hash)
+);
+CREATE TABLE IF NOT EXISTS game_map_sources (
+ game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL, source_version TEXT NOT NULL,
+ created_at INTEGER NOT NULL, PRIMARY KEY(game,level,map_hash,source_version),
+ FOREIGN KEY(game,level,map_hash) REFERENCES game_maps(game,level,map_hash)
+);
+CREATE TABLE IF NOT EXISTS game_completions (
+ account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ id TEXT NOT NULL, game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL,
+ moves INTEGER NOT NULL, actions TEXT NOT NULL, trace TEXT NOT NULL,
+ evidence_complete INTEGER NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id,id), FOREIGN KEY(game,level,map_hash) REFERENCES game_maps(game,level,map_hash)
+);
+CREATE INDEX IF NOT EXISTS game_completion_best ON game_completions(account_id,game,level,map_hash,moves);
+CREATE INDEX IF NOT EXISTS game_completion_eligible ON game_completions(account_id,game,level,evidence_complete,moves);
+SQL;
+
+RewardCheckins :: #string SQL
+CREATE TABLE IF NOT EXISTS reward_checkins (
+ account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ game TEXT NOT NULL, day INTEGER NOT NULL, created_at INTEGER NOT NULL,
+ PRIMARY KEY(account_id,game,day)
+);
+SQL;
+
+AccountHolds :: #string SQL_END
+CREATE TABLE IF NOT EXISTS server_account_holds (
+    user_id_hash TEXT PRIMARY KEY,
+    held_at INTEGER NOT NULL,
+    purge_after INTEGER NOT NULL
+);
+SQL_END;
+
+AccountBackups :: #string SQL_END
+
+CREATE TABLE IF NOT EXISTS server_account_backups (
+    user_id_hash TEXT PRIMARY KEY,
+    backup TEXT NOT NULL,
+    salt TEXT NOT NULL,
+    verifier TEXT NOT NULL,
+    failed_attempts INTEGER NOT NULL DEFAULT 0,
+    locked_until INTEGER NOT NULL DEFAULT 0,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS server_account_backup_secret (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    secret BLOB NOT NULL
+);
+SQL_END;
+
+AccountPasskeys :: "CREATE TABLE IF NOT EXISTS server_account_passkeys(user_id_hash TEXT NOT NULL,credential TEXT NOT NULL,wrapper TEXT NOT NULL,verifier TEXT NOT NULL,label TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(user_id_hash,credential));";
+
+GoogleAccounts :: "CREATE TABLE IF NOT EXISTS server_account_google(subject_hash TEXT PRIMARY KEY,user_id_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL);";
+
+#scope_export
+TokenAllocations :: #string SQL
+CREATE TABLE IF NOT EXISTS token_allocation_migration (
+    version INTEGER PRIMARY KEY CHECK(version=1),
+    historical_ledger_seq INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO token_allocation_migration(version,historical_ledger_seq)
+SELECT 1,COALESCE(MAX(ledger_seq),0) FROM token_ledger;
+CREATE TABLE IF NOT EXISTS token_google_origins (
+    payment_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    package_name TEXT NOT NULL CHECK(package_name<>''),
+    app_id TEXT NOT NULL CHECK(app_id<>''),
+    amount INTEGER NOT NULL CHECK(amount>0)
+);
+CREATE TABLE IF NOT EXISTS token_allocation_receipts (
+    receipt_id TEXT PRIMARY KEY REFERENCES token_ledger(receipt_id)
+);
+CREATE TABLE IF NOT EXISTS token_allocations (
+    receipt_id TEXT PRIMARY KEY REFERENCES token_ledger(receipt_id),
+    account_id TEXT NOT NULL,
+    asset_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    source_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
+    source_type TEXT NOT NULL,
+    provider_payment_id TEXT NOT NULL,
+    issued INTEGER NOT NULL CHECK(issued>0),
+    remaining INTEGER NOT NULL CHECK(remaining<=issued),
+    ledger_seq INTEGER NOT NULL UNIQUE
+);
+CREATE INDEX IF NOT EXISTS token_allocation_pool ON token_allocations(account_id,asset_id,app_id,ledger_seq);
+CREATE INDEX IF NOT EXISTS token_allocation_source ON token_allocations(account_id,source_receipt_id,source_type);
+CREATE UNIQUE INDEX IF NOT EXISTS token_allocation_google_payment ON token_allocations(provider_payment_id) WHERE source_type='google_play';
+CREATE TABLE IF NOT EXISTS token_allocation_debits (
+    debit_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
+    credit_receipt_id TEXT NOT NULL,
+    units INTEGER NOT NULL CHECK(units>0),
+    PRIMARY KEY(debit_receipt_id,credit_receipt_id)
+);
+CREATE TABLE IF NOT EXISTS token_referral_offsets (
+    account_id TEXT NOT NULL,
+    source_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
+    credit_receipt_id TEXT NOT NULL REFERENCES token_allocations(receipt_id),
+    units INTEGER NOT NULL CHECK(units>0),
+    remaining INTEGER NOT NULL CHECK(remaining>=0 AND remaining<=units),
+    PRIMARY KEY(account_id,source_receipt_id,credit_receipt_id)
+);
+SQL;
+
+#scope_file
+TelegramStars :: #string SQL
+CREATE TABLE IF NOT EXISTS telegram_stars_invoices (
+    invoice_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    bot_id INTEGER NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    product_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    units INTEGER NOT NULL CHECK(units > 0),
+    expires_at INTEGER NOT NULL,
+    state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','cancelled','credited','refunded')),
+    invoice_url TEXT NOT NULL DEFAULT '',
+    link_attempt INTEGER NOT NULL DEFAULT 0,
+    checkout_id TEXT NOT NULL DEFAULT '',
+    charge_id TEXT NOT NULL DEFAULT '',
+    UNIQUE(account_id,app_id,bot_id,node_id,audience,request_id)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS telegram_stars_charge ON telegram_stars_invoices(bot_id,charge_id) WHERE charge_id<>'';
+CREATE TABLE IF NOT EXISTS telegram_stars_history_refunds (
+    bot_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    charge_id TEXT NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL CHECK(amount > 0),
+    PRIMARY KEY(bot_id,node_id,audience,charge_id,buyer_id,amount)
+);
+CREATE TABLE IF NOT EXISTS telegram_stars_launches (
+    digest TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    app_id TEXT NOT NULL,
+    bot_id INTEGER NOT NULL,
+    buyer_id INTEGER NOT NULL,
+    node_id TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS telegram_stars_launch_expiry ON telegram_stars_launches(expires_at);
+SQL;
+
+#scope_export
+Statements :: (history: string) -> [18]string {
+    statements: [18]string = .[TelegramAccountEntries, history, SharedLists, Publications,
+        StoragePlans, Unlocks, TokenRescales, ExchangeRates, core.FeedbackReplies, GameEvidence,
+        RewardCheckins, AccountHolds, AccountBackups, AccountPasskeys, GoogleAccounts,
+        core.TombstoneContent, TokenAllocations, TelegramStars]
+    return statements
+}

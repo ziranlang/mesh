@@ -1,0 +1,7 @@
+identity :: #import "identity";
+scope :: #import "scope";
+
+Valid :: (source: string, target: string, prefix: string, permission: string) -> bool {
+    return identity.ValidNamespace(source) && identity.ValidNamespace(target) &&
+        scope.ValidCollectionPrefix(prefix) && permission == "read"
+}

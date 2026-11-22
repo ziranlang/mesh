@@ -1,0 +1,618 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    coding :: #import "content_coding_native";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    mutex :: #import "std/mutex_linux";
+    numbers :: #import "token_payload";
+    rate :: #import "account_recovery_http_native";
+    response :: #import "http_json_native";
+    wire :: #import "wire_text";
+    tx :: #import "signed_tx_native";
+    utf8 :: #import "std/utf8";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    registry :: #import "app_registry_queries";
+    signing :: #import "token_signing_native";
+    shop :: #import "token_shop_rules";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    State :: struct {
+        signer: issuer.Issuer
+        products: Vec(u8)
+    }
+
+    #scope_file
+    Assets :: "/api/v1/tokens/assets";
+    Products :: "/api/v1/tokens/products";
+    Issuer :: "/api/v1/tokens/issuer";
+    Balance :: "/api/v1/tokens/balance";
+    Ledger :: "/api/v1/tokens/ledger";
+    TokenActivityPath :: "/api/v1/tokens/activity";
+    Receipt :: "/api/v1/tokens/receipts/";
+    Latest :: "/api/v1/tokens/checkpoints/latest";
+    Spend :: "/api/v1/tokens/spend";
+    Credit :: "/api/v1/admin/tokens/manual-credit";
+    Checkpoint :: "/api/v1/admin/tokens/checkpoint";
+
+    Product :: struct {
+        id: string
+        units: s64
+        atomic: s64
+    }
+
+    Before :: (left: string, right: string) -> bool {
+        length := ifx left.count < right.count then left.count else right.count
+        for byte, index: left[:length] {
+            if byte != right[index] {
+                return byte < right[index]
+            }
+        }
+        return left.count < right.count
+    }
+
+    ProductConfiguration :: (configuration: string, directPurchases: bool, output: *Vec(u8)) -> bool {
+        products: Vec(Product)
+        remaining := configuration
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            remaining = item.after
+            name := wire.Cut(wire.TrimSpace(item.before), #char ":")
+            if !name.found || name.before == "" {
+                continue
+            }
+            price := wire.Cut(name.after, #char ":")
+            if wire.Cut(price.after, #char ":").found {
+                continue
+            }
+            units := numbers.ParseInteger(price.before)
+            if !units.is_ok || units.value <= 0 {
+                continue
+            }
+            atomic := numbers.ParseInteger(price.after)
+            product: Product = .{id = name.before, units = units.value,
+                atomic = ifx directPurchases && atomic.is_ok && atomic.value > 0 then atomic.value else 0}
+            slot: s64 = 0
+            {
+                view := VecSlice(products, 0, products.count)
+                while slot < view.count && Before(view[slot].id, product.id) {
+                    slot += 1
+                }
+                if slot < view.count && view[slot].id == product.id {
+                    view[slot] = product
+                    continue
+                }
+            }
+            if !VecPush(products, product) {
+                return false
+            }
+            view := VecSlice(products, 0, products.count)
+            index := view.count - 1
+            while index > slot {
+                view[index] = view[index - 1]
+                index -= 1
+            }
+            view[slot] = product
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        array := json.JsonNewArray(*document)
+        for product: VecSlice(products, 0, products.count) {
+            item := json.JsonNewObject(*document)
+            if !ledger.PutText(*document, item, "product_id", product.id) ||
+                !ledger.PutInt(*document, item, "token_units", product.units) ||
+                !ledger.PutInt(*document, item, "monero_atomic_amount", product.atomic, true) || !json.JsonAppend(*document, array, item) {
+                return false
+            }
+        }
+        return json.JsonSet(*document, root, "products", array) &&
+            json.JsonWriteInto(output, *document, root, json.JsonCompactStyle(false)) && BuilderAppend(<<output, "\n")
+    }
+
+    ReadOnly :: (path: string) -> bool {
+        return path == Assets || path == Products || path == Issuer || path == Balance || path == Ledger ||
+            path == TokenActivityPath || path == Latest || wire.TrimPrefix(path, Receipt).count != path.count
+    }
+
+    Reply :: (access: *accounts.AccountAccess, connection: *void, method: string, document: *json.JsonDocument, root: s32) -> s32 {
+        return response.Reply(connection, method, 200, document, root, access.configuration.zstdResponses)
+    }
+
+    Error :: (access: *accounts.AccountAccess, connection: *void, method: string, status: u32, message: string) -> s32 {
+        return response.ErrorReply(connection, method, status, message, access.configuration.zstdResponses)
+    }
+
+    IssuerReply :: (state: *State, access: *accounts.AccountAccess, connection: *void, method: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "issuer_id", ledger.IssuerID) ||
+            !ledger.PutText(*document, root, "public_key", issuer.PublicHex(*state.signer)) ||
+            !ledger.PutText(*document, root, "algorithm", "Ed25519") ||
+            !ledger.PutText(*document, root, "status", issuer.Status(*state.signer)) {
+            return 0
+        }
+        return Reply(access, connection, method, *document, root)
+    }
+
+    Filter :: (connection: *void, name: string) -> string {
+        return wire.TrimSpace(http.QueryArgument(connection, name))
+    }
+
+    // The Go handler ignores the ParseInt error for since, which preserves
+    // its saturated value for a decimal outside int64.
+    Since :: (value: string) -> s64 {
+        parsed := numbers.ParseInteger(value)
+        if parsed.is_ok || value == "" {
+            return parsed.value
+        }
+        negative := value[0] == #char "-"
+        start := ifx negative || value[0] == #char "+" then 1 else 0
+        if start == value.count {
+            return 0
+        }
+        for digit: value[start:] {
+            if digit < #char "0" || digit > #char "9" {
+                return 0
+            }
+        }
+        return ifx negative then -9223372036854775807 - 1 else 9223372036854775807
+    }
+
+    AccountRead :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string, account: string) -> s32 {
+        document: json.JsonDocument
+        database := access.configuration.database
+        if path == TokenActivityPath {
+            before := numbers.ParseInteger(Filter(connection, "before_seq"))
+            limit := numbers.ParseInteger(Filter(connection, "limit"))
+            cursor := ifx before.is_ok && before.value > 0 then before.value else 9223372036854775807
+            page := ifx limit.is_ok && limit.value >= 1 && limit.value <= 500 then limit.value else 100
+            root := ledger.ActivityObject(database, account, cursor, page, *document)
+            if root < 0 {
+                return Error(access, connection, method, 500, "token activity failed")
+            }
+            return Reply(access, connection, method, *document, root)
+        }
+        app := Filter(connection, "app_id")
+        if app != "" && !identity.ValidNamespace(app) {
+            return Error(access, connection, method, 400, "invalid app_id")
+        }
+        if path == Balance {
+            root := ledger.BalanceObject(database, account, app, *document)
+            if root < 0 {
+                return Error(access, connection, method, 500, "token balance failed")
+            }
+            return Reply(access, connection, method, *document, root)
+        }
+        size := Filter(connection, "limit")
+        page: s64 = -1
+        if size != "" {
+            limit := numbers.ParseInteger(size)
+            if !limit.is_ok || limit.value < 1 || limit.value > 100 {
+                return Error(access, connection, method, 400, "invalid ledger limit")
+            }
+            page = limit.value
+        }
+        root := ledger.LedgerObject(database, account, app, Since(Filter(connection, "since")), page, *document)
+        if root < 0 {
+            return Error(access, connection, method, 500, "token ledger failed")
+        }
+        return Reply(access, connection, method, *document, root)
+    }
+
+    PublicRead :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string, receiptID: string) -> s32 {
+        document: json.JsonDocument
+        database := access.configuration.database
+        if path == Assets {
+            root := ledger.AssetsObject(database, *document)
+            if root < 0 {
+                return Error(access, connection, method, 500, "token assets failed")
+            }
+            return Reply(access, connection, method, *document, root)
+        }
+        if path == Latest {
+            result := ledger.Latest(database, *document)
+            if result.status != 200 {
+                return Error(access, connection, method, result.status,
+                    ifx result.status == 404 then "checkpoint not found" else "token checkpoint failed")
+            }
+            return Reply(access, connection, method, *document, result.node)
+        }
+        result := ledger.Receipt(database, receiptID, *document)
+        if result.status != 200 {
+            return Error(access, connection, method, result.status,
+                ifx result.status == 404 then "receipt not found" else "token receipt failed")
+        }
+        return Reply(access, connection, method, *document, result.node)
+    }
+
+    Failure :: (status: u32, message: string) -> writes.Result {
+        return .{status = status, error = message}
+    }
+
+    // Go structs accept unknown fields, ignore null values, and match JSON field
+    // names case-insensitively. A recognized field with the wrong type is invalid.
+    ReadFields :: (document: *json.JsonDocument, names: []string, fields: []s32, amount: *s64) -> bool {
+        kind := json.JsonKindOf(document, document.root)
+        if kind != .Object && kind != .Null {
+            return false
+        }
+        for index: 0..fields.count - 1 {
+            fields[index] = -1
+        }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            valueKind := json.JsonKindOf(document, node)
+            if valueKind != .Null {
+                name: Text = json.JsonKey(document, node)
+                label := TextView(name)
+                if wire.MatchesToken(label, "amount") {
+                    parsed, valid := json.JsonInteger(document, node)
+                    if !valid {
+                        return false
+                    }
+                    <<amount = parsed
+                } else {
+                    for field, index: names {
+                        if wire.MatchesToken(label, field) {
+                            if valueKind != .String {
+                                return false
+                            }
+                            fields[index] = node
+                            break
+                        }
+                    }
+                }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    NormalizeJSONText :: (text: string, fromEscapes: bool, output: *Vec(u8)) -> bool {
+        start: s64 = 0
+        at: s64 = 0
+        while at < text.count {
+            end := ifx text.count - at < 4 then text.count else at + 4
+            decoded := utf8.Decode(text[at:end], 0)
+            if decoded.valid {
+                at += cast(s64)decoded.after
+                continue
+            }
+            if !BuilderAppend(<<output, text[start:at]) || !BuilderAppend(<<output, "�") {
+                return false
+            }
+            // Invalid wire bytes are replaced one at a time. Once the wire is
+            // valid, an invalid scalar can only come from one JSON escape.
+            if fromEscapes && end - at >= 3 && text[at] == 237 && text[at + 1] >= 160 && text[at + 1] <= 191 &&
+                text[at + 2] >= 128 && text[at + 2] <= 191 {
+                at += 3
+            } else {
+                at += 1
+            }
+            start = at
+        }
+        return BuilderAppend(<<output, text[start:])
+    }
+
+    ReadText :: (document: *json.JsonDocument, field: s32) -> Text, bool {
+        text: Text = json.JsonString(document, field)
+        if !utf8.Valid(TextView(text)) {
+            normalized: Vec(u8)
+            if !NormalizeJSONText(TextView(text), true, *normalized) {
+                return .{}, false
+            }
+            return BuilderFinish(normalized), true
+        }
+        return text, true
+    }
+
+    AuthorizeSpend :: (access: *accounts.AccountAccess, connection: *void, account: string, app: string,
+        raw: []u8, now: s64, auditTime: string) -> writes.Result {
+        database := access.configuration.database
+        args: [2]sql.Argument = .[sql.TextArg(app), sql.TextArg(ledger.AssetID)]
+        exists := sql.ReadInteger(database, registry.ActiveAppSQL, args[:1])
+        if !exists.found {
+            return Failure(500, "token spend failed")
+        }
+        if exists.value == 0 {
+            return Failure(400, "unknown app_id")
+        }
+        header := wire.TrimSpace(http.Header(connection, "X-Mesh-Tx"))
+        if header != "" {
+            verified := tx.VerifyTx(database, access.configuration.verify, header, account, app, "POST", Spend, raw, now, auditTime)
+            if verified.status != 0 {
+                return Failure(verified.status, verified.message)
+            }
+            if verified.databaseError != sqlite.SQLITE_OK {
+                return Failure(500, "authentication failed")
+            }
+        }
+        policy := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM token_app_permissions WHERE app_id=?1)", args[:1])
+        if !policy.found {
+            return Failure(500, "authentication failed")
+        }
+        if policy.value == 0 {
+            return .{}
+        }
+        permission := sql.ReadInteger(database,
+            "SELECT legacy_unsigned_until FROM token_app_permissions WHERE app_id=?1 AND asset_id=?2 AND permission='spend' AND status='active'", args[:])
+        if permission.status != sqlite.SQLITE_OK {
+            return Failure(500, "authentication failed")
+        }
+        if !permission.found {
+            return Failure(403, "app token permission denied")
+        }
+        if header == "" && (permission.value == 0 || now > permission.value) {
+            return Failure(401, "signed transaction required")
+        }
+        return .{}
+    }
+
+    SpendRequest :: (state: *State, access: *accounts.AccountAccess, connection: *void, actor: string, request: *json.JsonDocument,
+        raw: []u8, at: string, now: s64, document: *json.JsonDocument) -> writes.Result {
+        names: [5]string = .["app_id", "asset_id", "action", "idempotency_key", "metadata"]
+        fields: [5]s32
+        amount: s64
+        if !ReadFields(request, names[:], fields[:], *amount) {
+            return Failure(400, "invalid json")
+        }
+        appText, appOK := ReadText(request, fields[0])
+        assetText, assetOK := ReadText(request, fields[1])
+        actionText, actionOK := ReadText(request, fields[2])
+        keyText, keyOK := ReadText(request, fields[3])
+        metadataText, metadataOK := ReadText(request, fields[4])
+        if !appOK || !assetOK || !actionOK || !keyOK || !metadataOK {
+            return Failure(400, "invalid json")
+        }
+        app := wire.TrimSpace(TextView(appText))
+        asset := wire.TrimSpace(TextView(assetText))
+        action := wire.TrimSpace(TextView(actionText))
+        key := wire.TrimSpace(TextView(keyText))
+        metadata := wire.TrimSpace(TextView(metadataText))
+        if !identity.ValidNamespace(app) {
+            return Failure(400, "invalid app_id")
+        }
+        if amount <= 0 {
+            return Failure(400, "amount required")
+        }
+        if !identity.ValidNamespace(action) {
+            return Failure(400, "invalid action")
+        }
+        if !identity.ValidClientID(key) {
+            return Failure(400, "invalid idempotency_key")
+        }
+        violation := shop.Validate(app, action, key, amount, metadata)
+        if violation != "" {
+            return Failure(400, violation)
+        }
+        if !state.signer.signing {
+            return Failure(503, "token issuer unavailable")
+        }
+        if asset != "" && asset != ledger.AssetID {
+            return Failure(400, "unsupported asset_id")
+        }
+        reference: Vec(u8)
+        if !BuilderAppend(reference, action) || !BuilderAppend(reference, ":") || !BuilderAppend(reference, key) {
+            return Failure(500, "token spend failed")
+        }
+        if metadata != "" {
+            digest: [65]u8
+            if !signing.HashHex(metadata, digest[:]) || !BuilderAppend(reference, ":") || !BuilderAppend(reference, TextView(digest[:16])) {
+                return Failure(500, "token spend failed")
+            }
+        }
+        denied := AuthorizeSpend(access, connection, actor, app, raw, now, at)
+        if denied.status != 0 {
+            return denied
+        }
+        event: signing.Event = .{account = actor, app = app, kind = "debit", amount = -amount, source = "spend",
+            reference = TextView(VecSlice(reference, 0, reference.count))}
+        return writes.Spend(access.configuration.database, *state.signer, event, at, key, document)
+    }
+
+    CreditRequest :: (state: *State, access: *accounts.AccountAccess, request: *json.JsonDocument,
+        at: string, document: *json.JsonDocument) -> writes.Result {
+        names: [3]string = .["account_id", "app_id", "source_ref"]
+        fields: [3]s32
+        amount: s64
+        if !ReadFields(request, names[:], fields[:], *amount) {
+            return Failure(400, "invalid json")
+        }
+        if !state.signer.signing {
+            return Failure(503, "token issuer unavailable")
+        }
+        accountText, accountOK := ReadText(request, fields[0])
+        appText, appOK := ReadText(request, fields[1])
+        referenceText, referenceOK := ReadText(request, fields[2])
+        if !accountOK || !appOK || !referenceOK {
+            return Failure(400, "invalid json")
+        }
+        account: [64]u8
+        if !identity.NormalizeUserID(wire.TrimSpace(TextView(accountText)), account[:]) {
+            return Failure(400, "invalid account_id")
+        }
+        reference := wire.TrimSpace(TextView(referenceText))
+        generated: Vec(u8)
+        if reference == "" {
+            timestamp: [31]u8
+            formatted := signing.WireTime(signing.Now(), true, timestamp[:])
+            if formatted == "" || !BuilderAppend(generated, "manual:") || !BuilderAppend(generated, formatted) {
+                return Failure(400, "token credit failed")
+            }
+            reference = TextView(VecSlice(generated, 0, generated.count))
+        }
+        event: signing.Event = .{account = TextView(account[:]), app = wire.TrimSpace(TextView(appText)), kind = "credit",
+            amount = amount, source = "admin", reference = reference}
+        return writes.Credit(access.configuration.database, *state.signer, event, at, document)
+    }
+
+    Mutation :: (state: *State, access: *accounts.AccountAccess, adminToken: string, connection: *void, path: string,
+        input: []u8, overflow: bool, document: *json.JsonDocument) -> writes.Result {
+        database := access.configuration.database
+        now := signing.Now()
+        if !now.valid {
+            return Failure(500, "token clock unavailable")
+        }
+        actor: auth.BearerAuthentication
+        if path == Spend {
+            actor = auth.Authenticate(database, connection, access.configuration.secret, now.seconds, "", false)
+            if actor.status != 0 {
+                return Failure(actor.status, actor.message)
+            }
+        } else {
+            if adminToken == "" {
+                return Failure(403, "admin disabled")
+            }
+            if !auth.AdminMatches(connection, adminToken) {
+                return Failure(401, "admin token required")
+            }
+        }
+        normalized: Vec(u8)
+        request: response.Body
+        decoded := false
+        length: s64 = 0
+        if path == Checkpoint {
+            if !state.signer.signing {
+                return Failure(503, "token issuer unavailable")
+            }
+        } else {
+            loaded := response.Decode(connection, input, overflow || input.count > access.configuration.maximumBodyBytes,
+                access.configuration.maximumBodyBytes, access.configuration.zstdRequests, *request)
+            if loaded.status != 0 {
+                if loaded.error == "request body too large" {
+                    return Failure(400, "request body too large")
+                }
+                if loaded.error == "invalid or oversized gzip body" {
+                    return Failure(400, "invalid or oversized gzip body")
+                }
+                if loaded.error == "invalid or oversized zstd body" {
+                    return Failure(400, "invalid or oversized zstd body")
+                }
+                if loaded.error == "unsupported content encoding" {
+                    return Failure(400, "unsupported content encoding")
+                }
+                return Failure(400, "could not decode request body")
+            }
+            decoded = loaded.decoded
+            length = loaded.length
+        }
+        raw := ifx decoded then VecSlice(request.scratch, 0, length) else input
+        if path != Checkpoint {
+            text := TextView(raw)
+            if !utf8.Valid(text) {
+                if !NormalizeJSONText(text, false, *normalized) {
+                    return Failure(400, "invalid json")
+                }
+                text = TextView(VecSlice(normalized, 0, normalized.count))
+            }
+            if !json.JsonRead(*request.document, text) {
+                return Failure(400, "invalid json")
+            }
+        }
+        failure := Failure(500, "token checkpoint failed")
+        if path == Spend {
+            failure = Failure(500, "token spend failed")
+        } else if path == Credit {
+            failure = Failure(400, "token credit failed")
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return failure
+        }
+        defer writes.Rollback(database)
+        result: writes.Result
+        if path == Checkpoint {
+            result = writes.Checkpoint(database, *state.signer, document)
+        } else {
+            timestamp: [31]u8
+            at := signing.WireTime(now, false, timestamp[:])
+            if at == "" {
+                return failure
+            }
+            if path == Spend {
+                result = SpendRequest(state, access, connection, TextView(actor.userID[:]), *request.document, raw, at, now.seconds, document)
+            } else {
+                result = CreditRequest(state, access, *request.document, at, document)
+            }
+        }
+        if result.status == 200 && sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return failure
+        }
+        return result
+    }
+
+    #scope_export
+    Open :: (state: *State, rawProducts: string, directPurchases: bool, publicKey: []u8, privateKey: []u8) -> bool {
+        products: Vec(u8)
+        if !ProductConfiguration(rawProducts, directPurchases, *products) || !issuer.Open(*state.signer, publicKey, privateKey) {
+            return false
+        }
+        VecSwap(state.products, products)
+        return true
+    }
+
+    Close :: (state: *State) {
+        issuer.Close(*state.signer)
+        VecFree(state.products)
+    }
+
+    Handles :: (path: string) -> bool {
+        return ReadOnly(path) || path == Credit || path == Checkpoint || path == Spend
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return method == "POST" && (path == Credit || path == Spend)
+    }
+
+    Handle :: (state: *State, access: *accounts.AccountAccess, adminToken: string, connection: *void, method: string,
+        path: string, input: []u8, overflow: bool) -> s32 {
+        read := ReadOnly(path)
+        if (read && method != "GET" && method != "HEAD") || (!read && method != "POST") {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = ifx read then "GET, HEAD" else "POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if path == Products {
+            return coding.WriteJSON(connection, method, 200, VecSlice(state.products, 0, state.products.count), access.configuration.zstdResponses)
+        }
+        if path == Issuer {
+            return IssuerReply(state, access, connection, method)
+        }
+        receiptID := wire.TrimPrefix(path, Receipt)
+        receiptRoute := receiptID.count != path.count
+        if receiptRoute {
+            if !identity.ValidResourceID(receiptID) {
+                return Error(access, connection, method, 400, "invalid receipt_id")
+            }
+            if !rate.AllowAddress(access, connection, "token-receipt:", 60) {
+                return Error(access, connection, method, 429, "too many receipt requests")
+            }
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return Error(access, connection, method, 500, "token database unavailable")
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        if path == Assets || path == Latest || receiptRoute {
+            return PublicRead(access, connection, method, path, receiptID)
+        }
+        if !read {
+            document: json.JsonDocument
+            result := Mutation(state, access, adminToken, connection, path, input, overflow, *document)
+            if result.status != 200 {
+                return Error(access, connection, method, result.status, result.error)
+            }
+            return Reply(access, connection, method, *document, result.node)
+        }
+        now := calendar.UnixMilliseconds() / 1000
+        actor := auth.Authenticate(access.configuration.database, connection, access.configuration.secret, now, "", false)
+        if actor.status != 0 {
+            return Error(access, connection, method, actor.status, actor.message)
+        }
+        return AccountRead(access, connection, method, path, TextView(actor.userID[:]))
+    }
+}

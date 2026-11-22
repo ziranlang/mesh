@@ -1,0 +1,65 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    address :: #import "client_address_native";
+    limiting :: #import "rate_limit_native";
+    transport :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    replies :: #import "http_json_native";
+    limits :: #import "server_limits";
+    binary :: #import "binary_codec";
+    sha :: #import "crypto/sha256";
+    oqs :: #import "oqs/Oqs";
+    clock :: #import "std/timer";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Reply :: (connection: *void, status: u32, document: *json.JsonDocument, root: s32, retry: s64 = 0) -> s32 {
+        digits: [24]u8
+        headers: [2]transport.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"},
+            .{name = "Retry-After", value = numbers.FormatInteger(retry, digits[:])}]
+        count := ifx retry > 0 then 2 else 1
+        return replies.ReplyWithHeaders(connection, status, document, root, headers[:count])
+    }
+
+    ErrorReply :: (connection: *void, status: u32, message: string, retry: s64 = 0) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "error", json.JsonNewString(*document, message)) { return 0 }
+        if retry > 0 && !json.JsonSet(*document, root, "retry_after", json.JsonNewInteger(*document, retry)) { return 0 }
+        return Reply(connection, status, *document, root, retry)
+    }
+
+    BooleanReply :: (connection: *void, name: string, answer: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, name, json.JsonNewBool(*document, answer)) { return 0 }
+        return Reply(connection, 200, *document, root)
+    }
+
+    AllowAddress :: (access: *accounts.AccountAccess, connection: *void, route: string, limit: s64) -> bool {
+        ip := address.FromRequest(connection)
+        bucket: Vec(u8)
+        if !BuilderAppend(bucket, route) || !BuilderAppend(bucket, TextView(ip.bytes[:ip.count])) { return false }
+        return limiting.Allow(*access.limiter, TextView(VecSlice(bucket, 0, bucket.count)), limit, 60000, clock.MonotonicMilliseconds())
+    }
+
+    ProofDigest :: (proof: string, hex: []u8) -> bool {
+        if proof.count != 64 || !binary.IsHex(proof) || hex.count < 65 { return false }
+        decoded := binary.DecodeBinaryField(proof)
+        if decoded.error != "" || decoded.value.count != 32 { return false }
+        proofBytes := VecSlice(decoded.value, 0, decoded.value.count)
+        defer oqs.Cleanse(proofBytes)
+        digest := sha.Sha256Of(TextView(proofBytes))
+        defer oqs.Cleanse(digest[:])
+        return sha.BytesToHex(*digest[0], digest.count, *hex[0], hex.count) == 1
+    }
+
+    DecodeBody :: (connection: *void, input: []u8, overflow: bool, zstd: bool, output: []u8) -> coding.DecodedBody {
+        if overflow { return .{error = "request body too large"} }
+        header: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Content-Encoding", header[:])
+        if count < 0 { return .{error = "invalid content encoding"} }
+        return coding.Decode(input, TextView(header[:count]), zstd, output.count, output)
+    }
+}

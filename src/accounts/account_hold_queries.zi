@@ -1,0 +1,74 @@
+// Tables a deletion of the account reaches, parents before children. Storage
+// totals are derived from the other rows, which rebuild them on restore.
+HeldTables :: #string SQL_END
+WITH RECURSIVE
+edges(child, parent) AS (
+    SELECT tables.name, keys."table"
+    FROM sqlite_master AS tables, pragma_foreign_key_list(tables.name, 'main') AS keys
+    WHERE tables.type='table' AND keys.on_delete='CASCADE'
+),
+reached(name, depth) AS (
+    SELECT 'server_users', 0
+    UNION
+    SELECT edges.child, reached.depth+1
+    FROM edges JOIN reached ON edges.parent=reached.name
+    WHERE reached.depth<16 AND edges.child<>'server_storage_usage'
+)
+SELECT name FROM reached GROUP BY name ORDER BY MAX(depth), name
+SQL_END;
+
+// The rows of a table that its held parents own: exactly those a deletion
+// cascades to. Parents are held first, so their copies already exist.
+HoldCondition :: #string SQL_END
+SELECT COALESCE(group_concat(clause, ' OR '), '') FROM (
+    SELECT 'EXISTS(SELECT 1 FROM held."' || keys."table" || '" AS parent WHERE ' ||
+        group_concat('parent."' || keys."to" || '"=item."' || keys."from" || '"', ' AND ') || ')' AS clause
+    FROM pragma_foreign_key_list(?1, 'main') AS keys
+    WHERE keys.on_delete='CASCADE'
+      AND EXISTS(SELECT 1 FROM held.sqlite_master WHERE type='table' AND name=keys."table")
+    GROUP BY keys.id
+)
+SQL_END;
+
+// Columns a held table and its live table share, so a column added while
+// the account was on hold takes its default.
+RestoreColumns :: #string SQL_END
+SELECT COALESCE(group_concat('"' || kept.name || '"', ','), '')
+FROM pragma_table_info(?1, 'held') AS kept
+WHERE EXISTS(SELECT 1 FROM pragma_table_info(?1, 'main') AS live WHERE live.name=kept.name)
+SQL_END;
+
+// A held row comes back only where every row it refers to still exists, such
+// as a friend who has not deleted their own account.
+RestoreCondition :: #string SQL_END
+SELECT COALESCE(group_concat(clause, ' AND '), '') FROM (
+    SELECT '(item."' || MIN(CASE WHEN keys.seq=0 THEN keys."from" END) ||
+        '" IS NULL OR EXISTS(SELECT 1 FROM main."' || keys."table" || '" AS parent WHERE ' ||
+        group_concat('parent."' || keys."to" || '"=item."' || keys."from" || '"', ' AND ') || '))' AS clause
+    FROM pragma_foreign_key_list(?1, 'main') AS keys
+    GROUP BY keys.id
+)
+SQL_END;
+
+HeldTable :: "SELECT EXISTS(SELECT 1 FROM held.sqlite_master WHERE type='table' AND name=?1)";
+
+// Someone may have taken the account's alias while it was on hold.
+AliasTaken :: #string SQL_END
+UPDATE held.server_users SET alias=NULL
+WHERE alias IS NOT NULL AND EXISTS(
+    SELECT 1 FROM main.server_users AS other WHERE lower(other.alias)=lower(held.server_users.alias))
+SQL_END;
+
+HoldRecord :: #string SQL_END
+INSERT INTO server_account_holds(user_id_hash,held_at,purge_after) VALUES(?1,?2,?3)
+ON CONFLICT(user_id_hash) DO UPDATE SET held_at=excluded.held_at,purge_after=excluded.purge_after
+SQL_END;
+
+Attach :: "ATTACH DATABASE ?1 AS held";
+Detach :: "DETACH DATABASE held";
+HoldExists :: "SELECT EXISTS(SELECT 1 FROM server_account_holds WHERE user_id_hash=?1)";
+AccountExists :: "SELECT EXISTS(SELECT 1 FROM main.server_users WHERE user_id_hash=?1)";
+ReleaseHold :: "DELETE FROM server_account_holds WHERE user_id_hash=?1";
+HeldUntil :: "SELECT COALESCE((SELECT purge_after FROM server_account_holds WHERE user_id_hash=?1),0)";
+DueHold :: "SELECT user_id_hash FROM server_account_holds WHERE purge_after<=?1 ORDER BY purge_after,user_id_hash LIMIT 1";
+ReleaseDueHold :: "DELETE FROM server_account_holds WHERE user_id_hash=?1 AND purge_after<=?2";

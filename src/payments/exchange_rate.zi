@@ -189,15 +189,6 @@ Sources :: () -> []RateSource {
     return values
 }
 
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS exchange_rates (
- pair TEXT PRIMARY KEY, usd_cents INTEGER NOT NULL CHECK(usd_cents > 0),
- updated_at INTEGER NOT NULL, sources TEXT NOT NULL
-);
-SQL;
-}
-
 // The median of the quotes within 10% of the median of all of them, with the
 // names that agreed. No rate unless at least two sources agree.
 Combine :: (quotes: []RateQuote) -> XmrRate {

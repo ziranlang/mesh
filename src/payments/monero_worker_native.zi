@@ -1,0 +1,98 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    rates :: #import "exchange_rate_native";
+    wallet :: #import "monero_wallet_native";
+    rpc :: #import "monero_rpc_native";
+    invoice :: #import "monero_invoice_sync_native";
+    deposit :: #import "monero_deposit_sync_native";
+    signing :: #import "token_signing_native";
+    socket :: #import "std/socket_linux";
+    thread :: #import "std/thread_linux";
+    stdio :: #import "std/stdio_linux";
+    wire :: #import "wire_text";
+
+    Worker :: struct {
+        accounts: *accounts.AccountAccess
+        rates: *rates.ExchangeRateState
+        configuration: wallet.Configuration
+        notified: invoice.Notified
+        thread: thread.Thread
+        interval: s32
+        stopFD: s32
+        opened: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (descriptors: *socket.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+
+    Wait :: (worker: *Worker, timeout: s32) -> bool {
+        if !worker.opened || worker.stopFD < 0 { return false }
+        descriptor: socket.LinuxPollFd = .{fd = worker.stopFD, events = 1}
+        return Poll(*descriptor, 1, timeout) > 0
+    }
+
+    Stopping :: (context: *void) -> bool { return Wait(cast(*Worker)context, 0) }
+
+    Report :: (message: string, cancel: rpc.Cancellation) {
+        if !rpc.Cancelled(cancel) { unused stdio.PrintError(message) }
+    }
+
+    Run :: (context: *void) {
+        worker := cast(*Worker)context
+        cancel: rpc.Cancellation = .{stopping = Stopping, context = context}
+        database := worker.accounts.configuration.database
+        lock := *worker.accounts.databaseLock
+        while !rpc.Cancelled(cancel) {
+            if !invoice.Reconcile(database, lock, worker.configuration, *worker.notified, cancel) {
+                Report("Monero invoice reconciliation failed\n", cancel)
+            }
+            if rpc.Cancelled(cancel) { return }
+            snapshot := rates.Current(worker.rates, signing.Now().seconds)
+            if !deposit.Reconcile(database, lock, worker.configuration, *snapshot, cancel) {
+                Report("Monero account deposit reconciliation failed\n", cancel)
+            }
+            if Wait(worker, worker.interval) { return }
+        }
+    }
+
+    #scope_export
+    Open :: (worker: *Worker, access: *accounts.AccountAccess, configuration: wallet.Configuration,
+        exchange: *rates.ExchangeRateState, intervalMilliseconds: s32) -> bool {
+        worker.stopFD = -1
+        if wire.TrimSpace(configuration.wallet.url) == "" { return true }
+        worker.stopFD = EventFD(0, 0x80800) // EFD_CLOEXEC | EFD_NONBLOCK
+        if worker.stopFD < 0 { return false }
+        worker.accounts = access
+        worker.configuration = configuration
+        worker.rates = exchange
+        worker.interval = ifx intervalMilliseconds > 0 then intervalMilliseconds else 60000
+        worker.opened = true
+        if thread.ThreadStart(*worker.thread, Run, cast(*void)worker) { return true }
+        unused CloseFD(worker.stopFD)
+        worker.stopFD = -1
+        worker.opened = false
+        return false
+    }
+
+    Cancellation :: (worker: *Worker) -> rpc.Cancellation { return .{stopping = Stopping, context = cast(*void)worker} }
+
+    Stop :: (worker: *Worker) {
+        if !worker.opened || worker.stopFD < 0 { return }
+        unused Signal(worker.stopFD, 1)
+        if thread.ThreadRunning(*worker.thread) { thread.ThreadWait(*worker.thread) }
+    }
+
+    // The HTTP handler shares the cancellation descriptor until requests drain.
+    Close :: (worker: *Worker) {
+        if !worker.opened { return }
+        Stop(worker)
+        unused CloseFD(worker.stopFD)
+        worker.stopFD = -1
+        worker.opened = false
+        invoice.Close(*worker.notified)
+    }
+}

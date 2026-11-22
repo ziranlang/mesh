@@ -1,0 +1,200 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    aliases :: #import "alias_store_native";
+    rules :: #import "entitlement_rules_native";
+    issuer :: #import "token_issuer_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    wire :: #import "wire_text";
+    identity :: #import "identity";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    #import "std/vec"
+
+    #scope_file
+    AliasRoute :: "/api/v1/account/alias";
+    PurchaseRoute :: "/api/v1/account/alias/purchase";
+    PurchaseLimit :: 2048;
+    PrivateCache :: "private, no-store";
+
+    Command :: struct {
+        alias: s32
+        user: s32
+        request: s32
+        confirmed: s64
+    }
+
+    ReadBody :: (connection: *void, settings: accounts.Configuration, body: []u8, overflow: bool, limit: s64,
+        scratch: *replies.Body, document: *json.JsonDocument) -> string {
+        result := replies.Decode(connection, body, overflow || body.count > settings.maximumBodyBytes,
+            limit, settings.zstdRequests, scratch)
+        if result.status != 0 { return result.error }
+        if result.length > limit { return "request body too large" }
+        payload := ifx result.decoded then VecSlice(scratch.scratch, 0, result.length) else body
+        if !json.JsonRead(document, TextView(payload)) { return "invalid json" }
+        return ""
+    }
+
+    LegacyCommand :: (document: *json.JsonDocument, output: *Command) -> bool {
+        kind := json.JsonKindOf(document, document.root)
+        if kind == .Null { return true }
+        if kind != .Object { return false }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            key := TextView(name)
+            alias := wire.MatchesToken(key, "alias")
+            if alias || wire.MatchesToken(key, "user_id_hash") {
+                value := json.JsonKindOf(document, node)
+                if value == .String {
+                    if alias { output.alias = node } else { output.user = node }
+                } else if value != .Null { return false }
+            }
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    PurchaseCommand :: (document: *json.JsonDocument, output: *Command) -> bool {
+        if json.JsonKindOf(document, document.root) != .Object { return false }
+        foundPrice := false
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            key := TextView(name)
+            kind := json.JsonKindOf(document, node)
+            if key == "alias" && output.alias < 0 && (kind == .String || kind == .Null) {
+                output.alias = node
+            } else if key == "request_id" && output.request < 0 && (kind == .String || kind == .Null) {
+                output.request = node
+            } else if key == "price_units" && !foundPrice {
+                foundPrice = true
+                if kind != .Null {
+                    units, valid := json.JsonInteger(document, node)
+                    if !valid || units < 0 { return false }
+                    output.confirmed = units
+                }
+            } else { return false }
+            node = json.JsonNext(document, node)
+        }
+        identifier: Text = json.JsonString(document, output.request)
+        return identity.ValidID(TextView(identifier), 8, 128)
+    }
+
+    HeaderMismatch :: (header: string) -> string {
+        if header == "X-Ksync-User" { return "X-Ksync-User does not match user_id_hash" }
+        if header == "X-Inbe-User" { return "X-Inbe-User does not match user_id_hash" }
+        return "X-Mesh-User does not match user_id_hash"
+    }
+
+    SameUser :: (body: string, header: string) -> bool {
+        if body == header { return true }
+        left: [64]u8
+        right: [64]u8
+        return identity.NormalizeUserID(body, left[:]) && identity.NormalizeUserID(header, right[:]) &&
+            TextView(left[:]) == TextView(right[:])
+    }
+
+    Respond :: (access: *accounts.AccountAccess, connection: *void, verb: string, cache: bool,
+        result: rules.Result, document: *json.JsonDocument) -> s32 {
+        if !cache {
+            zstd := access.configuration.zstdResponses
+            if result.status != 200 { return replies.ErrorReply(connection, verb, result.status, result.message, zstd) }
+            return replies.Reply(connection, verb, 200, document, result.node, zstd)
+        }
+        node := result.node
+        if result.status != 200 {
+            node = json.JsonNewObject(document)
+            if !json.JsonSet(document, node, "error", json.JsonNewString(document, result.message)) { return 0 }
+        }
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = PrivateCache}]
+        return replies.ReplyWithHeaders(connection, result.status, document, node, headers[:])
+    }
+
+    Claim :: (database: *void, signer: *issuer.Issuer, account: string, enabled: bool, legacy: bool,
+        auditTime: string, receiptTime: string, command: Command, input: *json.JsonDocument,
+        output: *json.JsonDocument) -> rules.Result {
+        unavailable := rules.Failure(503, "alias purchase unavailable")
+        if legacy { unavailable = rules.Failure(ifx enabled then 503 else 500, ifx enabled then "alias unavailable" else "alias failed") }
+        value: Text = json.JsonString(input, command.alias)
+        request: Text = json.JsonString(input, command.request)
+        normalized := aliases.Normalize(TextView(value))
+        alias := TextView(VecSlice(normalized, 0, normalized.count))
+        // The legacy assignment handler applies the existing normalizer twice.
+        assignment := aliases.Normalize(ifx legacy then alias else "")
+        if legacy { alias = TextView(VecSlice(assignment, 0, assignment.count)) }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return unavailable }
+        defer writes.Rollback(database)
+        result := aliases.Claim(database, signer, account, alias, TextView(value), enabled, command.confirmed,
+            TextView(request), legacy, auditTime, receiptTime, output)
+        if result.status == 200 && sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return unavailable }
+        return result
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return route == AliasRoute || route == PurchaseRoute }
+
+    ReadsBody :: (route: string, verb: string) -> bool { return verb == "POST" && Handles(route) }
+
+    Handle :: (access: *accounts.AccountAccess, signer: *issuer.Issuer, enabled: bool, connection: *void,
+        verb: string, route: string, body: []u8, overflow: bool) -> s32 {
+        legacy := verb == "POST" && route == AliasRoute
+        buying := verb == "POST" && route == PurchaseRoute
+        reading := (verb == "GET" || verb == "HEAD") && route == AliasRoute
+        if !legacy && !buying && !reading {
+            allow := ifx route == AliasRoute then "GET, HEAD, POST" else "POST"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        settings := access.configuration
+        scratch: replies.Body
+        input: json.JsonDocument
+        command: Command = .{alias = -1, user = -1, request = -1}
+        if legacy {
+            problem := ReadBody(connection, settings, body, overflow, settings.maximumBodyBytes, *scratch, *input)
+            if problem != "" { return replies.ErrorReply(connection, verb, 400, problem, settings.zstdResponses) }
+            if !LegacyCommand(*input, *command) { return replies.ErrorReply(connection, verb, 400, "invalid json", settings.zstdResponses) }
+            header := auth.UserHeader(connection)
+            if header.value == "" { return replies.ErrorReply(connection, verb, 400, "missing X-Mesh-User", settings.zstdResponses) }
+            provided: Text = json.JsonString(*input, command.user)
+            bodyUser := wire.TrimSpace(TextView(provided))
+            if bodyUser != "" && !SameUser(bodyUser, header.value) {
+                return replies.ErrorReply(connection, verb, 400, HeaderMismatch(header.name), settings.zstdResponses)
+            }
+        }
+        now := signing.Now()
+        stamp: [31]u8
+        auditTime := signing.WireTime(now, true, stamp[:])
+        if auditTime == "" || !mutex.Lock(*access.databaseLock) {
+            return replies.ErrorReply(connection, verb, 500, "authentication failed", settings.zstdResponses)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        authenticated := auth.Authenticate(settings.database, connection, settings.secret, now.seconds, auditTime, false)
+        output: json.JsonDocument
+        if authenticated.status != 0 {
+            return Respond(access, connection, verb, !legacy, rules.Failure(authenticated.status, authenticated.message), *output)
+        }
+        account := TextView(authenticated.userID[:])
+        if reading {
+            normalized := aliases.Normalize(http.QueryArgument(connection, "alias"))
+            result := aliases.Quote(settings.database, account, TextView(VecSlice(normalized, 0, normalized.count)), enabled, *output)
+            return Respond(access, connection, verb, true, result, *output)
+        }
+        if buying {
+            maximum := ifx settings.maximumBodyBytes < PurchaseLimit then settings.maximumBodyBytes else PurchaseLimit
+            problem := ReadBody(connection, settings, body, overflow, maximum, *scratch, *input)
+            if problem != "" || !PurchaseCommand(*input, *command) {
+                return Respond(access, connection, verb, true, rules.Failure(400, "invalid alias purchase"), *output)
+            }
+        }
+        seconds: [31]u8
+        result := Claim(settings.database, signer, account, enabled, legacy, auditTime, signing.WireTime(now, false, seconds[:]),
+            command, *input, *output)
+        return Respond(access, connection, verb, buying || enabled, result, *output)
+    }
+}

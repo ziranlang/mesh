@@ -1,0 +1,281 @@
+#if TARGET == .C && OS == .LINUX {
+    wallet :: #import "monero_wallet_native";
+    rpc :: #import "monero_rpc_native";
+    rates :: #import "exchange_rate_native";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    signing :: #import "token_signing_native";
+    writes :: #import "token_writes_native";
+    mutex :: #import "std/mutex_linux";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    #scope_file
+    Deposit :: struct {
+        tx: Text
+        owner: Text
+        amount: s64
+        height: s64
+        units: s64
+        account: s64
+        address: s64
+        unlock: s64
+        locked: bool
+    }
+
+    Selected :: struct {
+        positions: HashMap(string, s64)
+        keys: Vec(Text)
+        transfers: Vec(wallet.Transfer)
+    }
+
+    InsertSQL :: #string SQL
+INSERT INTO monero_deposits(tx_id,account_index,address_index,account_id,amount_atomic,block_height,
+    confirmations,unlock_time,locked,double_spend_seen,status,rate_atomic_amount,rate_token_units,
+    usd_cents,usd_updated_at,usd_sources,token_units)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+ON CONFLICT(tx_id,account_index,address_index) DO UPDATE SET
+    amount_atomic=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.amount_atomic ELSE excluded.amount_atomic END,
+    block_height=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.block_height ELSE excluded.block_height END,
+    confirmations=excluded.confirmations,
+    unlock_time=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.unlock_time ELSE excluded.unlock_time END,
+    locked=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.locked ELSE excluded.locked END,
+    double_spend_seen=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.double_spend_seen ELSE excluded.double_spend_seen END,
+    status=CASE WHEN monero_deposits.status IN ('credited','compensation_hold','conflict_hold','rollback_hold','compensated','finalized')
+        THEN monero_deposits.status ELSE excluded.status END,
+    updated_at=CURRENT_TIMESTAMP
+SQL;
+    CreditSQL :: #string SQL
+UPDATE monero_deposits SET status='credited',receipt_id=?4,
+    confirmed_at=CASE WHEN confirmed_at='' THEN CURRENT_TIMESTAMP ELSE confirmed_at END,
+    credited_at=CASE WHEN credited_at='' THEN CURRENT_TIMESTAMP ELSE credited_at END,updated_at=CURRENT_TIMESTAMP
+WHERE tx_id=?1 AND account_index=?2 AND address_index=?3 AND status='confirmed' AND receipt_id=''
+SQL;
+    HoldSQL :: #string SQL
+UPDATE monero_deposits SET status=?4,updated_at=CURRENT_TIMESTAMP
+WHERE tx_id=?1 AND account_index=?2 AND address_index=?3 AND status IN ('credited','compensation_hold','conflict_hold')
+SQL;
+    SaveHeightSQL :: #string SQL
+INSERT INTO monero_wallet_state(wallet_id,last_height,updated_at) VALUES('default',?1,CURRENT_TIMESTAMP)
+ON CONFLICT(wallet_id) DO UPDATE SET last_height=CASE WHEN excluded.last_height<monero_wallet_state.last_height
+    THEN 0 ELSE excluded.last_height END,updated_at=excluded.updated_at
+SQL;
+    MonitorSQL :: #string SQL
+SELECT tx_id,account_id,amount_atomic,block_height,token_units,account_index,address_index,unlock_time,locked
+FROM monero_deposits WHERE status IN ('credited','compensation_hold','conflict_hold')
+ORDER BY first_seen_at,tx_id,account_index,address_index
+SQL;
+
+    ReadText :: (database: *void, query: string, arguments: []sql.Argument, output: *Text) -> bool {
+        row := sql.Prepare(database, query, arguments)
+        if row.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return true }
+        if status != sqlite.SQLITE_ROW { return false }
+        copy: Text = TextCopy(sql.ColumnText(row.value, 0))
+        VecSwap(output.bytes, copy.bytes)
+        return true
+    }
+
+    Credit :: (database: *void, configuration: wallet.Configuration, key: []sql.Argument, owner: string, units: s64) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        payment: Text = wallet.PaymentID(key[0].text, key[1].integer, key[2].integer, "")
+        timeBytes: [31]u8
+        at := signing.WireTime(signing.Now(), false, timeBytes[:])
+        if TextView(payment) == "" || at == "" { return false }
+        credit := writes.CreditPayment(database, configuration.signer, "monero_account", TextView(payment), .{account = owner,
+            kind = "credit", amount = units, source = "monero_account", reference = TextView(payment)}, at)
+        if credit.status != 200 { return false }
+        arguments: [4]sql.Argument = .[key[0], key[1], key[2], sql.TextArg(TextView(credit.id[:]))]
+        return sql.Execute(database, CreditSQL, arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1 &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Observe :: (database: *void, configuration: wallet.Configuration, rate: *rates.RateSnapshot, transfer: *wallet.Transfer) -> bool {
+        tx := TextView(transfer.id[:transfer.idLength])
+        address: [2]sql.Argument = .[sql.IntArg(transfer.account), sql.IntArg(transfer.address)]
+        owner: Text
+        if !ReadText(database, "SELECT account_id FROM monero_account_addresses WHERE account_index=?1 AND address_index=?2 AND disabled_at=''", address[:], *owner) { return false }
+        if TextView(owner) == "" { return true }
+        key: [3]sql.Argument = .[sql.TextArg(tx), address[0], address[1]]
+        fixed := sql.ReadInteger(database, "SELECT token_units FROM monero_deposits WHERE tx_id=?1 AND account_index=?2 AND address_index=?3", key[:])
+        if fixed.status != sqlite.SQLITE_OK { return false }
+        units := ifx fixed.found then fixed.value else wallet.Units(transfer.amount, configuration.rateAtomic, configuration.rateTokens)
+        state := "confirming"
+        if transfer.doubleSpend { state = "double_spend" }
+        else if transfer.amount < wallet.Minimum(configuration) || units <= 0 { state = "below_minimum" }
+        else if wallet.Usable(configuration, <<transfer) { state = "confirmed" }
+        arguments: [17]sql.Argument = .[key[0], key[1], key[2], sql.TextArg(TextView(owner)), sql.IntArg(transfer.amount), sql.IntArg(transfer.height),
+            sql.IntArg(transfer.confirmations), sql.IntArg(transfer.unlockTime), sql.IntArg(cast(s64)transfer.locked), sql.IntArg(cast(s64)transfer.doubleSpend),
+            sql.TextArg(state), sql.IntArg(configuration.rateAtomic), sql.IntArg(configuration.rateTokens), sql.IntArg(rate.cents), sql.IntArg(rate.updatedAt),
+            sql.TextArg(TextView(rate.sources)), sql.IntArg(units)]
+        // Persist the original rates even if the issuer cannot yet commit a credit.
+        if sql.Execute(database, InsertSQL, arguments[:]) != sqlite.SQLITE_OK { return false }
+        if state != "confirmed" { return true }
+        payable := sql.ReadInteger(database,
+            "SELECT 1 FROM monero_deposits WHERE tx_id=?1 AND account_index=?2 AND address_index=?3 AND status='confirmed' AND receipt_id=''", key[:])
+        return payable.status == sqlite.SQLITE_OK && (!payable.found || Credit(database, configuration, key[:], TextView(owner), units))
+    }
+
+    SelectTransfers :: (selected: *Selected, transfers: []wallet.Transfer) -> bool {
+        for transfer: transfers {
+            key: Text = wallet.PaymentID(TextView(transfer.id[:transfer.idLength]), transfer.account, transfer.address, "")
+            if TextView(key) == "" { return false }
+            index: s64
+            if HashMapGet(*selected.positions, TextView(key), *index) {
+                previous := selected.transfers[index]
+                if previous.amount == transfer.amount && ((previous.height == 0 && transfer.height > 0) ||
+                    (previous.height == transfer.height && previous.confirmations <= transfer.confirmations)) { selected.transfers[index] = transfer }
+                continue
+            }
+            if !VecPush(selected.transfers, transfer) || !VecPush(selected.keys, key) { return false }
+            stored := VecSlice(selected.keys, selected.keys.count - 1, selected.keys.count)
+            HashMapSet(*selected.positions, TextView(stored[0]), selected.transfers.count - 1)
+        }
+        return true
+    }
+
+    Discover :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, rate: *rates.RateSnapshot,
+        height: s64, minimum: s64, cancel: rpc.Cancellation) -> s64 {
+        confirmed := wallet.LoadTransfers(configuration, .{minHeight = minimum, useHeight = true, incoming = true, pending = true}, cancel)
+        if !confirmed.ok { return -1 }
+        pool := wallet.LoadTransfers(configuration, .{pool = true}, cancel)
+        if !pool.ok { return -1 }
+        selected: Selected
+        defer HashMapFree(*selected.positions)
+        if !SelectTransfers(*selected, wallet.Entries(*pool)) ||
+            !SelectTransfers(*selected, wallet.Entries(*confirmed)) { return -1 }
+        maximum := height
+        for transfer: wallet.Entries(*confirmed) {
+            if transfer.incoming && transfer.height > maximum { maximum = transfer.height }
+        }
+        if !mutex.Lock(lock) { return -1 }
+        defer mutex.Unlock(lock)
+        success := true
+        for transfer: VecSlice(selected.transfers, 0, selected.transfers.count) {
+            if rpc.Cancelled(cancel) { return -1 }
+            if !Observe(database, configuration, rate, *transfer) { success = false }
+        }
+        return ifx success then maximum else -1
+    }
+
+    Monitor :: (database: *void, lock: *mutex.Mutex, output: *Vec(Deposit)) -> bool {
+        if !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        none: [0]sql.Argument
+        query := sql.Prepare(database, MonitorSQL, none[:])
+        if query.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(query.value)
+        next := sqlite.SqliteStep(query.value)
+        while next == sqlite.SQLITE_ROW {
+            item: Deposit = .{tx = TextCopy(sql.ColumnText(query.value, 0)), owner = TextCopy(sql.ColumnText(query.value, 1)),
+                amount = sqlite.SqliteColumnInt64(query.value, 2), height = sqlite.SqliteColumnInt64(query.value, 3), units = sqlite.SqliteColumnInt64(query.value, 4),
+                account = sqlite.SqliteColumnInt64(query.value, 5), address = sqlite.SqliteColumnInt64(query.value, 6),
+                unlock = sqlite.SqliteColumnInt64(query.value, 7), locked = sqlite.SqliteColumnInt64(query.value, 8) != 0}
+            if !VecPush(<<output, item) { return false }
+            next = sqlite.SqliteStep(query.value)
+        }
+        return next == sqlite.SQLITE_DONE
+    }
+
+    Compensate :: (database: *void, configuration: wallet.Configuration, deposit: *Deposit, arguments: []sql.Argument) -> bool {
+        if deposit.units <= 0 || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        key: Text = wallet.PaymentID(TextView(deposit.tx), deposit.account, deposit.address, "monero_reorg:")
+        bytes: [31]u8
+        at := signing.WireTime(signing.Now(), false, bytes[:])
+        if TextView(key) == "" || at == "" { return false }
+        debit := writes.SpendEvent(database, configuration.signer, .{account = TextView(deposit.owner), kind = "debit",
+            amount = -deposit.units, source = "monero_reorg", reference = TextView(key)}, at, TextView(key))
+        if debit.status != 200 { return false }
+        return sql.Execute(database, "UPDATE monero_deposits SET status='compensated',updated_at=CURRENT_TIMESTAMP WHERE tx_id=?1 AND account_index=?2 AND address_index=?3 AND status='compensation_hold'", arguments) == sqlite.SQLITE_OK &&
+            sqlite.SqliteChanges(database) == 1 && sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Inspect :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, height: s64,
+        deposit: *Deposit, cancel: rpc.Cancellation) -> bool {
+        if height < deposit.height { return false }
+        entries := wallet.LoadTransfers(configuration, .{account = deposit.account, address = deposit.address, useAddress = true, incoming = true}, cancel)
+        if !entries.ok { return false }
+        state := "conflict_hold"
+        for transfer: wallet.Entries(*entries) {
+            if TextView(transfer.id[:transfer.idLength]) != TextView(deposit.tx) { continue }
+            if transfer.doubleSpend && transfer.account == deposit.account && transfer.address == deposit.address { state = "compensation_hold"; break }
+            if transfer.amount == deposit.amount && transfer.height == deposit.height && transfer.unlockTime == deposit.unlock &&
+                transfer.locked == deposit.locked && transfer.account == deposit.account && transfer.address == deposit.address &&
+                transfer.confirmations >= height - transfer.height {
+                finality := wallet.Finality(configuration)
+                state = ifx height - deposit.height >= finality && transfer.confirmations >= finality then "finalized" else ""
+            }
+            break
+        }
+        if state == "" { return true }
+        if !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        if rpc.Cancelled(cancel) { return false }
+        arguments: [4]sql.Argument = .[sql.TextArg(TextView(deposit.tx)), sql.IntArg(deposit.account), sql.IntArg(deposit.address), sql.TextArg(state)]
+        if sql.Execute(database, HoldSQL, arguments[:]) != sqlite.SQLITE_OK { return false }
+        return state != "compensation_hold" || sqlite.SqliteChanges(database) == 0 || Compensate(database, configuration, deposit, arguments[:3])
+    }
+
+    Bookmark :: (database: *void, lock: *mutex.Mutex, active: *bool) -> s64 {
+        if !mutex.Lock(lock) { return -1 }
+        defer mutex.Unlock(lock)
+        none: [0]sql.Argument
+        owners := sql.ReadInteger(database, "SELECT 1 FROM monero_account_addresses WHERE disabled_at='' LIMIT 1", none[:])
+        if owners.status != sqlite.SQLITE_OK { return -1 }
+        <<active = owners.found
+        if !owners.found { return 0 }
+        height := sql.ReadInteger(database, "SELECT last_height FROM monero_wallet_state WHERE wallet_id='default'", none[:])
+        return ifx height.status == sqlite.SQLITE_OK then height.value else -1
+    }
+
+    StartingHeight :: (database: *void, lock: *mutex.Mutex, bookmark: s64, height: s64) -> s64 {
+        if !mutex.Lock(lock) { return -1 }
+        defer mutex.Unlock(lock)
+        if height < bookmark {
+            held := sqlite.SqliteExecText(database, "UPDATE monero_deposits SET status='rollback_hold',updated_at=CURRENT_TIMESTAMP WHERE status IN ('credited','compensation_hold','conflict_hold')")
+            return ifx held == sqlite.SQLITE_OK then 0 else -1
+        }
+        arguments: [1]sql.Argument = .[sql.IntArg(bookmark)]
+        earliest := sql.ReadInteger(database, "SELECT COALESCE(MIN(block_height),?1) FROM monero_deposits WHERE receipt_id='' AND status IN ('confirming','confirmed') AND block_height>0 AND block_height<?1", arguments[:])
+        if earliest.status != sqlite.SQLITE_OK { return -1 }
+        return ifx earliest.value > 0 then earliest.value - 1 else 0
+    }
+
+    #scope_export
+    Reconcile :: (database: *void, lock: *mutex.Mutex, configuration: wallet.Configuration, rate: *rates.RateSnapshot, cancel: rpc.Cancellation) -> bool {
+        if !wallet.ValidRate(configuration) { return true }
+        active: bool
+        bookmark := Bookmark(database, lock, *active)
+        if bookmark < 0 { return false }
+        if !active { return true }
+        height := wallet.Height(configuration, cancel)
+        if height < 0 { return false }
+        minimum := StartingHeight(database, lock, bookmark, height)
+        if minimum < 0 { return false }
+        maximum := Discover(database, lock, configuration, rate, height, minimum, cancel)
+        if maximum < 0 { return false }
+        deposits: Vec(Deposit)
+        if !Monitor(database, lock, *deposits) { return false }
+        if deposits.count > 0 {
+            tip := wallet.Height(configuration, cancel)
+            if tip < 0 { return false }
+            for *deposit: VecSlice(deposits, 0, deposits.count) {
+                if !Inspect(database, lock, configuration, tip, deposit, cancel) { return false }
+            }
+        }
+        if rpc.Cancelled(cancel) || !mutex.Lock(lock) { return false }
+        defer mutex.Unlock(lock)
+        durable := ifx height < bookmark then height else maximum
+        arguments: [1]sql.Argument = .[sql.IntArg(durable)]
+        return sql.Execute(database, SaveHeightSQL, arguments[:]) == sqlite.SQLITE_OK
+    }
+}

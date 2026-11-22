@@ -1,0 +1,69 @@
+#if TARGET == .C && OS == .LINUX {
+    auth :: #import "http_auth_native";
+    reply :: #import "http_json_native";
+    transport :: #import "http_server_native";
+    schema :: #import "trust_schema";
+    policy :: #import "mesh_policy_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    json :: #import "std/json_document";
+    sha :: #import "crypto/sha256";
+
+    #scope_file
+    Peer :: (document: *json.JsonDocument, row: *void) -> s32 {
+        object := json.JsonNewObject(document)
+        names: [4]string = .["node_id", "display_name", "space_id", "trusted_at"]
+        columns: [4]s32 = .[0, 2, 4, 6]
+        for name, index: names {
+            value := sql.ColumnText(row, columns[index])
+            if name == "space_id" && value == "" { continue }
+            if !json.JsonSet(document, object, name, json.JsonNewStringCopy(document, value)) { return -1 }
+        }
+        bytes := sqlite.SqliteColumnBlob(row, 1)
+        count := cast(s64)sqlite.SqliteColumnBytes(row, 1)
+        public: [65]u8
+        if bytes == null || count != 32 || sha.BytesToHex(bytes, count, *public[0], public.count) != 1 { return -1 }
+        if !json.JsonSet(document, object, "public_key", json.JsonNewStringCopy(document, TextView(public[:64]))) { return -1 }
+        addresses: json.JsonDocument
+        storedPolicy: json.JsonDocument
+        if !json.JsonRead(*addresses, sql.ColumnText(row, 3)) ||
+            !json.JsonRead(*storedPolicy, sql.ColumnText(row, 5)) ||
+            !json.JsonSet(document, object, "addresses", policy.StringList(document, *addresses, addresses.root)) ||
+            !json.JsonSet(document, object, "policy", policy.Policy(document, *storedPolicy, storedPolicy.root)) { return -1 }
+        return object
+    }
+
+    Read :: (document: *json.JsonDocument, database: *void) -> s32 {
+        arguments: []sql.Argument
+        rows := sql.Prepare(database, schema.ListPeersQuery, arguments)
+        if rows.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(rows.value)
+        array := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { return array }
+            if status != sqlite.SQLITE_ROW || !json.JsonAppend(document, array, Peer(document, rows.value)) { return -1 }
+        }
+        return -1
+    }
+
+    #scope_export
+    Path :: "/api/v1/node/peers";
+
+    List :: (connection: *void, method: string, database: *void, adminToken: string) -> s32 {
+        if method != "GET" && method != "HEAD" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        authorized := auth.LocalOperator(connection, adminToken)
+        if authorized.status != 0 { return reply.ErrorReply(connection, method, authorized.status, authorized.problem, false) }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "peers", Read(*document, database)) {
+            return reply.ErrorReply(connection, method, 500, "peer list failed", false)
+        }
+        headers: []transport.HeaderValue
+        return reply.ReplyWithHeaders(connection, 200, *document, root, headers)
+    }
+}

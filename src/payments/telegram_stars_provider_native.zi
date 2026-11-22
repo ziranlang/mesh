@@ -1,0 +1,511 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    authorization :: #import "authorization_native";
+    calendar :: #import "std/date_time_linux";
+    fields :: #import "sync_json_fields";
+    initData :: #import "delegate_telegram_native";
+    integers :: #import "token_payload";
+    issuer :: #import "token_issuer_native";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    numbers :: #import "std/number_text";
+    sqlite :: #import "sqlite/SQLite";
+    store :: #import "telegram_stars_store_native";
+    telegram :: #import "telegram_transport_native";
+    transfer :: #import "peer_http_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Offer :: struct {
+        product: Text
+        title: Text
+        amount: s64
+        units: s64
+    }
+
+    Configuration :: struct {
+        signer: *issuer.Issuer
+        apps: Text
+        offers: Vec(Offer)
+        node: string
+        audience: string
+        enabled: bool
+    }
+
+    Result :: struct {
+        status: u32
+        error: string
+    }
+
+    History :: struct {
+        seen: s64
+        matched: s64
+        valid: bool
+        unavailable: bool
+    }
+
+    #scope_file
+    Price :: struct {
+        product: string
+        amount: s64
+    }
+
+    PriceList :: struct {
+        items: Vec(Price)
+    }
+
+    AlphaNumeric :: (byte: u8) -> bool {
+        return (byte >= #char "a" && byte <= #char "z") || (byte >= #char "A" && byte <= #char "Z") ||
+            (byte >= #char "0" && byte <= #char "9")
+    }
+
+    ConfiguredApp :: (settings: *Configuration, app: string) -> bool {
+        remaining := TextView(settings.apps)
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            if wire.TrimSpace(item.before) == app {
+                return true
+            }
+            remaining = item.after
+        }
+        return false
+    }
+
+    Prices :: (configuration: string, output: *PriceList) -> bool {
+        remaining := configuration
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            remaining = item.after
+            pair := wire.Cut(wire.TrimSpace(item.before), #char ":")
+            if !pair.found || pair.before == "" || wire.Cut(pair.after, #char ":").found {
+                continue
+            }
+            parsed := integers.ParseInteger(pair.after)
+            amount := ifx parsed.is_ok && parsed.value > 0 && parsed.value <= 9007199254740991 then parsed.value else 0
+            {
+                prices := VecSlice(output.items, 0, output.items.count)
+                index: s64 = 0
+                while index < prices.count && prices[index].product != pair.before { index += 1 }
+                if index < prices.count {
+                    prices[index].amount = 0
+                    continue
+                }
+            }
+            if !VecPush(output.items, Price.{product = pair.before, amount = amount}) {
+                return false
+            }
+        }
+        return true
+    }
+
+    ProductOffer :: (catalog: *json.JsonDocument, node: s32, prices: []Price) -> Offer {
+        name: Text = json.JsonString(catalog, json.JsonMember(catalog, node, "product_id"))
+        units := authorization.Integer(catalog, json.JsonMember(catalog, node, "token_units"))
+        if units <= 0 || units > 9007199254740991 || units % 1000000 != 0 || !ValidID(TextView(name), 1, 128) {
+            return .{}
+        }
+        amount: s64
+        for price: prices {
+            if price.product == TextView(name) {
+                amount = price.amount
+                break
+            }
+        }
+        digits: [24]u8
+        title: Vec(u8)
+        if amount <= 0 || !BuilderAppend(title, numbers.FormatInteger(units / 1000000, digits[:])) || !BuilderAppend(title, " Dew") {
+            return .{}
+        }
+        return .{product = name, title = BuilderFinish(title), amount = amount, units = units}
+    }
+
+    PayloadID :: (payload: string) -> string {
+        id := wire.TrimPrefix(payload, store.PayloadPrefix)
+        if id.count == payload.count || !authorization.HexID(id, 32) {
+            return ""
+        }
+        return id
+    }
+
+    HasPayloadPrefix :: (payload: string) -> bool {
+        return wire.TrimPrefix(payload, store.PayloadPrefix).count != payload.count
+    }
+
+    OpaqueID :: (value: string) -> bool {
+        if value.count == 0 || value.count > 256 {
+            return false
+        }
+        for byte: value {
+            if byte < 33 || byte > 126 {
+                return false
+            }
+        }
+        return true
+    }
+
+    InvoiceLinkValid :: (link: string) -> bool {
+        slug := wire.TrimPrefix(link, "https://t.me/$")
+        if slug.count == link.count {
+            slug = wire.TrimPrefix(link, "https://t.me/invoice/")
+        }
+        if slug.count == link.count || slug.count == 0 || slug.count > 128 {
+            return false
+        }
+        for byte: slug {
+            if !AlphaNumeric(byte) && byte != #char "-" && byte != #char "_" {
+                return false
+            }
+        }
+        return true
+    }
+
+    ResultJSON :: (bot: telegram.Configuration, method: string, payload: *json.JsonDocument, root: s32,
+        response: *transfer.Response, reply: *json.JsonDocument, timeout: s64 = 10) -> bool {
+        return telegram.Call(bot, method, payload, root, response, timeout) && response.status == 200 &&
+            json.JsonRead(reply, TextView(VecSlice(response.bytes, 0, response.bytes.count))) &&
+            json.JsonKindOf(reply, json.JsonMember(reply, reply.root, "ok")) == .True
+    }
+
+    #scope_export
+    ValidID :: (value: string, minimum: s64, maximum: s64) -> bool {
+        if value.count < minimum || value.count > maximum || value == "." || value == ".." {
+            return false
+        }
+        for byte: value {
+            if !AlphaNumeric(byte) && byte != #char "-" && byte != #char "." && byte != #char "_" {
+                return false
+            }
+        }
+        return true
+    }
+
+    Offers :: (catalog: []u8, priceSettings: string, offers: *Vec(Offer)) -> bool {
+        if priceSettings == "" {
+            return true
+        }
+        prices: PriceList
+        document: json.JsonDocument
+        if !Prices(priceSettings, *prices) || !json.JsonRead(*document, TextView(catalog)) {
+            return false
+        }
+        collection := json.JsonMember(*document, document.root, "products")
+        if json.JsonKindOf(*document, collection) != .Array {
+            return false
+        }
+        item := json.JsonFirst(*document, collection)
+        while item >= 0 {
+            offer := ProductOffer(*document, item, VecSlice(prices.items, 0, prices.items.count))
+            quoted := offer.amount > 0
+            if quoted && !VecPush(<<offers, offer) {
+                return false
+            }
+            item = json.JsonNext(*document, item)
+        }
+        return true
+    }
+
+    Catalog :: (settings: *Configuration, merchant: store.Merchant, app: string) -> []Offer {
+        if !settings.enabled || merchant.bot <= 0 || issuer.Status(settings.signer) != "ok" ||
+            settings.offers.count > 32 || !ConfiguredApp(settings, app) {
+            return VecSlice(settings.offers, 0, 0)
+        }
+        return VecSlice(settings.offers, 0, settings.offers.count)
+    }
+
+    Product :: (settings: *Configuration, merchant: store.Merchant, app: string, id: string) -> Offer {
+        for *offer: Catalog(settings, merchant, app) {
+            if TextView(offer.product) == id {
+                return .{product = TextCopy(id), title = TextCopy(TextView(offer.title)), amount = offer.amount, units = offer.units}
+            }
+        }
+        return .{}
+    }
+
+    OfferActive :: (settings: *Configuration, merchant: store.Merchant, invoice: *store.Invoice) -> bool {
+        for *offer: Catalog(settings, merchant, TextView(invoice.app)) {
+            if TextView(offer.product) == TextView(invoice.product) {
+                return offer.amount == invoice.amount && offer.units == invoice.units
+            }
+        }
+        return false
+    }
+
+    CreateLink :: (bot: telegram.Configuration, invoice: *store.Invoice) -> Text {
+        payload: Vec(u8)
+        if !BuilderAppend(payload, store.PayloadPrefix) || !BuilderAppend(payload, TextView(invoice.id)) {
+            return .{}
+        }
+        body: json.JsonDocument
+        root := json.JsonNewObject(*body)
+        prices := json.JsonNewArray(*body)
+        price := json.JsonNewObject(*body)
+        title := TextView(invoice.title)
+        if !authorization.PutText(*body, root, "title", title) || !authorization.PutText(*body, root, "description", title) ||
+            !authorization.PutText(*body, root, "payload", TextView(VecSlice(payload, 0, payload.count))) ||
+            !authorization.PutText(*body, root, "provider_token", "") || !authorization.PutText(*body, root, "currency", store.Currency) ||
+            !authorization.PutText(*body, price, "label", title) || !authorization.PutInt(*body, price, "amount", invoice.amount) ||
+            !json.JsonAppend(*body, prices, price) || !json.JsonSet(*body, root, "prices", prices) {
+            return .{}
+        }
+        response: transfer.Response
+        answer: json.JsonDocument
+        if !ResultJSON(bot, "createInvoiceLink", *body, root, *response, *answer) {
+            return .{}
+        }
+        link: Text = json.JsonString(*answer, json.JsonMember(*answer, answer.root, "result"))
+        if !InvoiceLinkValid(TextView(link)) { return .{} }
+        return link
+    }
+
+    #scope_file
+    ReadType :: (document: *json.JsonDocument, at: s32, kind: json.JsonKind) -> bool {
+        actual := json.JsonKindOf(document, at)
+        return actual == kind || actual == .Missing || actual == .Null
+    }
+
+    Present :: (document: *json.JsonDocument, at: s32) -> bool {
+        kind := json.JsonKindOf(document, at)
+        return kind != .Missing && kind != .Null
+    }
+
+    User :: struct {
+        id: s64
+        bot: bool
+        valid: bool
+    }
+
+    ReadUser :: (document: *json.JsonDocument, at: s32) -> User {
+        names: [2]string = .["id", "is_bot"]
+        kinds: [2]json.JsonKind = .[.Number, .True]
+        values: [2]s32
+        if !fields.Read(document, at, names[:], kinds[:], values[:]) {
+            return .{}
+        }
+        return .{id = fields.Number(document, values[0]), bot = json.JsonKindOf(document, values[1]) == .True, valid = true}
+    }
+
+    PaymentFields :: struct {
+        payload: Text
+        currency: Text
+        amount: s64
+        charge: Text
+        valid: bool
+    }
+
+    ReadPayment :: (document: *json.JsonDocument, at: s32, providerKey: string) -> PaymentFields {
+        names: [4]string = .["invoice_payload", "currency", "total_amount", providerKey]
+        kinds: [4]json.JsonKind = .[.String, .String, .Number, .String]
+        values: [4]s32
+        if !fields.Read(document, at, names[:], kinds[:], values[:]) {
+            return .{}
+        }
+        return .{payload = json.JsonString(document, values[0]), currency = json.JsonString(document, values[1]),
+            amount = fields.Number(document, values[2]), charge = json.JsonString(document, values[3]), valid = true}
+    }
+
+    CheckoutAllowed :: (access: *accounts.AccountAccess, settings: *Configuration, merchant: store.Merchant,
+        payment: store.Payment, checkout: string) -> bool {
+        if !mutex.Lock(*access.databaseLock) {
+            return false
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        record := store.Read(database, payment.invoiceID)
+        invoice := *record.invoice
+        if record.status != sqlite.SQLITE_OK || !record.found ||
+            (TextView(invoice.checkout) != checkout && !OfferActive(settings, merchant, invoice)) {
+            return false
+        }
+        status := store.Approve(database, merchant, payment, checkout, calendar.UnixMilliseconds() / 1000)
+        return status.status == sqlite.SQLITE_OK && status.accepted
+    }
+
+    Checkout :: (access: *accounts.AccountAccess, settings: *Configuration, bot: telegram.Configuration,
+        merchant: store.Merchant, document: *json.JsonDocument, at: s32) -> Result {
+        buyer := ReadUser(document, json.JsonMember(document, at, "from"))
+        query := ReadPayment(document, at, "id")
+        if !buyer.valid || !query.valid {
+            return .{status = 400, error = "invalid Telegram update"}
+        }
+        id := TextView(query.charge)
+        if !OpaqueID(id) {
+            return .{status = 400, error = "invalid Telegram checkout query"}
+        }
+        payment: store.Payment = .{invoiceID = PayloadID(TextView(query.payload)), buyer = buyer.id,
+            amount = query.amount, currency = TextView(query.currency)}
+        ok := payment.invoiceID != "" && payment.currency == store.Currency && buyer.id > 0 && !buyer.bot && merchant.bot > 0 &&
+            merchant.audience != "" && issuer.Status(settings.signer) == "ok" && CheckoutAllowed(access, settings, merchant, payment, id)
+        request: json.JsonDocument
+        root := json.JsonNewObject(*request)
+        response: transfer.Response
+        reply: json.JsonDocument
+        if !authorization.PutText(*request, root, "pre_checkout_query_id", id) || !authorization.PutBool(*request, root, "ok", ok) ||
+            (!ok && !authorization.PutText(*request, root, "error_message", "This offer is unavailable. Return to the app and try again.")) ||
+            !ResultJSON(bot, "answerPreCheckoutQuery", *request, root, *response, *reply, 8) {
+            return .{status = 503, error = "Telegram checkout reply temporarily unavailable"}
+        }
+        return .{status = 200}
+    }
+
+    Settle :: (access: *accounts.AccountAccess, settings: *Configuration, merchant: store.Merchant,
+        payment: store.Payment, refund: bool) -> store.Outcome {
+        if !mutex.Lock(*access.databaseLock) {
+            return .{status = sqlite.SQLITE_BUSY}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return store.Settle(access.configuration.database, settings.signer, merchant, payment, refund)
+    }
+
+    #scope_export
+    Process :: (access: *accounts.AccountAccess, settings: *Configuration, bot: telegram.Configuration,
+        merchant: store.Merchant, document: *json.JsonDocument) -> Result {
+        message := json.JsonMember(document, document.root, "message")
+        check := json.JsonMember(document, document.root, "pre_checkout_query")
+        paid := json.JsonMember(document, message, "successful_payment")
+        reversal := json.JsonMember(document, message, "refunded_payment")
+        hasCheckout := Present(document, check)
+        hasPayment := Present(document, paid)
+        refund := Present(document, reversal)
+        if !hasCheckout && !hasPayment && !refund {
+            return .{}
+        }
+        if !initData.ValidJSONKeys(document) || (hasPayment && refund) || (hasCheckout && (hasPayment || refund)) {
+            return .{status = 400, error = "invalid Telegram payment update"}
+        }
+        if !ReadType(document, check, .Object) || !ReadType(document, paid, .Object) || !ReadType(document, reversal, .Object) {
+            return .{status = 400, error = "invalid Telegram update"}
+        }
+        if hasCheckout {
+            return Checkout(access, settings, bot, merchant, document, check)
+        }
+        details := ReadPayment(document, ifx refund then reversal else paid, "telegram_payment_charge_id")
+        if !details.valid {
+            return .{status = 400, error = "invalid Telegram update"}
+        }
+        payload := TextView(details.payload)
+        if !HasPayloadPrefix(payload) {
+            return .{}
+        }
+        sender := ReadUser(document, json.JsonMember(document, message, "from"))
+        chat := json.JsonMember(document, message, "chat")
+        chatID := authorization.Integer(document, json.JsonMember(document, chat, "id"))
+        chatType: Text = json.JsonString(document, json.JsonMember(document, chat, "type"))
+        privateChat := TextView(chatType) == "private"
+        payment: store.Payment = .{invoiceID = PayloadID(payload), buyer = ifx refund then chatID else sender.id,
+            amount = details.amount, currency = TextView(details.currency), charge = TextView(details.charge)}
+        if payment.invoiceID == "" || payment.buyer <= 0 || (refund && !privateChat) ||
+            (!refund && (sender.bot || (privateChat && chatID != payment.buyer))) || payment.currency != store.Currency ||
+            payment.amount <= 0 || !OpaqueID(payment.charge) {
+            return .{status = 400, error = "invalid Telegram payment"}
+        }
+        settled := Settle(access, settings, merchant, payment, refund)
+        if settled.status != sqlite.SQLITE_OK {
+            return .{status = 503, error = "Telegram payment temporarily unavailable"}
+        }
+        if !settled.accepted {
+            return .{status = 409, error = "Telegram payment does not match an approved invoice"}
+        }
+        return .{status = 200}
+    }
+
+    #scope_file
+    HistoryItem :: struct {
+        invoiceID: Text
+        charge: Text
+        buyer: s64
+        amount: s64
+        refund: bool
+        valid: bool
+    }
+
+    ReadHistoryPartner :: (document: *json.JsonDocument, at: s32, data: []s32) -> bool {
+        names: [4]string = .["type", "transaction_type", "invoice_payload", "user"]
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .Object]
+        return fields.Read(document, at, names[:], kinds[:], data) && ReadUser(document, data[3]).valid
+    }
+
+    HistoryPayment :: (document: *json.JsonDocument, at: s32) -> HistoryItem {
+        names: [5]string = .["id", "amount", "nanostar_amount", "source", "receiver"]
+        kinds: [5]json.JsonKind = .[.String, .Number, .Number, .Object, .Object]
+        values: [5]s32
+        incoming: [4]s32
+        outgoing: [4]s32
+        if !fields.Read(document, at, names[:], kinds[:], values[:]) ||
+            !ReadHistoryPartner(document, values[3], incoming[:]) || !ReadHistoryPartner(document, values[4], outgoing[:]) {
+            return .{}
+        }
+        refund := Present(document, values[4])
+        if Present(document, values[3]) == refund || fields.Number(document, values[2]) != 0 {
+            return .{valid = true}
+        }
+        charge: Text = json.JsonString(document, values[0])
+        if !OpaqueID(TextView(charge)) {
+            return .{valid = true}
+        }
+        partner := ifx refund then outgoing[:] else incoming[:]
+        kind: Text = json.JsonString(document, partner[0])
+        registration: Text = json.JsonString(document, partner[1])
+        payload: Text = json.JsonString(document, partner[2])
+        buyer := ReadUser(document, partner[3])
+        if TextView(kind) != "user" || !buyer.valid || buyer.bot || buyer.id <= 0 ||
+            (TextView(registration) != "invoice_payment" && !(refund && TextView(registration) == "" && TextView(payload) == "")) {
+            return .{valid = true}
+        }
+        id := PayloadID(TextView(payload))
+        amount := fields.Number(document, values[1])
+        if (id == "" && (!refund || TextView(payload) != "")) || amount == -9223372036854775808 {
+            return .{valid = true}
+        }
+        if refund && amount < 0 {
+            amount = -amount
+        }
+        if amount <= 0 {
+            return .{valid = true}
+        }
+        return .{invoiceID = TextCopy(id), buyer = buyer.id, amount = amount, charge = charge, refund = refund, valid = true}
+    }
+
+    #scope_export
+    Reconcile :: (access: *accounts.AccountAccess, settings: *Configuration, bot: telegram.Configuration,
+        merchant: store.Merchant, offset: s64) -> History {
+        request: json.JsonDocument
+        root := json.JsonNewObject(*request)
+        response: transfer.Response
+        reply: json.JsonDocument
+        if !authorization.PutInt(*request, root, "offset", offset) || !authorization.PutInt(*request, root, "limit", 32) ||
+            !ResultJSON(bot, "getStarTransactions", *request, root, *response, *reply) {
+            return .{}
+        }
+        result := json.JsonMember(*reply, reply.root, "result")
+        collection := json.JsonMember(*reply, result, "transactions")
+        if !ReadType(*reply, result, .Object) || !ReadType(*reply, collection, .Array) {
+            return .{}
+        }
+        page: Vec(HistoryItem)
+        item := json.JsonFirst(*reply, collection)
+        while item >= 0 {
+            record := HistoryPayment(*reply, item)
+            valid := record.valid
+            if page.count >= 32 || !valid || !VecPush(page, record) {
+                return .{}
+            }
+            item = json.JsonNext(*reply, item)
+        }
+        matched: s64 = 0
+        for *record: VecSlice(page, 0, page.count) {
+            charge := TextView(record.charge)
+            if charge != "" {
+                payment: store.Payment = .{invoiceID = TextView(record.invoiceID), buyer = record.buyer,
+                    amount = record.amount, currency = store.Currency, charge = charge}
+                settled := Settle(access, settings, merchant, payment, record.refund)
+                if settled.status != sqlite.SQLITE_OK {
+                    return .{unavailable = true}
+                }
+                if settled.accepted {
+                    matched += 1
+                }
+            }
+        }
+        return .{seen = page.count, matched = matched, valid = true}
+    }
+}

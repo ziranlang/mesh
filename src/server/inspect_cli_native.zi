@@ -1,0 +1,99 @@
+#if TARGET == .C && OS == .LINUX {
+    inspection :: #import "inspect_native";
+    schema :: #import "sqlite_schema";
+    sqlite :: #import "sqlite/SQLite";
+    wire :: #import "wire_text";
+    env :: #import "std/environment_linux";
+    memory :: #import "std/byte_text_linux";
+    stdio :: #import "std/stdio_linux";
+    #import "std/vec"
+
+    #scope_file
+    Usage :: "usage: mesh inspect [-db <path>] [-full] [summary|users|user <user_id_hash>|doctor <user_id_hash>]\n";
+
+    Options :: struct {
+        path: string
+        full: bool
+        firstCommand: s64
+        help: bool
+        error: string
+    }
+
+    InspectOptions :: (arguments: []string) -> Options {
+        options: Options
+        for index: 0..arguments.count - 1 {
+            if index < options.firstCommand { continue }
+            argument := arguments[index]
+            if argument == "--" {
+                options.firstCommand = index + 1
+                break
+            }
+            if argument.count < 2 || argument[0] != #char "-" { break }
+            parts := wire.Cut(wire.TrimPrefix(wire.TrimPrefix(argument, "-"), "-"), #char "=")
+            options.firstCommand = index + 1
+            if parts.before == "db" {
+                if parts.found {
+                    options.path = parts.after
+                } else {
+                    if options.firstCommand == arguments.count { return .{error = "-db requires a path"} }
+                    options.path = arguments[options.firstCommand]
+                    options.firstCommand += 1
+                }
+            } else if parts.before == "full" {
+                value := parts.after
+                if !parts.found || value == "1" || value == "true" || value == "TRUE" || value == "True" || value == "t" || value == "T" {
+                    options.full = true
+                } else if value == "0" || value == "false" || value == "FALSE" || value == "False" || value == "f" || value == "F" {
+                    options.full = false
+                } else {
+                    return .{error = "-full requires a boolean"}
+                }
+            } else if parts.before == "h" || parts.before == "help" {
+                return .{help = true}
+            } else {
+                return .{error = "unknown inspect option"}
+            }
+        }
+        return options
+    }
+
+    Report :: (context: *void, text: string) -> bool {
+        return stdio.WriteOutput(text)
+    }
+
+    Error :: (message: string) -> s32 {
+        unused stdio.PrintError("inspect: ")
+        unused stdio.PrintError(message)
+        unused stdio.PrintError("\n")
+        return 1
+    }
+
+    #scope_export
+    // The CLI never creates a database or runs any startup migrations.
+    Run :: (argc: s32, argv: **u8) -> s32 {
+        arguments: Vec(string)
+        for index: 0..cast(s64)argc - 1 {
+            if index < 2 { continue }
+            if !VecPush(arguments, memory.TextFromCString(argv[index])) { return Error("cannot read command line") }
+        }
+        args := VecSlice(arguments, 0, arguments.count)
+        options := InspectOptions(args)
+        if options.help { return ifx stdio.WriteOutput(Usage) then 0 else 1 }
+        if options.error != "" { return Error(options.error) }
+        path := options.path
+        if path == "" { path = wire.TrimSpace(env.EnvironmentText("MESH_DB")) }
+        if path == "" { path = "daochi.db" }
+        opened := schema.OpenReadOnly(path)
+        if opened.status != sqlite.SQLITE_OK { return Error("cannot open database read-only") }
+        defer sqlite.SqliteClose(opened.database)
+        result := inspection.Run(opened.database, args[options.firstCommand:], options.full, null, Report)
+        if result.usage != "" { return Error(result.usage) }
+        if result.unknown { return Error("unknown inspect command") }
+        if result.status != sqlite.SQLITE_OK {
+            if result.status == sqlite.SQLITE_MISUSE { return Error("invalid user_id_hash") }
+            if result.status == sqlite.SQLITE_DONE { return Error("user not found") }
+            return Error(memory.TextFromCString(sqlite.SqliteErrorMessage(opened.database)))
+        }
+        return 0
+    }
+}

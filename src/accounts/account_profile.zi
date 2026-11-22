@@ -4,6 +4,7 @@ sql :: #import "std/sql_go";
 errors :: #import "std/errors_go";
 state :: #import "account_state";
 timestamp :: #import "timestamp";
+rules :: #import "account_profile_rules";
 
 AliasResult :: struct {
     value: string
@@ -75,8 +76,7 @@ SetIcon :: (database: *sql.Database, context: ctx.Context, userID: string,
     arguments[0] = userID
     arguments[1] = icon
     arguments[2] = timestamp.CanonicalNow()
-    updated := sql.Exec(database, context,
-        "UPDATE server_users SET profile_icon=?2,last_seen_at=?3 WHERE user_id_hash=?1", arguments[:])
+    updated := sql.Exec(database, context, rules.SetIconSQL, arguments[:])
     if updated.error != null {
         return updated.error
     }

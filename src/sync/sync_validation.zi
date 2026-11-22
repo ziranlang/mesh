@@ -1,7 +1,7 @@
 #import "std/go_types"
 #import "sync_types"
 apps :: #import "app_store";
-records :: #import "encrypted_record";
+records :: #import "record_validation";
 identity :: #import "identity";
 scope :: #import "scope";
 logs :: #import "log_safety";

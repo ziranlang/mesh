@@ -1,0 +1,49 @@
+wire :: #import "wire_text";
+#import "std/vec"
+
+#scope_file
+KnownName :: (id: string) -> string {
+    if id == "sun-salutation" { return "Sun Salutation" }
+    if id == "whm" { return "Wim Hof" }
+    if id == "meditation" { return "Meditation" }
+    if id == "yoga" { return "Yoga" }
+    return ""
+}
+
+SeparatorWidth :: (id: string, at: s64) -> s64 {
+    if id[at] == #char "-" { return 1 }
+    return wire.WhitespaceWidth(id, at)
+}
+
+#scope_export
+DisplayName :: (id: string) -> Vec(u8) {
+    output: Vec(u8)
+    known := KnownName(id)
+    if known != "" {
+        if !BuilderAppend(output, known) { return .{} }
+        return output
+    }
+    at: s64 = 0
+    while at < id.count {
+        width := SeparatorWidth(id, at)
+        if width != 0 {
+            at += width
+            continue
+        }
+        if output.count != 0 && !BuilderAppend(output, " ") { return .{} }
+        first := id[at]
+        at += 1
+        // Match the legacy transformation of the first byte, even for UTF-8.
+        if first >= 128 {
+            if !BuilderAppend(output, "�") { return .{} }
+        } else {
+            if first >= #char "a" && first <= #char "z" { first -= #char "a" - #char "A" }
+            if !VecPush(output, first) { return .{} }
+        }
+        start := at
+        while at < id.count && SeparatorWidth(id, at) == 0 { at += 1 }
+        if !BuilderAppend(output, id[start:at]) { return .{} }
+    }
+    if output.count == 0 && !BuilderAppend(output, "Habit") { return .{} }
+    return output
+}

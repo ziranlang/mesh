@@ -1,0 +1,56 @@
+#if TARGET == .C && OS == .LINUX {
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    #import "std/vec"
+
+    AccountLookup :: struct {
+        id: [64]u8
+        found: bool
+        status: s32
+    }
+
+    // Match the account lookup's ASCII-only folding and single optional '@'.
+    Normalize :: (source: string, buffer: []u8) -> string {
+        for byte: source {
+            if byte > 127 { return source }
+        }
+        trimmed := wire.TrimPrefix(wire.TrimSpace(source), "@")
+        if trimmed.count > buffer.count { return source }
+        for byte, index: trimmed {
+            buffer[index] = ifx byte >= #char "A" && byte <= #char "Z" then byte + 32 else byte
+        }
+        return TextView(buffer[:trimmed.count])
+    }
+
+    #scope_file
+    AliasReference :: (value: string) -> bool {
+        if value.count < 1 || value.count > 32 { return false }
+        for byte: value {
+            if !(byte >= #char "a" && byte <= #char "z") && !(byte >= #char "0" && byte <= #char "9") && byte != #char "_" {
+                return false
+            }
+        }
+        return true
+    }
+
+    #scope_export
+    ResolveNormalized :: (database: *void, reference: string) -> AccountLookup {
+        byID := identity.ValidUserID(reference)
+        if !byID && !AliasReference(reference) { return .{} }
+        query := ifx byID then "SELECT user_id_hash FROM server_users WHERE user_id_hash=?1" else "SELECT user_id_hash FROM server_users WHERE alias=?1 COLLATE NOCASE ORDER BY julianday(created_at),rowid LIMIT 1"
+        args: [1]sql.Argument = .[sql.TextArg(reference)]
+        prepared := sql.Prepare(database, query, args[:])
+        if prepared.status != sqlite.SQLITE_OK { return .{status = prepared.status} }
+        defer sqlite.SqliteFinalize(prepared.value)
+        status := sqlite.SqliteStep(prepared.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        accountID := sql.ColumnText(prepared.value, 0)
+        if !identity.ValidUserID(accountID) { return .{status = sqlite.SQLITE_MISUSE} }
+        result: AccountLookup = .{found = true}
+        for byte, index: accountID { result.id[index] = byte }
+        return result
+    }
+}

@@ -1,0 +1,58 @@
+calendar :: #import "std/calendar";
+timestamp :: #import "timestamp_value";
+
+#scope_file
+Digits :: (output: []u8, start: s64, width: s64, value: s64) {
+    remaining := value
+    index := start + width
+    while index > start {
+        index -= 1
+        output[index] = cast(u8)(48 + remaining % 10)
+        remaining /= 10
+    }
+}
+
+#scope_export
+// Formats the UTC instant with fixed-width nanoseconds. Parsing a timezone
+// offset can carry the UTC date one year outside the four-digit input range.
+UTC :: (value: timestamp.TimestampValue, output: []u8) -> s64 {
+    if !value.valid || value.nanoseconds < 0 || value.nanoseconds >= 1000000000 { return 0 }
+    day := value.seconds / 86400 + timestamp.DaysBeforeYear(1970)
+    hourSeconds := value.seconds % 86400
+    if hourSeconds < 0 {
+        hourSeconds += 86400
+        day -= 1
+    }
+    if day < -365 || day >= timestamp.DaysBeforeYear(10001) { return 0 }
+    year := day / 365
+    while timestamp.DaysBeforeYear(year) > day { year -= 1 }
+    while timestamp.DaysBeforeYear(year + 1) <= day { year += 1 }
+    remaining := day - timestamp.DaysBeforeYear(year)
+    calendarYear := cast(s32)((year % 400 + 400) % 400 + 2000)
+    month: s32 = 1
+    daysInMonth := cast(s64)calendar.DaysInMonth(calendarYear, month)
+    while remaining >= daysInMonth {
+        remaining -= daysInMonth
+        month += 1
+        daysInMonth = cast(s64)calendar.DaysInMonth(calendarYear, month)
+    }
+
+    yearWidth: s64 = ifx year < 0 || year > 9999 then 5 else 4
+    suffix := "-00-00T00:00:00.000000000Z"
+    length := yearWidth + suffix.count
+    if output.count < length { return 0 }
+    if year < 0 {
+        output[0] = #char "-"
+        Digits(output, 1, 4, -year)
+    } else {
+        Digits(output, 0, yearWidth, year)
+    }
+    for byte, index: suffix { output[yearWidth + index] = byte }
+    Digits(output, yearWidth + 1, 2, cast(s64)month)
+    Digits(output, yearWidth + 4, 2, remaining + 1)
+    Digits(output, yearWidth + 7, 2, hourSeconds / 3600)
+    Digits(output, yearWidth + 10, 2, hourSeconds / 60 % 60)
+    Digits(output, yearWidth + 13, 2, hourSeconds % 60)
+    Digits(output, yearWidth + 16, 9, cast(s64)value.nanoseconds)
+    return length
+}

@@ -1,0 +1,79 @@
+ReadinessInputs :: struct {
+    databaseAvailable: bool
+    persistentTokenSecret: bool
+    verifierAvailable: bool
+    issuerStatus: string
+    directPurchasesEnabled: bool
+    moneroRateOrProduct: bool
+    moneroWalletConfigured: bool
+}
+
+Readiness :: struct {
+    status: s32
+    state: string
+    database: string
+    tokenSecret: string
+    verifier: string
+    issuer: string
+    directPurchases: string
+}
+
+Evaluate :: (input: ReadinessInputs) -> Readiness {
+    checks: Readiness = .{
+        status = 200, state = "ok", database = "ok", tokenSecret = "ok",
+        verifier = "ok", issuer = input.issuerStatus
+    }
+    if !input.databaseAvailable {
+        checks.database = "unavailable"
+    }
+    if !input.persistentTokenSecret {
+        checks.tokenSecret = "ephemeral"
+    }
+    if !input.verifierAvailable {
+        checks.verifier = "missing"
+    }
+    if input.directPurchasesEnabled {
+        if checks.issuer != "ok" {
+            checks.directPurchases = "issuer_private_key_missing"
+        } else if !input.moneroRateOrProduct {
+            checks.directPurchases = "monero_rate_or_product_missing"
+        } else if !input.moneroWalletConfigured {
+            checks.directPurchases = "monero_wallet_rpc_missing"
+        } else {
+            checks.directPurchases = "ok"
+        }
+    }
+    if checks.database != "ok" || checks.tokenSecret != "ok" || checks.verifier != "ok" ||
+        (input.directPurchasesEnabled && checks.directPurchases != "ok") {
+        checks.status = 503
+        checks.state = "not_ready"
+    }
+    return checks
+}
+#import "std/vec"
+json :: #import "std/json_quote";
+
+HealthBody :: "{\"status\":\"ok\"}\n";
+
+
+// Keep the same field order as the previous encoder's sorted map keys.
+Body :: (checks: Readiness) -> Vec(u8) {
+    output: Vec(u8)
+    if !BuilderAppend(output, "{\"checks\":{\"database\":") ||
+        !json.JsonQuoteInto(*output, checks.database, false) {
+        return .{}
+    }
+    if checks.directPurchases != "" &&
+        (!BuilderAppend(output, ",\"token_direct_purchases\":") ||
+            !json.JsonQuoteInto(*output, checks.directPurchases, false)) {
+        return .{}
+    }
+    if !BuilderAppend(output, ",\"token_issuer\":") || !json.JsonQuoteInto(*output, checks.issuer, false) ||
+        !BuilderAppend(output, ",\"token_secret\":") || !json.JsonQuoteInto(*output, checks.tokenSecret, false) ||
+        !BuilderAppend(output, ",\"verifier\":") || !json.JsonQuoteInto(*output, checks.verifier, false) ||
+        !BuilderAppend(output, "},\"status\":") || !json.JsonQuoteInto(*output, checks.state, false) ||
+        !BuilderAppend(output, "}\n") {
+        return .{}
+    }
+    return output
+}

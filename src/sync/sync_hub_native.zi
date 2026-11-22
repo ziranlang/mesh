@@ -1,0 +1,209 @@
+#if TARGET == .C && OS == .LINUX {
+    mutex :: #import "std/mutex_linux";
+    sockets :: #import "std/socket_linux";
+
+    HintQueueLimit :: 8;
+
+    Hub :: struct {
+        lock: mutex.Mutex
+        watchers: *Watcher
+        stopping: bool
+    }
+
+    Watcher :: struct {
+        hub: *Hub
+        next: *Watcher
+        account: [64]u8
+        fd: s32
+        version: s64
+        hintCount: s64
+        hintVersions: [HintQueueLimit]s64
+    }
+
+    Notification :: struct {
+        version: s64
+        hintCount: s64
+        hintVersions: [HintQueueLimit]s64
+        stopping: bool
+    }
+
+    WatchResult :: struct {
+        watcher: *Watcher
+        status: u32
+    }
+
+    ConnectionLimitPerUser :: 8;
+
+    ConnectionStats :: struct {
+        users: s64
+        clients: s64
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    Drain :: (fd: s32, value: *u64) -> s32 #foreign c "eventfd_read";
+    Allocate :: (size: usize) -> *void #foreign c "malloc";
+    Free :: (pointer: *void) #foreign c "free";
+
+    #scope_export
+    Open :: (hub: *Hub) -> bool {
+        return mutex.Open(*hub.lock)
+    }
+
+    Stop :: (hub: *Hub) {
+        if !mutex.Lock(*hub.lock) {
+            return
+        }
+        defer mutex.Unlock(*hub.lock)
+        hub.stopping = true
+        watch := hub.watchers
+        while watch != null {
+            unused Signal(watch.fd, 1)
+            watch = watch.next
+        }
+    }
+
+    // Existing watchers belong to the old daemon. Resume only after it joins.
+    Resume :: (hub: *Hub) -> bool {
+        if !mutex.Lock(*hub.lock) { return false }
+        defer mutex.Unlock(*hub.lock)
+        if hub.watchers != null { return false }
+        hub.stopping = false
+        return true
+    }
+
+    // Close after stopping the HTTP daemon, which owns the subscriptions.
+    Close :: (hub: *Hub) {
+        unused mutex.Close(*hub.lock)
+    }
+
+    Watch :: (hub: *Hub, account: [64]u8) -> WatchResult {
+        if !mutex.Lock(*hub.lock) {
+            return .{status = 503}
+        }
+        defer mutex.Unlock(*hub.lock)
+        if hub.stopping {
+            return .{status = 503}
+        }
+        user := TextView(account[:])
+        count: s64 = 0
+        watch := hub.watchers
+        while watch != null {
+            subscriber := watch.account
+            if TextView(subscriber[:]) == user {
+                count += 1
+            }
+            watch = watch.next
+        }
+        if count >= ConnectionLimitPerUser {
+            return .{status = 429}
+        }
+        created := cast(*Watcher)Allocate(size_of(Watcher))
+        if created == null {
+            return .{status = 503}
+        }
+        fd := EventFD(0, 526336) // EFD_CLOEXEC | EFD_NONBLOCK
+        if fd < 0 {
+            Free(cast(*void)created)
+            return .{status = 503}
+        }
+        <<created = .{hub = hub, next = hub.watchers, account = account, fd = fd}
+        hub.watchers = created
+        return .{watcher = created}
+    }
+
+    Stats :: (hub: *Hub) -> ConnectionStats {
+        if !mutex.Lock(*hub.lock) { return .{} }
+        defer mutex.Unlock(*hub.lock)
+        result: ConnectionStats
+        watch := hub.watchers
+        while watch != null {
+            result.clients += 1
+            account := watch.account
+            first := hub.watchers
+            // The listener bounds the number of watchers. Reuse the list
+            // under its lock instead of allocating account identifiers.
+            while first != watch {
+                other := first.account
+                if TextView(account[:]) == TextView(other[:]) { break }
+                first = first.next
+            }
+            if first == watch { result.users += 1 }
+            watch = watch.next
+        }
+        return result
+    }
+
+    Unwatch :: (watcher: *Watcher) {
+        if watcher == null {
+            return
+        }
+        hub := watcher.hub
+        if !mutex.Lock(*hub.lock) {
+            return
+        }
+        defer mutex.Unlock(*hub.lock)
+        link := *hub.watchers
+        while <<link != null {
+            if <<link == watcher {
+                <<link = watcher.next
+                descriptor: sockets.LinuxSocket = .{fd = watcher.fd, valid = true}
+                unused sockets.SocketClose(*descriptor)
+                Free(cast(*void)watcher)
+                return
+            }
+            node := <<link
+            link = *node.next
+        }
+    }
+
+    Publish :: (hub: *Hub, account: string, version: s64) {
+        if !mutex.Lock(*hub.lock) {
+            return
+        }
+        defer mutex.Unlock(*hub.lock)
+        watch := hub.watchers
+        while watch != null {
+            subscriber := watch.account
+            if TextView(subscriber[:]) == account && version > watch.version {
+                watch.version = version
+                unused Signal(watch.fd, 1)
+            }
+            watch = watch.next
+        }
+    }
+
+    PublishHint :: (hub: *Hub, account: string) {
+        if hub == null || !mutex.Lock(*hub.lock) {
+            return
+        }
+        defer mutex.Unlock(*hub.lock)
+        watch := hub.watchers
+        while watch != null {
+            subscriber := watch.account
+            if TextView(subscriber[:]) == account && watch.hintCount < HintQueueLimit {
+                // Each barrier keeps this hint behind versions published before it.
+                watch.hintVersions[watch.hintCount] = watch.version
+                watch.hintCount += 1
+                unused Signal(watch.fd, 1)
+            }
+            watch = watch.next
+        }
+    }
+
+    Latest :: (watch: *Watcher) -> Notification {
+        hub := watch.hub
+        if !mutex.Lock(*hub.lock) {
+            return .{stopping = true}
+        }
+        defer mutex.Unlock(*hub.lock)
+        signals: u64
+        unused Drain(watch.fd, *signals)
+        result: Notification = .{version = watch.version, stopping = hub.stopping,
+            hintCount = watch.hintCount, hintVersions = watch.hintVersions}
+        watch.hintCount = 0
+        return result
+    }
+}

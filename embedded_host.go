@@ -49,16 +49,9 @@ func NodeResume(handle C.longlong) C.int {
 
 //export NodeRequest
 func NodeRequest(handle C.longlong, method *C.char, path *C.char, body *C.char, output *C.char, capacity C.int) C.int {
-	if method == nil || path == nil || output == nil || capacity < 1 || capacity > (2<<20) {
+	if method == nil || path == nil || output == nil || !EmbeddedRuntime_ResponseCapacityAllowed(int64(capacity)) {
 		return 0
 	}
-	result := EmbeddedRuntime_Request(int64(handle), C.GoString(method), C.GoString(path), C.GoString(body))
-	if result.Error != nil || len(result.Value) >= int(capacity) {
-		return 0
-	}
-	encoded := result.Value
 	buffer := unsafe.Slice((*byte)(unsafe.Pointer(output)), int(capacity))
-	copy(buffer, encoded)
-	buffer[len(encoded)] = 0
-	return C.int(len(encoded))
+	return C.int(EmbeddedRuntime_WriteRequest(int64(handle), C.GoString(method), C.GoString(path), C.GoString(body), buffer))
 }

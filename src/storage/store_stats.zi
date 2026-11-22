@@ -9,6 +9,7 @@ file :: #import "std/file_go";
 errors :: #import "std/errors_go";
 sorting :: #import "std/sort";
 scope :: #import "collection_scope";
+stats_queries :: #import "store_stats_queries";
 native :: #system_library "go:database/sql";
 filesystem :: #system_library "go:os";
 system :: #system_library "go:syscall";
@@ -203,7 +204,7 @@ Apps :: (database: *sql.Database, context: ctx.Context) -> AppStorageResult {
     }
     matchers := loaded.value
     empty: [0]Any
-    queried := sql.Query(database, context, CollectionStorageSQL, empty[:])
+    queried := sql.Query(database, context, stats_queries.CollectionStorageSQL, empty[:])
     result.error = queried.error
     if result.error != null {
         return result
@@ -278,7 +279,7 @@ Storage :: (database: *sql.Database, context: ctx.Context, path: string) -> Node
     }
     empty: [0]Any
     destinations: [1]Any = .[*usage.SQLitePageBytes]
-    row := sql.QueryRow(database, context, "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", empty[:])
+    row := sql.QueryRow(database, context, stats_queries.PageBytesSQL, empty[:])
     result.error = sql.ScanRow(row, destinations[:])
     if result.error != null {
         return result
@@ -298,7 +299,7 @@ Storage :: (database: *sql.Database, context: ctx.Context, path: string) -> Node
     }
     payloadCount: isize
     payloadDestinations: [2]Any = .[*payloadCount, *usage.EncryptedPayloadBytes]
-    payloadRow := sql.QueryRow(database, context, PayloadStorageSQL, empty[:])
+    payloadRow := sql.QueryRow(database, context, stats_queries.PayloadStorageSQL, empty[:])
     result.error = sql.ScanRow(payloadRow, payloadDestinations[:])
     if result.error != null {
         return result
@@ -310,7 +311,3 @@ Storage :: (database: *sql.Database, context: ctx.Context, path: string) -> Node
     result.value = usage
     return result
 }
-
-#scope_file
-CollectionStorageSQL :: "\nSELECT collection,\n       COUNT(*),\n       COALESCE(SUM(LENGTH(collection)+LENGTH(id)+LENGTH(key_id)+LENGTH(nonce)+LENGTH(ciphertext)+LENGTH(content_hash)+LENGTH(parent_id)),0)\nFROM server_encrypted_records\nGROUP BY collection\nORDER BY collection";
-PayloadStorageSQL :: "\nSELECT COUNT(*), COALESCE(SUM(LENGTH(client_id)+LENGTH(payload_json)),0)\nFROM server_encrypted_payloads";

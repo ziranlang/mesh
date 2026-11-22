@@ -1,0 +1,162 @@
+#if TARGET == .C && OS == .LINUX {
+    queries :: #import "account_export_queries";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    json :: #import "std/json_document";
+    numbers :: #import "std/float_text";
+    bytes :: #import "std/byte_text_linux";
+    utf8 :: #import "std/utf8";
+    #import "std/vec"
+
+    #scope_file
+    StringValue :: (document: *json.JsonDocument, source: []u8) -> s32 {
+        value := TextView(source)
+        if utf8.Valid(value) {
+            return json.JsonNewStringCopy(document, value)
+        }
+        buffer: Vec(u8)
+        // SQLite column sizes fit a signed 32-bit integer.
+        capacity := value.count * 3
+        if !VecResizeBounded(buffer, capacity, capacity) {
+            return -1
+        }
+        clean := utf8.Copy(source, VecSlice(buffer, 0, buffer.count))
+        if !clean.complete {
+            return -1
+        }
+        return json.JsonNewStringCopy(document, TextView(VecSlice(buffer, 0, clean.count)))
+    }
+
+    TextBytes :: (row: *void, column: s32) -> []u8 {
+        pointer := sqlite.SqliteColumnText(row, column)
+        count := sqlite.SqliteColumnBytes(row, column)
+        return bytes.BytesFromPointer(pointer, cast(u64)count)
+    }
+
+    ColumnValue :: (document: *json.JsonDocument, row: *void, column: s32, readJSON: bool) -> s32 {
+        kind := sqlite.SqliteColumnType(row, column)
+        if kind == sqlite.SQLITE_NULL {
+            return json.JsonNewNull(document)
+        }
+        if kind == sqlite.SQLITE_INTEGER {
+            return json.JsonNewInteger(document, sqlite.SqliteColumnInt64(row, column))
+        }
+        if kind == sqlite.SQLITE_FLOAT {
+            encoded: Text = numbers.Float64Repr(sqlite.SqliteColumnDouble(row, column))
+            parsed: json.JsonDocument
+            if !json.JsonRead(*parsed, TextView(encoded)) || json.JsonKindOf(*parsed, parsed.root) != .Number {
+                return -1
+            }
+            return json.JsonCopy(document, *parsed, parsed.root)
+        }
+        if kind == sqlite.SQLITE_TEXT {
+            return StringValue(document, TextBytes(row, column))
+        }
+        if kind != sqlite.SQLITE_BLOB {
+            return -1
+        }
+        pointer := sqlite.SqliteColumnBlob(row, column)
+        count := sqlite.SqliteColumnBytes(row, column)
+        if pointer == null || count == 0 {
+            return json.JsonNewString(document, "")
+        }
+        source := bytes.BytesFromPointer(pointer, cast(u64)count)
+        // The Go SQLite driver gives TEXT to its caller as a string. Only
+        // BLOBs in these columns pass through the legacy JSON decoder.
+        if readJSON {
+            parsed: json.JsonDocument
+            if json.JsonRead(*parsed, TextView(source)) {
+                return json.JsonCopy(document, *parsed, parsed.root)
+            }
+        }
+        return StringValue(document, source)
+    }
+
+    ReadTable :: (database: *void, select: queries.TableQuery, user: []sql.Argument,
+        document: *json.JsonDocument) -> s32 {
+        rows := sql.Prepare(database, select.query, user)
+        if rows.status != sqlite.SQLITE_OK {
+            return -1
+        }
+        defer sqlite.SqliteFinalize(rows.value)
+        count := sqlite.SqliteColumnCount(rows.value)
+        array := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                return array
+            }
+            if status != sqlite.SQLITE_ROW {
+                return -1
+            }
+            object := json.JsonNewObject(document)
+            column: s32 = 0
+            while column < count {
+                name := bytes.TextFromCString(sqlite.SqliteColumnName(rows.value, column))
+                if name == "" || !json.JsonSetCopy(document, object, name,
+                    ColumnValue(document, rows.value, column, name == select.jsonField)) {
+                    return -1
+                }
+                column += 1
+            }
+            if !json.JsonAppend(document, array, object) {
+                return -1
+            }
+        }
+        return -1
+    }
+
+    Profile :: (database: *void, user: []sql.Argument, document: *json.JsonDocument, root: s32) -> s32 {
+        row := sql.Prepare(database, queries.ProfileSQL, user)
+        if row.status != sqlite.SQLITE_OK {
+            return 500
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return 404
+        }
+        if status != sqlite.SQLITE_ROW {
+            return 500
+        }
+        alias := TextBytes(row.value, 0)
+        if alias.count != 0 && !json.JsonSet(document, root, "account_alias", StringValue(document, alias)) {
+            return 500
+        }
+        icon := sqlite.SqliteColumnInt64(row.value, 1)
+        if icon != 0 && !json.JsonSet(document, root, "profile_icon", json.JsonNewInteger(document, icon)) {
+            return 500
+        }
+        return 0
+    }
+
+    #scope_export
+    // The caller keeps exclusive use of the SQLite connection. A read
+    // transaction assembles the export from one database snapshot.
+    Export :: (database: *void, user: string, document: *json.JsonDocument, root: s32) -> s32 {
+        if sqlite.SqliteExecText(database, "BEGIN") != sqlite.SQLITE_OK {
+            return 500
+        }
+        defer sqlite.SqliteExecText(database, "ROLLBACK")
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        status := Profile(database, arguments[:], document, root)
+        if status != 0 {
+            return status
+        }
+        tables := json.JsonNewObject(document)
+        tableQueries := queries.Tables()
+        for select: tableQueries {
+            array := ReadTable(database, select, arguments[:], document)
+            if array < 0 || ((!select.skipEmpty || json.JsonCount(document, array) > 0) &&
+                !json.JsonSet(document, tables, select.name, array)) {
+                return 500
+            }
+        }
+        if !json.JsonSet(document, root, "status", json.JsonNewString(document, "ok")) ||
+            !json.JsonSet(document, root, "user_id_hash", json.JsonNewStringCopy(document, user)) ||
+            !json.JsonSet(document, root, "tables", tables) {
+            return 500
+        }
+        return 0
+    }
+}

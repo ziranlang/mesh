@@ -1,21 +1,5 @@
 // Explicit ASCII validation preserves the released protocol's byte grammar.
-go_strings :: #system_library "go:strings";
-TrimSpace :: (value: string) -> string #foreign go_strings "TrimSpace";
-Split :: (value: string, separator: string) -> []string #foreign go_strings "Split";
-ToLower :: (value: string) -> string #foreign go_strings "ToLower";
-TrimPrefix :: (value: string, prefix: string) -> string #foreign go_strings "TrimPrefix";
-
-NormalizeAccountAlias :: (value: string) -> string {
-    // Unicode lowercasing can turn lookalikes such as the Kelvin sign or
-    // dotted capital I into ASCII. Keep non-ASCII input invalid, including
-    // invisible edge spaces, before folding the permitted ASCII case.
-    for byte: value {
-        if byte > cast(u8)127 {
-            return value
-        }
-    }
-    return TrimPrefix(ToLower(TrimSpace(value)), "@")
-}
+wire_text :: #import "wire_text";
 
 ValidUserID :: (value: string) -> bool {
     if value.count != 64 {
@@ -30,6 +14,16 @@ ValidUserID :: (value: string) -> bool {
         index += 1
     }
     return true
+}
+
+// Normalize a hexadecimal account ID into exactly 64 caller-owned bytes.
+NormalizeUserID :: (user: string, output: []u8) -> bool {
+    value := wire_text.TrimSpace(user)
+    if output.count != 64 || value.count != output.count { return false }
+    for byte, index: value {
+        output[index] = ifx byte >= #char "A" && byte <= #char "F" then byte + 32 else byte
+    }
+    return ValidUserID(TextView(output))
 }
 
 ValidID :: (value: string, minimum: s64, maximum: s64) -> bool {
@@ -125,30 +119,40 @@ ValidVersionSegment :: (value: string) -> bool {
 }
 
 ValidEncryptedHierarchyCollection :: (collection: string) -> bool {
-    parts: []string = Split(TrimSpace(collection), ".")
-    if parts.count == 3 && parts[0] == "account" {
-        return ValidVersionSegment(parts[1]) && ValidNamespaceSegment(parts[2])
-    }
-    if parts.count < 4 {
+    scope := wire_text.Cut(wire_text.TrimSpace(collection), #char ".")
+    if !scope.found {
         return false
     }
-    if parts[0] != "private" && parts[0] != "shared" && parts[0] != "friends" && parts[0] != "public" {
+    if scope.before == "account" {
+        version := wire_text.Cut(scope.after, #char ".")
+        return version.found && ValidVersionSegment(version.before) && ValidNamespaceSegment(version.after)
+    }
+    if scope.before != "private" && scope.before != "shared" &&
+        scope.before != "friends" && scope.before != "public" {
         return false
     }
-    if !ValidNamespaceSegment(parts[1]) || !ValidVersionSegment(parts[2]) {
+
+    app := wire_text.Cut(scope.after, #char ".")
+    version := wire_text.Cut(app.after, #char ".")
+    if !app.found || !version.found || !ValidNamespaceSegment(app.before) ||
+        !ValidVersionSegment(version.before) {
         return false
     }
-    index: s64 = 3
-    while index < parts.count {
-        if !ValidNamespaceSegment(parts[index]) {
+    remaining := version.after
+    while remaining.count > 0 {
+        segment := wire_text.Cut(remaining, #char ".")
+        if !ValidNamespaceSegment(segment.before) {
             return false
         }
-        index += 1
+        if !segment.found {
+            return true
+        }
+        remaining = segment.after
     }
-    return true
+    return false
 }
 
 ValidLegacyEncryptedCollection :: (collection: string) -> bool {
-    value: string = TrimSpace(collection)
+    value: string = wire_text.TrimSpace(collection)
     return value == "inbe.habits" || value == "inbe.habit_days" || value == "inbe.sessions"
 }

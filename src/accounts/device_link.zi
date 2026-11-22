@@ -14,6 +14,7 @@ body :: #import "http_body";
 strict :: #import "strict_json";
 limiting :: #import "rate_limit";
 address :: #import "client_address";
+rules :: #import "device_link_rules";
 strings :: #system_library "go:strings";
 
 LinkInput :: struct {
@@ -45,11 +46,6 @@ Links :: struct {
     limiter: *limiting.RateLimiter
 }
 
-LINK_ID_LENGTH :: 32
-// A sealed account key and its envelope fit well inside this limit.
-LINK_DATA_MAX :: 16384
-LINK_ENTRIES_MAX :: 4096
-
 #scope_file
 Join :: (parts: []string, separator: string) -> string #foreign strings;
 
@@ -76,32 +72,13 @@ Guard :: (writer: http.ResponseWriter, request: *http.Request) -> bool {
 }
 
 ReadInput :: (writer: http.ResponseWriter, request: *http.Request, input: *LinkInput) -> bool {
-    raw := body.ReadJSON(writer, request, LINK_DATA_MAX + 1024)
+    raw := body.ReadJSON(writer, request, rules.LINK_DATA_MAX + 1024)
     if raw.error != null || strict.Decode(raw.value, input) != null ||
-        !IDValid(input.id) {
+        !rules.IDValid(input.id) {
         response.Error(writer, 400, "invalid device link")
         return false
     }
     return true
-}
-
-// A link ID is 32 lowercase hexadecimal characters: 128 random bits.
-IDValid :: (value: string) -> bool {
-    if value.count != LINK_ID_LENGTH {
-        return false
-    }
-    for byte: value {
-        digit := byte >= cast(u8)48 && byte <= cast(u8)57
-        letter := byte >= cast(u8)97 && byte <= cast(u8)102
-        if !digit && !letter {
-            return false
-        }
-    }
-    return true
-}
-
-SlotValid :: (slot: string) -> bool {
-    return slot == "request" || slot == "response"
 }
 
 // Removes expired links. The caller holds the lock.
@@ -126,20 +103,20 @@ Put :: (writer: http.ResponseWriter, request: *http.Request) {
     if !ReadInput(writer, request, *input) {
         return
     }
-    if !SlotValid(input.slot) || input.data.count == 0 || input.data.count > LINK_DATA_MAX {
+    if !rules.SlotValid(input.slot) || input.data.count == 0 || input.data.count > rules.LINK_DATA_MAX {
         response.Error(writer, 400, "invalid device link message")
         return
     }
     now := clock.Now()
     Lock(*device_links.mu)
     defer Unlock(*device_links.mu)
-    if MapCount(device_links.entries) >= LINK_ENTRIES_MAX {
+    if MapCount(device_links.entries) >= rules.LINK_ENTRIES_MAX {
         Prune(now)
     }
     // An absent link reads as a zero entry, whose expiry has passed.
     entry := MapGet(device_links.entries, input.id)
     if clock.After(now, entry.ExpiresAt) {
-        if MapCount(device_links.entries) >= LINK_ENTRIES_MAX {
+        if MapCount(device_links.entries) >= rules.LINK_ENTRIES_MAX {
             response.Error(writer, 503, "device links are busy")
             return
         }
@@ -175,7 +152,7 @@ Get :: (writer: http.ResponseWriter, request: *http.Request) {
     if !ReadInput(writer, request, *input) {
         return
     }
-    if !SlotValid(input.slot) {
+    if !rules.SlotValid(input.slot) {
         response.Error(writer, 400, "invalid device link slot")
         return
     }

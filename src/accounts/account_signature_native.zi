@@ -1,0 +1,109 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    keys :: #import "account_keys_native";
+    challenge :: #import "challenge_native";
+    identity :: #import "identity";
+    codec :: #import "codec";
+    binary :: #import "binary_codec";
+    message :: #import "account_signing_message";
+    sha :: #import "crypto/sha256";
+    clock :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    #import "std/constant_time"
+    #import "std/vec"
+
+    VerifySignature :: #type (publicKey: []u8, message: []u8, signature: []u8) -> bool;
+
+    Authentication :: struct {
+        authenticated: bool
+        userID: [64]u8
+        publicKey: [codec.mlDSA44PublicKeySize]u8
+        status: u32
+        message: string
+        databaseError: s32
+    }
+
+    #scope_file
+    KeyMatchesAccount :: (user: string, key: []u8) -> bool {
+        digest := sha.Sha256Of(TextView(key))
+        hex: [65]u8
+        if sha.BytesToHex(*digest[0], digest.count, *hex[0], hex.count) != 1 { return false }
+        return user == TextView(hex[:64])
+    }
+
+    UpperMethod :: (method: string) -> Vec(u8) {
+        output: Vec(u8)
+        for byte: method {
+            upper := ifx byte >= #char "a" && byte <= #char "z" then byte - 32 else byte
+            if !VecPush(output, upper) { return .{} }
+        }
+        return output
+    }
+
+    #scope_export
+    // Reads the registered key under lock, then runs ML-DSA-44 verification
+    // completely unlocked so concurrent requests do not serialize on crypto.
+    AuthenticateWithLock :: (database: *void, lock: *mutex.Mutex, challenges: *challenge.ChallengeStore,
+        verify: VerifySignature, user: string, publicKeyText: string, signatureText: string,
+        signatureContext: string, method: string, path: string, payload: []u8) -> Authentication {
+        account: [64]u8
+        if !identity.NormalizeUserID(user, account[:]) { return .{status = 400, message = "invalid user_id_hash"} }
+        userID := TextView(account[:])
+        pending := challenge.Outstanding(challenges, userID, clock.MonotonicMilliseconds())
+        if pending.status != .OK { return .{status = 503, message = "challenges are busy"} }
+        if pending.count == 0 { return .{status = 400, message = "missing or expired challenge"} }
+        if database == null || verify == null { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        key: keys.Key
+        if lock != null {
+            if !mutex.Lock(lock) { return .{databaseError = sqlite.SQLITE_BUSY} }
+            key = keys.Read(database, userID)
+            unused mutex.Unlock(lock)
+        } else {
+            key = keys.Read(database, userID)
+        }
+        if key.status != sqlite.SQLITE_OK { return .{databaseError = key.status} }
+        if !key.found {
+            if publicKeyText == "" { return .{status = 400, message = "public_key required for first sync"} }
+            decoded := binary.DecodeBinaryField(publicKeyText)
+            if decoded.error != "" { return .{status = 400, message = "invalid public_key"} }
+            if decoded.value.count != codec.mlDSA44PublicKeySize { return .{status = 400, message = "wrong public_key size"} }
+            bytes := VecSlice(decoded.value, 0, decoded.value.count)
+            if !KeyMatchesAccount(userID, bytes) { return .{status = 400, message = "public_key does not match user_id_hash"} }
+            for byte, index: bytes { key.bytes[index] = byte }
+            key.count = codec.mlDSA44PublicKeySize
+        } else if publicKeyText != "" {
+            decoded := binary.DecodeBinaryField(publicKeyText)
+            if decoded.error != "" || decoded.value.count != key.count || key.count > codec.mlDSA44PublicKeySize ||
+                !ConstantTimeEqual(VecSlice(decoded.value, 0, decoded.value.count), key.bytes[:key.count]) {
+                return .{status = 400, message = "public_key does not match registered user"}
+            }
+        }
+        decoded := binary.DecodeBinaryField(signatureText)
+        if decoded.error != "" { return .{status = 400, message = "invalid signature"} }
+        if decoded.value.count != codec.mlDSA44SignatureSize { return .{status = 400, message = "wrong signature size"} }
+        if key.count != codec.mlDSA44PublicKeySize { return .{status = 401, message = "signature rejected"} }
+        signature := VecSlice(decoded.value, 0, decoded.value.count)
+        upper := UpperMethod(method)
+        if upper.count != method.count { return .{databaseError = sqlite.SQLITE_NOMEM} }
+        verb := TextView(VecSlice(upper, 0, upper.count))
+        digest := sha.Sha256Of(TextView(payload))
+        for index: 0..pending.count - 1 {
+            candidate := pending.challenges[index]
+            signed := message.Canonical(signatureContext, candidate.nonce[:], verb, path, digest)
+            if signed.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
+            if !verify(key.bytes[:], VecSlice(signed, 0, signed.count), signature) { continue }
+            if !challenge.Take(challenges, userID, candidate.nonce[:], clock.MonotonicMilliseconds()) {
+                return .{status = 400, message = "missing or expired challenge"}
+            }
+            return .{authenticated = true, userID = account, publicKey = key.bytes}
+        }
+        return .{status = 401, message = "signature rejected"}
+    }
+
+    Authenticate :: (database: *void, challenges: *challenge.ChallengeStore, verify: VerifySignature,
+        user: string, publicKeyText: string, signatureText: string, signatureContext: string,
+        method: string, path: string, payload: []u8) -> Authentication {
+        return AuthenticateWithLock(database, null, challenges, verify, user, publicKeyText,
+            signatureText, signatureContext, method, path, payload)
+    }
+}

@@ -1,0 +1,312 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    ledger :: #import "token_ledger_native";
+    mutex :: #import "std/mutex_linux";
+    response :: #import "http_json_native";
+    rules :: #import "game_evidence_rules_native";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    #scope_file
+    Maps :: "/api/v1/admin/game-maps";
+    Completions :: "/api/v1/game-completions";
+    InsertMap :: "INSERT INTO game_maps(game,level,map_hash,map,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";
+    ReadMap :: "SELECT map FROM game_maps WHERE game=?1 AND level=?2 AND map_hash=?3";
+    CompareMap :: "SELECT map=?4 FROM game_maps WHERE game=?1 AND level=?2 AND map_hash=?3";
+    InsertSource :: "INSERT INTO game_map_sources(game,level,map_hash,source_version,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";
+    InsertCompletion :: "INSERT INTO game_completions(account_id,id,game,level,map_hash,moves,actions,trace,evidence_complete,payload,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11) ON CONFLICT DO NOTHING";
+    ReadHistory :: "SELECT c.payload,m.map FROM game_completions c JOIN game_maps m USING(game,level,map_hash) WHERE c.account_id=?1 AND c.game=?2 AND c.level=?3 AND c.map_hash=?4 ORDER BY c.moves,c.created_at,c.id LIMIT 16 OFFSET ?5";
+
+    RegistrationFields: [3]string = .["game", "source_version", "maps"];
+    MapFields: [3]string = .["level", "map_hash", "map"];
+    CompletionFields: [7]string = .["game", "level", "map_hash", "moves", "actions", "trace", "evidence_complete"];
+
+    Revision :: struct {
+        level: s64
+        hash: Text
+        board: Text
+    }
+
+    Fields :: (document: *json.JsonDocument, object: s32, names: []string, fields: []s32) -> bool {
+        if json.JsonKindOf(document, object) != .Object { return false }
+        for index: 0..fields.count - 1 { fields[index] = -1 }
+        node := json.JsonFirst(document, object)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            index: s64 = 0
+            while index < names.count && names[index] != TextView(name) { index += 1 }
+            if index == names.count || fields[index] >= 0 { return false }
+            fields[index] = node
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    PrivateReply :: (connection: *void, method: string, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"}]
+        if method == "HEAD" {
+            empty: []u8
+            return http.WriteWithHeaders(connection, status, "application/json", empty, headers[:])
+        }
+        return response.ReplyWithHeaders(connection, status, document, root, headers[:])
+    }
+
+    PrivateError :: (connection: *void, method: string, status: u32, message: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ledger.PutText(*document, root, "error", message) { return 0 }
+        return PrivateReply(connection, method, status, *document, root)
+    }
+
+    ReadRevision :: (document: *json.JsonDocument, node: s32) -> Revision {
+        fields: [3]s32
+        if !Fields(document, node, MapFields[:], fields[:]) { return .{} }
+        level, valid := json.JsonInteger(document, fields[0])
+        if !valid { return .{} }
+        hash: Text = json.JsonString(document, fields[1])
+        board: Text = json.JsonString(document, fields[2])
+        if !rules.ValidRevision(level, TextView(hash), TextView(board)) { return .{} }
+        return .{level = level, hash = hash, board = board}
+    }
+
+    SaveMaps :: (access: *accounts.AccountAccess, source: string, revisions: []Revision, now: s64) -> bool {
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        for *revision: revisions {
+            arguments: [5]sql.Argument = .[sql.TextArg(rules.Game), sql.IntArg(revision.level),
+                sql.TextArg(TextView(revision.hash)), sql.TextArg(TextView(revision.board)), sql.IntArg(now)]
+            if sql.Execute(database, InsertMap, arguments[:]) != sqlite.SQLITE_OK { return false }
+            existing := sql.ReadInteger(database, CompareMap, arguments[:4])
+            if !existing.found || existing.value != 1 { return false }
+            arguments[3] = sql.TextArg(source)
+            if sql.Execute(database, InsertSource, arguments[:]) != sqlite.SQLITE_OK { return false }
+        }
+        return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Register :: (access: *accounts.AccountAccess, admin: string, connection: *void, input: []u8, overflow: bool) -> s32 {
+        compressed := access.configuration.zstdResponses
+        if admin == "" { return response.ErrorReply(connection, "POST", 403, "admin disabled", compressed) }
+        if !auth.AdminMatches(connection, admin) { return response.ErrorReply(connection, "POST", 401, "admin token required", compressed) }
+        body: response.Body
+        fields: [3]s32
+        invalid := "invalid map registration"
+        {
+            read := response.Read(connection, input, overflow || input.count > BodyLimit, BodyLimit, access.configuration.zstdRequests, *body)
+            if read.status != 0 { return response.ErrorReply(connection, "POST", 400, invalid, compressed) }
+        }
+        root := body.document.root
+        if !Fields(*body.document, root, RegistrationFields[:], fields[:]) ||
+            !json.JsonIs(*body.document, fields[0], rules.Game) || json.JsonKindOf(*body.document, fields[2]) != .Array {
+            return response.ErrorReply(connection, "POST", 400, invalid, compressed)
+        }
+        sourceText: Text = json.JsonString(*body.document, fields[1])
+        source := TextView(sourceText)
+        count := json.JsonCount(*body.document, fields[2])
+        if source.count < 1 || source.count > 128 || count < 1 || count > 512 {
+            return response.ErrorReply(connection, "POST", 400, invalid, compressed)
+        }
+        revisions: Vec(Revision)
+        node := json.JsonFirst(*body.document, fields[2])
+        while node >= 0 {
+            revision := ReadRevision(*body.document, node)
+            if revision.level == 0 { return response.ErrorReply(connection, "POST", 400, invalid, compressed) }
+            if !VecPush(revisions, revision) { return response.ErrorReply(connection, "POST", 503, "map archive unavailable", compressed) }
+            node = json.JsonNext(*body.document, node)
+        }
+        now := signing.Now()
+        if !now.valid || !SaveMaps(access, source, VecSlice(revisions, 0, revisions.count), now.seconds) {
+            return response.ErrorReply(connection, "POST", 503, "map archive unavailable", compressed)
+        }
+        return response.Reply(connection, "POST", 200, *body.document, root, compressed)
+    }
+
+    CopyMap :: (access: *accounts.AccountAccess, arguments: []sql.Argument, target: []u8) -> s32 {
+        if !mutex.Lock(*access.databaseLock) { return sqlite.SQLITE_BUSY }
+        defer mutex.Unlock(*access.databaseLock)
+        statement := sql.Prepare(access.configuration.database, ReadMap, arguments)
+        if statement.status != sqlite.SQLITE_OK { return statement.status }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status != sqlite.SQLITE_ROW { return status }
+        board := sql.ColumnText(statement.value, 0)
+        if board.count != target.count { return sqlite.SQLITE_DONE }
+        for byte, index: board { target[index] = byte }
+        return sqlite.SQLITE_OK
+    }
+
+    SaveCompletion :: (access: *accounts.AccountAccess, arguments: []sql.Argument, created: *bool) -> bool {
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        database := access.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return false }
+        defer writes.Rollback(database)
+        if sql.Execute(database, InsertCompletion, arguments) != sqlite.SQLITE_OK { return false }
+        created.* = sqlite.SqliteChanges(database) > 0
+        return sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    Submit :: (access: *accounts.AccountAccess, connection: *void, account: string, now: s64, input: []u8, overflow: bool) -> s32 {
+        body: response.Body
+        fields: [7]s32
+        {
+            read := response.Read(connection, input, overflow || input.count > BodyLimit, BodyLimit, access.configuration.zstdRequests, *body)
+            if read.status != 0 { return PrivateError(connection, "POST", 400, "invalid completion evidence") }
+        }
+        if !Fields(*body.document, body.document.root, CompletionFields[:], fields[:]) {
+            return PrivateError(connection, "POST", 400, "invalid completion evidence")
+        }
+        game := json.JsonIs(*body.document, fields[0], rules.Game)
+        level, levelValid := json.JsonInteger(*body.document, fields[1])
+        moves, movesValid := json.JsonInteger(*body.document, fields[3])
+        complete, completeValid := json.JsonBool(*body.document, fields[6])
+        if (!levelValid && fields[1] >= 0 && json.JsonKindOf(*body.document, fields[1]) != .Null) ||
+            (!movesValid && fields[3] >= 0 && json.JsonKindOf(*body.document, fields[3]) != .Null) ||
+            (!completeValid && fields[6] >= 0 && json.JsonKindOf(*body.document, fields[6]) != .Null) {
+            return PrivateError(connection, "POST", 400, "invalid completion evidence")
+        }
+        for index: s32.[0, 2, 4, 5] {
+            field := fields[index]
+            kind := json.JsonKindOf(*body.document, field)
+            if field >= 0 && kind != .Null && kind != .String { return PrivateError(connection, "POST", 400, "invalid completion evidence") }
+        }
+        hashText: Text = json.JsonString(*body.document, fields[2])
+        actionsText: Text = json.JsonString(*body.document, fields[4])
+        traceText: Text = json.JsonString(*body.document, fields[5])
+        hash := TextView(hashText)
+        actions := TextView(actionsText)
+        trace := TextView(traceText)
+        invalid := "invalid completion or unknown map version"
+        if !game || level < 1 || level > 4096 || !rules.HexText(hash, 64) {
+            return PrivateError(connection, "POST", 400, invalid)
+        }
+        mapArguments: [3]sql.Argument = .[sql.TextArg(rules.Game), sql.IntArg(level), sql.TextArg(hash)]
+        board: [rules.MapSize]u8
+        status := CopyMap(access, mapArguments[:], board[:])
+        unavailable := "completion archive unavailable"
+        if status != sqlite.SQLITE_OK && status != sqlite.SQLITE_DONE { return PrivateError(connection, "POST", 503, unavailable) }
+        if status == sqlite.SQLITE_DONE || !rules.ValidCompletion(level, hash, TextView(board[:]), moves, actions, trace, complete) {
+            return PrivateError(connection, "POST", 400, invalid)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        bytes: Vec(u8)
+        id: [65]u8
+        // These validated string values are all ASCII. Keep the Go struct's
+        // original field order and compact JSON for cross-version replay IDs.
+        if !ledger.PutText(*document, root, "game", rules.Game) || !ledger.PutInt(*document, root, "level", level) ||
+            !ledger.PutText(*document, root, "map_hash", hash) || !ledger.PutInt(*document, root, "moves", moves) ||
+            !ledger.PutText(*document, root, "actions", actions) || !ledger.PutText(*document, root, "trace", trace) ||
+            !json.JsonSet(*document, root, "evidence_complete", json.JsonNewBool(*document, complete)) ||
+            !json.JsonWriteInto(*bytes, *document, root, json.JsonCompactStyle(false)) ||
+            !signing.HashHex(TextView(VecSlice(bytes, 0, bytes.count)), id[:]) {
+            return PrivateError(connection, "POST", 503, unavailable)
+        }
+        receipt := TextView(id[:64])
+        payload := TextView(VecSlice(bytes, 0, bytes.count))
+        arguments: [11]sql.Argument = .[sql.TextArg(account), sql.TextArg(receipt), sql.TextArg(rules.Game),
+            sql.IntArg(level), sql.TextArg(hash), sql.IntArg(moves), sql.TextArg(actions), sql.TextArg(trace),
+            sql.IntArg(ifx complete then 1 else 0), sql.TextArg(payload), sql.IntArg(now)]
+        created: bool
+        if !SaveCompletion(access, arguments[:], *created) { return PrivateError(connection, "POST", 503, unavailable) }
+        reply: json.JsonDocument
+        result := json.JsonNewObject(*reply)
+        if !ledger.PutText(*reply, result, "id", receipt) || !json.JsonSet(*reply, result, "created", json.JsonNewBool(*reply, created)) { return 0 }
+        return PrivateReply(connection, "POST", 200, *reply, result)
+    }
+
+    QueryNumber :: (value: string) -> s64 {
+        if value.count == 0 { return -1 }
+        signed := value[0] == #char "+" || value[0] == #char "-"
+        index: s64 = ifx signed then 1 else 0
+        if index == value.count { return -1 }
+        number: s64 = 0
+        while index < value.count {
+            byte := value[index]
+            if byte < #char "0" || byte > #char "9" { return -1 }
+            number = number * 10 + cast(s64)(byte - #char "0")
+            if number > 2147483647 { return -1 }
+            index += 1
+        }
+        return ifx value[0] == #char "-" then -number else number
+    }
+
+    ReadHistoryPage :: (access: *accounts.AccountAccess, arguments: []sql.Argument, document: *json.JsonDocument,
+        root: s32, offset: s64) -> bool {
+        if !mutex.Lock(*access.databaseLock) { return false }
+        defer mutex.Unlock(*access.databaseLock)
+        rows := sql.Prepare(access.configuration.database, ReadHistory, arguments)
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        completions := json.JsonNewArray(document)
+        count: s64 = 0
+        status := sqlite.SqliteStep(rows.value)
+        while status == sqlite.SQLITE_ROW {
+            payload: json.JsonDocument
+            if !json.JsonRead(*payload, sql.ColumnText(rows.value, 0)) ||
+                !json.JsonAppend(document, completions, json.JsonCopy(document, *payload, payload.root)) { return false }
+            if count == 0 && !ledger.PutText(document, root, "map", sql.ColumnText(rows.value, 1)) { return false }
+            count += 1
+            status = sqlite.SqliteStep(rows.value)
+        }
+        return status == sqlite.SQLITE_DONE && (count != 0 || ledger.PutText(document, root, "map", "")) &&
+            json.JsonSet(document, root, "completions", completions) && ledger.PutInt(document, root, "next_offset", offset + count)
+    }
+
+    History :: (access: *accounts.AccountAccess, connection: *void, method: string, account: string) -> s32 {
+        game := http.QueryArgument(connection, "game")
+        level := QueryNumber(http.QueryArgument(connection, "level"))
+        offsetText := http.QueryArgument(connection, "offset")
+        offset := ifx offsetText == "" then 0 else QueryNumber(offsetText)
+        hash := http.QueryArgument(connection, "map_hash")
+        if game != rules.Game || level < 1 || level > 4096 || offset < 0 {
+            return PrivateError(connection, method, 400, "invalid completion history query")
+        }
+        invalid := "completion history unavailable or invalid map version"
+        if !rules.HexText(hash, 64) { return PrivateError(connection, method, 400, invalid) }
+        arguments: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(game), sql.IntArg(level), sql.TextArg(hash), sql.IntArg(offset)]
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !ReadHistoryPage(access, arguments[:], *document, root, offset) { return PrivateError(connection, method, 400, invalid) }
+        return PrivateReply(connection, method, 200, *document, root)
+    }
+
+    Authenticate :: (access: *accounts.AccountAccess, connection: *void, now: s64) -> auth.BearerAuthentication {
+        if !mutex.Lock(*access.databaseLock) { return .{status = 503, message = "completion archive unavailable"} }
+        defer mutex.Unlock(*access.databaseLock)
+        return auth.Authenticate(access.configuration.database, connection, access.configuration.secret, now, "", false)
+    }
+
+    #scope_export
+    BodyLimit :: 1048576;
+
+    Handles :: (path: string) -> bool { return path == Maps || path == Completions }
+
+    ReadsBody :: (path: string, method: string) -> bool { return Handles(path) && method == "POST" }
+
+    Handle :: (access: *accounts.AccountAccess, admin: string, connection: *void, method: string, path: string, input: []u8, overflow: bool) -> s32 {
+        allowed := path == Completions && (method == "GET" || method == "HEAD")
+        if method != "POST" && !allowed {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = ifx path == Maps then "POST" else "GET, HEAD, POST"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if path == Maps { return Register(access, admin, connection, input, overflow) }
+        now := signing.Now()
+        if !now.valid { return PrivateError(connection, method, 503, "completion archive unavailable") }
+        actor := Authenticate(access, connection, now.seconds)
+        if actor.status != 0 { return response.ErrorReply(connection, method, actor.status, actor.message, access.configuration.zstdResponses) }
+        account := TextView(actor.userID[:])
+        if method == "POST" { return Submit(access, connection, account, now.seconds, input, overflow) }
+        return History(access, connection, method, account)
+    }
+}

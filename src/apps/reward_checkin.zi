@@ -16,13 +16,6 @@ CheckInResult :: struct {
 }
 
 #scope_file
-Schema :: #string SQL
-CREATE TABLE IF NOT EXISTS reward_checkins (
- account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- game TEXT NOT NULL, day INTEGER NOT NULL, created_at INTEGER NOT NULL,
- PRIMARY KEY(account_id,game,day)
-);
-SQL
 InsertCheckIn :: "INSERT INTO reward_checkins(account_id,game,day,created_at) VALUES(?1,?2,?3,?4) ON CONFLICT DO NOTHING";
 // Walking back from today, each earlier row sits one position further down, so
 // day + position stays today + 1 until the first missed day.
@@ -34,10 +27,6 @@ SELECT COUNT(*) FROM (
 SQL
 
 #scope_export
-SchemaSQL :: () -> string {
-    return Schema
-}
-
 // The UTC day of a Unix time, in days since 1970.
 Day :: (unix_seconds: s64) -> s64 {
     if unix_seconds < 0 {

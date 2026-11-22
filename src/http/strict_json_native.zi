@@ -1,0 +1,26 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+
+    // The caller supplies the allowed names and receives their string nodes.
+    // Missing and explicit null values both read as empty strings.
+    ReadStringFields :: (document: *json.JsonDocument, body: []u8, names: []string, fields: []s32) -> bool {
+        if names.count != fields.count || !json.JsonRead(document, TextView(body)) ||
+            json.JsonKindOf(document, document.root) != .Object {
+            return false
+        }
+        for index: 0..fields.count - 1 { fields[index] = -1 }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(document, node)
+            index: s64 = 0
+            while index < names.count && names[index] != TextView(name) { index += 1 }
+            kind := json.JsonKindOf(document, node)
+            if index == names.count || fields[index] >= 0 || (kind != .String && kind != .Null) {
+                return false
+            }
+            fields[index] = node
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+}

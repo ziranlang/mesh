@@ -133,9 +133,6 @@ PortalPair :: (map: string, first: s32, second: s32) -> bool {
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return Schema
-}
 MapHash :: (game: string, level: s32, map: string) -> string {
     if game != "shovey.classic" || level < 1 || level > 4096 || !HexText(map, 1440) {
         return ""
@@ -335,26 +332,6 @@ Eligible :: (database: *sql.Database, context: ctx.Context, account: string, rew
 }
 
 #scope_file
-Schema :: #string SQL
-CREATE TABLE IF NOT EXISTS game_maps (
- game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL, map TEXT NOT NULL,
- created_at INTEGER NOT NULL, PRIMARY KEY(game,level,map_hash)
-);
-CREATE TABLE IF NOT EXISTS game_map_sources (
- game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL, source_version TEXT NOT NULL,
- created_at INTEGER NOT NULL, PRIMARY KEY(game,level,map_hash,source_version),
- FOREIGN KEY(game,level,map_hash) REFERENCES game_maps(game,level,map_hash)
-);
-CREATE TABLE IF NOT EXISTS game_completions (
- account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- id TEXT NOT NULL, game TEXT NOT NULL, level INTEGER NOT NULL, map_hash TEXT NOT NULL,
- moves INTEGER NOT NULL, actions TEXT NOT NULL, trace TEXT NOT NULL,
- evidence_complete INTEGER NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL,
- PRIMARY KEY(account_id,id), FOREIGN KEY(game,level,map_hash) REFERENCES game_maps(game,level,map_hash)
-);
-CREATE INDEX IF NOT EXISTS game_completion_best ON game_completions(account_id,game,level,map_hash,moves);
-CREATE INDEX IF NOT EXISTS game_completion_eligible ON game_completions(account_id,game,level,evidence_complete,moves);
-SQL
 InsertMap :: "INSERT INTO game_maps(game,level,map_hash,map,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";
 ReadMap :: "SELECT map FROM game_maps WHERE game=?1 AND level=?2 AND map_hash=?3";
 InsertSource :: "INSERT INTO game_map_sources(game,level,map_hash,source_version,created_at) VALUES(?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING";

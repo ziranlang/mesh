@@ -159,6 +159,24 @@ func TestZiranWebSocketWritesMatchBaseline(t *testing.T) {
 	}
 }
 
+type shortWebSocketConnection struct {
+	websocketMemoryConnection
+}
+
+func (connection *shortWebSocketConnection) Write(data []byte) (int, error) {
+	return connection.websocketMemoryConnection.Write(data[:len(data)/2])
+}
+
+func TestZiranWebSocketStopsAfterShortHeaderWrite(t *testing.T) {
+	connection := &shortWebSocketConnection{}
+	if err := Websocket_WriteFrame(connection, 1, []byte("message")); err != io.ErrShortWrite {
+		t.Fatalf("short header write error = %v", err)
+	}
+	if connection.writes != 1 || !bytes.Equal(connection.Bytes(), []byte{0x81}) {
+		t.Fatalf("continued after short header write: %x", connection.Bytes())
+	}
+}
+
 type websocketHijackWriter struct {
 	*httptest.ResponseRecorder
 	connection *websocketMemoryConnection

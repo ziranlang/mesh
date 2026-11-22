@@ -539,7 +539,7 @@ func (s *Server) baselineSyncHTTPValidateSyncRequest(ctx context.Context, req Sy
 		return errors.New("app_id required")
 	}
 	for _, item := range req.EncryptedRecords {
-		if !EncryptedRecord_ValidForProtocol(item, req.ProtocolVersion) {
+		if !RecordValidation_ValidForProtocol(item, req.ProtocolVersion) {
 			return errors.New("invalid encrypted record")
 		}
 		if req.AppID != "" {

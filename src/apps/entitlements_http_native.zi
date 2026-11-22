@@ -1,0 +1,198 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    replies :: #import "http_json_native";
+    rules :: #import "entitlement_rules_native";
+    plans :: #import "storage_plan_native";
+    unlocks :: #import "unlock_native";
+    writes :: #import "token_writes_native";
+    signing :: #import "token_signing_native";
+    identity :: #import "identity";
+    sqlite :: #import "sqlite/SQLite";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    StorageRoute :: "/api/v1/storage/plan";
+    UnlocksRoute :: "/api/v1/unlocks";
+    GrantsRoute :: "/api/v1/unlocks/grant";
+    ProductsRoute :: "/api/v1/unlocks/products";
+    BodyLimit :: 1024;
+
+    Command :: struct {
+        fields: [3]s32
+        expected: s64
+    }
+
+    ReadCommand :: (document: *json.JsonDocument, names: []string, nodes: []s32) -> bool {
+        if json.JsonKindOf(document, document.root) != .Object { return false }
+        node := json.JsonFirst(document, document.root)
+        while node >= 0 {
+            key: Text = json.JsonKey(document, node)
+            index: s64 = 0
+            while index < names.count && names[index] != TextView(key) { index += 1 }
+            if index == names.count || nodes[index] >= 0 { return false }
+            nodes[index] = node
+            node = json.JsonNext(document, node)
+        }
+        return true
+    }
+
+    OptionalText :: (document: *json.JsonDocument, node: s32) -> bool {
+        kind := json.JsonKindOf(document, node)
+        return node < 0 || kind == .Null || kind == .String
+    }
+
+    ParseBody :: (connection: *void, body: []u8, overflow: bool, settings: accounts.Configuration,
+        route: string, input: *replies.Body, document: *json.JsonDocument, command: *Command) -> bool {
+        limit := ifx settings.maximumBodyBytes < BodyLimit then settings.maximumBodyBytes else BodyLimit
+        if overflow || body.count > settings.maximumBodyBytes { return false }
+        decoded := replies.Decode(connection, body, false, limit, settings.zstdRequests, input)
+        if decoded.status != 0 || decoded.length > limit { return false }
+        payload := ifx decoded.decoded then VecSlice(input.scratch, 0, decoded.length) else body
+        if !json.JsonRead(document, TextView(payload)) { return false }
+        if route == StorageRoute {
+            names: [3]string = .["size", "period", "request_id"]
+            nodes: [3]s32 = .[-1, -1, -1]
+            if !ReadCommand(document, names[:], nodes[:]) || !OptionalText(document, nodes[0]) ||
+                !OptionalText(document, nodes[1]) || !OptionalText(document, nodes[2]) { return false }
+            size: Text = json.JsonString(document, nodes[0])
+            period: Text = json.JsonString(document, nodes[1])
+            request: Text = json.JsonString(document, nodes[2])
+            command.fields = nodes
+            return rules.Price(StorageSize(TextView(size)), TextView(period)) > 0 && identity.ValidClientID(TextView(request))
+        }
+        names: [2]string = .["product", "expected_units"]
+        nodes: [2]s32 = .[-1, -1]
+        if !ReadCommand(document, names[:], nodes[:]) || !OptionalText(document, nodes[0]) { return false }
+        product: Text = json.JsonString(document, nodes[0])
+        if !identity.ValidNamespace(TextView(product)) { return false }
+        command.fields[0] = nodes[0]
+        if nodes[1] >= 0 && json.JsonKindOf(document, nodes[1]) != .Null {
+            expected, valid := json.JsonInteger(document, nodes[1])
+            if !valid { return false }
+            command.expected = expected
+        }
+        return true
+    }
+
+    StorageSize :: (size: string) -> string {
+        if size == "5gb" { return "5gb" }
+        if size == "1gb" || size == "" { return "1gb" }
+        return ""
+    }
+
+    Problem :: (route: string, verb: string) -> rules.Result {
+        if route == StorageRoute {
+            if verb == "POST" { return rules.Failure(503, "storage upgrade unavailable") }
+            return rules.Failure(503, "storage balance unavailable")
+        }
+        if route == GrantsRoute { return rules.Failure(503, "pack grants unavailable") }
+        if verb == "POST" { return rules.Failure(503, "unlock unavailable") }
+        return rules.Failure(503, "unlocks unavailable")
+    }
+
+    Dispatch :: (configuration: rules.Configuration, database: *void, user: string, free: s64, route: string,
+        verb: string, command: Command, now: s64, at: string, input: *json.JsonDocument, document: *json.JsonDocument) -> rules.Result {
+        purchase := verb == "POST" && route != GrantsRoute
+        begin := ifx purchase then "BEGIN IMMEDIATE" else "BEGIN"
+        if sqlite.SqliteExecText(database, begin) != sqlite.SQLITE_OK { return Problem(route, verb) }
+        defer writes.Rollback(database)
+        result: rules.Result
+        if route == StorageRoute {
+            if purchase {
+                size: Text = json.JsonString(input, command.fields[0])
+                period: Text = json.JsonString(input, command.fields[1])
+                request: Text = json.JsonString(input, command.fields[2])
+                result = plans.Purchase(database, configuration, user, StorageSize(TextView(size)), TextView(period),
+                    TextView(request), now, at, free, document)
+            } else {
+                result = plans.Status(database, configuration, user, now, free, document)
+            }
+        } else if route == GrantsRoute {
+            product: Text = json.JsonString(input, command.fields[0])
+            result = unlocks.Grant(database, configuration.signer, user, TextView(product), now, document)
+        } else if purchase {
+            product: Text = json.JsonString(input, command.fields[0])
+            result = unlocks.Purchase(database, configuration, user, TextView(product), command.expected, now, at, document)
+        } else {
+            result = unlocks.List(database, configuration, user, now, document)
+        }
+        if result.status == 200 && sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return Problem(route, verb) }
+        return result
+    }
+
+    Respond :: (connection: *void, result: rules.Result, cache: string, document: *json.JsonDocument) -> s32 {
+        node := result.node
+        if result.status != 200 {
+            node = json.JsonNewObject(document)
+            if !json.JsonSet(document, node, "error", json.JsonNewString(document, result.message)) { return 0 }
+        }
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = cache}]
+        return replies.ReplyWithHeaders(connection, result.status, document, node, headers[:])
+    }
+
+    #scope_export
+    ConfigurationError :: (configuration: rules.Configuration, stableSecret: bool, directPurchases: bool,
+        walletURL: string, network: string) -> string {
+        return rules.ConfigurationError(configuration, stableSecret, directPurchases, walletURL, network)
+    }
+
+    Handles :: (route: string) -> bool {
+        return route == StorageRoute || route == UnlocksRoute || route == GrantsRoute || route == ProductsRoute
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return verb == "POST" && (route == StorageRoute || route == UnlocksRoute || route == GrantsRoute)
+    }
+
+    Handle :: (access: *accounts.AccountAccess, configuration: rules.Configuration, connection: *void, verb: string,
+        route: string, body: []u8, overflow: bool) -> s32 {
+        read := (verb == "GET" || verb == "HEAD") && route != GrantsRoute
+        write := ReadsBody(route, verb)
+        if !read && !write {
+            allow := "GET, HEAD, POST"
+            if route == ProductsRoute { allow = "GET, HEAD" }
+            if route == GrantsRoute { allow = "POST" }
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        now := signing.Now()
+        output: json.JsonDocument
+        if route == ProductsRoute {
+            return Respond(connection, unlocks.Prices(configuration, now.seconds, *output), "no-store", *output)
+        }
+        settings := access.configuration
+        at: [31]u8
+        authenticationTime := signing.WireTime(now, true, at[:])
+        if authenticationTime == "" || !mutex.Lock(*access.databaseLock) {
+            return replies.ErrorReply(connection, verb, 500, "authentication failed", settings.zstdResponses)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        authenticated := auth.Authenticate(settings.database, connection, settings.secret, now.seconds, authenticationTime, false)
+        if authenticated.status != 0 {
+            return replies.ErrorReply(connection, verb, authenticated.status, authenticated.message, settings.zstdResponses)
+        }
+        cache := "private, no-store"
+        if route == StorageRoute && write && !rules.Enabled(configuration) {
+            return Respond(connection, rules.Failure(503, "storage upgrades unavailable"), cache, *output)
+        }
+        input: replies.Body
+        request: json.JsonDocument
+        command: Command
+        if write && !ParseBody(connection, body, overflow, settings, route, *input, *request, *command) {
+            problem := "invalid unlock"
+            if route == StorageRoute { problem = "invalid storage upgrade" }
+            if route == GrantsRoute { problem = "invalid grant request" }
+            return Respond(connection, rules.Failure(400, problem), cache, *output)
+        }
+        receiptAt: [31]u8
+        atSeconds := signing.WireTime(now, false, receiptAt[:])
+        result := Dispatch(configuration, settings.database, TextView(authenticated.userID[:]), settings.accountStorageLimit,
+            route, verb, command, now.seconds, atSeconds, *request, *output)
+        return Respond(connection, result, cache, *output)
+    }
+}

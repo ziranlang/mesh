@@ -1,0 +1,53 @@
+#if TARGET == .C && OS == .LINUX {
+    json :: #import "std/json_document";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    TextField :: (document: *json.JsonDocument, root: s32, key: string, value: string) -> bool {
+        return json.JsonSet(document, root, key, json.JsonNewStringCopy(document, value))
+    }
+
+    IntegerField :: (document: *json.JsonDocument, root: s32, key: string, value: s64) -> bool {
+        return json.JsonSet(document, root, key, json.JsonNewInteger(document, value))
+    }
+
+    BooleanField :: (document: *json.JsonDocument, root: s32, key: string, value: bool) -> bool {
+        return json.JsonSet(document, root, key, json.JsonNewBool(document, value))
+    }
+
+    Storage :: (document: *json.JsonDocument, root: s32, used: s64, limit: s64) -> bool {
+        node := json.JsonNewObject(document)
+        return IntegerField(document, node, "used_bytes", used) &&
+            (limit <= 0 || IntegerField(document, node, "limit_bytes", limit)) && json.JsonSet(document, root, "account_storage", node)
+    }
+
+    TextIfPresent :: (document: *json.JsonDocument, item: s32, key: string, value: string) -> bool {
+        return value == "" || TextField(document, item, key, value)
+    }
+
+    AttachEncryptedPayload :: (document: *json.JsonDocument, row: *void) -> s32 {
+        payload: json.JsonDocument
+        if !json.JsonRead(*payload, sql.ColumnText(row, 2)) {
+            return -1
+        }
+        item := json.JsonNewObject(document)
+        if !IntegerField(document, item, "id", sqlite.SqliteColumnInt64(row, 0)) ||
+            !TextIfPresent(document, item, "client_id", sql.ColumnText(row, 1)) ||
+            !json.JsonSet(document, item, "payload", json.JsonCopy(document, *payload, payload.root)) ||
+            !TextIfPresent(document, item, "created_at", sql.ColumnText(row, 3)) ||
+            !IntegerField(document, item, "server_version", sqlite.SqliteColumnInt64(row, 4)) {
+            return -1
+        }
+        return item
+    }
+
+    AttachCapabilities :: (document: *json.JsonDocument, root: s32, zstd: bool) -> bool {
+        capabilityNames: [4]string = .["v6-signed-transactions", "http-gzip-v1", "record-gzip-v1", "basic-storage-free-v1"]
+        array := json.JsonNewArray(document)
+        for name: capabilityNames {
+            if !json.JsonAppend(document, array, json.JsonNewStringCopy(document, name)) { return false }
+        }
+        return (!zstd || json.JsonAppend(document, array, json.JsonNewString(document, "http-zstd-v1"))) &&
+            json.JsonSet(document, root, "server_capabilities", array)
+    }
+}

@@ -4,6 +4,7 @@ io :: #import "std/io_go";
 json :: #import "std/json_go";
 errors :: #import "std/errors_go";
 coding :: #import "content_coding";
+preferences :: #import "encoding_preferences";
 go_io :: #system_library "go:io";
 native_http :: #system_library "go:net/http";
 strings :: #system_library "go:strings";
@@ -23,10 +24,10 @@ ReadJSON :: (writer: http.ResponseWriter, request: *http.Request, limit: s64) ->
         result.error = errors.New("request body too large")
         return result
     }
-    encoding := coding.RequestEncoding(Join(HeaderValues(http.Headers(request), "Content-Encoding"), ","))
-    if encoding == "gzip" || (encoding == "zstd" && coding.ZstdRequestsEnabled()) {
+    encoding := preferences.Request(Join(HeaderValues(http.Headers(request), "Content-Encoding"), ","))
+    if encoding == preferences.RequestCoding.Gzip || (encoding == preferences.RequestCoding.Zstd && coding.ZstdRequestsEnabled()) {
         decoded: io.ReadAllResult
-        if encoding == "gzip" {
+        if encoding == preferences.RequestCoding.Gzip {
             decoded = coding.DecodeGzip(read.value, limit)
         } else {
             decoded = coding.DecodeZstd(read.value, limit)
@@ -36,7 +37,7 @@ ReadJSON :: (writer: http.ResponseWriter, request: *http.Request, limit: s64) ->
             return result
         }
         read.value = decoded.value
-    } else if encoding != "" && encoding != "identity" {
+    } else if encoding != preferences.RequestCoding.Identity {
         result.error = errors.New("unsupported content encoding")
         return result
     }

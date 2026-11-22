@@ -1,0 +1,593 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    address :: #import "client_address_native";
+    allowance :: #import "storage_allowance_native";
+    auth :: #import "http_auth_native";
+    coding :: #import "content_coding_native";
+    encoding :: #import "encoding_preferences";
+    fields :: #import "sync_response_native";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    limits :: #import "server_limits";
+    lookup :: #import "account_lookup_native";
+    quota :: #import "storage_usage_rules";
+    rates :: #import "rate_limit_native";
+    replies :: #import "http_json_native";
+    scan :: #import "std/json_scan";
+    sha :: #import "crypto/sha256";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    text :: #import "std/text_tools";
+    time :: #import "timestamp_format";
+    wire :: #import "wire_text";
+    calendar :: #import "std/date_time_linux";
+    clock :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    random :: #import "std/random_linux";
+    utf8 :: #import "std/utf8";
+    #import "std/vec"
+
+    MaxRequestBytes :: 67108864;
+
+    #scope_file
+    Path :: "/api/v1/publications";
+    Prefix :: "/api/v1/publications/";
+    MaxTitleBytes :: 80;
+    MaxFormatBytes :: 64;
+    Columns :: "p.id,p.author,COALESCE(u.alias,''),p.format,p.title,p.levels,p.visibility,p.updated_at";
+    PublicationFromSQL :: " FROM server_publications p JOIN server_users u ON u.user_id_hash=p.author";
+    Visible :: "(p.visibility='public' OR p.author=?2 OR (p.visibility='friends' AND ?2!='' AND EXISTS(SELECT 1 FROM server_friendships f WHERE (f.user_id_a=p.author AND f.user_id_b=?2) OR (f.user_id_a=?2 AND f.user_id_b=p.author))))";
+    Newest :: " ORDER BY p.updated_at DESC,p.rowid DESC LIMIT 50";
+    Unavailable :: "publications unavailable";
+    Missing :: "publication not found";
+    Invalid :: "invalid publication";
+
+    Result :: struct {
+        status: u32
+        error: string
+        used: s64
+        limit: s64
+    }
+
+    Draft :: struct {
+        id: string
+        format: string
+        title: string
+        visibility: string
+        document: string
+    }
+
+    Failed :: () -> Result {
+        return .{status = 500, error = Unavailable}
+    }
+
+    ValidID :: (value: string) -> bool {
+        if value.count != 32 {
+            return false
+        }
+        for byte: value {
+            if !scan.Digit(byte) && (byte < #char "a" || byte > #char "f") {
+                return false
+            }
+        }
+        return true
+    }
+
+    ValidFormat :: (value: string) -> bool {
+        if value.count == 0 || value.count > MaxFormatBytes {
+            return false
+        }
+        for byte: value {
+            if !scan.Digit(byte) && (byte < #char "a" || byte > #char "z") && byte != #char "." && byte != #char "-" {
+                return false
+            }
+        }
+        return true
+    }
+
+    ValidTitle :: (value: string) -> bool {
+        if value.count > MaxTitleBytes || wire.TrimSpace(value) == "" {
+            return false
+        }
+        for byte, index: value {
+            if byte < 32 || byte == 127 {
+                return false
+            }
+            if byte == 194 && index + 1 < value.count && value[index + 1] >= 128 && value[index + 1] <= 159 {
+                return false
+            }
+        }
+        return true
+    }
+
+    // The input has passed SQLite's JSON validator. Locate the end of a value
+    // without decoding numbers or building an in-memory tree of the document.
+    ValueEnd :: (body: string, start: s32) -> s32 {
+        depth: s32 = 0
+        cursor := start
+        while cursor < body.count {
+            byte := body[cursor]
+            if byte == #char "\"" {
+                quoted := scan.ReadString(body, cursor)
+                if !quoted.valid || depth == 0 {
+                    return ifx quoted.valid then quoted.after else -1
+                }
+                cursor = quoted.after
+                continue
+            }
+            if depth == 0 && (byte == #char "," || byte == #char "}" || scan.Space(body, cursor) != cursor) {
+                return cursor
+            }
+            if byte == #char "{" || byte == #char "[" {
+                depth += 1
+            } else if byte == #char "}" || byte == #char "]" {
+                depth -= 1
+                if depth == 0 {
+                    return cursor + 1
+                }
+            }
+            cursor += 1
+        }
+        return -1
+    }
+
+    // Go's draft decoder accepts unknown fields and case-insensitive field
+    // names. Null leaves scalar fields alone, and the last document wins.
+    DraftFields :: (body: string, positions: []s32, document: *scan.JsonRange) -> bool {
+        cursor := scan.Space(body, 0)
+        if cursor >= body.count || body[cursor] != #char "{" {
+            return false
+        }
+        names: [4]string = .["id", "format", "title", "visibility"]
+        for index: 0..3 {
+            positions[index] = -1
+        }
+        cursor = scan.Space(body, cursor + 1)
+        if cursor < body.count && body[cursor] == #char "}" {
+            return scan.Space(body, cursor + 1) == body.count
+        }
+        while cursor < body.count {
+            key := scan.ReadString(body, cursor)
+            if !key.valid {
+                return false
+            }
+            colon := scan.Space(body, key.after)
+            if colon >= body.count || body[colon] != #char ":" {
+                return false
+            }
+            start := scan.Space(body, colon + 1)
+            end := ValueEnd(body, start)
+            if end < 0 {
+                return false
+            }
+            nameBuffer: [16]u8
+            count := scan.ReadStringText(body, cursor, nameBuffer[:])
+            if count >= 0 {
+                name := TextView(nameBuffer[:count])
+                if wire.MatchesToken(name, "document") {
+                    <<document = .{start = start, end = end}
+                } else {
+                    for expected, index: names {
+                        if wire.MatchesToken(name, expected) && body[start:end] != "null" {
+                            if body[start] != #char "\"" {
+                                return false
+                            }
+                            positions[index] = start
+                        }
+                    }
+                }
+            }
+            cursor = scan.Space(body, end)
+            if cursor >= body.count {
+                return false
+            }
+            if body[cursor] == #char "}" {
+                return scan.Space(body, cursor + 1) == body.count
+            }
+            if body[cursor] != #char "," {
+                return false
+            }
+            cursor = scan.Space(body, cursor + 1)
+        }
+        return false
+    }
+
+    Metadata :: (document: *json.JsonDocument, row: *void, viewer: string) -> s32 {
+        item := json.JsonNewObject(document)
+        author := json.JsonNewObject(document)
+        owner := sql.ColumnText(row, 1)
+        if !fields.TextField(document, author, "public_id", owner) ||
+            !fields.TextField(document, author, "alias", sql.ColumnText(row, 2)) ||
+            !fields.TextField(document, item, "id", sql.ColumnText(row, 0)) ||
+            !json.JsonSet(document, item, "author", author) ||
+            !fields.TextField(document, item, "format", sql.ColumnText(row, 3)) ||
+            !fields.TextField(document, item, "title", sql.ColumnText(row, 4)) ||
+            !fields.IntegerField(document, item, "levels", sqlite.SqliteColumnInt64(row, 5)) ||
+            !fields.TextField(document, item, "visibility", sql.ColumnText(row, 6)) ||
+            !fields.IntegerField(document, item, "updated_at", sqlite.SqliteColumnInt64(row, 7)) ||
+            !fields.BooleanField(document, item, "mine", owner == viewer) {
+            return -1
+        }
+        return item
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    ReadItem :: (database: *void, viewer: string, id: string, withDocument: bool, body: *Vec(u8)) -> Result {
+        if !ValidID(id) {
+            return .{status = 404, error = Missing}
+        }
+        extra := ifx withDocument then ",p.document,json_valid(p.document) AND instr(p.document,char(0))=0" else ""
+        visibility := ifx withDocument then Visible else "p.author=?2"
+        parts: [6]string = .["SELECT ", Columns, extra, PublicationFromSQL, " WHERE p.id=?1 AND ", visibility]
+        query: Text = text.TextJoin(parts[:], "")
+        args: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(viewer)]
+        selection := sql.Prepare(database, TextView(query), args[:])
+        if selection.status != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        defer sqlite.SqliteFinalize(selection.value)
+        step := sqlite.SqliteStep(selection.value)
+        if step == sqlite.SQLITE_DONE {
+            return .{status = 404, error = Missing}
+        }
+        if step != sqlite.SQLITE_ROW {
+            return Failed()
+        }
+        document: json.JsonDocument
+        item := Metadata(*document, selection.value, viewer)
+        if item < 0 || !BuilderAppend(<<body, "{\"publication\":") ||
+            !json.JsonWriteInto(body, *document, item, json.JsonCompactStyle(false)) {
+            return Failed()
+        }
+        if withDocument {
+            original := sql.ColumnText(selection.value, 8)
+            if sqlite.SqliteColumnInt64(selection.value, 9) != 1 || !utf8.Valid(original) ||
+                !BuilderAppend(<<body, ",\"document\":") || !BuilderAppend(<<body, original) {
+                return Failed()
+            }
+        }
+        if !BuilderAppend(<<body, "}\n") {
+            return Failed()
+        }
+        return .{status = 200}
+    }
+
+    List :: (database: *void, connection: *void, viewer: string, body: *Vec(u8)) -> Result {
+        format := wire.TrimSpace(http.QueryArgument(connection, "format"))
+        if format != "" && !ValidFormat(format) {
+            return .{status = 400, error = "invalid format"}
+        }
+        reference := wire.TrimSpace(http.QueryArgument(connection, "author"))
+        if sqlite.SqliteExecText(database, "BEGIN") != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        defer Rollback(database)
+        parts: [7]string = .["SELECT ", Columns, PublicationFromSQL, " WHERE (?1='' OR p.format=?1) AND ",
+            "p.visibility='public'", "", Newest]
+        args: [3]sql.Argument = .[sql.TextArg(format), sql.TextArg(viewer), sql.TextArg("")]
+        count: s64 = 1
+        author: lookup.AccountLookup
+        if reference != "" {
+            normalized: [64]u8
+            author = lookup.ResolveNormalized(database, lookup.Normalize(reference, normalized[:]))
+            if author.status != sqlite.SQLITE_OK {
+                return Failed()
+            }
+            if !author.found {
+                if !BuilderAppend(<<body, "{\"publications\":[]}\n") {
+                    return Failed()
+                }
+                return .{status = 200}
+            }
+            args[2] = sql.TextArg(TextView(author.id[:]))
+            parts[4] = "p.author=?3 AND "
+            parts[5] = Visible
+            count = 3
+        }
+        query: Text = text.TextJoin(parts[:], "")
+        selection := sql.Prepare(database, TextView(query), args[:count])
+        if selection.status != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        defer sqlite.SqliteFinalize(selection.value)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        items := json.JsonNewArray(*document)
+        step := sqlite.SqliteStep(selection.value)
+        while step == sqlite.SQLITE_ROW {
+            if !json.JsonAppend(*document, items, Metadata(*document, selection.value, viewer)) {
+                return Failed()
+            }
+            step = sqlite.SqliteStep(selection.value)
+        }
+        if step != sqlite.SQLITE_DONE || !json.JsonSet(*document, root, "publications", items) ||
+            !json.JsonWriteInto(body, *document, root, json.JsonCompactStyle(false)) || !BuilderAppend(<<body, "\n") {
+            return Failed()
+        }
+        return .{status = 200}
+    }
+
+    Publish :: (settings: *accounts.Configuration, user: string, draft: Draft, now: s64, body: *Vec(u8)) -> Result {
+        database := settings.database
+        replacing := draft.id != ""
+        id := draft.id
+        generated: [33]u8
+        if replacing {
+            if !ValidID(id) {
+                return .{status = 404, error = Missing}
+            }
+        } else {
+            bytes: [16]u8
+            if !random.FillSecure(bytes[:]) || sha.BytesToHex(*bytes[0], bytes.count, *generated[0], generated.count) != 1 {
+                return Failed()
+            }
+            id = TextView(generated[:32])
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        defer Rollback(database)
+        if replacing {
+            owner: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(user)]
+            existing := sql.ReadInteger(database, "SELECT 1 FROM server_publications WHERE id=?1 AND author=?2", owner[:])
+            if existing.status != sqlite.SQLITE_OK {
+                return Failed()
+            }
+            if !existing.found {
+                return .{status = 404, error = Missing}
+            }
+        }
+        args: [1]sql.Argument = .[sql.TextArg(user)]
+        before := sql.ReadInteger(database, quota.UsageSQL, args[:])
+        maximum := allowance.Allowance(database, user, now, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if before.status != sqlite.SQLITE_OK || maximum.status != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        doc: [1]sql.Argument = .[sql.TextArg(draft.document)]
+        levels := sql.ReadInteger(database, "SELECT CASE WHEN json_valid(?1)=0 THEN -1 WHEN json_type(?1,'$.levels')='array' THEN json_array_length(?1,'$.levels') ELSE 0 END", doc[:])
+        if levels.status != sqlite.SQLITE_OK || !levels.found {
+            return Failed()
+        }
+        if levels.value < 0 {
+            return .{status = 400, error = Invalid}
+        }
+        values: [8]sql.Argument = .[sql.TextArg(id), sql.TextArg(user), sql.TextArg(draft.format), sql.TextArg(draft.title),
+            sql.TextArg(draft.visibility), sql.IntArg(levels.value), doc[0], sql.IntArg(now)]
+        query := "INSERT INTO server_publications(id,author,format,title,visibility,levels,document,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)"
+        if replacing {
+            query = "UPDATE server_publications SET format=?3,title=?4,visibility=?5,levels=?6,document=?7,updated_at=?8 WHERE id=?1 AND author=?2"
+        }
+        if sql.Execute(database, query, values[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 {
+            return Failed()
+        }
+        after := sql.ReadInteger(database, quota.UsageSQL, args[:])
+        if after.status != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        if quota.Exceeds(before.value, after.value, maximum.value) {
+            return .{status = 413, error = "account storage limit reached", used = before.value, limit = maximum.value}
+        }
+        if ReadItem(database, user, id, false, body).status != 200 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        return .{status = 200}
+    }
+
+    Unpublish :: (database: *void, user: string, id: string, body: *Vec(u8)) -> Result {
+        if !ValidID(id) {
+            return .{status = 404, error = Missing}
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        defer Rollback(database)
+        args: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(user)]
+        if sql.Execute(database, "DELETE FROM server_publications WHERE id=?1 AND author=?2", args[:]) != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        if sqlite.SqliteChanges(database) == 0 {
+            return .{status = 404, error = Missing}
+        }
+        if !BuilderAppend(<<body, "{\"deleted\":true}\n") || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        return .{status = 200}
+    }
+
+    Post :: (settings: *accounts.Configuration, connection: *void, user: string, now: s64,
+        input: []u8, overflow: bool, body: *Vec(u8)) -> Result {
+        if overflow || input.count > MaxRequestBytes {
+            return .{status = 413, error = "publication too large"}
+        }
+        header: [limits.MaxHeaderBytes]u8
+        size := http.JoinHeader(connection, "Content-Encoding", header[:])
+        if size < 0 || encoding.Request(TextView(header[:size])) == .Unsupported {
+            return .{status = 400, error = Invalid}
+        }
+        payload: replies.Body
+        decoded := replies.Decode(connection, input, overflow, MaxRequestBytes, settings.zstdRequests, *payload)
+        if decoded.status != 0 {
+            if decoded.status == 503 {
+                return .{status = 503, error = "could not decode request body"}
+            }
+            return .{status = 400, error = Invalid}
+        }
+        raw := ifx decoded.decoded then TextView(VecSlice(payload.scratch, 0, decoded.length)) else TextView(input)
+        if raw.count == 0 || !utf8.Valid(raw) {
+            return .{status = 400, error = Invalid}
+        }
+        arguments: [1]sql.Argument = .[sql.TextArg(raw)]
+        valid := sql.ReadInteger(settings.database, "SELECT json_valid(?1) AND instr(?1,char(0))=0", arguments[:])
+        if valid.status != sqlite.SQLITE_OK {
+            return Failed()
+        }
+        if valid.value != 1 {
+            return .{status = 400, error = Invalid}
+        }
+        positions: [4]s32
+        span: scan.JsonRange
+        if !DraftFields(raw, positions[:], *span) || span.start == span.end || raw[span.start] != #char "{" {
+            return .{status = 400, error = Invalid}
+        }
+        idBytes: [33]u8
+        formatBytes: [MaxFormatBytes + 1]u8
+        titleBytes: [MaxTitleBytes + 1]u8
+        visibilityBytes: [8]u8
+        idLength := ifx positions[0] < 0 then 0 else scan.ReadStringText(raw, positions[0], idBytes[:])
+        formatLength := scan.ReadStringText(raw, positions[1], formatBytes[:])
+        titleLength := scan.ReadStringText(raw, positions[2], titleBytes[:])
+        visibilityLength := scan.ReadStringText(raw, positions[3], visibilityBytes[:])
+        if formatLength < 0 || titleLength < 0 || visibilityLength < 0 {
+            return .{status = 400, error = Invalid}
+        }
+        format := TextView(formatBytes[:formatLength])
+        title := TextView(titleBytes[:titleLength])
+        visibility := TextView(visibilityBytes[:visibilityLength])
+        if !ValidFormat(format) || !ValidTitle(title) || (visibility != "public" && visibility != "friends" && visibility != "private") {
+            return .{status = 400, error = Invalid}
+        }
+        if idLength < 0 {
+            return .{status = 404, error = Missing}
+        }
+        return Publish(settings, user, .{id = TextView(idBytes[:idLength]), format = format, title = title,
+            visibility = visibility, document = raw[span.start:span.end]}, now, body)
+    }
+
+    Allowed :: (access: *accounts.AccountAccess, connection: *void, user: string, writing: bool) -> bool {
+        key: Vec(u8)
+        prefix := ifx writing then "publications:write:" else "publications:read:"
+        if !BuilderAppend(key, prefix) {
+            return false
+        }
+        if user == "" {
+            remote := address.FromRequest(connection)
+            if !BuilderAppend(key, "address:") || !BuilderAppend(key, TextView(remote.bytes[:remote.count])) {
+                return false
+            }
+        } else if !BuilderAppend(key, user) {
+            return false
+        }
+        limit: s64 = ifx writing then 60 else 120
+        window: s64 = ifx writing then 3600000 else 60000
+        return rates.Allow(*access.limiter, TextView(VecSlice(key, 0, key.count)), limit, window, clock.MonotonicMilliseconds())
+    }
+
+    Apply :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string, input: []u8,
+        overflow: bool, hasCredentials: bool, body: *Vec(u8)) -> Result {
+        now := calendar.UnixMilliseconds()
+        if now < 0 || !mutex.Lock(*access.databaseLock) {
+            return Failed()
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        settings := *access.configuration
+        user: auth.BearerAuthentication
+        viewer := ""
+        if hasCredentials {
+            stamp: [31]u8
+            length := time.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, stamp[:])
+            if length == 0 {
+                return Failed()
+            }
+            user = auth.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(stamp[:length]), false)
+            if user.status != 0 {
+                return .{status = user.status, error = user.message}
+            }
+            viewer = TextView(user.userID[:])
+        }
+        writing := verb == "POST" || verb == "DELETE"
+        if !Allowed(access, connection, viewer, writing) {
+            return .{status = 429, error = "publication rate limit exceeded"}
+        }
+        if verb == "POST" {
+            return Post(settings, connection, viewer, now / 1000, input, overflow, body)
+        }
+        id := wire.TrimPrefix(route, Prefix)
+        if verb == "DELETE" {
+            return Unpublish(settings.database, viewer, id, body)
+        }
+        if route == Path {
+            return List(settings.database, connection, viewer, body)
+        }
+        return ReadItem(settings.database, viewer, id, true, body)
+    }
+
+    EncodingError :: (connection: *void, status: u32, message: string, headers: []http.HeaderValue) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !fields.TextField(*document, root, "error", message) {
+            return 0
+        }
+        return replies.ReplyWithHeaders(connection, status, *document, root, headers)
+    }
+
+    ErrorBody :: (result: Result, body: *Vec(u8)) -> bool {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        return fields.TextField(*document, root, "error", result.error) &&
+            (result.limit <= 0 || (fields.TextField(*document, root, "code", "storage_full") &&
+                fields.Storage(*document, root, result.used, result.limit))) &&
+            json.JsonWriteInto(body, *document, root, json.JsonCompactStyle(false)) && BuilderAppend(<<body, "\n")
+    }
+
+    WriteResult :: (connection: *void, status: u32, bytes: []u8, selected: string, headers: []http.HeaderValue) -> s32 {
+        if selected == "identity" {
+            return http.WriteWithHeaders(connection, status, "application/json", bytes, headers[:2])
+        }
+        packed: Vec(u8)
+        bound := coding.EncodeBound(selected, bytes.count)
+        if bound <= 0 || !VecResizeBounded(packed, bound, bound) {
+            return EncodingError(connection, 503, "response encoder unavailable", headers[:2])
+        }
+        size := coding.Encode(selected, bytes, VecSlice(packed, 0, bound))
+        if size < 0 {
+            return EncodingError(connection, 503, "response encoder unavailable", headers[:2])
+        }
+        headers[2] = .{name = "Content-Encoding", value = selected}
+        return http.WriteWithHeaders(connection, status, "application/json", VecSlice(packed, 0, size), headers[:])
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == Path || wire.TrimPrefix(route, Prefix) != route
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return route == Path && verb == "POST"
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        body: []u8, overflow: bool) -> s32 {
+        collection := route == Path
+        reading := verb == "GET" || verb == "HEAD"
+        if !reading && !ReadsBody(route, verb) && (collection || verb != "DELETE") {
+            allow := ifx collection then "GET, HEAD, POST" else "DELETE, GET, HEAD"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        hasCredentials := !reading || wire.TrimSpace(http.Header(connection, "Authorization")) != ""
+        cache := ifx hasCredentials then "private, no-store" else "public, max-age=15"
+        headers: [3]http.HeaderValue = .[.{name = "Cache-Control", value = cache},
+            .{name = "Vary", value = "Authorization, Accept-Encoding"}, .{}]
+        accepted: [encoding.MaximumHeaderBytes]u8
+        count := http.JoinHeader(connection, "Accept-Encoding", accepted[:])
+        selected := ifx count < 0 then "" else encoding.Select(TextView(accepted[:count]), access.configuration.zstdResponses)
+        if selected == "" {
+            return EncodingError(connection, 406, "no acceptable content encoding", headers[:2])
+        }
+        output: Vec(u8)
+        result := Apply(access, connection, verb, route, body, overflow, hasCredentials, *output)
+        if result.error != "" {
+            VecClear(output)
+            if !ErrorBody(result, *output) {
+                return 0
+            }
+        }
+        return WriteResult(connection, result.status, VecSlice(output, 0, output.count), selected, headers[:])
+    }
+}

@@ -1,12 +1,10 @@
 #import "std/go_types"
 errors :: #import "std/errors_go";
+names :: #import "path_name";
 filepath :: #system_library "go:path/filepath";
-strings :: #system_library "go:strings";
 
 #scope_file
 IsLocal :: (path: string) -> bool #foreign filepath;
-ContainsAny :: (value: string, characters: string) -> bool #foreign strings;
-ContainsNul :: (value: string, character: s32) -> bool #foreign strings "ContainsRune";
 
 #scope_export
 ComponentResult :: struct {
@@ -14,9 +12,8 @@ ComponentResult :: struct {
     error: Error
 }
 
-// Only a single, unchanged name may address a stored object.
 Validate :: (value: string) -> ComponentResult {
-    if !IsLocal(value) || value == "." || ContainsAny(value, "/\\") || ContainsNul(value, 0) {
+    if !names.Valid(value) || !IsLocal(value) {
         return .{error = errors.New("invalid filesystem component")}
     }
     return .{value = value}

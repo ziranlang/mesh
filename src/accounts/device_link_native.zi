@@ -1,0 +1,264 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "device_link_rules";
+    address :: #import "client_address_native";
+    limiting :: #import "rate_limit_native";
+    transport :: #import "http_server_native";
+    coding :: #import "content_coding_native";
+    replies :: #import "http_json_native";
+    limits :: #import "server_limits";
+    wire :: #import "wire_text";
+    clock :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    RequestLimit :: rules.LINK_DATA_MAX + 1024;
+
+    #scope_file
+    c :: #system_library "c";
+    Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+    Free :: (pointer: *void) #foreign c "free";
+    PutPath :: "/api/v1/link/put";
+    GetPath :: "/api/v1/link/get";
+    ClosePath :: "/api/v1/link/close";
+    LifetimeMilliseconds :: 600000;
+
+    Entry :: struct {
+        id: [rules.LINK_ID_LENGTH]u8
+        request: Vec(u8)
+        response: Vec(u8)
+        expiresAt: s64
+        closed: bool
+    }
+
+    #scope_export
+    Store :: struct {
+        lock: mutex.Mutex
+        limiter: limiting.RateLimiter
+        entries: Vec(*Entry)
+    }
+
+    #scope_file
+    Fields :: struct {
+        id: Text
+        slot: Text
+        data: Text
+        valid: bool
+    }
+
+    Read :: (payload: []u8) -> Fields {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(payload)) || json.JsonKindOf(*document, document.root) != .Object {
+            return .{}
+        }
+        input: Fields
+        seen: u8 = 0
+        node := json.JsonFirst(*document, document.root)
+        while node >= 0 {
+            name: Text = json.JsonKey(*document, node)
+            field := TextView(name)
+            bit: u8 = ifx field == "id" then 1 else ifx field == "slot" then 2 else ifx field == "data" then 4 else 0
+            kind := json.JsonKindOf(*document, node)
+            if bit == 0 || (seen & bit) != 0 || (kind != .String && kind != .Null) {
+                return .{}
+            }
+            seen |= bit
+            if kind == .String {
+                if bit == 1 {
+                    input.id = json.JsonString(*document, node)
+                } else if bit == 2 {
+                    input.slot = json.JsonString(*document, node)
+                } else {
+                    input.data = json.JsonString(*document, node)
+                }
+            }
+            node = json.JsonNext(*document, node)
+        }
+        input.valid = rules.IDValid(TextView(input.id))
+        return input
+    }
+
+    Release :: (entry: *Entry) {
+        VecFree(entry.request)
+        VecFree(entry.response)
+        Free(cast(*void)entry)
+    }
+
+    Expire :: (store: *Store, now: s64) {
+        active: s64 = 0
+        {
+            entries := VecSlice(store.entries, 0, store.entries.count)
+            for entry: entries {
+                if entry.expiresAt < now {
+                    Release(entry)
+                } else {
+                    entries[active] = entry
+                    active += 1
+                }
+            }
+        }
+        unused VecResize(store.entries, active)
+    }
+
+    Find :: (store: *Store, id: string, now: s64) -> *Entry {
+        for entry: VecSlice(store.entries, 0, store.entries.count) {
+            candidate := entry.id
+            if entry.expiresAt >= now && TextView(candidate[:]) == id {
+                return entry
+            }
+        }
+        return null
+    }
+
+    Status :: struct {
+        status: u32
+        message: string
+    }
+
+    Put :: (store: *Store, entry: *Entry, id: string, request: bool, data: string, now: s64) -> Status {
+        current := entry
+        if current == null {
+            if store.entries.count == rules.LINK_ENTRIES_MAX {
+                Expire(store, now)
+            }
+            if store.entries.count == rules.LINK_ENTRIES_MAX {
+                return .{status = 503, message = "device links are busy"}
+            }
+            current = cast(*Entry)Allocate(1, size_of(Entry))
+            if current == null {
+                return .{status = 503, message = "device links are busy"}
+            }
+            for byte, index: id { current.id[index] = byte }
+            current.expiresAt = now + LifetimeMilliseconds
+        }
+        if current.closed {
+            return .{status = 409, message = "device link closed"}
+        }
+        slot := ifx request then *current.request else *current.response
+        if slot.count != 0 {
+            message := ifx request then "device link request already sent" else "device link response already sent"
+            return .{status = 409, message = message}
+        }
+        if !BuilderAppend(<<slot, data) || (entry == null && !VecPush(store.entries, current)) {
+            if entry == null { Release(current) }
+            return .{status = 503, message = "device links are busy"}
+        }
+        return .{}
+    }
+
+    Act :: (store: *Store, path: string, payload: []u8, now: s64,
+        document: *json.JsonDocument, root: s32) -> Status {
+        input := Read(payload)
+        if !input.valid {
+            return .{status = 400, message = "invalid device link"}
+        }
+        id := TextView(input.id)
+        slot := TextView(input.slot)
+        data := TextView(input.data)
+        request := slot == "request"
+        if path == PutPath && (!rules.SlotValid(slot) || data.count == 0 || data.count > rules.LINK_DATA_MAX) {
+            return .{status = 400, message = "invalid device link message"}
+        }
+        if path == GetPath && !rules.SlotValid(slot) {
+            return .{status = 400, message = "invalid device link slot"}
+        }
+        if !mutex.Lock(*store.lock) {
+            return .{status = 503, message = "device links are busy"}
+        }
+        defer mutex.Unlock(*store.lock)
+        entry := Find(store, id, now)
+        if path == GetPath {
+            if entry == null || entry.closed {
+                return .{status = 404, message = "device link waiting"}
+            }
+            message := ifx request then VecSlice(entry.request, 0, entry.request.count) else VecSlice(entry.response, 0, entry.response.count)
+            if message.count == 0 {
+                return .{status = 404, message = "device link waiting"}
+            }
+            copy: [rules.LINK_DATA_MAX]u8
+            for byte, index: message {
+                copy[index] = byte
+            }
+            if !json.JsonSet(document, root, "data", json.JsonNewStringCopy(document, TextView(copy[:message.count]))) {
+                return .{status = 503, message = "device links are busy"}
+            }
+            return .{}
+        }
+        if !json.JsonSet(document, root, "ok", json.JsonNewBool(document, true)) {
+            return .{status = 503, message = "device links are busy"}
+        }
+        if path == PutPath {
+            return Put(store, entry, id, request, data, now)
+        }
+        if entry != null {
+            VecFree(entry.request)
+            VecFree(entry.response)
+            entry.closed = true
+        }
+        return .{}
+    }
+
+    #scope_export
+    Open :: (store: *Store) -> bool {
+        if !mutex.Open(*store.lock) {
+            return false
+        }
+        if !limiting.Open(*store.limiter) {
+            unused mutex.Close(*store.lock)
+            return false
+        }
+        return true
+    }
+
+    // The HTTP workers have stopped before destroying their mailbox.
+    Close :: (store: *Store) {
+        for entry: VecSlice(store.entries, 0, store.entries.count) { Release(entry) }
+        VecFree(store.entries)
+        limiting.Close(*store.limiter)
+        unused mutex.Close(*store.lock)
+    }
+
+    Handles :: (path: string) -> bool {
+        return path == PutPath || path == GetPath || path == ClosePath
+    }
+
+    Handle :: (store: *Store, connection: *void, method: string, path: string,
+        body: []u8, overflow: bool, zstdRequests: bool, zstdResponses: bool) -> s32 {
+        if method != "POST" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "POST"}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        now := clock.MonotonicMilliseconds()
+        ip := address.FromRequest(connection)
+        if now < 0 || now > 9223372036854775807 - LifetimeMilliseconds ||
+            !limiting.Allow(*store.limiter, TextView(ip.bytes[:ip.count]), 300, 60000, now) {
+            return replies.ErrorReply(connection, method, 429, "device link rate limit exceeded", zstdResponses)
+        }
+        encoding: [limits.MaxHeaderBytes]u8
+        count := transport.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if count < 0 || overflow || body.count > RequestLimit {
+            return replies.ErrorReply(connection, method, 400, "invalid device link", zstdResponses)
+        }
+        header := TextView(encoding[:count])
+        payload := body
+        decoded: Vec(u8)
+        if header != "" && !wire.MatchesToken(wire.TrimSpace(header), "identity") {
+            if !VecResizeBounded(decoded, RequestLimit, RequestLimit) {
+                return replies.ErrorReply(connection, method, 503, "request decoder unavailable", zstdResponses)
+            }
+            unpacked := coding.Decode(body, header, zstdRequests, RequestLimit, VecSlice(decoded, 0, decoded.count))
+            if unpacked.error != "" {
+                return replies.ErrorReply(connection, method, 400, "invalid device link", zstdResponses)
+            }
+            payload = unpacked.bytes
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        result := Act(store, path, payload, now, *document, root)
+        if result.status != 0 {
+            return replies.ErrorReply(connection, method, result.status, result.message, zstdResponses)
+        }
+        return replies.Reply(connection, method, 200, *document, root, zstdResponses)
+    }
+}

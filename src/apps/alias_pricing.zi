@@ -4,6 +4,7 @@
 #import "protocol"
 catalog :: #import "alias_catalog";
 identity :: #import "identity";
+account_alias :: #import "account_alias";
 ledger :: #import "token_ledger";
 receipts :: #import "token_receipt";
 timestamp :: #import "timestamp";
@@ -126,7 +127,7 @@ Claim :: (database: *sql.Database, context: ctx.Context, signer: ed.PrivateKey,
                 return result
             }
             // Replaying an old purchase cannot take the name back after a rename.
-            if identity.NormalizeAccountAlias(current) != alias {
+            if account_alias.NormalizeAccountAlias(current) != alias {
                 result.error = errors.New("claim already completed; alias changed")
                 return result
             }
@@ -139,7 +140,7 @@ Claim :: (database: *sql.Database, context: ctx.Context, signer: ed.PrivateKey,
             return result
         }
     }
-    if current != "" && identity.NormalizeAccountAlias(current) == alias {
+    if current != "" && account_alias.NormalizeAccountAlias(current) == alias {
         return result
     }
     if !identity.ValidAccountAlias(alias) {

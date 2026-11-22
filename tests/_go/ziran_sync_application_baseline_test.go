@@ -35,7 +35,7 @@ func (s *Store) baselineApplicationApplySyncDetailed(ctx context.Context, req Sy
 		return SyncResult{}, nil, fmt.Errorf("social_cache is server-owned")
 	}
 	for _, item := range req.EncryptedRecords {
-		if !EncryptedRecord_ValidForProtocol(item, req.ProtocolVersion) {
+		if !RecordValidation_ValidForProtocol(item, req.ProtocolVersion) {
 			return SyncResult{}, nil, fmt.Errorf("invalid encrypted record")
 		}
 	}

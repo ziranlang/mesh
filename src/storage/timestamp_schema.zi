@@ -1,0 +1,24 @@
+// Bump when another stored timestamp rewrite is required.
+TimestampSchemaVersion :: 1;
+VersionQuery :: "PRAGMA user_version";
+AdvanceVersion :: "PRAGMA user_version=1";
+TimestampColumn :: struct {
+    table: string
+    column: string
+}
+Columns: [14]TimestampColumn = .[
+    TimestampColumn.{table = "server_habits", column = "updated_at"},
+    TimestampColumn.{table = "server_habit_days", column = "updated_at"},
+    TimestampColumn.{table = "server_sessions", column = "updated_at"},
+    TimestampColumn.{table = "server_sessions", column = "started_at"},
+    TimestampColumn.{table = "server_meditation_logs", column = "completed_at"},
+    TimestampColumn.{table = "server_encrypted_records", column = "updated_at"},
+    TimestampColumn.{table = "server_social_snapshots", column = "updated_at"},
+    TimestampColumn.{table = "server_sync_ops", column = "created_at"},
+    TimestampColumn.{table = "server_users", column = "created_at"},
+    TimestampColumn.{table = "server_users", column = "last_seen_at"},
+    TimestampColumn.{table = "server_clients", column = "last_seen_at"},
+    TimestampColumn.{table = "server_clients", column = "last_login_at"},
+    TimestampColumn.{table = "server_clients", column = "last_sync_at"},
+    TimestampColumn.{table = "server_encrypted_payloads", column = "created_at"}
+];

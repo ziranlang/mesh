@@ -1,0 +1,310 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    addresses :: #import "network_address";
+    ascii :: #import "std/text";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    coding :: #import "encoding_preferences";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    text_tools :: #import "std/text_tools";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    limits :: #import "server_limits";
+    mutex :: #import "std/mutex_linux";
+    network :: #import "network_scope_native";
+    replies :: #import "http_json_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Configuration :: struct {
+        ownerID: string
+        developerToken: string
+    }
+
+    RequestLimit :: 65536;
+
+    #scope_file
+    AccountRoute :: "/api/v1/lumi/developer";
+    RelayRoute :: "/api/v1/admin/lumi/developer";
+    Unavailable :: "developer chat unavailable";
+    MessageLimit :: 8192;
+
+    Schema :: #string SQL_END
+CREATE TABLE IF NOT EXISTS server_lumi_developer_turns (
+    account_id TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    reply TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(account_id,id)
+);
+SQL_END;
+
+    PruneTurns :: "DELETE FROM server_lumi_developer_turns WHERE account_id=?1 AND created_at<datetime('now','-7 days')";
+
+    InsertTurn :: #string SQL_END
+INSERT INTO server_lumi_developer_turns(account_id,id,text)
+SELECT ?1,?2,?3 WHERE (SELECT COUNT(*) FROM server_lumi_developer_turns WHERE account_id=?1 AND reply='')<8
+ON CONFLICT(account_id,id) DO NOTHING
+SQL_END;
+
+    SelectTurn :: "SELECT text,reply FROM server_lumi_developer_turns WHERE account_id=?1 AND id=?2";
+
+    NextTurn :: #string SQL_END
+SELECT id,text FROM server_lumi_developer_turns
+WHERE account_id=?1 AND reply='' AND created_at>=datetime('now','-7 days') ORDER BY rowid LIMIT 1
+SQL_END;
+
+    FinishTurn :: #string SQL_END
+UPDATE server_lumi_developer_turns SET reply=?3 WHERE account_id=?1 AND id=?2 AND (reply='' OR reply=?3)
+SQL_END;
+
+    Input :: struct {
+        id: Text
+        text: Text
+        reply: Text
+        accountID: Text
+        valid: bool
+    }
+
+    Result :: struct {
+        status: u32
+        problem: string
+        root: s32
+    }
+
+    IsLoopbackIP :: (host: string) -> bool {
+        ip := network.ParseIP(host)
+        return addresses.Classify(ip.bytes[:ip.count]) == .Loopback
+    }
+
+    LoopbackHost :: (authority: string) -> bool {
+        if IsLoopbackIP(authority) { return true }
+        host := authority
+        port := ""
+        if text_tools.TextHasPrefix(authority, "[") {
+            bracket := wire.Cut(authority[1:], #char "]")
+            if !bracket.found { return false }
+            host = bracket.before
+            if bracket.after != "" {
+                if !text_tools.TextHasPrefix(bracket.after, ":") { return false }
+                port = bracket.after[1:]
+            }
+        } else {
+            split := wire.Cut(authority, #char ":")
+            host = split.before
+            port = split.after
+        }
+        for byte: port {
+            if byte < #char "0" || byte > #char "9" { return false }
+        }
+        return (host.count == 9 && ascii.StartsWithFoldASCII(host, "localhost")) || IsLoopbackIP(host)
+    }
+
+    DirectLoopback :: (connection: *void) -> bool {
+        peer := http.RemoteAddress(connection)
+        if addresses.Classify(peer.bytes[:peer.count]) != .Loopback { return false }
+        proxies: [8]string = .["X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Real-IP",
+            "Forwarded", "CF-Connecting-IP", "True-Client-IP", "Via"]
+        value: [limits.MaxHeaderBytes]u8
+        for header: proxies {
+            if http.JoinHeader(connection, header, value[:]) != 0 { return false }
+        }
+        count := http.JoinHeader(connection, "Host", value[:])
+        if count <= 0 || !LoopbackHost(TextView(value[:count])) { return false }
+        count = http.JoinHeader(connection, "Origin", value[:])
+        if count < 0 { return false }
+        origin := wire.TrimSpace(TextView(value[:count]))
+        if origin == "" { return true }
+        if text_tools.TextHasPrefix(origin, "http://") { return LoopbackHost(origin[7:]) }
+        if text_tools.TextHasPrefix(origin, "https://") { return LoopbackHost(origin[8:]) }
+        return false
+    }
+
+    ValidID :: (id: string) -> bool {
+        if id.count != 32 { return false }
+        for byte: id {
+            digit := byte >= #char "0" && byte <= #char "9"
+            letter := byte >= #char "a" && byte <= #char "f"
+            if !digit && !letter { return false }
+        }
+        return true
+    }
+
+    ParseInput :: (body: string) -> Input {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, body) { return .{} }
+        keys: [4]string = .["id", "text", "reply", "account_id"]
+        kinds: [4]json.JsonKind = .[.String, .String, .String, .String]
+        members: [4]s32
+        if !fields.Read(*document, document.root, keys[:], kinds[:], members[:]) { return .{} }
+        input: Input
+        input.id = json.JsonString(*document, members[0])
+        input.text = json.JsonString(*document, members[1])
+        input.reply = json.JsonString(*document, members[2])
+        input.accountID = json.JsonString(*document, members[3])
+        input.valid = ValidID(TextView(input.id))
+        return input
+    }
+
+    ReadInput :: (connection: *void, body: []u8, overflow: bool, zstd: bool) -> Input {
+        if overflow || body.count > RequestLimit { return .{} }
+        {
+            encoding: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+            if count < 0 || coding.Request(TextView(encoding[:count])) == .Unsupported { return .{} }
+        }
+        request: replies.Body
+        decoded := replies.Decode(connection, body, overflow, RequestLimit, zstd, *request)
+        if decoded.status != 0 { return .{} }
+        if decoded.decoded { return ParseInput(TextView(VecSlice(request.scratch, 0, decoded.length))) }
+        return ParseInput(TextView(body))
+    }
+
+    Turn :: (document: *json.JsonDocument, id: string, text: string, reply: string, account: string) -> Result {
+        root := json.JsonNewObject(document)
+        if root < 0 || !json.JsonSet(document, root, "id", json.JsonNewStringCopy(document, id)) ||
+            (text != "" && !json.JsonSet(document, root, "text", json.JsonNewStringCopy(document, text))) ||
+            (reply != "" && !json.JsonSet(document, root, "reply", json.JsonNewStringCopy(document, reply))) ||
+            (account != "" && !json.JsonSet(document, root, "account_id", json.JsonNewStringCopy(document, account))) {
+            return .{}
+        }
+        return .{status = 200, root = root}
+    }
+
+    ReadAccountTurn :: (database: *void, args: []sql.Argument, id: string, text: string, document: *json.JsonDocument) -> Result {
+        statement := sql.Prepare(database, SelectTurn, args)
+        if statement.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE {
+            if text != "" { return .{status = 429, problem = "developer chat queue full"} }
+            return .{status = 404, problem = "unknown developer turn"}
+        }
+        if status != sqlite.SQLITE_ROW { return .{} }
+        if text != "" && text != sql.ColumnText(statement.value, 0) {
+            return .{status = 409, problem = "developer turn already exists"}
+        }
+        return Turn(document, id, "", sql.ColumnText(statement.value, 1), "")
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    AccountTurn :: (database: *void, account: string, id: string, text: string, document: *json.JsonDocument) -> Result {
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(text)]
+        if text == "" { return ReadAccountTurn(database, args[:2], id, text, document) }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return .{} }
+        defer RollbackIfActive(database)
+        if sql.Execute(database, PruneTurns, args[:1]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, InsertTurn, args[:]) != sqlite.SQLITE_OK {
+            return .{}
+        }
+        result := ReadAccountTurn(database, args[:2], id, text, document)
+        if result.status == 0 || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return .{} }
+        return result
+    }
+
+    RelayNext :: (database: *void, account: string, document: *json.JsonDocument) -> Result {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        statement := sql.Prepare(database, NextTurn, args[:])
+        if statement.status != sqlite.SQLITE_OK { return .{} }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE { return Turn(document, "", "", "", account) }
+        if status != sqlite.SQLITE_ROW { return .{} }
+        return Turn(document, sql.ColumnText(statement.value, 0), sql.ColumnText(statement.value, 1), "", account)
+    }
+
+    RelayFinish :: (database: *void, account: string, id: string, reply: string, document: *json.JsonDocument) -> Result {
+        result := Turn(document, id, "", "", "")
+        if result.status != 200 { return result }
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(reply)]
+        if sql.Execute(database, FinishTurn, args[:]) != sqlite.SQLITE_OK { return .{} }
+        if sqlite.SqliteChanges(database) != 1 { return .{status = 409, problem = "developer turn unavailable"} }
+        return result
+    }
+
+    Ready :: (configuration: Configuration) -> bool {
+        return identity.ValidUserID(configuration.ownerID) && configuration.developerToken.count >= 32
+    }
+
+    Account :: (access: *accounts.AccountAccess, connection: *void, configuration: Configuration,
+        body: []u8, overflow: bool, document: *json.JsonDocument) -> Result {
+        settings := access.configuration
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, audit[:])
+        if now < 0 || count == 0 { return .{status = 500, problem = "authentication failed"} }
+        user := auth.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
+        if user.status != 0 { return .{status = user.status, problem = user.message} }
+        if !Ready(configuration) { return .{} }
+        account := TextView(user.userID[:])
+        if account != configuration.ownerID { return .{status = 403, problem = "owner account required"} }
+        input := ReadInput(connection, body, overflow, settings.zstdRequests)
+        if !input.valid { return .{status = 400, problem = "invalid developer turn"} }
+        text := TextView(input.text)
+        if TextView(input.accountID) != "" || TextView(input.reply) != "" || text.count > MessageLimit ||
+            (text != "" && wire.TrimSpace(text) == "") {
+            return .{status = 400, problem = "invalid developer message"}
+        }
+        if sqlite.SqliteExecText(settings.database, Schema) != sqlite.SQLITE_OK { return .{} }
+        return AccountTurn(settings.database, account, TextView(input.id), text, document)
+    }
+
+    Relay :: (access: *accounts.AccountAccess, connection: *void, configuration: Configuration,
+        verb: string, body: []u8, overflow: bool, document: *json.JsonDocument) -> Result {
+        if !DirectLoopback(connection) { return .{status = 403, problem = "developer relay requires loopback"} }
+        if !Ready(configuration) { return .{} }
+        if !auth.AdminMatches(connection, configuration.developerToken) {
+            return .{status = 401, problem = "admin token required"}
+        }
+        settings := access.configuration
+        if !mutex.Lock(*access.databaseLock) { return .{} }
+        defer mutex.Unlock(*access.databaseLock)
+        if sqlite.SqliteExecText(settings.database, Schema) != sqlite.SQLITE_OK { return .{} }
+        if verb != "POST" { return RelayNext(settings.database, configuration.ownerID, document) }
+        input := ReadInput(connection, body, overflow, settings.zstdRequests)
+        if !input.valid { return .{status = 400, problem = "invalid developer turn"} }
+        reply := TextView(input.reply)
+        if TextView(input.accountID) != configuration.ownerID || TextView(input.text) != "" ||
+            reply.count > MessageLimit || wire.TrimSpace(reply) == "" {
+            return .{status = 400, problem = "invalid developer reply"}
+        }
+        return RelayFinish(settings.database, configuration.ownerID, TextView(input.id), reply, document)
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool { return route == AccountRoute || route == RelayRoute }
+
+    ReadsBody :: (route: string, verb: string) -> bool { return verb == "POST" && Handles(route) }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        configuration: Configuration, body: []u8, overflow: bool) -> s32 {
+        empty: [0]u8
+        if !Handles(route) { return http.Write(connection, 404, "", empty[:]) }
+        if !ReadsBody(route, verb) && !(route == RelayRoute && (verb == "GET" || verb == "HEAD")) {
+            allow := ifx route == RelayRoute then "GET, HEAD, POST" else "POST"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            return http.WriteWithHeaders(connection, 405, "", empty[:], headers[:])
+        }
+        document: json.JsonDocument
+        result: Result
+        if route == AccountRoute {
+            result = Account(access, connection, configuration, body, overflow, *document)
+        } else {
+            result = Relay(access, connection, configuration, verb, body, overflow, *document)
+        }
+        zstd := access.configuration.zstdResponses
+        if result.status == 0 { return replies.ErrorReply(connection, verb, 503, Unavailable, zstd) }
+        if result.status != 200 { return replies.ErrorReply(connection, verb, result.status, result.problem, zstd) }
+        return replies.Reply(connection, verb, result.status, *document, result.root, zstd)
+    }
+}

@@ -1,0 +1,112 @@
+#if TARGET == .C && OS == .LINUX {
+    canonical :: #import "canonical_json_native";
+    calendar :: #import "std/date_time_linux";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    json :: #import "std/json_document";
+    policy :: #import "mesh_policy_native";
+    schema :: #import "trust_schema";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    #import "std/vec"
+
+    #scope_file
+    Failure :: "could not record pairing";
+
+    Timestamp :: (output: []u8) -> s64 {
+        now := calendar.UnixMilliseconds()
+        return format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = now >= 0}, output)
+    }
+
+    IssuedCheck :: struct {
+        error: string
+        alreadyCompleted: bool
+    }
+
+    CheckIssued :: (database: *void, document: *json.JsonDocument, invite: s32, id: string, peer: string) -> IssuedCheck {
+        arguments: [1]sql.Argument = .[sql.TextArg(id)]
+        row := sql.Prepare(database, schema.IssuedInviteQuery, arguments[:])
+        if row.status != sqlite.SQLITE_OK { return .{error = Failure} }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return .{error = "pairing invite was not issued by this node"} }
+        if status != sqlite.SQLITE_ROW { return .{error = Failure} }
+        signature: Text = fields.StringField(document, invite, "signature")
+        expiry := fields.Number(document, json.JsonMember(document, invite, "expires_at"))
+        if sql.ColumnText(row.value, 0) != TextView(signature) || sqlite.SqliteColumnInt64(row.value, 1) != expiry {
+            return .{error = "pairing invite does not match the issued invite"}
+        }
+        if expiry <= calendar.UnixMilliseconds() / 1000 { return .{error = "pairing invite expired"} }
+        completed := sql.ColumnText(row.value, 2)
+        if completed == peer { return .{alreadyCompleted = true} }
+        if completed != "" { return .{error = "pairing invite already completed by another node"} }
+        return .{}
+    }
+
+    WritePeer :: (database: *void, document: *json.JsonDocument, invite: s32, peer: s32,
+        public: []u8, stamp: string, inverse: bool) -> bool {
+        id: Text = fields.StringField(document, peer, "node_id")
+        name: Text = fields.StringField(document, peer, "display_name")
+        space: Text = fields.StringField(document, invite, "space_id")
+        addresses: Vec(u8)
+        storedPolicy: Vec(u8)
+        if !canonical.Encode(document, json.JsonMember(document, peer, "addresses"), *addresses) { return false }
+        original := json.JsonMember(document, invite, "policy")
+        if inverse {
+            direction: Text = fields.StringField(document, original, "direction")
+            normalized := policy.Direction(TextView(direction))
+            reversed := ifx normalized == "pull" then "push" else ifx normalized == "push" then "pull" else normalized
+            changed: json.JsonDocument
+            root := policy.Policy(*changed, document, original, reversed)
+            if root < 0 || !canonical.Encode(*changed, root, *storedPolicy) { return false }
+        } else if !canonical.Encode(document, original, *storedPolicy) { return false }
+        arguments: [7]sql.Argument = .[sql.TextArg(TextView(id)), sql.BlobArg(public), sql.TextArg(TextView(name)),
+            sql.TextArg(TextView(VecSlice(addresses, 0, addresses.count))), sql.TextArg(TextView(space)),
+            sql.TextArg(TextView(VecSlice(storedPolicy, 0, storedPolicy.count))), sql.TextArg(stamp)]
+        return sql.Execute(database, schema.UpsertPeerSQL, arguments[:]) == sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    RecordInvite :: (database: *void, document: *json.JsonDocument, invite: s32) -> bool {
+        id: Text = fields.StringField(document, invite, "invite_id")
+        signature: Text = fields.StringField(document, invite, "signature")
+        expiry := fields.Number(document, json.JsonMember(document, invite, "expires_at"))
+        stamp: [40]u8
+        length := Timestamp(stamp[:])
+        if length <= 0 { return false }
+        bindings: [4]sql.Argument = .[sql.TextArg(TextView(id)), sql.TextArg(TextView(signature)),
+            sql.IntArg(expiry), sql.TextArg(TextView(stamp[:length]))]
+        return sql.Execute(database, schema.IssueInviteSQL, bindings[:]) == sqlite.SQLITE_OK
+    }
+
+    Trust :: (database: *void, document: *json.JsonDocument, invite: s32, peer: s32, key: []u8, issued: bool) -> string {
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return Failure }
+        defer {
+            if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+        }
+        inviteID: Text = fields.StringField(document, invite, "invite_id")
+        peerID: Text = fields.StringField(document, peer, "node_id")
+        stamp: [40]u8
+        length := Timestamp(stamp[:])
+        if length <= 0 { return Failure }
+        time := TextView(stamp[:length])
+        id := TextView(inviteID)
+        if issued {
+            checked := CheckIssued(database, document, invite, id, TextView(peerID))
+            if checked.error != "" { return checked.error }
+            if checked.alreadyCompleted { return ifx sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK then "" else Failure }
+            args: [2]sql.Argument = .[sql.TextArg(TextView(peerID)), sql.TextArg(id)]
+            if sql.Execute(database, schema.CompleteInviteSQL, args[:]) != sqlite.SQLITE_OK { return Failure }
+            if sqlite.SqliteChanges(database) != 1 { return "pairing invite was completed concurrently" }
+        } else {
+            args: [1]sql.Argument = .[sql.TextArg(id)]
+            consumed := sql.ReadInteger(database, schema.ConsumedInviteQuery, args[:])
+            if consumed.status != sqlite.SQLITE_OK || !consumed.found { return Failure }
+            if consumed.value != 0 { return "pairing invite already consumed" }
+            consume: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(time)]
+            if sql.Execute(database, schema.ConsumeInviteSQL, consume[:]) != sqlite.SQLITE_OK { return Failure }
+        }
+        if !WritePeer(database, document, invite, peer, key, time, issued) { return Failure }
+        return ifx sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK then "" else Failure
+    }
+}

@@ -51,7 +51,7 @@ func TestZiranStartupLocalHTTPURLAgainstBaseline(t *testing.T) {
 
 func TestZiranStartupHTTPConfiguration(t *testing.T) {
 	handler := http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
-	server := Startup_NewHTTPServer("[::]:8080", handler)
+	server := HttpServer_New("[::]:8080", handler)
 	if server.Addr != "[::]:8080" || reflect.ValueOf(server.Handler).Pointer() != reflect.ValueOf(handler).Pointer() ||
 		server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 15*time.Second ||
 		server.WriteTimeout != 15*time.Second || server.IdleTimeout != time.Minute ||

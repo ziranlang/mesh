@@ -1,0 +1,116 @@
+#if TARGET == .C && OS == .LINUX {
+    http :: #import "http_server_native";
+    network :: #import "network_scope_native";
+    wire :: #import "wire_text";
+    numbers :: #import "std/number_text";
+    c_string :: #import "std/c_string";
+
+    Endpoint :: struct {
+        host: string
+        port: u16
+        valid: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    IPv4 :: 2;
+    IPv6 :: 10;
+    Stream :: 1;
+
+    AddressInfo :: struct {
+        flags: s32
+        family: s32
+        socketType: s32
+        protocol: s32
+        length: u32
+        address: *u8
+        canonicalName: *u8
+        next: *AddressInfo
+    }
+
+    SocketIPv6 :: struct {
+        family: u16
+        port: u16
+        flow: u32
+        bytes: [16]u8
+        scope: u32
+    }
+
+    Resolve :: (host: *u8, service: *u8, hints: *AddressInfo, list: **AddressInfo) -> s32 #foreign c "getaddrinfo";
+    Free :: (list: *AddressInfo) #foreign c "freeaddrinfo";
+
+    #scope_export
+    ParseEndpoint :: (endpoint: string) -> Endpoint {
+        named := wire.Cut(endpoint, #char ":")
+        host := named.before
+        portText := named.after
+        if endpoint.count > 0 && endpoint[0] == #char "[" {
+            bracketed := wire.Cut(endpoint[1:], #char "]")
+            if !bracketed.found || bracketed.after.count < 2 || bracketed.after[0] != #char ":" {
+                return .{}
+            }
+            host = bracketed.before
+            portText = bracketed.after[1:]
+        }
+        number, digits := numbers.IntegerPrefix(portText)
+        if !named.found || digits == 0 || digits != portText.count || number < 0 || number > 65535 {
+            return .{}
+        }
+        return .{host = host, port = cast(u16)number, valid = true}
+    }
+
+    AllowsBind :: (endpoint: Endpoint, scope: *network.Scope) -> bool {
+        if !scope.lanOnly { return true }
+        host := wire.Cut(endpoint.host, #char "%").before
+        ip := network.ParseIP(host)
+        return ip.count > 0 && network.AllowsIP(scope, ip.bytes[:ip.count])
+    }
+
+    Bind :: (endpoint: Endpoint, maximumConnections: u32, context: *void, handler: http.RequestHandler,
+        completed: http.RequestCompletion) -> *void {
+        if !endpoint.valid { return null }
+        host := endpoint.host
+        port := endpoint.port
+        if host == "" {
+            daemon := http.StartAny(port, maximumConnections, context, handler, completed)
+            if daemon != null {
+                return daemon
+            }
+            ip: [4]u8
+            return http.Start(ip, port, maximumConnections, context, handler, completed)
+        }
+        hostname: [1025]u8
+        if !c_string.CopyCString(host, hostname[:]) {
+            return null
+        }
+        hints: AddressInfo = .{socketType = Stream}
+        list: *AddressInfo = null
+        if Resolve(*hostname[0], null, *hints, *list) != 0 || list == null {
+            return null
+        }
+        defer Free(list)
+        node := list
+        while node != null {
+            daemon: *void = null
+            if node.address != null {
+                if node.family == IPv6 && node.length >= 28 {
+                    address := cast(*SocketIPv6)node.address
+                    daemon = http.StartIPv6(address.bytes, address.scope, port, maximumConnections, context, handler, completed)
+                } else if node.family == IPv4 && node.length >= 16 {
+                    ip: [4]u8 = .[node.address[4], node.address[5], node.address[6], node.address[7]]
+                    daemon = http.Start(ip, port, maximumConnections, context, handler, completed)
+                }
+            }
+            if daemon != null {
+                return daemon
+            }
+            node = node.next
+        }
+        return null
+    }
+
+    Start :: (endpoint: string, maximumConnections: u32, context: *void, handler: http.RequestHandler,
+        completed: http.RequestCompletion) -> *void {
+        return Bind(ParseEndpoint(endpoint), maximumConnections, context, handler, completed)
+    }
+}

@@ -1,0 +1,397 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    allowance :: #import "storage_allowance_native";
+    identity :: #import "identity";
+    codec :: #import "shared_lists_json_native";
+    queries :: #import "shared_lists_queries";
+    quota :: #import "storage_usage_rules";
+    fields :: #import "sync_json_fields";
+    notifications :: #import "sync_hub_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    sha :: #import "crypto/sha256";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    Outcome :: struct {
+        status: u32
+        malformed: bool
+    }
+
+    #scope_file
+    Role :: enum { None; Viewer; Editor; Owner; }
+
+    Command :: struct {
+        requestID: string
+        action: string
+        target: string
+        invitationID: string
+        access: string
+        listID: string
+        title: string
+        revision: s64
+        count: s64
+        validList: bool
+        items: string
+    }
+
+    Change :: struct {
+        visible: bool
+        allPending: bool
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    HasCapacity :: (database: *void, user: string, id: string, count: s64) -> bool {
+        args: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(id), sql.IntArg(count)]
+        capacity := sql.ReadInteger(database, queries.Capacity, args[:])
+        return capacity.status == sqlite.SQLITE_OK && capacity.found && capacity.value != 0
+    }
+
+    Friends :: (database: *void, first: string, second: string) -> bool {
+        args: [2]sql.Argument = .[sql.TextArg(first), sql.TextArg(second)]
+        found := sql.ReadInteger(database,
+            "SELECT EXISTS(SELECT 1 FROM server_friendships WHERE user_id_a=min(?1,?2) AND user_id_b=max(?1,?2))", args[:])
+        return found.status == sqlite.SQLITE_OK && found.value != 0
+    }
+
+    AccessRole :: (name: string) -> Role {
+        if name == "owner" {
+            return .Owner
+        }
+        if name == "editor" {
+            return .Editor
+        }
+        if name == "viewer" {
+            return .Viewer
+        }
+        return .None
+    }
+
+    Membership :: (database: *void, list: string, owner: string, user: string) -> Role {
+        if owner == user {
+            return .Owner
+        }
+        if !Friends(database, owner, user) {
+            return .None
+        }
+        args: [2]sql.Argument = .[sql.TextArg(list), sql.TextArg(user)]
+        prepared := sql.Prepare(database, queries.ReadMembership, args[:])
+        if prepared.status != sqlite.SQLITE_OK {
+            return .None
+        }
+        defer sqlite.SqliteFinalize(prepared.value)
+        if sqlite.SqliteStep(prepared.value) != sqlite.SQLITE_ROW {
+            return .None
+        }
+        return AccessRole(sql.ColumnText(prepared.value, 0))
+    }
+
+    Answer :: (database: *void, user: string, command: Command, change: *Change) -> u32 {
+        args: [2]sql.Argument = .[sql.TextArg(command.invitationID), .{}]
+        picked := sql.Prepare(database, queries.ReadInvitation, args[:1])
+        if picked.status != sqlite.SQLITE_OK {
+            return 404
+        }
+        defer sqlite.SqliteFinalize(picked.value)
+        if sqlite.SqliteStep(picked.value) != sqlite.SQLITE_ROW || sql.ColumnText(picked.value, 1) != user {
+            return 404
+        }
+        wanted := "declined"
+        if command.action == "accept" {
+            wanted = "accepted"
+            if !Friends(database, sql.ColumnText(picked.value, 0), user) {
+                return 403
+            }
+            if !HasCapacity(database, user, sql.ColumnText(picked.value, 3), sqlite.SqliteColumnInt64(picked.value, 4)) {
+                return 409
+            }
+        }
+        current := sql.ColumnText(picked.value, 2)
+        if current == wanted {
+            return 0
+        }
+        if current != "pending" {
+            return 409
+        }
+        args[1] = sql.TextArg(wanted)
+        change.visible = true
+        return ifx sql.Execute(database, queries.ChangeInvitation, args[:]) == sqlite.SQLITE_OK then 0 else 500
+    }
+
+    Invite :: (database: *void, user: string, originalOwner: string, command: Command, change: *Change) -> u32 {
+        access := ifx command.access == "" then "editor" else command.access
+        role := AccessRole(access)
+        if role == .None {
+            return 400
+        }
+        if !identity.ValidUserID(command.target) || user == command.target || !command.validList || !Friends(database, user, command.target) {
+            return 403
+        }
+        owner := originalOwner
+        if owner == "" {
+            if !HasCapacity(database, user, command.listID, command.count) {
+                return 409
+            }
+            create: [4]sql.Argument = .[sql.TextArg(command.listID), sql.TextArg(user), sql.TextArg(command.title), sql.TextArg(command.items)]
+            if sql.Execute(database, "INSERT INTO server_shared_lists(id,owner,title,items,revision,deleted) VALUES(?1,?2,?3,?4,1,0)", create[:]) != sqlite.SQLITE_OK {
+                return 409
+            }
+            owner = user
+        }
+        member := Membership(database, command.listID, owner, user)
+        if owner != user && ((member != .Owner && member != .Editor) || !Friends(database, owner, command.target)) {
+            return 403
+        }
+        if role == .Owner && member != .Owner {
+            return 403
+        }
+        if command.target == owner {
+            return 400
+        }
+        args: [4]sql.Argument = .[sql.TextArg(command.listID), sql.TextArg(command.target), sql.TextArg(command.requestID), sql.TextArg(access)]
+        if sql.Execute(database, queries.Invite, args[:3]) != sqlite.SQLITE_OK {
+            return 500
+        }
+        change.visible = sqlite.SqliteChanges(database) != 0
+        return ifx sql.Execute(database, queries.InviteAccess, args[:]) == sqlite.SQLITE_OK then 0 else 500
+    }
+
+    Manage :: (database: *void, owner: string, member: Role, command: Command) -> u32 {
+        if member != .Owner {
+            return 403
+        }
+        if !identity.ValidUserID(command.target) || command.target == owner {
+            return 400
+        }
+        args: [3]sql.Argument = .[sql.TextArg(command.listID), sql.TextArg(command.target), sql.TextArg(command.access)]
+        present := sql.ReadInteger(database,
+            "SELECT EXISTS(SELECT 1 FROM server_list_invitations WHERE list_id=?1 AND target=?2 AND status IN ('pending','accepted'))", args[:2])
+        if present.status != sqlite.SQLITE_OK || present.value == 0 {
+            return 404
+        }
+        if command.action == "remove" {
+            return ifx sql.Execute(database, queries.RemoveInvitation, args[:2]) == sqlite.SQLITE_OK then 0 else 500
+        }
+        if AccessRole(command.access) == .None {
+            return 400
+        }
+        return ifx sql.Execute(database, queries.SetAccess, args[:]) == sqlite.SQLITE_OK then 0 else 500
+    }
+
+    Save :: (database: *void, user: string, owner: string, revision: s64, command: Command) -> u32 {
+        if command.action != "save" || !command.validList {
+            return 400
+        }
+        if command.revision != revision {
+            return 409
+        }
+        if !HasCapacity(database, owner, command.listID, command.count) || !HasCapacity(database, user, command.listID, command.count) {
+            return 409
+        }
+        args: [3]sql.Argument = .[sql.TextArg(command.listID), sql.TextArg(command.title), sql.TextArg(command.items)]
+        selected := sql.Prepare(database, "SELECT target FROM server_list_invitations WHERE list_id=?1 AND status='accepted'", args[:1])
+        if selected.status != sqlite.SQLITE_OK {
+            return 500
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        step := sqlite.SqliteStep(selected.value)
+        while step == sqlite.SQLITE_ROW {
+            if !HasCapacity(database, sql.ColumnText(selected.value, 0), command.listID, command.count) {
+                return 409
+            }
+            step = sqlite.SqliteStep(selected.value)
+        }
+        if step != sqlite.SQLITE_DONE {
+            return 500
+        }
+        return ifx sql.Execute(database, "UPDATE server_shared_lists SET title=?2,items=?3,revision=revision+1 WHERE id=?1", args[:]) == sqlite.SQLITE_OK then 0 else 500
+    }
+
+    Execute :: (database: *void, user: string, command: Command, change: *Change) -> u32 {
+        if command.action == "accept" || command.action == "decline" {
+            return Answer(database, user, command, change)
+        }
+        args: [1]sql.Argument = .[sql.TextArg(command.listID)]
+        row := sql.Prepare(database, "SELECT owner,revision,title FROM server_shared_lists WHERE id=?1 AND deleted=0", args[:])
+        if row.status != sqlite.SQLITE_OK {
+            return ifx command.action == "invite" then 500 else 404
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if command.action == "invite" {
+            if step != sqlite.SQLITE_ROW && step != sqlite.SQLITE_DONE {
+                return 500
+            }
+            owner := ifx step == sqlite.SQLITE_ROW then sql.ColumnText(row.value, 0) else ""
+            return Invite(database, user, owner, command, change)
+        }
+        if step != sqlite.SQLITE_ROW {
+            return 404
+        }
+        owner := sql.ColumnText(row.value, 0)
+        member := Membership(database, command.listID, owner, user)
+        if command.action == "access" || command.action == "remove" {
+            change.visible = true
+            return Manage(database, owner, member, command)
+        }
+        if member == .None {
+            return 404
+        }
+        if command.action == "delete" {
+            if member != .Owner {
+                return 403
+            }
+            change.visible = true
+            change.allPending = true
+            return ifx sql.Execute(database, "UPDATE server_shared_lists SET deleted=1,items='[]',revision=revision+1 WHERE id=?1", args[:]) == sqlite.SQLITE_OK then 0 else 500
+        }
+        if member == .Viewer {
+            return 403
+        }
+        change.visible = true
+        change.allPending = command.title != sql.ColumnText(row.value, 2)
+        return Save(database, user, owner, sqlite.SqliteColumnInt64(row.value, 1), command)
+    }
+
+    Usage :: (database: *void, user: string) -> sql.IntegerResult {
+        args: [1]sql.Argument = .[sql.TextArg(user)]
+        return sql.ReadInteger(database, quota.UsageSQL, args[:])
+    }
+
+    ChargedOwner :: (database: *void, command: Command, user: string) -> Text {
+        args: [1]sql.Argument = .[sql.TextArg(command.listID)]
+        query := "SELECT owner FROM server_shared_lists WHERE id=?1"
+        if command.action == "accept" || command.action == "decline" {
+            args[0] = sql.TextArg(command.invitationID)
+            query = "SELECT l.owner FROM server_list_invitations i JOIN server_shared_lists l ON l.id=i.list_id WHERE i.id=?1"
+        }
+        row := sql.Prepare(database, query, args[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_ROW {
+            return TextCopy(sql.ColumnText(row.value, 0))
+        }
+        if step == sqlite.SQLITE_DONE {
+            return TextCopy(user)
+        }
+        return .{}
+    }
+
+    Notify :: (database: *void, hub: *notifications.Hub, user: string, command: Command, change: Change) {
+        answering := command.action == "accept" || command.action == "decline"
+        listID := ifx answering then "" else command.listID
+        invitationID := ifx answering then command.invitationID else ""
+        target := ifx command.action == "invite" || command.action == "access" || command.action == "remove" then command.target else ""
+        args: [5]sql.Argument = .[sql.TextArg(listID), sql.TextArg(user), sql.TextArg(target),
+            sql.IntArg(ifx change.allPending then 1 else 0), sql.TextArg(invitationID)]
+        recipients := sql.Prepare(database, queries.NotifyRecipients, args[:])
+        if recipients.status != sqlite.SQLITE_OK {
+            return
+        }
+        defer sqlite.SqliteFinalize(recipients.value)
+        while sqlite.SqliteStep(recipients.value) == sqlite.SQLITE_ROW {
+            notifications.PublishHint(hub, sql.ColumnText(recipients.value, 0))
+        }
+    }
+
+    ApplyTransaction :: (settings: accounts.Configuration, hub: *notifications.Hub, user: string,
+        command: Command, digest: string, now: s64) -> u32 {
+        database := settings.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return 500
+        }
+        defer Rollback(database)
+        receipt: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(command.requestID), sql.TextArg(digest)]
+        repeat := sql.ReadInteger(database, "SELECT body=?3 FROM server_list_commands WHERE user_id=?1 AND request_id=?2", receipt[:])
+        if repeat.status != sqlite.SQLITE_OK {
+            return 500
+        }
+        if repeat.found {
+            return ifx repeat.value != 0 then 0 else 409
+        }
+        ownerText: Text = ChargedOwner(database, command, user)
+        owner := TextView(ownerText)
+        if owner == "" {
+            return 500
+        }
+        beforeOwner := Usage(database, owner)
+        beforeActor := Usage(database, user)
+        ownerLimit := allowance.Allowance(database, owner, now, settings.accountStorageLimit, settings.storagePlansEnabled)
+        actorLimit := allowance.Allowance(database, user, now, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if beforeOwner.status != sqlite.SQLITE_OK || beforeActor.status != sqlite.SQLITE_OK ||
+            ownerLimit.status != sqlite.SQLITE_OK || actorLimit.status != sqlite.SQLITE_OK {
+            return 500
+        }
+        change: Change
+        status := Execute(database, user, command, *change)
+        if status != 0 {
+            return status
+        }
+        if sql.Execute(database, "INSERT INTO server_list_commands(user_id,request_id,body) VALUES(?1,?2,?3)", receipt[:]) != sqlite.SQLITE_OK {
+            return 500
+        }
+        afterOwner := Usage(database, owner)
+        afterActor := Usage(database, user)
+        if afterOwner.status != sqlite.SQLITE_OK || afterActor.status != sqlite.SQLITE_OK {
+            return 500
+        }
+        if quota.Exceeds(beforeOwner.value, afterOwner.value, ownerLimit.value) || quota.Exceeds(beforeActor.value, afterActor.value, actorLimit.value) {
+            return 413
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return 500
+        }
+        if hub != null && change.visible {
+            Notify(database, hub, user, command, change)
+        }
+        return 0
+    }
+
+    #scope_export
+    Apply :: (settings: accounts.Configuration, hub: *notifications.Hub, user: string, payload: string, now: s64) -> Outcome {
+        source: json.JsonDocument
+        if !json.JsonRead(*source, payload) {
+            return .{status = 400, malformed = true}
+        }
+        document: json.JsonDocument
+        draft := codec.Decode(*source, *document)
+        if draft.root < 0 {
+            return .{status = 400, malformed = true}
+        }
+        id: Text = fields.StringField(*document, draft.root, "request_id")
+        requestID := TextView(id)
+        if !identity.ValidResourceID(requestID) || requestID.count > 36 {
+            return .{status = 400}
+        }
+        encoded: Vec(u8)
+        items: Vec(u8)
+        if !codec.WriteGo(*document, draft.root, *encoded) || !codec.WriteGo(*document, draft.items, *items) {
+            return .{status = 500}
+        }
+        hash := sha.Sha256Of(TextView(VecSlice(encoded, 0, encoded.count)))
+        hex: [65]u8
+        if sha.BytesToHex(*hash[0], hash.count, *hex[0], hex.count) != 1 {
+            return .{status = 500}
+        }
+        list := json.JsonMember(*document, draft.root, "list")
+        action: Text = fields.StringField(*document, draft.root, "action")
+        target: Text = fields.StringField(*document, draft.root, "target")
+        invitation: Text = fields.StringField(*document, draft.root, "invitation_id")
+        access: Text = fields.StringField(*document, draft.root, "access")
+        listID: Text = fields.StringField(*document, list, "id")
+        title: Text = fields.StringField(*document, list, "title")
+        command: Command = .{requestID = requestID, action = TextView(action), target = TextView(target), invitationID = TextView(invitation),
+            access = TextView(access), listID = TextView(listID), title = TextView(title),
+            revision = fields.Number(*document, json.JsonMember(*document, list, "revision")), count = draft.count,
+            validList = draft.validList, items = TextView(VecSlice(items, 0, items.count))}
+        return .{status = ApplyTransaction(settings, hub, user, command, TextView(hex[:64]), now)}
+    }
+}

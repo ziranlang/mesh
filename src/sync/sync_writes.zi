@@ -4,6 +4,8 @@ sql :: #import "std/sql_go";
 ctx :: #import "std/context_go";
 state :: #import "account_state";
 timestamp :: #import "timestamp";
+typed_queries :: #import "typed_write_queries";
+record_queries :: #import "record_write_queries";
 clock :: #import "std/time_go";
 scope :: #import "scope";
 native :: #system_library "go:database/sql";
@@ -110,7 +112,7 @@ UpsertSession :: (transaction: *sql.Transaction, context: ctx.Context, userID: s
         session.DeletedAt, timestamp.NormalizeTime(session.UpdatedAt, ""), version.value,
     ]
     written := sql.ExecTx(transaction, context,
-        "\n\tINSERT INTO server_sessions(user_id_hash,id,started_at,local_date,topic,activity,source,\n\t\trounds_hash,mood_before,mood_after,energy,stress,note,tags,deleted_at,updated_at,server_version)\n\tVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)\n\tON CONFLICT(user_id_hash,id) DO UPDATE SET\n\t\tstarted_at=excluded.started_at,\n\t\tlocal_date=excluded.local_date,\n\t\ttopic=excluded.topic,\n\t\tactivity=excluded.activity,\n\t\tsource=excluded.source,\n\t\trounds_hash=excluded.rounds_hash,\n\t\tmood_before=excluded.mood_before,\n\t\tmood_after=excluded.mood_after,\n\t\tenergy=excluded.energy,\n\t\tstress=excluded.stress,\n\t\tnote=excluded.note,\n\t\ttags=excluded.tags,\n\t\tdeleted_at=excluded.deleted_at,\n\t\tupdated_at=excluded.updated_at,\n\t\tserver_version=excluded.server_version\n\tWHERE excluded.updated_at >= server_sessions.updated_at", arguments[:])
+        typed_queries.UpsertSession, arguments[:])
     result.error = written.error
     if result.error != null {
         return result
@@ -130,7 +132,7 @@ UpsertSession :: (transaction: *sql.Transaction, context: ctx.Context, userID: s
     for round: session.Rounds {
         values: [5]Any = .[userID, session.ID, round.RoundIndex, round.Breaths, round.HoldSeconds]
         inserted := sql.ExecTx(transaction, context,
-            "\nINSERT INTO server_session_rounds(user_id_hash,session_id,round_index,breaths,hold_seconds)\nVALUES(?1,?2,?3,?4,?5)", values[:])
+            typed_queries.InsertRound, values[:])
         result.error = inserted.error
         if result.error != null {
             return result
@@ -154,7 +156,7 @@ UpsertRecord :: (transaction: *sql.Transaction, context: ctx.Context, userID: st
     item.SchemaVersion, item.ParentID, version.value, timestamp.WriteTimeLimit(now), item.FreeBytes,
     ]
     written := sql.ExecTx(transaction, context,
-        "\nINSERT INTO server_encrypted_records(user_id_hash,collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,server_version,free_bytes)\nVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?14)\nON CONFLICT(user_id_hash,collection,id) DO UPDATE SET\n\tkey_id=excluded.key_id,\n\tnonce=excluded.nonce,\n\tciphertext=excluded.ciphertext,\n\tupdated_at=excluded.updated_at,\n\tdeleted_at=excluded.deleted_at,\n\tcontent_hash=excluded.content_hash,\n\tschema_version=excluded.schema_version,\n\tparent_id=excluded.parent_id,\n\tfree_bytes=excluded.free_bytes,\n\tserver_version=excluded.server_version\nWHERE excluded.updated_at >= server_encrypted_records.updated_at OR server_encrypted_records.updated_at > ?13", arguments[:])
+        record_queries.Upsert, arguments[:])
     result.error = written.error
     if result.error == null {
         result.applied = state.Affected(written.value)
@@ -167,7 +169,7 @@ DeleteHabit :: (transaction: *sql.Transaction, context: ctx.Context, userID: str
     updatedAt := timestamp.NormalizeTime(habit.UpdatedAt, "")
     arguments: [3]Any = .[userID, habit.ID, updatedAt]
     removed := sql.ExecTx(transaction, context,
-        "\nDELETE FROM server_habits\nWHERE user_id_hash=?1 AND id=?2 AND updated_at<=?3", arguments[:])
+        typed_queries.DeleteHabit, arguments[:])
     result.error = removed.error
     if result.error != null {
         return result
@@ -178,7 +180,7 @@ DeleteHabit :: (transaction: *sql.Transaction, context: ctx.Context, userID: str
     }
     identifiers: [2]Any = .[userID, habit.ID]
     children := sql.ExecTx(transaction, context,
-        "\nDELETE FROM server_habit_days\nWHERE user_id_hash=?1 AND habit_id=?2", identifiers[:])
+        typed_queries.DeleteHabitDays, identifiers[:])
     result.error = children.error
     if result.error != null {
         return result
@@ -197,7 +199,7 @@ DeleteHabitDay :: (transaction: *sql.Transaction, context: ctx.Context, userID: 
     updatedAt := timestamp.NormalizeTime(day.UpdatedAt, "")
     arguments: [4]Any = .[userID, day.HabitID, day.LocalDate, updatedAt]
     removed := sql.ExecTx(transaction, context,
-        "\nDELETE FROM server_habit_days\nWHERE user_id_hash=?1 AND habit_id=?2 AND local_date=?3 AND updated_at<=?4", arguments[:])
+        typed_queries.DeleteHabitDay, arguments[:])
     result.error = removed.error
     if result.error != null {
         return result
@@ -219,7 +221,7 @@ DeleteSession :: (transaction: *sql.Transaction, context: ctx.Context, userID: s
     updatedAt := timestamp.NormalizeTime(session.UpdatedAt, session.StartedAt)
     arguments: [3]Any = .[userID, session.ID, updatedAt]
     removed := sql.ExecTx(transaction, context,
-        "\nDELETE FROM server_sessions\nWHERE user_id_hash=?1 AND id=?2 AND updated_at<=?3", arguments[:])
+        typed_queries.DeleteSession, arguments[:])
     result.error = removed.error
     if result.error != null {
         return result
@@ -230,7 +232,7 @@ DeleteSession :: (transaction: *sql.Transaction, context: ctx.Context, userID: s
     }
     identifiers: [2]Any = .[userID, session.ID]
     children := sql.ExecTx(transaction, context,
-        "\nDELETE FROM server_session_rounds\nWHERE user_id_hash=?1 AND session_id=?2", identifiers[:])
+        typed_queries.DeleteSessionRounds, identifiers[:])
     result.error = children.error
     if result.error != null {
         return result
@@ -272,7 +274,7 @@ UpsertMeditation :: (transaction: *sql.Transaction, context: ctx.Context, userID
     arguments: [6]Any = .[userID, item.ID, item.SessionID, item.DurationSeconds,
         timestamp.NormalizeTime(item.CompletedAt, item.Timestamp), version.value]
     written := sql.ExecTx(transaction, context,
-        "\nINSERT INTO server_meditation_logs(user_id_hash,id,session_id,duration_seconds,completed_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6)\nON CONFLICT(user_id_hash,id) DO NOTHING", arguments[:])
+        typed_queries.UpsertMeditation, arguments[:])
     result.error = written.error
     if result.error == null {
         result.applied = state.Affected(written.value)
@@ -322,23 +324,23 @@ WriteDay :: (transaction: *sql.Transaction, context: ctx.Context, userID: string
 UpsertHabit :: (transaction: *sql.Transaction, context: ctx.Context, userID: string,
     habit: Habit) -> SyncWriteResult {
     return WriteHabit(transaction, context, userID, habit,
-        "\nINSERT INTO server_habits(user_id_hash,id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)\nON CONFLICT(user_id_hash,id) DO UPDATE SET\n\tname=excluded.name,\n\tcolor_r=excluded.color_r,\n\tcolor_g=excluded.color_g,\n\tcolor_b=excluded.color_b,\n\tsync_mode=excluded.sync_mode,\n\tsync_activity=excluded.sync_activity,\n\tcounter_enabled=excluded.counter_enabled,\n\tsort_order=excluded.sort_order,\n\tdeleted_at=excluded.deleted_at,\n\tupdated_at=excluded.updated_at,\n\tserver_version=excluded.server_version\nWHERE excluded.updated_at >= server_habits.updated_at")
+        typed_queries.UpsertHabit)
 }
 
 UpsertHabitOp :: (transaction: *sql.Transaction, context: ctx.Context, userID: string,
     habit: Habit) -> SyncWriteResult {
     return WriteHabit(transaction, context, userID, habit,
-        "\nINSERT INTO server_habits(user_id_hash,id,name,color_r,color_g,color_b,sync_mode,sync_activity,counter_enabled,sort_order,deleted_at,updated_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)\nON CONFLICT(user_id_hash,id) DO UPDATE SET\n\tname=excluded.name,color_r=excluded.color_r,color_g=excluded.color_g,color_b=excluded.color_b,\n\tsync_mode=excluded.sync_mode,sync_activity=excluded.sync_activity,counter_enabled=excluded.counter_enabled,\n\tsort_order=excluded.sort_order,deleted_at=excluded.deleted_at,updated_at=excluded.updated_at,\n\tserver_version=excluded.server_version\nWHERE excluded.updated_at >= server_habits.updated_at")
+        typed_queries.UpsertHabitOp)
 }
 
 UpsertDay :: (transaction: *sql.Transaction, context: ctx.Context, userID: string,
     day: HabitDay) -> SyncWriteResult {
     return WriteDay(transaction, context, userID, day,
-        "\nINSERT INTO server_habit_days(user_id_hash,habit_id,local_date,completed,count,updated_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6,?7)\nON CONFLICT(user_id_hash,habit_id,local_date) DO UPDATE SET\n\tcompleted=excluded.completed,\n\tcount=excluded.count,\n\tupdated_at=excluded.updated_at,\n\tserver_version=excluded.server_version\nWHERE excluded.updated_at >= server_habit_days.updated_at")
+        typed_queries.UpsertDay)
 }
 
 UpsertDayOp :: (transaction: *sql.Transaction, context: ctx.Context, userID: string,
     day: HabitDay) -> SyncWriteResult {
     return WriteDay(transaction, context, userID, day,
-        "\nINSERT INTO server_habit_days(user_id_hash,habit_id,local_date,completed,count,updated_at,server_version)\nVALUES(?1,?2,?3,?4,?5,?6,?7)\nON CONFLICT(user_id_hash,habit_id,local_date) DO UPDATE SET\n\tcompleted=excluded.completed,count=excluded.count,updated_at=excluded.updated_at,server_version=excluded.server_version\nWHERE excluded.updated_at >= server_habit_days.updated_at")
+        typed_queries.UpsertDayOp)
 }

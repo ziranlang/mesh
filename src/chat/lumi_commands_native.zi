@@ -1,0 +1,143 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    text :: #import "std/text_tools";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Command :: struct {
+        name: Text
+        message: Text
+        foreign: bool
+        hasArgument: bool
+    }
+
+    #scope_export
+    Parse :: (input: string) -> Command {
+        result: Command
+        if input.count == 0 || input[0] != #char "/" {
+            result.message = TextCopy(input)
+            return result
+        }
+        boundary := input.count
+        for byte, index: input {
+            if byte == #char " " || byte == 9 || byte == 13 || byte == 10 {
+                boundary = index
+                break
+            }
+        }
+        word := input[1:boundary]
+        colon := wire.Cut(word, #char ":")
+        if colon.found {
+            diary := wire.Cut(colon.before, #char "@").before
+            if wire.MatchesToken(diary, "journal") || wire.MatchesToken(diary, "diary") {
+                boundary = colon.before.count + 1
+                word = colon.before
+            }
+        }
+        address := wire.Cut(word, #char "@")
+        if address.found && !wire.MatchesToken(address.after, "inlumi_bot") {
+            result.message = TextCopy(input)
+            result.foreign = true
+            return result
+        }
+        name: Text = text.TextLower(address.before)
+        suffix := input[boundary:]
+        normalized: Vec(u8)
+        if !BuilderAppend(normalized, "/") || !BuilderAppend(normalized, TextView(name)) || !BuilderAppend(normalized, suffix) {
+            return .{}
+        }
+        result.name = name
+        result.message = TextCopy(TextView(VecSlice(normalized, 0, normalized.count)))
+        result.hasArgument = wire.TrimSpace(suffix) != ""
+        return result
+    }
+
+    Known :: (command: string) -> bool {
+        catalogue: json.JsonDocument
+        if json.JsonRead(*catalogue, Document) {
+            item := json.JsonFirst(*catalogue, catalogue.root)
+            while item >= 0 {
+                name: Text = fields.StringField(*catalogue, item, "command")
+                if command == TextView(name) {
+                    return true
+                }
+                item = json.JsonNext(*catalogue, item)
+            }
+        }
+        return command == "suggest" || command == "theme" || command == "appearance" ||
+            command == "settings" || command == "light" || command == "dark" || command == "system"
+    }
+
+    Usage :: (command: string) -> string {
+        if command == "todo" {
+            return "/todo <task title>"
+        }
+        if command == "done" {
+            return "/done <task title>"
+        }
+        if command == "reopen" {
+            return "/reopen <task title>"
+        }
+        if command == "feedback" {
+            return "/feedback <problem or suggestion>"
+        }
+        if command == "suggest" {
+            return "/suggest <suggestion>"
+        }
+        if command == "theme" {
+            return "/theme <theme name>"
+        }
+        return ""
+    }
+
+    Help :: (linked: bool) -> Text {
+        introduction := "Open Inner Breeze, sign in, then open Profile, Telegram input, and tap Connect Telegram to link this chat.\n\n"
+        if linked {
+            introduction = "Lumi answers while Inner Breeze is open on one of your devices. Write normally or use a command:\n\n"
+        }
+        catalogue: json.JsonDocument
+        output: Vec(u8)
+        if !json.JsonRead(*catalogue, Document) || !BuilderAppend(output, introduction) {
+            return .{}
+        }
+        item := json.JsonFirst(*catalogue, catalogue.root)
+        while item >= 0 {
+            name: Text = fields.StringField(*catalogue, item, "command")
+            description: Text = fields.StringField(*catalogue, item, "description")
+            if !BuilderAppend(output, "/") || !BuilderAppend(output, TextView(name)) || !BuilderAppend(output, " — ") ||
+                !BuilderAppend(output, TextView(description)) || !BuilderAppend(output, "\n") {
+                return .{}
+            }
+            item = json.JsonNext(*catalogue, item)
+        }
+        if !BuilderAppend(output, "\nExamples:\n/todo Buy tea\n/done Buy tea\n/habit Drink water\n/journal A calm morning\n/progress meditation 7\n/feedback Describe a problem (asks before sending)") {
+            return .{}
+        }
+        return TextCopy(TextView(VecSlice(output, 0, output.count)))
+    }
+
+    #scope_file
+    Document :: #string JSON
+[
+  {"command":"start","description":"Connect your Inner Breeze account"},
+  {"command":"help","description":"Show commands and examples"},
+  {"command":"app","description":"Open Inner Breeze"},
+  {"command":"history","description":"Open your full Lumi conversation in Inner Breeze"},
+  {"command":"todo","description":"Add a task: /todo <title>"},
+  {"command":"done","description":"Complete a task: /done <title>"},
+  {"command":"reopen","description":"Reopen a completed task: /reopen <title>"},
+  {"command":"lists","description":"Show your open tasks"},
+  {"command":"habit","description":"Complete a habit: /habit <title>"},
+  {"command":"habits","description":"Show today's habits"},
+  {"command":"journal","description":"Write to today's diary: /journal <text>"},
+  {"command":"diary","description":"Open your diary"},
+  {"command":"meditate","description":"Start meditation in Inner Breeze"},
+  {"command":"whm","description":"Start Wim Hof breathing in Inner Breeze"},
+  {"command":"practices","description":"Open your practices"},
+  {"command":"progress","description":"Show a chart: /progress <sessions|meditation|retention|habits> [1–31 days]"},
+  {"command":"feedback","description":"Draft feedback for your approval: /feedback <text>"},
+  {"command":"cancel","description":"Cancel a pending diary or habit choice"}
+]
+JSON;
+}

@@ -1,0 +1,96 @@
+// Changing or deleting older rows invalidates previously advertised state hashes.
+#import "std/vec"
+
+#scope_file
+ForgetOnDelete :: #string SQL_END
+
+CREATE TRIGGER IF NOT EXISTS server_state_hashes_forget_TABLE_delete
+AFTER DELETE ON TABLE
+BEGIN
+    DELETE FROM server_state_hashes WHERE user_id_hash=OLD.user_id_hash;
+END;
+SQL_END;
+
+ForgetOnStaleWrite :: #string SQL_END
+
+CREATE TRIGGER IF NOT EXISTS server_state_hashes_forget_TABLE_insert
+AFTER INSERT ON TABLE
+WHEN NEW.server_version <= (SELECT COALESCE(MAX(server_version),0) FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash)
+BEGIN
+    DELETE FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash;
+END;
+CREATE TRIGGER IF NOT EXISTS server_state_hashes_forget_TABLE_update
+AFTER UPDATE ON TABLE
+WHEN NEW.server_version <= (SELECT COALESCE(MAX(server_version),0) FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash)
+BEGIN
+    DELETE FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash;
+END;
+SQL_END;
+
+// Rounds carry no version of their own; their session's version decides.
+RoundsSchema :: #string SQL_END
+
+CREATE TRIGGER IF NOT EXISTS server_state_hashes_forget_server_session_rounds_write
+AFTER INSERT ON server_session_rounds
+WHEN COALESCE((SELECT server_version FROM server_sessions s WHERE s.user_id_hash=NEW.user_id_hash AND s.id=NEW.session_id),0) <=
+    (SELECT COALESCE(MAX(server_version),0) FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash)
+BEGIN
+    DELETE FROM server_state_hashes WHERE user_id_hash=NEW.user_id_hash;
+END;
+CREATE TRIGGER IF NOT EXISTS server_state_hashes_forget_server_session_rounds_delete
+AFTER DELETE ON server_session_rounds
+WHEN COALESCE((SELECT server_version FROM server_sessions s WHERE s.user_id_hash=OLD.user_id_hash AND s.id=OLD.session_id),0) <=
+    (SELECT COALESCE(MAX(server_version),0) FROM server_state_hashes WHERE user_id_hash=OLD.user_id_hash)
+BEGIN
+    DELETE FROM server_state_hashes WHERE user_id_hash=OLD.user_id_hash;
+END;
+SQL_END;
+
+TableSchema :: #string SQL_END
+
+CREATE TABLE IF NOT EXISTS server_state_hashes (
+    user_id_hash TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+    server_version INTEGER NOT NULL,
+    state_hash TEXT NOT NULL,
+    PRIMARY KEY(user_id_hash,server_version)
+);
+SQL_END;
+
+// Synced data whose writes must carry a newer version than any hash given out.
+VersionedTables: [6]string = .["server_habits", "server_habit_days", "server_sessions",
+    "server_meditation_logs", "server_social_snapshots", "server_encrypted_records"];
+
+AppendTriggers :: (output: *Vec(u8), template: string, table: string) -> bool {
+    marker := "TABLE"
+    start: s64 = 0
+    index: s64 = 0
+    while index <= template.count - marker.count {
+        if template[index:index + marker.count] == marker {
+            if !BuilderAppend(<<output, template[start:index]) || !BuilderAppend(<<output, table) {
+                return false
+            }
+            index += marker.count
+            start = index
+        } else {
+            index += 1
+        }
+    }
+    return BuilderAppend(<<output, template[start:])
+}
+
+#scope_export
+Build :: () -> Vec(u8) {
+    sql: Vec(u8)
+    if !BuilderAppend(sql, TableSchema) {
+        return .{}
+    }
+    for table: VersionedTables {
+        if !AppendTriggers(*sql, ForgetOnDelete, table) || !AppendTriggers(*sql, ForgetOnStaleWrite, table) {
+            return .{}
+        }
+    }
+    if !BuilderAppend(sql, RoundsSchema) {
+        return .{}
+    }
+    return sql
+}

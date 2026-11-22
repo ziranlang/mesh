@@ -1,0 +1,100 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    statements :: #import "sqlite_statement_native";
+    queries :: #import "account_state_queries";
+    session_queries :: #import "auth_session_queries";
+
+    #scope_file
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    InTransaction :: (database: *void) -> bool {
+        return database != null && !sqlite.SqliteGetAutocommit(database)
+    }
+
+    #scope_export
+    CurrentVersion :: (database: *void, user: string) -> statements.IntegerResult {
+        if database == null { return .{status = sqlite.SQLITE_MISUSE} }
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        return statements.ReadInteger(database, queries.ReadVersion, arguments[:])
+    }
+
+    NextVersion :: (database: *void, user: string) -> statements.IntegerResult {
+        if !InTransaction(database) { return .{status = sqlite.SQLITE_MISUSE} }
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        status := statements.Execute(database, queries.EnsureVersion, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        status = statements.Execute(database, queries.AdvanceVersion, arguments[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        result := statements.ReadInteger(database, queries.ReadNewVersion, arguments[:])
+        if result.status == sqlite.SQLITE_OK && !result.found { result.status = sqlite.SQLITE_DONE }
+        return result
+    }
+
+    Tombstoned :: (database: *void, user: string) -> statements.IntegerResult {
+        if database == null { return .{status = sqlite.SQLITE_MISUSE} }
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        return statements.ReadInteger(database, session_queries.AccountTombstoned, arguments[:])
+    }
+
+    Touch :: (database: *void, user: string, now: string) -> s32 {
+        if !InTransaction(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [2]statements.Argument = .[statements.TextArg(user), statements.TextArg(now)]
+        status := statements.Execute(database, queries.Touch, arguments[:])
+        if status != sqlite.SQLITE_OK { return status }
+        if sqlite.SqliteChanges(database) == 0 { return sqlite.SQLITE_DONE }
+        return statements.Execute(database, queries.EnsureVersion, arguments[:1])
+    }
+
+    Upsert :: (database: *void, user: string, publicKey: []u8, now: string) -> s32 {
+        if !InTransaction(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [3]statements.Argument = .[statements.TextArg(user), statements.BlobArg(publicKey), statements.TextArg(now)]
+        status := statements.Execute(database, queries.Upsert, arguments[:])
+        if status != sqlite.SQLITE_OK { return status }
+        return statements.Execute(database, queries.EnsureVersion, arguments[:1])
+    }
+
+    RegisterTx :: (database: *void, user: string, publicKey: []u8, now: string) -> s32 {
+        if !InTransaction(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        status := statements.Execute(database, queries.ClearTombstone, arguments[:])
+        if status != sqlite.SQLITE_OK { return status }
+        return Upsert(database, user, publicKey, now)
+    }
+
+    Register :: (database: *void, user: string, publicKey: []u8, now: string) -> s32 {
+        if database == null { return sqlite.SQLITE_MISUSE }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        status = RegisterTx(database, user, publicKey, now)
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    // The caller owns the transaction, including any hold or finalization state.
+    DeleteTx :: (database: *void, user: string) -> s32 {
+        if !InTransaction(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [1]statements.Argument = .[statements.TextArg(user)]
+        // The payment address and copies outside the account's foreign keys
+        // need explicit cleanup before the dependent rows are cascaded.
+        remove: [7]string = .[queries.WriteTombstone, queries.DisableMoneroAddresses, queries.DeleteChatUsage,
+            queries.DeleteBackup, queries.DeletePasskeys, queries.DeleteGoogleLinks, queries.DeleteUser]
+        for query: remove {
+            status := statements.Execute(database, query, arguments[:])
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    Delete :: (database: *void, user: string) -> s32 {
+        if database == null { return sqlite.SQLITE_MISUSE }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        status = DeleteTx(database, user)
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+}

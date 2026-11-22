@@ -1,0 +1,36 @@
+#import "std/vec"
+
+Replacement :: struct {
+    marker: string
+    value: string
+}
+
+// Substitute the original template in one pass. Inserted SQL is copied as-is.
+Append :: (output: *Vec(u8), template: string, replacements: []Replacement) -> bool {
+    start: s64 = 0
+    cursor: s64 = 0
+    while cursor < template.count {
+        matched := false
+        for replacement: replacements {
+            count := replacement.marker.count
+            if count > 0 && count <= template.count - cursor &&
+                template[cursor:cursor + count] == replacement.marker {
+                if !BuilderAppend(<<output, template[start:cursor]) ||
+                    !BuilderAppend(<<output, replacement.value) { return false }
+                cursor += count
+                start = cursor
+                matched = true
+                break
+            }
+        }
+        if !matched { cursor += 1 }
+    }
+    return BuilderAppend(<<output, template[start:])
+}
+
+Replace :: (template: string, marker: string, value: string) -> Vec(u8) {
+    output: Vec(u8)
+    replacements: [1]Replacement = .[.{marker = marker, value = value}]
+    if !Append(*output, template, replacements[:]) { return .{} }
+    return output
+}

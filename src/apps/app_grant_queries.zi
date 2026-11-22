@@ -1,0 +1,37 @@
+// App grants share their storage queries across both server backends.
+GrantInsertSQL :: #string SQL_END
+INSERT INTO server_app_grants(id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status)
+VALUES(?1,?2,?3,?4,?5,?6,'active')
+SQL_END;
+GrantByIDSQL :: #string SQL_END
+SELECT id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status,created_at,updated_at,revoked_at
+FROM server_app_grants WHERE user_id_hash=?1 AND id=?2
+SQL_END;
+GrantListSQL :: #string SQL_END
+SELECT id,user_id_hash,source_app_id,target_app_id,collection_prefix,permission,status,created_at,updated_at,revoked_at
+FROM server_app_grants WHERE user_id_hash=?1 ORDER BY updated_at DESC,id
+SQL_END;
+GrantRevokeSQL :: #string SQL_END
+UPDATE server_app_grants
+SET status='revoked', revoked_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+WHERE user_id_hash=?1 AND id=?2 AND status='active'
+SQL_END;
+CreateAuditSQL :: "INSERT INTO server_app_grant_audit(grant_id,user_id_hash,action,payload_json) VALUES(?1,?2,'create',?3)";
+RevokeAuditSQL :: "INSERT INTO server_app_grant_audit(grant_id,user_id_hash,action) VALUES(?1,?2,'revoke')";
+AuthorizedScopeSQL :: #string SQL_END
+SELECT EXISTS(
+ SELECT 1 FROM server_app_grants
+ WHERE user_id_hash=?1 AND source_app_id=?2 AND target_app_id=?3
+   AND collection_prefix=?4 AND permission='read' AND status='active'
+)
+SQL_END;
+VisibilitySQL :: "SELECT visibility FROM server_app_collections WHERE app_id=?1 AND collection_prefix=?2";
+ExactRecordsSQL :: #string SQL_END
+SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes
+FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 ORDER BY collection,id
+SQL_END;
+PrefixRecordsSQL :: #string SQL_END
+SELECT collection,id,key_id,nonce,ciphertext,updated_at,deleted_at,content_hash,schema_version,parent_id,free_bytes
+FROM server_encrypted_records WHERE user_id_hash=?1 AND collection LIKE ?2 ESCAPE '\'
+  AND substr(collection,1,length(?3))=?3 ORDER BY collection,id
+SQL_END;

@@ -1,0 +1,22 @@
+#if TARGET == .C {
+    commands :: #import "inspect_command";
+    inspection :: #import "sqlite_inspection";
+
+    InspectResult :: struct {
+        status: s32
+        usage: string
+        unknown: bool
+        command: string
+    }
+
+    Run :: (database: *void, arguments: []string, full: bool,
+        context: *void, write: inspection.WriteReport) -> InspectResult {
+        command := commands.Parse(arguments)
+        if command.usage != "" { return .{usage = command.usage} }
+        if command.action == .Summary { return .{status = inspection.Summary(database, context, write)} }
+        if command.action == .Users { return .{status = inspection.Users(database, context, write, full)} }
+        if command.action == .User { return .{status = inspection.User(database, context, write, command.user, full)} }
+        if command.action == .Doctor { return .{status = inspection.Doctor(database, context, write, command.user, full)} }
+        return .{unknown = true, command = command.name}
+    }
+}

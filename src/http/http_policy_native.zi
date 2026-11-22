@@ -1,0 +1,153 @@
+#if TARGET == .C && OS == .LINUX {
+    wire :: #import "wire_text";
+    ascii :: #import "std/text";
+
+    HeaderSetter :: #type (response: *void, name: string, value: string) -> bool;
+    PreflightStatus :: 204;
+
+    #scope_file
+    AllowedMethods :: "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+    AllowedHeaders :: "Authorization, Content-Type, Content-Encoding, X-Mesh-User, X-Mesh-Signature, X-Mesh-Tx, X-Mesh-Delegate, X-Mesh-Client, X-Mesh-Since-Version, X-Mesh-Limit, X-Mesh-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin";
+
+    ValidExtensionID :: (authority: string) -> bool {
+        if authority.count != 32 {
+            return false
+        }
+        for byte: authority {
+            if byte < #char "a" || byte > #char "p" {
+                return false
+            }
+        }
+        return true
+    }
+
+    ValidPort :: (port: string) -> bool {
+        if port == "" {
+            return true
+        }
+        if port[0] != #char ":" {
+            return false
+        }
+        for byte: port[1:] {
+            if byte < #char "0" || byte > #char "9" {
+                return false
+            }
+        }
+        return true
+    }
+
+    LocalOrigin :: (authority: string) -> bool {
+        host := authority
+        if authority[0] == #char "[" {
+            bracket := wire.Cut(authority[1:], #char "]")
+            if !bracket.found || !ValidPort(bracket.after) {
+                return false
+            }
+            host = bracket.before
+        } else {
+            colon: s64 = -1
+            for byte, index: authority {
+                if byte == #char ":" {
+                    colon = index
+                }
+            }
+            if colon >= 0 {
+                if !ValidPort(authority[colon:]) {
+                    return false
+                }
+                host = authority[:colon]
+            }
+        }
+        return host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" || host == "::1"
+    }
+
+    ManagedCrossOriginHeader :: (name: string) -> bool {
+        return EqualFoldASCII(name, "access-control-allow-origin") ||
+            EqualFoldASCII(name, "access-control-allow-credentials") ||
+            EqualFoldASCII(name, "access-control-allow-methods") ||
+            EqualFoldASCII(name, "access-control-allow-headers")
+    }
+
+    EqualFoldASCII :: (left: string, right: string) -> bool {
+        return left.count == right.count && ascii.StartsWithFoldASCII(left, right)
+    }
+
+    VariesByOrigin :: (value: string) -> bool {
+        return wire.ContainsToken(value, "origin", EqualFoldASCII) || wire.ContainsToken(value, "*", EqualFoldASCII)
+    }
+
+    ApplyCrossOrigin :: (response: *void, allowed: string, hasVaryOrigin: bool, set: HeaderSetter) -> bool {
+        if !set(response, "Access-Control-Allow-Methods", AllowedMethods) ||
+            !set(response, "Access-Control-Allow-Headers", AllowedHeaders) {
+            return false
+        }
+        if allowed == "" {
+            return true
+        }
+        return set(response, "Access-Control-Allow-Origin", allowed) &&
+            (hasVaryOrigin || set(response, "Vary", "Origin"))
+    }
+
+    #scope_export
+    IsPreflight :: (verb: string) -> bool {
+        return verb == "OPTIONS"
+    }
+
+    AllowedOrigin :: (origin: string) -> string {
+        if origin == "https://mesh-bew.pages.dev" || origin == "https://mesh.ziran-lang.org" ||
+            origin == "https://inbe.waozi.xyz" || origin == "https://innerbreeze.org" ||
+            origin == "https://uku.waozi.xyz" || origin == "https://shovey.waozi.xyz" ||
+            origin == "https://wurm.waozi.xyz" || origin == "https://dew.waozi.xyz" ||
+            origin == "https://arcade.waozi.xyz" || origin == "https://entity.waozi.xyz" ||
+            origin == "https://waozi.xyz" {
+            return origin
+        }
+        // The transport accepts header values at most 511 bytes long.
+        if origin.count >= 512 {
+            return ""
+        }
+        scheme := wire.Cut(origin, #char ":")
+        if !scheme.found || scheme.after.count < 3 || scheme.after[:2] != "//" {
+            return ""
+        }
+        // Go's URL parser accepts empty query and fragment markers.
+        fragment := wire.Cut(scheme.after[2:], #char "#")
+        query := wire.Cut(fragment.before, #char "?")
+        authority := query.before
+        if fragment.after != "" || query.after != "" || authority == "" {
+            return ""
+        }
+        if EqualFoldASCII(scheme.before, "chrome-extension") && ValidExtensionID(authority) {
+            return origin
+        }
+        if EqualFoldASCII(scheme.before, "http") && LocalOrigin(authority) {
+            return origin
+        }
+        return ""
+    }
+
+    // Route headers supply representation metadata and override cache defaults.
+    // Origin is a separate Vary field so existing variation tokens stay intact.
+    Apply :: (response: *void, origin: string, headers: []$Header, set: HeaderSetter) -> bool {
+        allowed := AllowedOrigin(origin)
+        hasVaryOrigin := false
+        hasCacheControl := false
+        hasNoSniff := false
+        for header: headers {
+            if ManagedCrossOriginHeader(header.name) {
+                continue
+            }
+            if EqualFoldASCII(header.name, "vary") {
+                hasVaryOrigin = hasVaryOrigin || VariesByOrigin(header.value)
+            }
+            hasCacheControl = hasCacheControl || EqualFoldASCII(header.name, "cache-control")
+            hasNoSniff = hasNoSniff || EqualFoldASCII(header.name, "x-content-type-options")
+            if !set(response, header.name, header.value) {
+                return false
+            }
+        }
+        return (hasCacheControl || set(response, "Cache-Control", "no-store")) &&
+            (hasNoSniff || set(response, "X-Content-Type-Options", "nosniff")) &&
+            ApplyCrossOrigin(response, allowed, hasVaryOrigin, set)
+    }
+}

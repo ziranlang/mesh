@@ -1,0 +1,121 @@
+#if TARGET == .C && OS == .LINUX {
+    cursors :: #import "mesh_cursor_native";
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    policy :: #import "mesh_policy_native";
+    schema :: #import "trust_schema";
+    sha :: #import "crypto/sha256";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    // Bound copied record bytes before JSON escaping and compression.
+    BatchBytes :: 25165824;
+
+    WriteCursor :: (output: *json.JsonDocument, root: s32, sequence: s64) -> bool {
+        encoded: Text = cursors.Encode(sequence)
+        return TextView(encoded) != "" && fields.SetString(output, root, "next_cursor", TextView(encoded)) &&
+            json.JsonSet(output, root, "truncated", json.JsonNewBool(output, true))
+    }
+
+    SetInt :: (document: *json.JsonDocument, root: s32, name: string, row: *void, column: s32) -> bool {
+        value := sqlite.SqliteColumnInt64(row, column)
+        return value == 0 || json.JsonSet(document, root, name, json.JsonNewInteger(document, value))
+    }
+
+    WriteRecord :: (document: *json.JsonDocument, row: *void, deleted: bool) -> s32 {
+        root := json.JsonNewObject(document)
+        if !fields.SetString(document, root, "user_id_hash", sql.ColumnText(row, 2)) ||
+            !SetInt(document, root, "mesh_version", row, 0) { return -1 }
+        if deleted {
+            if !fields.SetString(document, root, "collection", sql.ColumnText(row, 3)) ||
+                !fields.SetString(document, root, "id", sql.ColumnText(row, 4)) ||
+                !fields.SetString(document, root, "deleted_at", sql.ColumnText(row, 5)) { return -1 }
+            return root
+        }
+        public := cast(*u8)sqlite.SqliteColumnBlob(row, 16)
+        size := cast(s64)sqlite.SqliteColumnBytes(row, 16)
+        key: Vec(u8)
+        if size > 0 {
+            if public == null || !VecResizeBounded(key, size * 2 + 1, BatchBytes * 2 + 1) { return -1 }
+            bytes := VecSlice(key, 0, key.count)
+            if sha.BytesToHex(public, size, *bytes[0], bytes.count) != 1 { return -1 }
+        }
+        if !fields.SetString(document, root, "public_key", TextView(VecSlice(key, 0, size * 2))) { return -1 }
+        times: [2]string = .["created_at", "last_seen_at"]
+        for name, index: times {
+            value := sql.ColumnText(row, cast(s32)(17 + index))
+            if value != "" && !fields.SetString(document, root, name, value) { return -1 }
+        }
+        record := json.JsonNewObject(document)
+        required: [3]string = .["collection", "id", "updated_at"]
+        source: [3]s32 = .[3, 4, 10]
+        for name, index: required {
+            if !fields.SetString(document, record, name, sql.ColumnText(row, source[index])) { return -1 }
+        }
+        optional: [5]string = .["key_id", "nonce", "ciphertext", "content_hash", "parent_id"]
+        columns: [5]s32 = .[7, 8, 9, 12, 14]
+        for name, index: optional {
+            value := sql.ColumnText(row, columns[index])
+            if value != "" && !fields.SetString(document, record, name, value) { return -1 }
+        }
+        if !SetInt(document, record, "deleted_at", row, 11) ||
+            !SetInt(document, record, "schema_version", row, 13) ||
+            !SetInt(document, record, "free_bytes", row, 15) ||
+            !json.JsonSet(document, root, "Record", record) { return -1 }
+        return root
+    }
+
+    #scope_export
+    Export :: (database: *void, filters: *json.JsonDocument, policyNode: s32, output: *json.JsonDocument,
+        root: s32, cursor: string, limit: s64) -> bool {
+        decoded := cursors.Decode(cursor)
+        if !decoded.valid { return false }
+        records := json.JsonNewArray(output)
+        if !json.JsonSet(output, root, "records", records) { return false }
+        if !policy.Includes(filters, json.JsonMember(filters, policyNode, "data"), "encrypted_records", true) { return true }
+        deletions := json.JsonNewArray(output)
+        accounts := json.JsonMember(filters, policyNode, "accounts")
+        args: [1]sql.Argument = .[sql.IntArg(decoded.sequence)]
+        rows := sql.Prepare(database, schema.ExportRecordsSQL, args[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        emitted: s64 = 0
+        sequence: s64 = 0
+        bytes: s64 = 0
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE { break }
+            if status != sqlite.SQLITE_ROW { return false }
+            user := sql.ColumnText(rows.value, 2)
+            collection := sql.ColumnText(rows.value, 3)
+            if !identity.ValidUserID(user) ||
+                (json.JsonCount(filters, accounts) > 0 && !policy.Includes(filters, accounts, user, false)) { continue }
+            matched := policy.AllowsCollection(database, filters, policyNode, collection)
+            if matched < 0 { return false }
+            if matched == 0 { continue }
+            deleted := sql.ColumnText(rows.value, 1) == "delete"
+            if !deleted && (sqlite.SqliteColumnType(rows.value, 6) == sqlite.SQLITE_NULL ||
+                sqlite.SqliteColumnType(rows.value, 17) == sqlite.SQLITE_NULL) { continue }
+            size: s64 = 512
+            for column: 2..18 { size += cast(s64)sqlite.SqliteColumnBytes(rows.value, cast(s32)column) }
+            if size > BatchBytes - bytes {
+                if emitted == 0 || !WriteCursor(output, root, sequence) { return false }
+                break
+            }
+            item := WriteRecord(output, rows.value, deleted)
+            if !json.JsonAppend(output, ifx deleted then deletions else records, item) { return false }
+            bytes += size
+            emitted += 1
+            sequence = sqlite.SqliteColumnInt64(rows.value, 0)
+            if emitted >= limit {
+                if !WriteCursor(output, root, sequence) { return false }
+                break
+            }
+        }
+        return json.JsonCount(output, deletions) == 0 || json.JsonSet(output, root, "deletions", deletions)
+    }
+}

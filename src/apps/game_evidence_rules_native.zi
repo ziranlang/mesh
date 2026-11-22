@@ -1,0 +1,107 @@
+#if TARGET == .C && OS == .LINUX {
+    numbers :: #import "std/number_text";
+    sha :: #import "crypto/sha256";
+    shovey :: #import "shovey/rules";
+
+    #scope_export
+    Game :: "shovey.classic";
+    MapSize :: 1440;
+
+    HexText :: (value: string, size: s64) -> bool {
+        if value.count != size { return false }
+        for byte: value {
+            if shovey.ShoveyDigit(byte) < 0 { return false }
+        }
+        return true
+    }
+
+    MapMatches :: (level: s64, hash: string, board: string) -> bool {
+        if level < 1 || level > 4096 || !HexText(hash, 64) || !HexText(board, MapSize) { return false }
+        digits: [24]u8
+        context: sha.Sha256Context
+        sha.Sha256Initialize(*context)
+        sha.Sha256UpdateText(*context, "shovey.classic.map.v1\n")
+        sha.Sha256UpdateText(*context, numbers.FormatInteger(level, digits[:]))
+        sha.Sha256UpdateText(*context, "\n")
+        sha.Sha256UpdateText(*context, board)
+        digest: [32]u8
+        sha.Sha256FinishBytes(*context, digest[:])
+        encoded: [65]u8
+        return sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) == 1 && TextView(encoded[:64]) == hash
+    }
+
+    ValidRevision :: (level: s64, hash: string, board: string) -> bool {
+        if !MapMatches(level, hash, board) { return false }
+        players: s32 = 0
+        for cell: cast(s32)0..239 {
+            if shovey.ShoveyByte(board, cell * 2) == 10 { players += 1 }
+        }
+        return players == 1
+    }
+
+    #scope_file
+    Solid :: (kind: s32) -> bool {
+        return kind == 12 || kind == 63 || kind == 76 || kind == 84 ||
+            (kind >= 95 && kind <= 98) || kind == 106 || kind == 122 || (kind >= 139 && kind <= 142)
+    }
+
+    Movable :: (kind: s32) -> bool {
+        return (kind >= 1 && kind <= 3) || kind == 9 || kind == 19 || kind == 28 ||
+            (kind >= 36 && kind <= 38) || kind == 40 || (kind >= 44 && kind <= 46) ||
+            (kind >= 53 && kind <= 55) || kind == 72
+    }
+
+    Ground :: (board: string, cell: s32) -> s32 {
+        kind := shovey.ShoveyByte(board, cell * 2)
+        if kind != 0 && kind != 10 && !Movable(kind) { return kind }
+        return shovey.ShoveyByte(board, 480 + cell * 2)
+    }
+
+    Adjacent :: (first: s32, second: s32) -> bool {
+        return first == second - 12 || first == second + 12 ||
+            (first / 12 == second / 12 && (first == second - 1 || first == second + 1))
+    }
+
+    PortalPair :: (ground: []s32, portals: []s32, first: s32, second: s32) -> bool {
+        kind := ground[first]
+        return first != second && ground[second] == kind && portals[kind] == 2 &&
+            (kind == 8 || (kind >= 85 && kind <= 87))
+    }
+
+    #scope_export
+    ValidCompletion :: (level: s64, hash: string, board: string, moves: s64, actions: string, trace: string, complete: bool) -> bool {
+        if !MapMatches(level, hash, board) || moves < 1 || moves > 2147483647 ||
+            actions.count < 1 || actions.count > 60000 || trace.count < 2 || trace.count > 240000 ||
+            trace.count % 2 != 0 || !HexText(trace, trace.count) { return false }
+        for action: actions {
+            if (action < #char "0" || action > #char "3") && action != #char "f" && action != #char "t" { return false }
+        }
+        ground: [240]s32
+        blocked: [240]bool
+        portals: [256]s32
+        for cell: cast(s32)0..239 {
+            kind := Ground(board, cell)
+            ground[cell] = kind
+            blocked[cell] = Solid(kind) || Solid(shovey.ShoveyByte(board, 960 + cell * 2))
+            portals[kind] += 1
+        }
+        previous: s32 = -1
+        steps: s64 = 0
+        for offset: cast(s32)0..cast(s32)trace.count / 2 - 1 {
+            cell := shovey.ShoveyByte(trace, offset * 2)
+            if cell > 239 || blocked[cell] { return false }
+            if previous < 0 {
+                if complete && shovey.ShoveyByte(board, cell * 2) != 10 { return false }
+            } else {
+                portal := PortalPair(ground[:], portals[:], previous, cell)
+                if !Adjacent(previous, cell) && !portal { return false }
+                if !portal { steps += 1 }
+            }
+            previous = cell
+        }
+        if !complete { return true }
+        home := shovey.ShoveyByte(board, previous * 2)
+        return (home == 7 || home == 148) && moves >= steps && moves <= steps + actions.count &&
+            shovey.ShoveyRulesVerify(cast(s32)level, board, actions, trace, cast(s32)moves)
+    }
+}

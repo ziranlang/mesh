@@ -1,0 +1,255 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    accounts :: #import "account_state_native";
+    apps :: #import "record_scope_native";
+    input :: #import "typed_request_native";
+    application :: #import "typed_application_native";
+    encrypted :: #import "typed_records_native";
+    parser :: #import "record_request_native";
+    record_sync :: #import "record_sync_native";
+    signed :: #import "signed_tx_native";
+    ops :: #import "typed_ops_native";
+    clients :: #import "typed_clients_native";
+    client_queries :: #import "sync_client_queries";
+    audit :: #import "sync_audit_queries";
+    projection :: #import "typed_projection_native";
+    hashes :: #import "state_hash_native";
+    history :: #import "state_history_native";
+    migration :: #import "habit_migration_native";
+    packages :: #import "package_sequence_native";
+    storage :: #import "storage_allowance_native";
+    quota :: #import "storage_usage_rules";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    protocol :: #import "protocol";
+    rates :: #import "rate_limit_native";
+    notifications :: #import "sync_hub_native";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    output :: #import "sync_response_native";
+    replies :: #import "http_json_native";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    calendar :: #import "std/date_time_linux";
+    timer :: #import "std/timer";
+    mutex :: #import "std/mutex_linux";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    #scope_file
+    Result :: struct {
+        status: u32
+        message: string
+        version: s64
+        publish: bool
+        used: s64
+        allowance: s64
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) { unused sqlite.SqliteExecText(database, "ROLLBACK") }
+    }
+
+    HasChanges :: (request: *input.Request, document: *json.JsonDocument) -> bool {
+        return request.full || json.JsonFirst(document, request.habits) >= 0 || json.JsonFirst(document, request.habitDays) >= 0 ||
+            json.JsonFirst(document, request.sessions) >= 0 || json.JsonFirst(document, request.meditations) >= 0 ||
+            json.JsonFirst(document, request.encrypted) >= 0 || json.JsonFirst(document, request.ops) >= 0
+    }
+
+    Audit :: (database: *void, user: string, app: string, client: string, request: *input.Request,
+        version: s64, snapshotReason: string, remote: s64, document: *json.JsonDocument, applied: s32) {
+        value: Text = json.JsonWrite(document, applied, json.JsonCompactStyle(false))
+        if TextView(value) == "" { return }
+        arguments: [13]sql.Argument = .[sql.TextArg(user), sql.TextArg(client), sql.TextArg(app), sql.IntArg(request.protocolVersion),
+            sql.IntArg(request.since), sql.IntArg(request.clock), sql.IntArg(version), sql.TextArg(TextView(value)), sql.IntArg(remote),
+            sql.IntArg(ifx snapshotReason == "" then 0 else 1), sql.TextArg(snapshotReason), sql.IntArg(0), sql.IntArg(0)]
+        unused sql.Execute(database, audit.InsertSyncAuditSQL, arguments[:])
+    }
+
+    Store :: (settings: access.Configuration, user: string, app: string, client: string, key: []u8, now: time.TimestampValue,
+        when: string, document: *json.JsonDocument, request: *input.Request, records: *parser.Request, response: *json.JsonDocument,
+        root: s32, proof: record_sync.RequestProof) -> Result {
+        failure: Result = .{status = 500, message = "sync failed"}
+        database := settings.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return failure }
+        defer Rollback(database)
+        if request.protocolVersion >= 6 {
+            authorized := signed.VerifyTx(database, settings.verify, proof.signedTransaction, user, app, "POST", proof.path,
+                proof.body, now.seconds, when)
+            if authorized.databaseError != sqlite.SQLITE_OK { return failure }
+            if authorized.status != 0 { return .{status = authorized.status, message = authorized.message} }
+        }
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        allowance := storage.Allowance(database, user, now.seconds, settings.accountStorageLimit, settings.storagePlansEnabled)
+        if allowance.status != sqlite.SQLITE_OK { return failure }
+        before := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+        base := hashes.State(database, user)
+        if before.status != sqlite.SQLITE_OK || base.status != sqlite.SQLITE_OK { return failure }
+        since := request.since
+        compacted: s64 = 0
+        snapshotReason := ""
+        lastHash := TextView(request.lastServerHash)
+        baseHash := TextView(base.hex[:64])
+        if !request.full && lastHash != "" && !wire.MatchesToken(lastHash, baseHash) {
+            known := history.Matches(database, user, request.since, lastHash)
+            if known.status != sqlite.SQLITE_OK { return failure }
+            if known.value == 0 { snapshotReason = "state_hash_mismatch" }
+        }
+        if snapshotReason == "" && request.protocolVersion >= 2 && !request.full {
+            floor := sql.ReadInteger(database, client_queries.CompactedSQL, arguments[:])
+            if floor.status != sqlite.SQLITE_OK { return failure }
+            compacted = floor.value
+            if compacted > 0 && request.clock < compacted { snapshotReason = "sync_ops_compacted" }
+        }
+        full := snapshotReason != ""
+        if full { since = 0 }
+        hasChanges := HasChanges(request, document)
+        summary: protocol.SyncResult
+        accepted := json.JsonNewArray(response)
+        if accepted < 0 { return failure }
+        if !full || hasChanges {
+            applied := application.Apply(database, user, app, document, request, key, when)
+            if applied.invalidJSON { return .{status = 400, message = "invalid json"} }
+            if applied.status != sqlite.SQLITE_OK { return failure }
+            summary = applied.applied
+            written := encrypted.Apply(database, user, records, allowance.value, now)
+            if written.status != sqlite.SQLITE_OK || !ops.Apply(database, user, document, request.ops, when, *summary, response, accepted) { return failure }
+            summary.EncryptedRecords = cast(isize)written.applied
+        }
+        used := sql.ReadInteger(database, quota.UsageSQL, arguments[:])
+        if used.status != sqlite.SQLITE_OK { return failure }
+        if quota.Exceeds(before.value, used.value, allowance.value) {
+            return .{status = 413, message = "account storage limit reached", used = before.value, allowance = allowance.value}
+        }
+        current := accounts.CurrentVersion(database, user)
+        if current.status != sqlite.SQLITE_OK { return failure }
+        remote := json.JsonNewArray(response)
+        if remote < 0 || (request.protocolVersion >= 2 && !full && !ops.Attach(database, user, request.clock, response, remote)) { return failure }
+        acceptedCount := cast(s64)json.JsonCount(response, accepted)
+        remoteCount := cast(s64)json.JsonCount(response, remote)
+        recordedClock := ifx full && request.protocolVersion >= 2 then current.value else request.clock
+        clientState: [7]sql.Argument = .[arguments[0], sql.TextArg(client), sql.TextArg(when), sql.IntArg(request.since),
+            sql.IntArg(current.value), sql.IntArg(request.protocolVersion), sql.IntArg(recordedClock)]
+        if sql.Execute(database, client_queries.RecordSync, clientState[:]) != sqlite.SQLITE_OK ||
+            (request.protocolVersion >= 2 && !clients.Compact(database, user, current.value, now)) { return failure }
+        if request.protocolVersion >= 3 {
+            if migration.AccountTx(database, user) != sqlite.SQLITE_OK || !clients.AttachLegacy(database, user, response, root) { return failure }
+            current = accounts.CurrentVersion(database, user)
+            if current.status != sqlite.SQLITE_OK { return failure }
+        }
+        final := hashes.State(database, user)
+        if final.status != sqlite.SQLITE_OK { return failure }
+        applied := json.JsonNewObject(response)
+        returned := json.JsonNewObject(response)
+        diagnostics := json.JsonNewObject(response)
+        if !projection.Counts(response, applied, summary) || !projection.Attach(database, user, since, full, when, request, response, root, returned) ||
+            !projection.Profile(database, user, response, root) || !clients.AttachPolicy(database, user, now, response, root) ||
+            !output.TextIfPresent(response, diagnostics, "snapshot_reason", snapshotReason) ||
+            !output.IntegerField(response, diagnostics, "requested_since_server_version", request.since) ||
+            !output.IntegerField(response, diagnostics, "effective_since_server_version", since) ||
+            !output.IntegerField(response, diagnostics, "client_clock", request.clock) ||
+            (compacted != 0 && !output.IntegerField(response, diagnostics, "compacted_through_version", compacted)) ||
+            !output.BooleanField(response, diagnostics, "has_local_changes", hasChanges) ||
+            !output.IntegerField(response, diagnostics, "accepted_ops", acceptedCount) || !output.IntegerField(response, diagnostics, "remote_ops", remoteCount) ||
+            !json.JsonSet(response, diagnostics, "applied_input", json.JsonCopy(response, response, applied)) ||
+            !json.JsonSet(response, diagnostics, "returned_changes", returned) || !json.JsonSet(response, root, "diagnostics", diagnostics) ||
+            !json.JsonSet(response, root, "applied", applied) ||
+            (acceptedCount > 0 && !json.JsonSet(response, root, "accepted_ops", accepted)) ||
+            (remoteCount > 0 && !json.JsonSet(response, root, "ops", remote)) { return failure }
+        transition := ifx request.protocolVersion >= 5 then "encrypted_primary" else ""
+        if request.protocolVersion == 4 { transition = "dual_write" }
+        sequence := packages.LatestSequence(settings.path, app)
+        if !output.TextField(response, root, "status", "ok") || !output.AttachCapabilities(response, root, settings.zstdRequests) ||
+            !output.TextIfPresent(response, root, "transition_mode", transition) ||
+            (request.protocolVersion != 0 && (!output.IntegerField(response, root, "protocol_version", request.protocolVersion) ||
+                !output.IntegerField(response, root, "latest_protocol", request.protocolVersion))) ||
+            !output.IntegerField(response, root, "min_supported_protocol", protocol.MinSupportedProtocol) ||
+            !output.IntegerField(response, root, "server_latest_protocol", protocol.LatestProtocol) ||
+            (sequence > 0 && !output.IntegerField(response, root, "package_sequence", sequence)) ||
+            !output.IntegerField(response, root, "server_version", current.value) ||
+            (current.value != 0 && !output.IntegerField(response, root, "server_clock", current.value)) ||
+            !output.TextField(response, root, "server_state_hash", TextView(final.hex[:64])) ||
+            !output.TextField(response, root, "base_state_hash", baseHash) ||
+            !output.BooleanField(response, root, "changes_complete", !full) || !output.BooleanField(response, root, "full_snapshot_required", full) ||
+            !output.Storage(response, root, used.value, allowance.value) ||
+            history.Record(database, user, current.value, TextView(final.hex[:64])) != sqlite.SQLITE_OK ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return failure }
+        Audit(database, user, app, client, request, current.value, snapshotReason, remoteCount, response, applied)
+        publish := summary.Habits > 0 || summary.HabitDays > 0 || summary.Sessions > 0 || summary.MeditationLogs > 0 || summary.EncryptedRecords > 0
+        return .{version = current.value, publish = publish}
+    }
+
+    Process :: (service: *access.AccountAccess, hub: *notifications.Hub, connection: *void, document: *json.JsonDocument,
+        request: *input.Request, response: *json.JsonDocument, root: s32, proof: record_sync.RequestProof) -> Result {
+        settings := service.configuration
+        header := auth.UserHeader(connection)
+        if header.value == "" { return .{status = 400, message = "missing X-Mesh-User"} }
+        account: [64]u8
+        if !identity.NormalizeUserID(header.value, account[:]) { return .{status = 400, message = "invalid user_id_hash"} }
+        user := TextView(account[:])
+        requested := wire.TrimSpace(TextView(request.user))
+        if requested != "" {
+            body: [64]u8
+            if !identity.NormalizeUserID(requested, body[:]) || TextView(body[:]) != user {
+                return .{status = 400, message = "X-Mesh-User does not match user_id_hash"}
+            }
+        }
+        client := wire.TrimSpace(TextView(request.client))
+        if !identity.ValidClientID(client) { return .{status = 400, message = "invalid client_id"} }
+        milliseconds := calendar.UnixMilliseconds()
+        failure: Result = .{status = 500, message = "sync failed"}
+        if milliseconds < 0 || !mutex.Lock(*service.databaseLock) { return failure }
+        defer mutex.Unlock(*service.databaseLock)
+        now: time.TimestampValue = .{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
+        timestamp: [31]u8
+        size := format.UTC(now, timestamp[:])
+        if size == 0 { return failure }
+        when := TextView(timestamp[:size])
+        needsSignature := request.protocolVersion >= 6
+        authenticated := auth.Authenticate(settings.database, connection, settings.secret, now.seconds, when, !needsSignature)
+        if authenticated.status != 0 { return .{status = authenticated.status, message = authenticated.message} }
+        rateKey: Vec(u8)
+        if !BuilderAppend(rateKey, "sync:user:") || !BuilderAppend(rateKey, user) { return failure }
+        if !rates.Allow(*service.limiter, TextView(VecSlice(rateKey, 0, rateKey.count)), 300, 60000, timer.MonotonicMilliseconds()) {
+            return .{status = 429, message = "rate limit exceeded"}
+        }
+        key := record_sync.DecodePublicKey(wire.TrimSpace(TextView(request.publicKey)), user)
+        if key.error != "" { return .{status = 400, message = key.error} }
+        if authenticated.bootstrap && key.value.count == 0 { return .{status = 401, message = "sync account not found"} }
+        app := wire.TrimSpace(TextView(request.app))
+        if needsSignature && app == "" { return .{status = 400, message = "app_id required"} }
+        if app != "" {
+            if !identity.ValidNamespace(app) { return .{status = 400, message = "invalid app_id"} }
+            permitted := ifx needsSignature then apps.Active(settings.database, app, now.seconds) else apps.Legacy(settings.database, app, request.protocolVersion, when[:10])
+            if permitted.status != sqlite.SQLITE_OK { return failure }
+            if permitted.error != "" { return .{status = 400, message = permitted.error} }
+        }
+        if json.JsonFirst(document, request.social) >= 0 { return .{status = 400, message = "social_cache is server-owned"} }
+        records: parser.Request
+        if !parser.ReadRecords(document, request.encrypted, *records) { return .{status = 400, message = "invalid encrypted record"} }
+        validated := encrypted.Validate(settings.database, *records, app, request.protocolVersion)
+        if validated.status != sqlite.SQLITE_OK { return failure }
+        if validated.error != "" { return .{status = 400, message = validated.error} }
+        result := Store(settings, user, app, client, VecSlice(key.value, 0, key.value.count), now, when, document, request, *records, response, root, proof)
+        if result.status == 0 && result.publish && hub != null { notifications.Publish(hub, user, result.version) }
+        return result
+    }
+
+    #scope_export
+    Handle :: (service: *access.AccountAccess, hub: *notifications.Hub, connection: *void, document: *json.JsonDocument,
+        request: *input.Request, proof: record_sync.RequestProof) -> s32 {
+        zstd := service.configuration.zstdResponses
+        response: json.JsonDocument
+        root := json.JsonNewObject(*response)
+        result := Process(service, hub, connection, document, request, *response, root, proof)
+        if result.status == 413 {
+            rejected := json.JsonNewObject(*response)
+            if !output.TextField(*response, rejected, "error", result.message) || !output.TextField(*response, rejected, "code", "storage_full") ||
+                !output.Storage(*response, rejected, result.used, result.allowance) { return 0 }
+            return replies.Reply(connection, "POST", 413, *response, rejected, zstd)
+        }
+        if result.status != 0 { return replies.ErrorReply(connection, "POST", result.status, result.message, zstd) }
+        return replies.Reply(connection, "POST", 200, *response, root, zstd)
+    }
+}

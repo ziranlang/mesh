@@ -1,0 +1,92 @@
+#if TARGET == .C {
+    sqlite :: #import "sqlite/SQLite";
+    memory :: #import "std/byte_text_linux";
+    fragments :: #import "sql_fragments";
+    timestamp :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    schema :: #import "timestamp_schema";
+    database_queries :: #import "sqlite_schema";
+    #import "std/vec"
+
+    #scope_file
+    StoreRewrite :: "INSERT INTO temp.mesh_timestamp_rewrites(row_id,value) VALUES(?1,?2)";
+    ScanColumn :: "SELECT rowid, COLUMN FROM TABLE";
+    ApplyRewrites :: #string REWRITE_END
+UPDATE TABLE SET COLUMN=(SELECT value FROM temp.mesh_timestamp_rewrites WHERE row_id=TABLE.rowid)
+WHERE rowid IN (SELECT row_id FROM temp.mesh_timestamp_rewrites);
+DELETE FROM temp.mesh_timestamp_rewrites;
+REWRITE_END;
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    StageRewrites :: (database: *void, query: string) -> s32 {
+        rows: *void = null
+        status := sqlite.SqlitePrepareText(database, query, -1, *rows, null)
+        if status != sqlite.SQLITE_OK { return status }
+        defer sqlite.SqliteFinalize(rows)
+        rewrite: *void = null
+        status = sqlite.SqlitePrepareText(database, StoreRewrite, -1, *rewrite, null)
+        if status != sqlite.SQLITE_OK { return status }
+        defer sqlite.SqliteFinalize(rewrite)
+        scratch: [31]u8
+        status = sqlite.SqliteStep(rows)
+        while status == sqlite.SQLITE_ROW {
+            original := sqlite.SqliteColumnText(rows, 1)
+            count := sqlite.SqliteColumnBytes(rows, 1)
+            if original != null && count > 0 {
+                value := TextView(memory.BytesFromPointer(original, cast(u64)count))
+                canonicalLength := format.UTC(timestamp.Parse(value), scratch[:])
+                if canonicalLength > 0 && TextView(scratch[:canonicalLength]) != value {
+                    status = sqlite.SqliteBindInt64(rewrite, 1, sqlite.SqliteColumnInt64(rows, 0))
+                    if status != sqlite.SQLITE_OK { return status }
+                    status = sqlite.SqliteBindTextString(rewrite, 2, TextView(scratch[:canonicalLength]), cast(s32)canonicalLength)
+                    if status != sqlite.SQLITE_OK { return status }
+                    status = sqlite.SqliteStep(rewrite)
+                    if status != sqlite.SQLITE_DONE { return status }
+                    status = sqlite.SqliteReset(rewrite)
+                    if status != sqlite.SQLITE_OK { return status }
+                }
+            }
+            status = sqlite.SqliteStep(rows)
+        }
+        return ifx status == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else status
+    }
+
+    RewriteColumn :: (database: *void, target: schema.TimestampColumn) -> s32 {
+        columns: [2]fragments.Replacement = .[
+            .{marker = "TABLE", value = target.table}, .{marker = "COLUMN", value = target.column}
+        ]
+        scan: Vec(u8)
+        if !fragments.Append(*scan, ScanColumn, columns[:]) { return sqlite.SQLITE_NOMEM }
+        status := StageRewrites(database, TextView(VecSlice(scan, 0, scan.count)))
+        if status != sqlite.SQLITE_OK { return status }
+        apply: Vec(u8)
+        if !fragments.Append(*apply, ApplyRewrites, columns[:]) { return sqlite.SQLITE_NOMEM }
+        return sqlite.SqliteExecText(database, TextView(VecSlice(apply, 0, apply.count)))
+    }
+
+    #scope_export
+    Canonicalize :: (database: *void) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        version := database_queries.QueryInteger(database, schema.VersionQuery)
+        if version.status != sqlite.SQLITE_OK { return version.status }
+        if version.value >= schema.TimestampSchemaVersion { return sqlite.SqliteExecText(database, "COMMIT") }
+        status = sqlite.SqliteExecText(database, "CREATE TEMP TABLE mesh_timestamp_rewrites (row_id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
+        if status != sqlite.SQLITE_OK { return status }
+        for target: schema.Columns {
+            status = RewriteColumn(database, target)
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        status = sqlite.SqliteExecText(database, "DROP TABLE temp.mesh_timestamp_rewrites")
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, schema.AdvanceVersion)
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+}

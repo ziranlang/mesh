@@ -1,0 +1,52 @@
+mesh :: #import "ml_dsa44_native";
+oqs :: #import "oqs/Oqs";
+sha :: #import "crypto/sha256";
+env :: #import "std/environment_linux";
+
+#scope_file
+KnownAnswer :: (keyHex: string) -> s32 {
+    signatureHex := env.EnvironmentText("MESH_TEST_MLDSA_SIGNATURE")
+    messageHex := env.EnvironmentText("MESH_TEST_MLDSA_MESSAGE")
+    publicKey: [oqs.MlDsa44PublicKeyBytes + 1]u8
+    signature: [oqs.MlDsa44SignatureBytes]u8
+    message: [4096]u8
+    keySize := keyHex.count / 2
+    size := messageHex.count / 2
+    if keySize < 1 || keySize > publicKey.count || signatureHex.count != 2 * signature.count ||
+        size < 1 || size > message.count {
+        return 2
+    }
+    if sha.HexToBytes(keyHex, *publicKey[0], keySize) != 1 ||
+        sha.HexToBytes(signatureHex, *signature[0], signature.count) != 1 ||
+        sha.HexToBytes(messageHex, *message[0], size) != 1 {
+        return 2
+    }
+    return ifx mesh.Verify(publicKey[:keySize], message[:size], signature[:]) then 0 else 1
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    keyHex := env.EnvironmentText("MESH_TEST_MLDSA_PUBLIC_KEY")
+    if keyHex != "" {
+        return KnownAnswer(keyHex)
+    }
+    publicKey: [oqs.MlDsa44PublicKeyBytes]u8
+    privateKey: [oqs.MlDsa44SecretKeyBytes]u8
+    signature: [oqs.MlDsa44SignatureBytes]u8
+    message: [5]u8 = .[1, 0, 2, 3, 255]
+    defer oqs.Cleanse(privateKey[:])
+    if !mesh.KeyPair(publicKey[:], privateKey[:]) || !mesh.Sign(privateKey[:], message[:], signature[:]) ||
+        !mesh.Verify(publicKey[:], message[:], signature[:]) {
+        return 3
+    }
+    if mesh.Verify(publicKey[:], message[:0], signature[:]) ||
+        mesh.Verify(publicKey[:], message[:], signature[:signature.count - 1]) {
+        return 4
+    }
+    message[1] = 4
+    if mesh.Verify(publicKey[:], message[:], signature[:]) {
+        return 5
+    }
+    return 0
+}

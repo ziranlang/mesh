@@ -19,6 +19,15 @@
       "url": "https://github.com/ziranlang/qrcode.git"
     },
     {
+      "commit": "b09c88c14082339b66c7b7158d609a771e64ca69",
+      "dependencies": {},
+      "id": "p193f493072e2b40b",
+      "name": "sqlite3",
+      "ref": "version-3.53.4",
+      "source": true,
+      "url": "https://github.com/sqlite/sqlite.git"
+    },
+    {
       "commit": "1844042d1ca751e62e61df7617dba19c98588339",
       "dependencies": {},
       "id": "p3b3c785a0e17e605",
@@ -26,6 +35,14 @@
       "ref": "1844042d1ca751e62e61df7617dba19c98588339",
       "source": true,
       "url": "https://github.com/webmproject/libwebp.git"
+    },
+    {
+      "commit": "944826f70779a6b6cd53f6b06a75b36f4d8a2558",
+      "dependencies": {},
+      "id": "p5a3dad3b49e1d33d",
+      "name": "crypto",
+      "ref": "944826f70779a6b6cd53f6b06a75b36f4d8a2558",
+      "url": "https://git.waozi.xyz/ziranlang/crypto.git"
     },
     {
       "commit": "970d5e44b1702158cb16469892da6ff50f142427",
@@ -100,6 +117,15 @@
       "url": "https://github.com/waozixyz/shovey.git"
     },
     {
+      "commit": "ce8e0ccdf50cf26897cf31d81538654937579f4a",
+      "dependencies": {"sqlite3": "p193f493072e2b40b"},
+      "dependency_refs": {"sqlite3": "version-3.53.4"},
+      "id": "padce96609ba3b10f",
+      "name": "SQLite",
+      "ref": "ce8e0ccdf50cf26897cf31d81538654937579f4a",
+      "url": "https://git.waozi.xyz/ziranlang/sqlite.git"
+    },
+    {
       "commit": "944826f70779a6b6cd53f6b06a75b36f4d8a2558",
       "dependencies": {},
       "id": "pc23fbf455e97614d",
@@ -126,6 +152,14 @@
       "url": "https://github.com/raysan5/raylib.git"
     },
     {
+      "commit": "4f75a402c58c86648011c30bcb52380993887565",
+      "dependencies": {},
+      "id": "pd73f64df1a9c6f70",
+      "name": "compression",
+      "ref": "4f75a402c58c86648011c30bcb52380993887565",
+      "url": "https://git.waozi.xyz/ziranlang/compression.git"
+    },
+    {
       "commit": "9cc6872f75447c3a24c16764f9829d0f58751cb0",
       "dependencies": {},
       "id": "pe1027b9d16704793",
@@ -135,8 +169,8 @@
     }
   ],
   "root": {
-    "dependencies": {"shovey": "p996a48e854c61f5a"},
-    "dependency_refs": {"shovey": "master"},
+    "dependencies": {"compression": "pd73f64df1a9c6f70", "crypto": "p5a3dad3b49e1d33d", "oqs": "p7098ac9cd92f7e5f", "shovey": "p996a48e854c61f5a", "sqlite": "padce96609ba3b10f"},
+    "dependency_refs": {"compression": "4f75a402c58c86648011c30bcb52380993887565", "crypto": "944826f70779a6b6cd53f6b06a75b36f4d8a2558", "oqs": "22d2ddbdc236796953c905a05a2cebf5ab1b4ff3", "shovey": "master", "sqlite": "ce8e0ccdf50cf26897cf31d81538654937579f4a"},
     "name": "Mesh"
   },
   "toolchain": {

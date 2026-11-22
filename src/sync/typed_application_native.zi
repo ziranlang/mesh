@@ -1,0 +1,177 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    accounts :: #import "account_state_native";
+    ids :: #import "habit_id_native";
+    scope :: #import "scope";
+    input :: #import "typed_request_native";
+    writes :: #import "typed_write_native";
+    protocol :: #import "protocol";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    ApplyResult :: struct {
+        applied: protocol.SyncResult
+        status: s32
+        invalidJSON: bool
+    }
+
+    #scope_file
+    TemporaryDeletedHabits :: "CREATE TEMP TABLE mesh_deleted_habits(id TEXT PRIMARY KEY) WITHOUT ROWID";
+    DeletedHabits :: "SELECT EXISTS(SELECT 1 FROM temp.mesh_deleted_habits WHERE id=?1 OR id=?2)";
+    MarkDeletedHabit :: "INSERT OR IGNORE INTO temp.mesh_deleted_habits(id) VALUES(?1),(?2)";
+
+    StageCollections :: (database: *void, user: string, app: string) -> s32 {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        rows := sql.Prepare(database, "SELECT DISTINCT collection FROM server_encrypted_records WHERE user_id_hash=?1", arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return rows.status }
+        defer sqlite.SqliteFinalize(rows.value)
+        while true {
+            step := sqlite.SqliteStep(rows.value)
+            if step == sqlite.SQLITE_DONE { return sqlite.SQLITE_OK }
+            if step != sqlite.SQLITE_ROW { return step }
+            collection := sql.ColumnText(rows.value, 0)
+            owner := scope.CollectionOwnerApp(collection)
+            if owner == app || (owner == "" && app == "inbe") {
+                candidate: [1]sql.Argument = .[sql.TextArg(collection)]
+                status := sql.Execute(database, "INSERT INTO temp.mesh_replace_collections(name) VALUES(?1)", candidate[:])
+                if status != sqlite.SQLITE_OK { return status }
+            }
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    Replace :: (database: *void, user: string, requestedApp: string) -> s32 {
+        app := ifx requestedApp == "" then "inbe" else requestedApp
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        if app == "inbe" {
+            queries: [7]string = .[
+                "DELETE FROM server_session_rounds WHERE user_id_hash=?1",
+                "DELETE FROM server_sessions WHERE user_id_hash=?1",
+                "DELETE FROM server_habit_days WHERE user_id_hash=?1",
+                "DELETE FROM server_habits WHERE user_id_hash=?1",
+                "DELETE FROM server_meditation_logs WHERE user_id_hash=?1",
+                "DELETE FROM server_social_snapshots WHERE user_id_hash=?1",
+                "DELETE FROM server_encrypted_payloads WHERE user_id_hash=?1",
+            ]
+            for query: queries {
+                status := sql.Execute(database, query, arguments[:])
+                if status != sqlite.SQLITE_OK { return status }
+            }
+        }
+        status := sqlite.SqliteExecText(database, "CREATE TEMP TABLE mesh_replace_collections(name TEXT PRIMARY KEY) WITHOUT ROWID")
+        if status != sqlite.SQLITE_OK { return status }
+        status = StageCollections(database, user, app)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sql.Execute(database, "DELETE FROM server_encrypted_records WHERE user_id_hash=?1 AND collection IN (SELECT name FROM temp.mesh_replace_collections)", arguments[:])
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, "DROP TABLE temp.mesh_replace_collections")
+        if status != sqlite.SQLITE_OK { return status }
+        version := accounts.NextVersion(database, user)
+        return version.status
+    }
+
+    #scope_export
+    // The caller's transaction also owns bearer validation, snapshot
+    // selection, and any app-scoped encrypted records and operation log.
+    Apply :: (database: *void, user: string, app: string, document: *json.JsonDocument, request: *input.Request,
+        key: []u8, now: string) -> ApplyResult {
+        status: s32
+        if key.count > 0 {
+            status = accounts.Upsert(database, user, key, now)
+        } else {
+            status = accounts.Touch(database, user, now)
+        }
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        if request.full {
+            status = Replace(database, user, app)
+            if status != sqlite.SQLITE_OK { return .{status = status} }
+        }
+        result: ApplyResult
+        node := json.JsonFirst(document, request.meditations)
+        while node >= 0 {
+            decoded := input.ReadMeditation(document, node)
+            if !decoded.valid { return .{invalidJSON = true} }
+            meditation := decoded.row
+            meditation.ID = TextView(decoded.id)
+            meditation.SessionID = TextView(decoded.session)
+            meditation.CompletedAt = TextView(decoded.completed)
+            meditation.Timestamp = TextView(decoded.timestamp)
+            written := writes.Meditation(database, user, meditation, now)
+            if written.status != sqlite.SQLITE_OK { return .{status = written.status} }
+            result.applied.MeditationLogs += cast(isize)written.applied
+            node = json.JsonNext(document, node)
+        }
+        hasDeletedHabits := false
+        node = json.JsonFirst(document, request.habits)
+        while node >= 0 {
+            decoded := input.ReadHabit(document, node)
+            if !decoded.valid { return .{invalidJSON = true} }
+            original := TextView(decoded.id)
+            mapped := ids.ForWrite(database, user, original, "legacy-write")
+            if mapped.status != sqlite.SQLITE_OK { return .{status = mapped.status} }
+            canonical := TextView(VecSlice(mapped.value, 0, mapped.value.count))
+            habit := decoded.row
+            habit.ID = canonical
+            habit.Name = TextView(decoded.name)
+            habit.UpdatedAt = TextView(decoded.updatedAt)
+            if habit.DeletedAt > 0 {
+                if !hasDeletedHabits {
+                    status = sqlite.SqliteExecText(database, TemporaryDeletedHabits)
+                    if status != sqlite.SQLITE_OK { return .{status = status} }
+                    hasDeletedHabits = true
+                }
+                deleted: [2]sql.Argument = .[sql.TextArg(original), sql.TextArg(canonical)]
+                status = sql.Execute(database, MarkDeletedHabit, deleted[:])
+                if status != sqlite.SQLITE_OK { return .{status = status} }
+            }
+            if !request.bootstrap || habit.DeletedAt <= 0 {
+                written := writes.Habit(database, user, habit, now)
+                if written.status != sqlite.SQLITE_OK { return .{status = written.status} }
+                result.applied.Habits += cast(isize)written.applied
+            }
+            node = json.JsonNext(document, node)
+        }
+        node = json.JsonFirst(document, request.habitDays)
+        while node >= 0 {
+            decoded := input.ReadDay(document, node)
+            if !decoded.valid { return .{invalidJSON = true} }
+            original := TextView(decoded.id)
+            mapped := ids.ForWrite(database, user, original, "legacy-day-write")
+            if mapped.status != sqlite.SQLITE_OK { return .{status = mapped.status} }
+            canonical := TextView(VecSlice(mapped.value, 0, mapped.value.count))
+            if hasDeletedHabits {
+                lookup: [2]sql.Argument = .[sql.TextArg(original), sql.TextArg(canonical)]
+                deleted := sql.ReadInteger(database, DeletedHabits, lookup[:])
+                if deleted.status != sqlite.SQLITE_OK { return .{status = deleted.status} }
+                if deleted.value != 0 {
+                    node = json.JsonNext(document, node)
+                    continue
+                }
+            }
+            day := decoded.row
+            day.HabitID = canonical
+            day.UpdatedAt = TextView(decoded.updatedAt)
+            written := writes.HabitDay(database, user, day, now, false)
+            if written.status != sqlite.SQLITE_OK { return .{status = written.status} }
+            result.applied.HabitDays += cast(isize)written.applied
+            node = json.JsonNext(document, node)
+        }
+        if hasDeletedHabits {
+            status = sqlite.SqliteExecText(database, "DROP TABLE temp.mesh_deleted_habits")
+            if status != sqlite.SQLITE_OK { return .{status = status} }
+        }
+        node = json.JsonFirst(document, request.sessions)
+        while node >= 0 {
+            decoded := input.ReadSession(document, node)
+            if !decoded.valid { return .{invalidJSON = true} }
+            if !request.bootstrap || decoded.row.DeletedAt <= 0 {
+                written := writes.SessionInput(database, user, *decoded, now)
+                if written.status != sqlite.SQLITE_OK { return .{status = written.status} }
+                result.applied.Sessions += cast(isize)written.applied
+            }
+            node = json.JsonNext(document, node)
+        }
+        return result
+    }
+}

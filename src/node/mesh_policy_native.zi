@@ -1,0 +1,178 @@
+#if TARGET == .C && OS == .LINUX {
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    schema :: #import "trust_schema";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    text :: #import "std/text_tools";
+    unicode :: #import "std/unicode";
+    wire :: #import "wire_text";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    #scope_export
+    AllowsCollection :: (database: *void, filters: *json.JsonDocument, root: s32, collection: string) -> s32 {
+        list := json.JsonMember(filters, root, "collections")
+        if json.JsonCount(filters, list) > 0 {
+            matched := false
+            item := json.JsonFirst(filters, list)
+            while item >= 0 {
+                entry: Text = json.JsonString(filters, item)
+                pattern := wire.TrimSpace(TextView(entry))
+                if pattern != "" && (pattern == collection ||
+                    (text.TextHasSuffix(pattern, ".*") && text.TextHasPrefix(collection, pattern[:pattern.count - 1]))) {
+                    matched = true
+                    break
+                }
+                item = json.JsonNext(filters, item)
+            }
+            if !matched { return 0 }
+        }
+        apps := json.JsonMember(filters, root, "apps")
+        if json.JsonCount(filters, apps) == 0 { return 1 }
+        args: [1]sql.Argument = .[sql.TextArg(collection)]
+        row := sql.Prepare(database, schema.CollectionAppQuery, args[:])
+        if row.status != sqlite.SQLITE_OK { return -1 }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE { return 0 }
+        if status != sqlite.SQLITE_ROW { return -1 }
+        return ifx Includes(filters, apps, sql.ColumnText(row.value, 0), true) then 1 else 0
+    }
+
+    StringList :: (output: *json.JsonDocument, source: *json.JsonDocument, root: s32) -> s32 {
+        kind := json.JsonKindOf(source, root)
+        if kind == .Null { return json.JsonNewNull(output) }
+        if kind != .Array { return -1 }
+        result := json.JsonNewArray(output)
+        item := json.JsonFirst(source, root)
+        while item >= 0 {
+            kind = json.JsonKindOf(source, item)
+            if kind != .String && kind != .Null { return -1 }
+            value: Text = json.JsonString(source, item)
+            if !json.JsonAppend(output, result, json.JsonNewStringCopy(output, TextView(value))) { return -1 }
+            item = json.JsonNext(source, item)
+        }
+        return result
+    }
+
+    Policy :: (output: *json.JsonDocument, source: *json.JsonDocument, root: s32, direction: string = "") -> s32 {
+        names: [6]string = .["direction", "apps", "accounts", "collections", "spaces", "data"]
+        kinds: [6]json.JsonKind = .[.String, .Array, .Array, .Array, .Array, .Array]
+        nodes: [6]s32
+        if !fields.Read(source, root, names[:], kinds[:], nodes[:]) { return -1 }
+        result := json.JsonNewObject(output)
+        original: Text = json.JsonString(source, nodes[0])
+        selected := ifx direction == "" then TextView(original) else direction
+        if selected != "" && !json.JsonSet(output, result, "direction", json.JsonNewStringCopy(output, selected)) {
+            return -1
+        }
+        for index: 1..5 {
+            if json.JsonCount(source, nodes[index]) == 0 { continue }
+            if !json.JsonSet(output, result, names[index], StringList(output, source, nodes[index])) { return -1 }
+        }
+        return result
+    }
+
+    Direction :: (value: string) -> string {
+        input := wire.TrimSpace(value)
+        if wire.MatchesToken(input, "pull") || wire.MatchesToken(input, "receive") ||
+            wire.MatchesToken(input, "from_peer") || wire.MatchesToken(input, "from-peer") { return "pull" }
+        if wire.MatchesToken(input, "push") || wire.MatchesToken(input, "send") ||
+            wire.MatchesToken(input, "to_peer") || wire.MatchesToken(input, "to-peer") { return "push" }
+        if wire.MatchesToken(input, "bidirectional") || wire.MatchesToken(input, "both") ||
+            wire.MatchesToken(input, "mirror") || wire.MatchesToken(input, "readwrite") ||
+            wire.MatchesToken(input, "read-write") { return "bidirectional" }
+        return ""
+    }
+
+    ValidInbound :: (document: *json.JsonDocument, root: s32) -> bool {
+        accounts := json.JsonFirst(document, json.JsonMember(document, root, "accounts"))
+        while accounts >= 0 {
+            id: Text = json.JsonString(document, accounts)
+            if !identity.ValidUserID(TextView(id)) { return false }
+            accounts = json.JsonNext(document, accounts)
+        }
+        apps := json.JsonCount(document, json.JsonMember(document, root, "apps")) > 0
+        collections := json.JsonCount(document, json.JsonMember(document, root, "collections")) > 0
+        spaces := json.JsonCount(document, json.JsonMember(document, root, "spaces")) > 0
+        data := json.JsonFirst(document, json.JsonMember(document, root, "data"))
+        while data >= 0 {
+            value: Text = json.JsonString(document, data)
+            group := wire.TrimSpace(TextView(value))
+            if (apps || collections) && wire.MatchesToken(group, "encrypted_records") { return true }
+            if apps && wire.MatchesToken(group, "app_registry") { return true }
+            if spaces && wire.MatchesToken(group, "names") { return true }
+            data = json.JsonNext(document, data)
+        }
+        return false
+    }
+
+    Valid :: (document: *json.JsonDocument, root: s32) -> bool {
+        direction: Text = fields.StringField(document, root, "direction")
+        return Direction(TextView(direction)) != "" && ValidInbound(document, root)
+    }
+
+    Includes :: (document: *json.JsonDocument, list: s32, value: string, insensitive: bool) -> bool {
+        item := json.JsonFirst(document, list)
+        while item >= 0 {
+            candidate: Text = json.JsonString(document, item)
+            if insensitive {
+                if wire.MatchesToken(wire.TrimSpace(TextView(candidate)), value) { return true }
+            } else if TextView(candidate) == value { return true }
+            item = json.JsonNext(document, item)
+        }
+        return false
+    }
+
+    #scope_file
+    // In an approved filter, an omitted list means that field is unrestricted.
+    // In a request, omitting a restricted list would widen the export/import.
+    Subset :: (allowed: *json.JsonDocument, allowedList: s32, requested: *json.JsonDocument, requestedList: s32) -> bool {
+        if json.JsonCount(allowed, allowedList) == 0 { return true }
+        if json.JsonCount(requested, requestedList) == 0 { return false }
+        storage: Vec(u8)
+        offsets: Vec(s64)
+        item := json.JsonFirst(allowed, allowedList)
+        while item >= 0 {
+            value: Text = json.JsonString(allowed, item)
+            lower: Text = unicode.Lower(wire.TrimSpace(TextView(value)))
+            if !VecPush(offsets, storage.count) || !BuilderAppend(storage, TextView(lower)) { return false }
+            item = json.JsonNext(allowed, item)
+        }
+        if !VecPush(offsets, storage.count) { return false }
+        bytes := VecSlice(storage, 0, storage.count)
+        edges := VecSlice(offsets, 0, offsets.count)
+        entries: HashMap(string, bool)
+        defer HashMapFree(*entries)
+        index: s64 = 0
+        while index + 1 < edges.count {
+            HashMapSet(*entries, TextView(bytes[edges[index]:edges[index + 1]]), true)
+            index += 1
+        }
+        item = json.JsonFirst(requested, requestedList)
+        while item >= 0 {
+            value: Text = json.JsonString(requested, item)
+            lower: Text = unicode.Lower(wire.TrimSpace(TextView(value)))
+            if !HashMapHas(*entries, TextView(lower)) { return false }
+            item = json.JsonNext(requested, item)
+        }
+        return true
+    }
+
+    #scope_export
+    AllowsOperation :: (approved: *json.JsonDocument, approvedRoot: s32,
+        requested: *json.JsonDocument, requestedRoot: s32, exporting: bool) -> bool {
+        direction: Text = fields.StringField(approved, approvedRoot, "direction")
+        allowed := wire.TrimSpace(TextView(direction))
+        required := ifx exporting then "push" else "pull"
+        if !wire.MatchesToken(allowed, required) && !wire.MatchesToken(allowed, "bidirectional") { return false }
+        filters: [5]string = .["accounts", "apps", "collections", "spaces", "data"]
+        for filter: filters {
+            if !Subset(approved, json.JsonMember(approved, approvedRoot, filter),
+                requested, json.JsonMember(requested, requestedRoot, filter)) { return false }
+        }
+        return true
+    }
+}

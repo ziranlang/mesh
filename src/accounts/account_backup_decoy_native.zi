@@ -1,0 +1,100 @@
+#if TARGET == .C && OS == .LINUX {
+    rules :: #import "account_backup_rules";
+    bytes :: #import "std/byte_text_linux";
+    #import "std/hash_map"
+
+    #scope_file
+    c :: #system_library "c";
+    Allocate :: (count: usize) -> *void #foreign c "malloc";
+    Free :: (pointer: *void) #foreign c "free";
+    MaximumDecoys :: 65536;
+
+    #scope_export
+    Failure :: struct {
+        key: *u8
+        count: s64
+        lockedUntil: s64
+        lastFailure: s64
+    }
+
+    // The caller serializes decoy state with the account backup transaction.
+    Decoys :: struct {
+        entries: HashMap(string, Failure)
+        pruneAfter: s64
+    }
+
+    #scope_file
+    ClearSlot :: (store: *Decoys, slot: s64) {
+        Free(cast(*void)store.entries.values[slot].key)
+        store.entries.states[slot] = 2
+        store.entries.count -= 1
+        store.entries.removed += 1
+    }
+
+    Prune :: (store: *Decoys, now: s64) {
+        for slot: 0..store.entries.states.count - 1 {
+            if store.entries.states[slot] == 1 {
+                failure := store.entries.values[slot]
+                if failure.lockedUntil <= now && now - failure.lastFailure > rules.BackupLongestLockSeconds {
+                    ClearSlot(store, slot)
+                }
+            }
+        }
+    }
+
+    Save :: (store: *Decoys, key: string, slot: s64, count: s64, lockedUntil: s64, now: s64) -> bool {
+        if slot >= 0 {
+            entry := *store.entries.values[slot]
+            entry.count = count
+            entry.lockedUntil = lockedUntil
+            entry.lastFailure = now
+            return true
+        }
+        memory := cast(*u8)Allocate(cast(usize)key.count)
+        if memory == null { return false }
+        view := bytes.BytesFromPointer(memory, cast(u64)key.count)
+        for byte, index: key { view[index] = byte }
+        HashMapSet(*store.entries, TextView(view), Failure.{key = memory, count = count, lockedUntil = lockedUntil, lastFailure = now})
+        return true
+    }
+
+    #scope_export
+    Close :: (store: *Decoys) {
+        for slot: 0..store.entries.states.count - 1 {
+            if store.entries.states[slot] == 1 { Free(cast(*void)store.entries.values[slot].key) }
+        }
+        HashMapFree(*store.entries)
+    }
+
+    Forget :: (store: *Decoys, key: string) {
+        slot := HashMapFind(*store.entries, key)
+        if slot >= 0 { ClearSlot(store, slot) }
+    }
+
+    Keep :: (store: *Decoys, key: string, count: s64, lockedUntil: s64, now: s64) {
+        if count == 0 && lockedUntil <= now { return }
+        unused Save(store, key, HashMapFind(*store.entries, key), count, lockedUntil, now)
+    }
+
+    // A positive result is the number of seconds left on an existing lock.
+    RecordFailure :: (store: *Decoys, key: string, now: s64) -> s64 {
+        slot := HashMapFind(*store.entries, key)
+        count: s64 = 1
+        if slot >= 0 {
+            entry := store.entries.values[slot]
+            if entry.lockedUntil > now { return entry.lockedUntil - now }
+            count = entry.count + 1
+        } else if store.entries.count >= MaximumDecoys {
+            if store.pruneAfter <= now {
+                Prune(store, now)
+                store.pruneAfter = now + 1
+            }
+            if store.entries.count >= MaximumDecoys { return rules.BackupFirstLockSeconds }
+        }
+        lock := rules.BackupLockSeconds(count)
+        if !Save(store, key, slot, count, ifx lock > 0 then now + lock else 0, now) {
+            return rules.BackupFirstLockSeconds
+        }
+        return 0
+    }
+}

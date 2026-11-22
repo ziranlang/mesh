@@ -8,6 +8,7 @@ identity :: #import "identity";
 codec :: #import "codec";
 signing :: #import "signing";
 transaction :: #import "transaction";
+queries :: #import "signed_tx_queries";
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
 http :: #import "std/http_go";
@@ -21,8 +22,6 @@ go_sql :: #system_library "go:database/sql";
 go_strings :: #system_library "go:strings";
 
 TransactionContext :: "daochi-tx-v1";
-AppManifestContext :: "daochi-app-manifest-v1";
-AppApprovalContext :: "daochi-app-approval-v1";
 MaxFutureSkew :: 900000000000;
 SignedHeaderResult :: struct {
     value: SignedTxEnvelope
@@ -156,11 +155,11 @@ VerifyDevice :: (database: *sql.Database, context: ctx.Context, tx: SignedTxEnve
 }
 
 Record :: (database: *sql.Database, context: ctx.Context, tx: SignedTxEnvelope, replay: Error) -> Error {
-    deleted := DeleteExpired(database, context, "DELETE FROM server_signed_transactions WHERE expires_at<?1", clock.Unix(clock.Now()))
+    deleted := DeleteExpired(database, context, queries.DeleteExpiredSignedTransactionsSQL, clock.Unix(clock.Now()))
     if deleted.error != null {
         return deleted.error
     }
-    inserted := Insert(database, context, "INSERT INTO server_signed_transactions(account_id,tx_id,app_id,nonce,expires_at) VALUES(?1,?2,?3,?4,?5)", tx.accountID, tx.txID, tx.appID, tx.nonce, tx.expiresAt)
+    inserted := Insert(database, context, queries.InsertSignedTransactionSQL, tx.accountID, tx.txID, tx.appID, tx.nonce, tx.expiresAt)
     if inserted.error != null && Contains(errors.Message(inserted.error), "UNIQUE") {
         return replay
     }
@@ -168,5 +167,5 @@ Record :: (database: *sql.Database, context: ctx.Context, tx: SignedTxEnvelope, 
 }
 
 Forget :: (database: *sql.Database, context: ctx.Context, tx: SignedTxEnvelope) {
-    Delete(database, context, "DELETE FROM server_signed_transactions WHERE account_id=?1 AND tx_id=?2 AND app_id=?3 AND nonce=?4", tx.accountID, tx.txID, tx.appID, tx.nonce)
+    Delete(database, context, queries.DeleteSignedTransactionSQL, tx.accountID, tx.txID, tx.appID, tx.nonce)
 }

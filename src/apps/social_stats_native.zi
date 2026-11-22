@@ -1,0 +1,255 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    queries :: #import "social_stats_queries";
+    store :: #import "social_store_native";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    json :: #import "std/json_document";
+    numbers :: #import "std/float_text";
+    #import "std/vec"
+
+    #scope_file
+    GameMetric :: (metric: string) -> bool {
+        return metric == "achievements" || metric == "levels" || metric == "level" || metric == "score"
+    }
+
+    Activity :: (practice: string) -> s64 {
+        names: [7]string = .["whm", "meditation", "sun_salutation", "patterns", "tai_chi", "astral_projection", "workout"]
+        for name, index: names {
+            if practice == name {
+                return index
+            }
+        }
+        return -1
+    }
+
+    OptionalText :: (document: *json.JsonDocument, root: s32, name: string, value: string) -> bool {
+        return value == "" || store.TextField(document, root, name, value)
+    }
+
+    OptionalInteger :: (document: *json.JsonDocument, root: s32, name: string, value: s64) -> bool {
+        return value == 0 || json.JsonSet(document, root, name, json.JsonNewInteger(document, value))
+    }
+
+    FloatField :: (document: *json.JsonDocument, root: s32, value: float64) -> bool {
+        encoded: Text = numbers.Float64Repr(value)
+        parsed: json.JsonDocument
+        return json.JsonRead(*parsed, TextView(encoded)) && json.JsonKindOf(*parsed, parsed.root) == .Number &&
+            json.JsonSet(document, root, "value", json.JsonCopy(document, *parsed, parsed.root))
+    }
+
+    Metric :: struct {
+        practice: s32
+        name: s32
+        label: s32
+        localDate: s64
+        value: float64
+        valid: bool
+    }
+
+    MaxMetrics :: 100;
+
+    Profile :: struct {
+        app: s32
+        metrics: [MaxMetrics]Metric
+        count: s32
+        valid: bool
+    }
+
+    ReadMetric :: (document: *json.JsonDocument, node: s32) -> Metric {
+        result: Metric
+        // The generic field decoder treats every numeric field as an integer.
+        // Parse value separately so fractional statistics can be stored exactly.
+        names: [5]string = .["practice", "metric", "label", "local_date", "value"]
+        expected: [5]json.JsonKind = .[.String, .String, .String, .Number, .Number]
+        kind := json.JsonKindOf(document, node)
+        if kind != .Object && kind != .Null {
+            return .{}
+        }
+        nodes: [5]s32 = .[-1, -1, -1, -1, -1]
+        child := json.JsonFirst(document, node)
+        while child >= 0 {
+            kind = json.JsonKindOf(document, child)
+            if kind != .Null {
+                key: Text = json.JsonKey(document, child)
+                for name, index: names {
+                    if !wire.MatchesToken(TextView(key), name) {
+                        continue
+                    }
+                    if kind != expected[index] {
+                        return .{}
+                    }
+                    if index == 3 {
+                        localDate, valid := json.JsonInteger(document, child)
+                        if !valid {
+                            return .{}
+                        }
+                        result.localDate = localDate
+                    }
+                    if index == 4 {
+                        source: Text = json.JsonNumberText(document, child)
+                        value, valid := numbers.ParseFloat64(TextView(source))
+                        maximum: float64 = 1.7976931348623157e308
+                        if !valid || value > maximum || value < -maximum {
+                            return .{}
+                        }
+                        result.value = value
+                    }
+                    nodes[index] = child
+                    break
+                }
+            }
+            child = json.JsonNext(document, child)
+        }
+        result.practice = nodes[0]
+        result.name = nodes[1]
+        result.label = nodes[2]
+        result.valid = true
+        return result
+    }
+
+    ReadProfile :: (document: *json.JsonDocument) -> Profile {
+        root := json.JsonKindOf(document, document.root)
+        if root != .Object && root != .Null {
+            return .{}
+        }
+        result: Profile = .{app = -1, valid = true}
+        field := json.JsonFirst(document, document.root)
+        while field >= 0 {
+            key: Text = json.JsonKey(document, field)
+            kind := json.JsonKindOf(document, field)
+            if wire.MatchesToken(TextView(key), "app") && kind != .Null {
+                if kind != .String {
+                    return .{}
+                }
+                result.app = field
+            }
+            if wire.MatchesToken(TextView(key), "metrics") {
+                if kind != .Array && kind != .Null {
+                    return .{}
+                }
+                result.count = 0
+                item := json.JsonFirst(document, field)
+                while item >= 0 {
+                    metric := ReadMetric(document, item)
+                    if !metric.valid {
+                        return .{}
+                    }
+                    if result.count < MaxMetrics {
+                        result.metrics[result.count] = metric
+                    }
+                    result.count += 1
+                    item = json.JsonNext(document, item)
+                }
+            }
+            field = json.JsonNext(document, field)
+        }
+        return result
+    }
+
+    #scope_export
+    ValidQuery :: (app: string, practice: string, metric: string) -> bool {
+        return identity.ValidNamespace(app) && identity.ValidNamespace(practice) && identity.ValidNamespace(metric) &&
+            (GameMetric(metric) || (metric == "streak" && Activity(practice) >= 0) ||
+             (metric == "avg_hold" && practice == "whm") || (metric == "avg_time" && practice == "meditation"))
+    }
+
+    Write :: (database: *void, user: string, now: string, body: []u8, response: *json.JsonDocument) -> store.Result {
+        invalid := store.Fail(400, "invalid json")
+        failure := store.Fail(500, "profile stats failed")
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(body)) {
+            return invalid
+        }
+        input := ReadProfile(*document)
+        if !input.valid {
+            return invalid
+        }
+        appText: Text = json.JsonString(*document, input.app)
+        app := wire.TrimSpace(TextView(appText))
+        if !identity.ValidNamespace(app) {
+            return store.Fail(400, "invalid app")
+        }
+        if input.count > MaxMetrics {
+            return store.Fail(400, "too many metrics")
+        }
+        for metric: input.metrics[:input.count] {
+            practice: Text = json.JsonString(*document, metric.practice)
+            name: Text = json.JsonString(*document, metric.name)
+            if !identity.ValidNamespace(wire.TrimSpace(TextView(practice))) ||
+                !identity.ValidNamespace(wire.TrimSpace(TextView(name))) {
+                return store.Fail(400, "invalid metric")
+            }
+        }
+        applied: s64 = 0
+        for metric: input.metrics[:input.count] {
+            practice: Text = json.JsonString(*document, metric.practice)
+            name: Text = json.JsonString(*document, metric.name)
+            label: Text = json.JsonString(*document, metric.label)
+            arguments: [7]sql.Argument = .[sql.TextArg(user), sql.TextArg(app), sql.TextArg(wire.TrimSpace(TextView(practice))),
+                sql.TextArg(wire.TrimSpace(TextView(name))), sql.TextArg(wire.TrimSpace(TextView(label))),
+                sql.IntArg(metric.localDate), sql.TextArg(now)]
+            prepared := sql.Prepare(database, queries.UpsertProfile, arguments[:])
+            if prepared.status != sqlite.SQLITE_OK {
+                return failure
+            }
+            bound := sqlite.SqliteBindDouble(prepared.value, 8, metric.value)
+            step := ifx bound == sqlite.SQLITE_OK then sqlite.SqliteStep(prepared.value) else bound
+            finished := sqlite.SqliteFinalize(prepared.value)
+            if step != sqlite.SQLITE_DONE || finished != sqlite.SQLITE_OK {
+                return failure
+            }
+            applied += cast(s64)sqlite.SqliteChanges(database)
+        }
+        root := json.JsonNewObject(response)
+        if !store.TextField(response, root, "status", "ok") ||
+            !json.JsonSet(response, root, "applied", json.JsonNewInteger(response, applied)) {
+            return failure
+        }
+        return .{status = 200, node = root, notifyFriends = applied > 0}
+    }
+
+    Board :: (database: *void, user: string, app: string, practice: string, metric: string, now: string,
+        response: *json.JsonDocument) -> store.Result {
+        failed := store.Fail(500, "friend stats failed")
+        game := GameMetric(metric)
+        arguments: [6]sql.Argument = .[sql.TextArg(user), sql.TextArg(app), sql.TextArg(practice), sql.TextArg(metric),
+            sql.TextArg(now), sql.IntArg(Activity(practice))]
+        if !game && sql.Execute(database, queries.RefreshPractice, arguments[:]) != sqlite.SQLITE_OK {
+            return failed
+        }
+        arguments[5] = sql.IntArg(ifx game then 1 else 0)
+        selected := sql.Prepare(database, queries.ReadBoard, arguments[:])
+        if selected.status != sqlite.SQLITE_OK {
+            return failed
+        }
+        defer sqlite.SqliteFinalize(selected.value)
+        root := json.JsonNewObject(response)
+        rows := json.JsonNewArray(response)
+        if !json.JsonSet(response, root, "rows", rows) {
+            return failed
+        }
+        step := sqlite.SqliteStep(selected.value)
+        while step == sqlite.SQLITE_ROW {
+            statement := selected.value
+            row := json.JsonNewObject(response)
+            if !store.TextField(response, row, "user_id_hash", sql.ColumnText(statement, 0)) ||
+                !OptionalText(response, row, "alias", sql.ColumnText(statement, 1)) ||
+                !OptionalInteger(response, row, "profile_icon", sqlite.SqliteColumnInt64(statement, 2)) ||
+                !OptionalInteger(response, row, "game_icon", sqlite.SqliteColumnInt64(statement, 3)) ||
+                !store.TextField(response, row, "app", app) || !store.TextField(response, row, "practice", practice) ||
+                !store.TextField(response, row, "metric", metric) || !FloatField(response, row, sqlite.SqliteColumnDouble(statement, 4)) ||
+                !OptionalText(response, row, "label", sql.ColumnText(statement, 5)) ||
+                !OptionalInteger(response, row, "local_date", sqlite.SqliteColumnInt64(statement, 6)) ||
+                !store.TextField(response, row, "updated_at", sql.ColumnText(statement, 7)) || !json.JsonAppend(response, rows, row) {
+                return failed
+            }
+            step = sqlite.SqliteStep(statement)
+        }
+        if step != sqlite.SQLITE_DONE {
+            return failed
+        }
+        return .{status = 200, node = root}
+    }
+}

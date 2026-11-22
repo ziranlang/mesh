@@ -1,0 +1,9 @@
+MaxBytes :: 16777216;
+
+ValidHash :: (hash: string) -> bool {
+    if hash.count != 64 { return false }
+    for byte: hash {
+        if !(byte >= #char "0" && byte <= #char "9") && !(byte >= #char "a" && byte <= #char "f") { return false }
+    }
+    return true
+}

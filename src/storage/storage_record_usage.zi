@@ -1,28 +1,33 @@
 // Basic tracking is free for every account. Opaque custom content stays
 // charged until it is deleted: a deleted record keeps no content.
-strings :: #system_library "go:strings";
+fragments :: #import "sql_fragments";
+#import "std/vec"
 
 #scope_file
-Join :: (values: []string, separator: string) -> string #foreign strings;
-
-#scope_export
 BasicCollectionsSQL :: "'inbe.habits','inbe.habit_days','private.inbe.v1.habits','private.inbe.v1.habit-days','private.inbe.v1.habit-settings','private.inbe.v1.habit-changes','private.inbe.v1.habit-rewards','private.inbe.v1.habit-coins','private.inbe.v1.app-preferences','private.inbe.v1.app-order','private.inbe.v1.app-installs','private.inbe.v1.achievements','private.entity.v1.game-progress','private.entity.v1.profile'"
 MixedCollectionsSQL :: "'inbe.sessions','private.inbe.v1.sessions','private.inbe.v1.habit-entries'"
 
-RecordSizeSQL :: () -> string {
-    parts: [5]string = .[
-    "CASE WHEN ROW.deleted_at<>0 THEN 0 WHEN ROW.collection IN (", BasicCollectionsSQL,
-    ") THEN 0 ELSE MAX(0,LENGTH(ROW.collection)+LENGTH(ROW.id)+LENGTH(ROW.key_id)+LENGTH(ROW.nonce)+LENGTH(ROW.ciphertext)+LENGTH(ROW.content_hash)+LENGTH(ROW.parent_id)-CASE WHEN ROW.collection IN (",
-    MixedCollectionsSQL,
-    ") THEN MIN(524288,MAX(0,ROW.free_bytes)) ELSE 0 END) END"
+#scope_export
+RecordSizeSQL :: () -> Vec(u8) {
+    replacements: [2]fragments.Replacement = .[
+        .{marker = "BASIC", value = BasicCollectionsSQL},
+        .{marker = "MIXED", value = MixedCollectionsSQL}
     ]
-    return Join(parts[:], "")
+    output: Vec(u8)
+    template := "CASE WHEN ROW.deleted_at<>0 THEN 0 WHEN ROW.collection IN (BASIC) THEN 0 ELSE MAX(0,LENGTH(ROW.collection)+LENGTH(ROW.id)+LENGTH(ROW.key_id)+LENGTH(ROW.nonce)+LENGTH(ROW.ciphertext)+LENGTH(ROW.content_hash)+LENGTH(ROW.parent_id)-CASE WHEN ROW.collection IN (MIXED) THEN MIN(524288,MAX(0,ROW.free_bytes)) ELSE 0 END) END"
+    if !fragments.Append(*output, template, replacements[:]) { return .{} }
+    return output
 }
 
 // A packed copy must not reintroduce a charge for free fields. Custom notes
 // are already charged in the authoritative record, rather than twice.
-PackingSizeSQL :: () -> string {
-    parts: [5]string = .["CASE WHEN ROW.collection IN (", BasicCollectionsSQL,
-    ",", MixedCollectionsSQL, ") THEN 0 ELSE LENGTH(ROW.nonce)+LENGTH(ROW.ciphertext) END"]
-    return Join(parts[:], "")
+PackingSizeSQL :: () -> Vec(u8) {
+    replacements: [2]fragments.Replacement = .[
+        .{marker = "BASIC", value = BasicCollectionsSQL},
+        .{marker = "MIXED", value = MixedCollectionsSQL}
+    ]
+    output: Vec(u8)
+    template := "CASE WHEN ROW.collection IN (BASIC,MIXED) THEN 0 ELSE LENGTH(ROW.nonce)+LENGTH(ROW.ciphertext) END"
+    if !fragments.Append(*output, template, replacements[:]) { return .{} }
+    return output
 }

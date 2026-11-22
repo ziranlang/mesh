@@ -1,0 +1,238 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sha :: #import "crypto/sha256";
+    wire :: #import "token_wire";
+    signing :: #import "token_hmac_native";
+    payload_rules :: #import "token_payload";
+    identity :: #import "identity";
+    binary :: #import "binary_codec";
+    random :: #import "std/random_linux";
+    queries :: #import "auth_session_queries";
+    times :: #import "timestamp_value";
+    statements :: #import "sqlite_statement_native";
+    #import "std/vec"
+
+    SessionStatus :: struct {
+        active: bool
+        bootstrap: bool
+        accountMissing: bool
+        userID: [64]u8
+        databaseError: s32
+    }
+
+    IssuedSession :: struct {
+        token: Vec(u8)
+        error: string
+        databaseError: s32
+    }
+
+    #scope_file
+    Hash :: (bearer: string) -> [65]u8 {
+        digest := sha.Sha256Of(bearer)
+        hash: [65]u8
+        unused sha.BytesToHex(*digest[0], digest.count, *hash[0], hash.count)
+        return hash
+    }
+
+    BooleanQuery :: (database: *void, query: string, arguments: []statements.Argument) -> SessionStatus {
+        result := statements.ReadInteger(database, query, arguments)
+        if result.status != sqlite.SQLITE_OK { return .{databaseError = result.status} }
+        if !result.found { return .{databaseError = sqlite.SQLITE_DONE} }
+        return .{active = result.value != 0}
+    }
+
+    ActiveQuery :: (database: *void, userID: string, hash: string, now: s64) -> SessionStatus {
+        arguments: [3]statements.Argument = .[statements.TextArg(hash), statements.TextArg(userID), statements.IntArg(now)]
+        return BooleanQuery(database, queries.Active, arguments[:])
+    }
+
+    LegacyTime :: struct {
+        timestamp: times.TimestampValue
+        found: bool
+        status: s32
+    }
+
+    ReadTime :: (database: *void, query: string, name: string) -> LegacyTime {
+        arguments: [1]statements.Argument = .[statements.TextArg(name)]
+        statement := statements.Prepare(database, query, arguments[:])
+        if statement.status != sqlite.SQLITE_OK { return .{status = statement.status} }
+        defer sqlite.SqliteFinalize(statement.value)
+        status := sqlite.SqliteStep(statement.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        timestamp := times.Parse(statements.ColumnText(statement.value, 0))
+        if !timestamp.valid { return .{status = sqlite.SQLITE_MISUSE} }
+        return .{found = true, timestamp = timestamp}
+    }
+
+    Exists :: (database: *void, query: string, userID: string) -> SessionStatus {
+        arguments: [1]statements.Argument = .[statements.TextArg(userID)]
+        return BooleanQuery(database, query, arguments[:])
+    }
+
+    InsertSession :: (database: *void, metadata: payload_rules.AuthTokenMetadata,
+        hash: string, sessionID: string, clientID: string, createdAt: string) -> s32 {
+        arguments: [7]statements.Argument = .[statements.TextArg(hash), statements.TextArg(metadata.userID),
+            statements.TextArg(sessionID), statements.TextArg(clientID), statements.IntArg(metadata.issuedAt),
+            statements.IntArg(metadata.expiresAt), statements.TextArg(createdAt)]
+        return statements.Execute(database, queries.Insert, arguments[:])
+    }
+
+    Legacy :: (database: *void, metadata: payload_rules.AuthTokenMetadata,
+        hash: string, now: s64, createdAt: string, allowBootstrap: bool) -> SessionStatus {
+        deadline := ReadTime(database, queries.Setting, "legacy_v1_deadline")
+        if deadline.status != sqlite.SQLITE_OK { return .{databaseError = deadline.status} }
+        if !deadline.found { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        if now > deadline.timestamp.seconds { return .{} }
+        start := ReadTime(database, queries.Setting, "legacy_v1_started")
+        if start.status != sqlite.SQLITE_OK { return .{databaseError = start.status} }
+        if !start.found { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        account := ReadTime(database, queries.AccountCreated, metadata.userID)
+        if account.status != sqlite.SQLITE_OK { return .{databaseError = account.status} }
+        revocation := Exists(database, queries.LegacyRevoked, metadata.userID)
+        if revocation.databaseError != sqlite.SQLITE_OK { return revocation }
+        if revocation.active { return .{} }
+        if !account.found {
+            if !allowBootstrap { return .{} }
+            deleted := Exists(database, queries.AccountTombstoned, metadata.userID)
+            if deleted.databaseError != sqlite.SQLITE_OK { return deleted }
+            if deleted.active { return .{} }
+            return .{active = true, bootstrap = true}
+        }
+        if !times.Before(account.timestamp, start.timestamp) { return .{} }
+        existing := ActiveQuery(database, metadata.userID, hash, now)
+        if existing.databaseError != sqlite.SQLITE_OK || existing.active { return existing }
+        status := InsertSession(database, metadata, hash, hash, "", createdAt)
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        return ActiveQuery(database, metadata.userID, hash, now)
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    AuthorizeLegacy :: (database: *void, metadata: payload_rules.AuthTokenMetadata,
+        key: string, now: s64, createdAt: string, allowBootstrap: bool) -> SessionStatus {
+        if createdAt == "" || !sqlite.SqliteGetAutocommit(database) {
+            return .{databaseError = sqlite.SQLITE_MISUSE}
+        }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        defer RollbackIfActive(database)
+        result := Legacy(database, metadata, key, now, createdAt, allowBootstrap)
+        if result.databaseError != sqlite.SQLITE_OK { return result }
+        status = sqlite.SqliteExecText(database, "COMMIT")
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        return result
+    }
+
+    #scope_export
+    // Keep the original migration start and deadline on repeated startup.
+    Initialize :: (database: *void, deadline: string) -> s32 {
+        if database == null || !times.Parse(deadline).valid { return sqlite.SQLITE_MISUSE }
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        status = sqlite.SqliteExecText(database, queries.Schema)
+        if status != sqlite.SQLITE_OK { return status }
+        started: [1]statements.Argument = .[statements.TextArg("legacy_v1_started")]
+        status = statements.Execute(database, queries.InitializeStarted, started[:])
+        if status != sqlite.SQLITE_OK { return status }
+        ending: [2]statements.Argument = .[statements.TextArg("legacy_v1_deadline"), statements.TextArg(deadline)]
+        status = statements.Execute(database, queries.InitializeDeadline, ending[:])
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    // Issue only after authenticating the account. The caller may group the
+    // session record with device and account writes in the same transaction.
+    Issue :: (database: *void, secret: []u8, userID: string, clientID: string,
+        issuedAt: s64, expiresAt: s64, createdAt: string) -> IssuedSession {
+        if database == null { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        if secret.count == 0 || !identity.ValidUserID(userID) || !identity.ValidClientID(clientID) ||
+            expiresAt < issuedAt || !times.Parse(createdAt).valid {
+            return .{error = "invalid token input"}
+        }
+        entropy: [32]u8
+        if !random.FillSecure(entropy[:]) { return .{error = "secure session allocation failed"} }
+        formatted := payload_rules.FormatV2(userID, expiresAt, issuedAt, entropy)
+        if formatted.count == 0 { return .{error = "invalid token input"} }
+        payload := TextView(formatted.bytes[:formatted.count])
+        metadata := payload_rules.Parse(payload)
+        if metadata.error != "" { return .{error = "invalid token input"} }
+        signed := wire.Sign(secret, payload, signing.Compute)
+        if signed.error != "" { return .{error = "token signing failed"} }
+        token := signed.value
+        digest := Hash(TextView(VecSlice(token, 0, token.count)))
+        status := InsertSession(database, metadata.value, TextView(digest[:64]), metadata.value.sessionID, clientID, createdAt)
+        if status != sqlite.SQLITE_OK { return .{databaseError = status} }
+        if sqlite.SqliteChanges(database) != 1 { return .{databaseError = sqlite.SQLITE_DONE} }
+        return .{token = token}
+    }
+
+    RevokeBearer :: (database: *void, userID: string, bearer: string) -> s32 {
+        if database == null { return sqlite.SQLITE_MISUSE }
+        digest := Hash(bearer)
+        arguments: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(TextView(digest[:64]))]
+        status := statements.Execute(database, queries.RevokeBearer, arguments[:])
+        if status == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 0 { return sqlite.SQLITE_DONE }
+        return status
+    }
+
+    RevokeSession :: (database: *void, userID: string, sessionID: string) -> s32 {
+        if database == null || sessionID.count != 64 || !binary.IsHex(sessionID) { return sqlite.SQLITE_MISUSE }
+        arguments: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(sessionID)]
+        status := statements.Execute(database, queries.RevokeSession, arguments[:])
+        if status == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 0 { return sqlite.SQLITE_DONE }
+        return status
+    }
+
+    RevokeDevice :: (database: *void, userID: string, clientID: string) -> s32 {
+        if database == null || sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(clientID)]
+        return statements.Execute(database, queries.RevokeDevice, arguments[:])
+    }
+
+    RevokeLegacy :: (database: *void, userID: string, now: string) -> s32 {
+        if database == null || sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        arguments: [2]statements.Argument = .[statements.TextArg(userID), statements.TextArg(now)]
+        return statements.Execute(database, queries.RevokeLegacy, arguments[:])
+    }
+
+    // The caller holds this connection exclusively. An empty userID uses the
+    // authenticated identity from the token. Pass a canonical audit timestamp
+    // for legacy sessions and enable bootstrap only on an eligible sync route.
+    Authorize :: (database: *void, secret: []u8, bearer: string, userID: string,
+        now: s64, createdAt: string, allowBootstrap: bool) -> SessionStatus {
+        payload := wire.Verify(secret, bearer, signing.Compute)
+        if payload.error != "" { return .{} }
+        bytes := payload.value
+        parsed := payload_rules.Parse(TextView(VecSlice(bytes, 0, bytes.count)))
+        account := parsed.value.userID
+        if parsed.error != "" || (userID != "" && account != userID) || now > parsed.value.expiresAt { return .{} }
+        if database == null { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        found := Exists(database, queries.AccountExists, account)
+        if found.databaseError != sqlite.SQLITE_OK { return found }
+        if !found.active {
+            if !allowBootstrap { return .{accountMissing = true} }
+            deleted := Exists(database, queries.AccountTombstoned, account)
+            if deleted.databaseError != sqlite.SQLITE_OK { return deleted }
+            if deleted.active { return .{accountMissing = true} }
+            if parsed.value.version == "v2" { return .{} }
+        }
+        hash := Hash(bearer)
+        key := TextView(hash[:64])
+        result: SessionStatus
+        if parsed.value.version == "v2" {
+            result = ActiveQuery(database, account, key, now)
+        } else {
+            result = AuthorizeLegacy(database, parsed.value, key, now, createdAt, allowBootstrap)
+        }
+        if result.active {
+            for index: 0..63 { result.userID[index] = account[index] }
+        }
+        return result
+    }
+}

@@ -1,0 +1,296 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    backup :: #import "account_backup_store_native";
+    calendar :: #import "std/date_time_linux";
+    hmac :: #import "token_hmac_native";
+    http :: #import "http_server_native";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    oidc :: #import "account_google_oidc_native";
+    oqs :: #import "oqs/Oqs";
+    recovery :: #import "account_recovery_http_native";
+    replies :: #import "http_json_native";
+    secure :: #import "std/constant_time";
+    sha :: #import "crypto/sha256";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    strict :: #import "strict_json_native";
+    #import "std/vec"
+
+    MaxRequestBytes :: oidc.MaxTokenBytes;
+
+    State :: struct {
+        clientIDs: Vec(u8)
+        certificates: oidc.Certificates
+    }
+
+    #scope_file
+    MethodsPath :: "/api/v1/account-backup/methods";
+    LookupPath :: "/api/v1/account-backup/google";
+    LinkPath :: "/api/v1/account/google";
+    UnlinkPath :: "/api/v1/account/google/remove";
+    Disabled :: "sign in with google is not set up on this node";
+    InvalidRequest :: "invalid google token";
+    BadToken :: "google token not accepted";
+    Unavailable :: "account google unavailable";
+    NotLinked :: "no account linked";
+    Conflict :: "google account linked to another account";
+
+    LinkSQL :: #string SQL
+INSERT INTO server_account_google(subject_hash,user_id_hash,created_at)
+SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?2)
+ON CONFLICT(user_id_hash) DO UPDATE SET subject_hash=excluded.subject_hash,created_at=excluded.created_at
+SQL;
+
+    LookupSQL :: #string SQL
+SELECT link.user_id_hash FROM server_account_google link
+JOIN server_users account ON account.user_id_hash=link.user_id_hash WHERE link.subject_hash=?1
+SQL;
+
+    SubjectHash :: (database: *void, subject: string, output: []u8) -> bool {
+        secret: [32]u8
+        defer oqs.Cleanse(secret[:])
+        if backup.NodeSecret(database, secret[:]) != sqlite.SQLITE_OK {
+            return false
+        }
+        message: Vec(u8)
+        if !BuilderAppend(message, "account-google-subject\n") || !BuilderAppend(message, subject) {
+            return false
+        }
+        // Legacy links store the 32 digest bytes verbatim in SQLite TEXT.
+        return hmac.Compute(secret[:], TextView(VecSlice(message, 0, message.count)), output)
+    }
+
+    NonceMatches :: (account: string, proof: string) -> bool {
+        message: Vec(u8)
+        if !BuilderAppend(message, "waozi-google-link-v1\n") || !BuilderAppend(message, account) {
+            return false
+        }
+        digest := sha.Sha256Of(TextView(VecSlice(message, 0, message.count)))
+        expected: [65]u8
+        return sha.BytesToHex(*digest[0], digest.count, *expected[0], expected.count) == 1 &&
+            secure.ConstantTimeTextEqual(proof, TextView(expected[:64]))
+    }
+
+    TextReply :: (connection: *void, key: string, value: string) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, key, json.JsonNewString(*document, value)) {
+            return 0
+        }
+        return recovery.Reply(connection, 200, *document, root)
+    }
+
+    Methods :: (first: string, connection: *void, method: string, zstd: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if first != "" && !json.JsonSet(*document, root, "google_client_id", json.JsonNewString(*document, first)) {
+            return 0
+        }
+        return replies.Reply(connection, method, 200, *document, root, zstd)
+    }
+
+    Limited :: (connection: *void) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "error", json.JsonNewString(*document, "too many attempts")) {
+            return 0
+        }
+        return recovery.Reply(connection, 429, *document, root, 60)
+    }
+
+    Lookup :: (database: *void, connection: *void, subject: string) -> s32 {
+        digest: [32]u8
+        defer oqs.Cleanse(digest[:])
+        if !SubjectHash(database, subject, digest[:]) {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        args: [1]sql.Argument = .[sql.TextArg(TextView(digest[:]))]
+        row := sql.Prepare(database, LookupSQL, args[:])
+        if row.status != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        step := sqlite.SqliteStep(row.value)
+        if step == sqlite.SQLITE_DONE {
+            return recovery.ErrorReply(connection, 404, NotLinked)
+        }
+        if step != sqlite.SQLITE_ROW {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        account := sql.ColumnText(row.value, 0)
+        if !identity.ValidUserID(account) {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        return TextReply(connection, "account_id", account)
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    Link :: (database: *void, connection: *void, account: string, subject: string, nonce: string, now: s64) -> s32 {
+        if !NonceMatches(account, nonce) {
+            return recovery.ErrorReply(connection, 401, BadToken)
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        defer Rollback(database)
+        digest: [32]u8
+        defer oqs.Cleanse(digest[:])
+        if !SubjectHash(database, subject, digest[:]) {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        args: [3]sql.Argument = .[sql.TextArg(TextView(digest[:])), sql.TextArg(account), sql.IntArg(now)]
+        existing := sql.ReadInteger(database, "SELECT 1 FROM server_account_google WHERE subject_hash=?1 AND user_id_hash<>?2", args[:2])
+        if existing.status != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        if existing.found {
+            return recovery.ErrorReply(connection, 409, Conflict)
+        }
+        if sql.Execute(database, LinkSQL, args[:]) != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return recovery.ErrorReply(connection, 401, "sync account not found")
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        return recovery.BooleanReply(connection, "linked", true)
+    }
+
+    LinkState :: (database: *void, connection: *void, account: string, unlink: bool) -> s32 {
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        if !unlink {
+            linked := sql.ReadInteger(database, "SELECT 1 FROM server_account_google WHERE user_id_hash=?1", args[:])
+            if linked.status != sqlite.SQLITE_OK {
+                return recovery.ErrorReply(connection, 500, Unavailable)
+            }
+            return recovery.BooleanReply(connection, "linked", linked.found)
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        defer Rollback(database)
+        if sql.Execute(database, "DELETE FROM server_account_google WHERE user_id_hash=?1", args[:]) != sqlite.SQLITE_OK ||
+            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        return recovery.BooleanReply(connection, "linked", false)
+    }
+
+    // Reject unauthenticated linking before contacting the provider. The
+    // mutation checks the bearer again after proof verification and under the
+    // database mutex, so revocation during a certificate fetch takes effect.
+    BeforeLink :: (access: *accounts.AccountAccess, connection: *void) -> auth.BearerAuthentication {
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || !mutex.Lock(*access.databaseLock) {
+            return .{status = 500, message = Unavailable}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        return auth.Authenticate(access.configuration.database, connection, access.configuration.secret, now, "", false)
+    }
+
+    Apply :: (access: *accounts.AccountAccess, connection: *void, path: string, withProof: bool, subject: string, nonce: string) -> s32 {
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || !mutex.Lock(*access.databaseLock) {
+            return recovery.ErrorReply(connection, 500, Unavailable)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        settings := *access.configuration
+        if path == LookupPath {
+            return Lookup(settings.database, connection, subject)
+        }
+        actor := auth.Authenticate(settings.database, connection, settings.secret, now, "", false)
+        if actor.status != 0 {
+            return recovery.ErrorReply(connection, actor.status, actor.message)
+        }
+        account := TextView(actor.userID[:])
+        if withProof {
+            return Link(settings.database, connection, account, subject, nonce, now)
+        }
+        return LinkState(settings.database, connection, account, path == UnlinkPath)
+    }
+
+    #scope_export
+    Open :: (state: *State, clientIDs: string, fixtureURL: string = "") -> bool {
+        copiedIDs: Vec(u8)
+        if !BuilderAppend(copiedIDs, clientIDs) || !oidc.Open(*state.certificates, fixtureURL) {
+            return false
+        }
+        VecSwap(state.clientIDs, copiedIDs)
+        return true
+    }
+
+    Close :: (state: *State) {
+        oidc.Close(*state.certificates)
+        VecFree(state.clientIDs)
+    }
+
+    Handles :: (path: string) -> bool {
+        return path == MethodsPath || path == LookupPath || path == LinkPath || path == UnlinkPath
+    }
+
+    ReadsBody :: (path: string, method: string) -> bool {
+        return method == "POST" && (path == LookupPath || path == LinkPath)
+    }
+
+    Handle :: (state: *State, access: *accounts.AccountAccess, connection: *void, method: string, path: string,
+        input: []u8, overflow: bool) -> s32 {
+        reading := method == "GET" || method == "HEAD"
+        withProof := ReadsBody(path, method)
+        if !withProof && !(reading && (path == MethodsPath || path == LinkPath)) && !(path == UnlinkPath && method == "POST") {
+            allow := "POST"
+            if path == MethodsPath {
+                allow = "GET, HEAD"
+            } else if path == LinkPath {
+                allow = "GET, HEAD, POST"
+            }
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        clientIDs := TextView(VecSlice(state.clientIDs, 0, state.clientIDs.count))
+        first := oidc.FirstClientID(clientIDs)
+        if path == MethodsPath {
+            return Methods(first, connection, method, access.configuration.zstdResponses)
+        }
+        if !withProof {
+            return Apply(access, connection, path, false, "", "")
+        }
+        if first == "" {
+            return recovery.ErrorReply(connection, 404, Disabled)
+        }
+        if path == LookupPath {
+            if !recovery.AllowAddress(access, connection, "account-google-lookup:", 20) {
+                return Limited(connection)
+            }
+        } else {
+            actor := BeforeLink(access, connection)
+            if actor.status != 0 {
+                return recovery.ErrorReply(connection, actor.status, actor.message)
+            }
+        }
+        decodedBuffer: [MaxRequestBytes]u8
+        decoded := recovery.DecodeBody(connection, input, overflow, access.configuration.zstdRequests, decodedBuffer[:])
+        document: json.JsonDocument
+        names: [1]string = .["id_token"]
+        fields: [1]s32
+        if decoded.error != "" || !strict.ReadStringFields(*document, decoded.bytes, names[:], fields[:]) {
+            return recovery.ErrorReply(connection, 400, InvalidRequest)
+        }
+        token: Text = json.JsonString(*document, fields[0])
+        proof := oidc.Verify(*state.certificates, clientIDs, TextView(token))
+        if !proof.valid {
+            return recovery.ErrorReply(connection, 401, BadToken)
+        }
+        return Apply(access, connection, path, true, TextView(proof.subject), TextView(proof.nonce))
+    }
+}

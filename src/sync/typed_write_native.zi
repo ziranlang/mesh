@@ -1,0 +1,153 @@
+#if TARGET == .C && OS == .LINUX {
+    input :: #import "typed_request_native";
+    #import "std/vec"
+    protocol :: #import "protocol";
+    accounts :: #import "account_state_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    queries :: #import "typed_write_queries";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+
+    WriteResult :: struct {
+        applied: s64
+        status: s32
+    }
+
+    NormalizeTime :: (primary: string, fallback: string, now: string, target: []u8) -> string {
+        value := ifx primary != "" then primary else fallback
+        if value == "" {
+            return now
+        }
+        length := format.UTC(time.Parse(value), target)
+        return ifx length > 0 then TextView(target[:length]) else "0001-01-01T00:00:00.000000000Z"
+    }
+
+    #scope_file
+    WithVersion :: (database: *void, user: string, query: string, arguments: []sql.Argument) -> WriteResult {
+        version := accounts.NextVersion(database, user)
+        if version.status != sqlite.SQLITE_OK {
+            return .{status = version.status}
+        }
+        arguments[arguments.count - 1] = sql.IntArg(version.value)
+        status := sql.Execute(database, query, arguments)
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        return .{applied = cast(s64)sqlite.SqliteChanges(database)}
+    }
+
+    Remove :: (database: *void, user: string, query: string, children: string, arguments: []sql.Argument) -> WriteResult {
+        status := sql.Execute(database, query, arguments)
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        applied := cast(s64)sqlite.SqliteChanges(database)
+        if applied == 0 {
+            return .{}
+        }
+        if children != "" {
+            status = sql.Execute(database, children, arguments[:2])
+            if status != sqlite.SQLITE_OK {
+                return .{status = status}
+            }
+            applied += cast(s64)sqlite.SqliteChanges(database)
+        }
+        version := accounts.NextVersion(database, user)
+        return .{applied = applied, status = version.status}
+    }
+
+    #scope_export
+    Habit :: (database: *void, user: string, habit: protocol.Habit, now: string) -> WriteResult {
+        buffer: [31]u8
+        updated := NormalizeTime(habit.UpdatedAt, "", now, buffer[:])
+        if habit.DeletedAt > 0 {
+            arguments: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(habit.ID), sql.TextArg(updated)]
+            return Remove(database, user, queries.DeleteHabit, queries.DeleteHabitDays, arguments[:])
+        }
+        arguments: [13]sql.Argument = .[sql.TextArg(user), sql.TextArg(habit.ID), sql.TextArg(habit.Name),
+            sql.IntArg(cast(s64)habit.ColorR), sql.IntArg(cast(s64)habit.ColorG), sql.IntArg(cast(s64)habit.ColorB),
+            sql.IntArg(cast(s64)habit.SyncMode), sql.IntArg(cast(s64)habit.SyncActivity), sql.IntArg(cast(s64)habit.CounterEnabled),
+            sql.IntArg(cast(s64)habit.SortOrder), sql.IntArg(habit.DeletedAt), sql.TextArg(updated), sql.IntArg(0)]
+        return WithVersion(database, user, queries.UpsertHabit, arguments[:])
+    }
+
+    HabitDay :: (database: *void, user: string, day: protocol.HabitDay, now: string, remove: bool) -> WriteResult {
+        buffer: [31]u8
+        updated := NormalizeTime(day.UpdatedAt, "", now, buffer[:])
+        if remove {
+            arguments: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(day.HabitID), sql.IntArg(cast(s64)day.LocalDate), sql.TextArg(updated)]
+            return Remove(database, user, queries.DeleteHabitDay, "", arguments[:])
+        }
+        completed: s64 = ifx day.Completed then 1 else 0
+        count := cast(s64)day.Count
+        if !day.Completed {
+            count = 0
+        } else if count < 1 {
+            count = 1
+        }
+        arguments: [7]sql.Argument = .[sql.TextArg(user), sql.TextArg(day.HabitID), sql.IntArg(cast(s64)day.LocalDate),
+            sql.IntArg(completed), sql.IntArg(count), sql.TextArg(updated), sql.IntArg(0)]
+        return WithVersion(database, user, queries.UpsertDay, arguments[:])
+    }
+
+    Session :: (database: *void, user: string, session: protocol.Session, now: string) -> WriteResult {
+        updatedBuffer: [31]u8
+        if session.DeletedAt > 0 {
+            updated := NormalizeTime(session.UpdatedAt, session.StartedAt, now, updatedBuffer[:])
+            arguments: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(session.ID), sql.TextArg(updated)]
+            return Remove(database, user, queries.DeleteSession, queries.DeleteSessionRounds, arguments[:])
+        }
+        startedBuffer: [31]u8
+        started := NormalizeTime(session.StartedAt, "", now, startedBuffer[:])
+        updated := NormalizeTime(session.UpdatedAt, "", now, updatedBuffer[:])
+        arguments: [17]sql.Argument = .[sql.TextArg(user), sql.TextArg(session.ID), sql.TextArg(started), sql.IntArg(cast(s64)session.LocalDate),
+            sql.TextArg(session.Topic), sql.IntArg(cast(s64)session.Activity), sql.TextArg(session.Source), sql.TextArg(session.RoundsHash),
+            sql.IntArg(cast(s64)session.MoodBefore), sql.IntArg(cast(s64)session.MoodAfter), sql.IntArg(cast(s64)session.Energy),
+            sql.IntArg(cast(s64)session.Stress), sql.TextArg(session.Note), sql.TextArg(session.Tags), sql.IntArg(session.DeletedAt),
+            sql.TextArg(updated), sql.IntArg(0)]
+        written := WithVersion(database, user, queries.UpsertSession, arguments[:])
+        if written.status != sqlite.SQLITE_OK || written.applied == 0 || session.Rounds.count == 0 {
+            return written
+        }
+        status := sql.Execute(database, queries.DeleteSessionRounds, arguments[:2])
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        for round: session.Rounds {
+            item: [5]sql.Argument = .[arguments[0], arguments[1], sql.IntArg(cast(s64)round.RoundIndex),
+                sql.IntArg(cast(s64)round.Breaths), sql.IntArg(cast(s64)round.HoldSeconds)]
+            status = sql.Execute(database, queries.InsertRound, item[:])
+            if status != sqlite.SQLITE_OK {
+                return .{status = status}
+            }
+        }
+        return written
+    }
+
+    SessionInput :: (database: *void, user: string, decoded: *input.SessionInput, now: string,
+        fallbackID: string = "", remove: bool = false) -> WriteResult {
+        row := decoded.row
+        row.ID = TextView(decoded.id)
+        row.StartedAt = TextView(decoded.startedAt)
+        row.Topic = TextView(decoded.topic)
+        row.Source = TextView(decoded.source)
+        row.RoundsHash = TextView(decoded.roundsHash)
+        row.Note = TextView(decoded.note)
+        row.Tags = TextView(decoded.tags)
+        row.UpdatedAt = TextView(decoded.updatedAt)
+        row.Rounds = VecSlice(decoded.rounds, 0, decoded.rounds.count)
+        if row.ID == "" { row.ID = fallbackID }
+        if remove && row.DeletedAt <= 0 { row.DeletedAt = 1 }
+        return Session(database, user, row, now)
+    }
+
+    Meditation :: (database: *void, user: string, item: protocol.MeditationLog, now: string) -> WriteResult {
+        buffer: [31]u8
+        completed := NormalizeTime(item.CompletedAt, item.Timestamp, now, buffer[:])
+        duration := ifx item.DurationSeconds != 0 then item.DurationSeconds else item.Duration
+        arguments: [6]sql.Argument = .[sql.TextArg(user), sql.TextArg(item.ID), sql.TextArg(item.SessionID),
+            sql.IntArg(cast(s64)duration), sql.TextArg(completed), sql.IntArg(0)]
+        return WithVersion(database, user, queries.UpsertMeditation, arguments[:])
+    }
+}

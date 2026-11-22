@@ -1,0 +1,787 @@
+sqlite :: #import "sqlite/SQLite";
+diagnostics :: #import "sqlite_diagnostics";
+inspect :: #import "inspect_native";
+inspection :: #import "sqlite_inspection";
+schema :: #import "schema_sql";
+environment :: #import "std/environment_linux";
+sqlite_schema :: #import "sqlite_schema";
+startup :: #import "store_startup_native";
+timestamps :: #import "store_timestamps_native";
+habits :: #import "habit_migration_native";
+identifiers :: #import "habit_id_native";
+habit_id :: #import "habit_id_text";
+account :: #import "account_state_native";
+holds :: #import "account_hold_native";
+pages :: #import "record_page_native";
+writes :: #import "record_write_native";
+protocol :: #import "protocol";
+time_value :: #import "timestamp_value";
+packing :: #import "record_packing_schema";
+json :: #import "std/json_document";
+files :: #import "std/file_linux";
+sessions :: #import "auth_sessions_native";
+session_queries :: #import "auth_session_queries";
+#import "std/vec"
+
+#scope_file
+Capture :: (context: *void, text: string) -> bool {
+    return BuilderAppend(<<(cast(*Vec(u8))context), text)
+}
+
+StopAfterFirstWrite :: (context: *void, text: string) -> bool {
+    output := cast(*Vec(u8))context
+    return output.count == 0 && BuilderAppend(<<output, text)
+}
+
+SessionChecks :: (database: *void) -> bool {
+    user := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    // Independent Python HMAC and SHA-256 known answer for this synthetic key.
+    secret: [32]u8
+    bearer := "djIKMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZgoyMDAKMTAwCjExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTExMTEK.a_GCo0cFpEz5jUjSE9GcAfK7tnnGJgLBbc_uDIpeEro"
+    unavailable := sessions.Authorize(database, secret[:], bearer, user, 200, "", false)
+    if unavailable.active || unavailable.databaseError == sqlite.SQLITE_OK {
+        return false
+    }
+    if sqlite.SqliteExecText(database, session_queries.Schema) != sqlite.SQLITE_OK {
+        return false
+    }
+    missing := sessions.Authorize(database, secret[:], bearer, user, 200, "", false)
+    if missing.active || missing.databaseError != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, IssuedSession) != sqlite.SQLITE_OK {
+        return false
+    }
+    valid := sessions.Authorize(database, secret[:], bearer, user, 200, "", false)
+    if !valid.active || valid.databaseError != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bearer, user, 201, "", false).active ||
+        sessions.Authorize(database, secret[:], bearer, "other", 200, "", false).active ||
+        sessions.Authorize(database, secret[:], bearer[:bearer.count - 1], user, 200, "", false).active {
+        return false
+    }
+    if sqlite.SqliteExecText(database, "UPDATE server_auth_sessions SET expires_at=199") != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bearer, user, 200, "", false).active {
+        return false
+    }
+    if sqlite.SqliteExecText(database, "UPDATE server_auth_sessions SET expires_at=200, revoked_at='revoked'") != sqlite.SQLITE_OK {
+        return false
+    }
+    revoked := sessions.Authorize(database, secret[:], bearer, user, 200, "", false)
+    return !revoked.active && revoked.databaseError == sqlite.SQLITE_OK
+}
+
+LegacySessionChecks :: (database: *void) -> bool {
+    user := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    newUser := "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    secret: [32]u8
+    bearer := "djEKMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZgozMDAK.iv7gCg27RV3fRRqAvHs2e-vnzu5V0rBJbD99xWclzp0"
+    bootstrapBearer := "djEKZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZGRkZAozMDAK.XxWCjpaqhZTRBobroGMShAvBMfNEC36tLaVqatZppZs"
+    now := "1970-01-01T00:03:20.000000000Z"
+    installed := sqlite.SqliteExecText(database, LegacySessions)
+    if installed != sqlite.SQLITE_OK { return false }
+    accepted := sessions.Authorize(database, secret[:], bearer, user, 200, now, false)
+    if !accepted.active || accepted.bootstrap || accepted.databaseError != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_auth_sessions WHERE issued_at=0 AND token_hash=session_id") {
+        return false
+    }
+    if sessions.Authorize(database, secret[:], bearer, user, 211, now, false).active {
+        return false
+    }
+    denied := sessions.Authorize(database, secret[:], bootstrapBearer, newUser, 200, now, false)
+    bootstrap := sessions.Authorize(database, secret[:], bootstrapBearer, newUser, 200, now, true)
+    if denied.active || !bootstrap.active || !bootstrap.bootstrap || bootstrap.databaseError != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_auth_sessions WHERE user_id_hash LIKE 'ddd%'") {
+        return false
+    }
+    if sqlite.SqliteExecText(database,
+        "INSERT INTO server_account_tombstones(user_id_hash) VALUES('dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd')") != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bootstrapBearer, newUser, 200, now, true).active {
+        return false
+    }
+    if sqlite.SqliteExecText(database, "UPDATE server_auth_sessions SET revoked_at='revoked' WHERE issued_at=0") != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bearer, user, 200, now, false).active {
+        return false
+    }
+    if sqlite.SqliteExecText(database, "DELETE FROM server_auth_sessions WHERE issued_at=0; UPDATE server_users SET created_at='1970-01-01T00:01:41.000000001Z'") != sqlite.SQLITE_OK ||
+        sessions.Authorize(database, secret[:], bearer, user, 200, now, false).active {
+        return false
+    }
+    if sqlite.SqliteExecText(database, "UPDATE server_users SET created_at='1970-01-01 00:01:40'; DROP TABLE server_auth_legacy_revocations") != sqlite.SQLITE_OK {
+        return false
+    }
+    failed := sessions.Authorize(database, secret[:], bearer, user, 200, now, false)
+    return !failed.active && failed.databaseError != sqlite.SQLITE_OK && sqlite.SqliteGetAutocommit(database)
+}
+
+InspectionChecks :: (database: *void) -> bool {
+    statements := schema.Tables()
+    for statement: statements {
+        if sqlite.SqliteExecText(database, statement) != sqlite.SQLITE_OK {
+            return false
+        }
+    }
+    if sqlite.SqliteExecText(database,
+        "INSERT INTO server_users(user_id_hash,public_key,created_at,last_seen_at) VALUES('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',x'AA0123456789ABCDEF00','2000-01-01','2001-02-03')") != sqlite.SQLITE_OK {
+        return false
+    }
+
+    summary: Vec(u8)
+    noArguments: []string
+    if inspect.Run(database, noArguments, false, cast(*void)(*summary), Capture).status != sqlite.SQLITE_OK ||
+        TextView(VecSlice(summary, 0, summary.count)) != ExpectedSummary {
+        return false
+    }
+
+    users: Vec(u8)
+    if inspection.Users(database, cast(*void)(*users), Capture, false) != sqlite.SQLITE_OK ||
+        TextView(VecSlice(users, 0, users.count)) !=
+            "Users\n0123456789ab...89abcdef  key=aa0123456789...abcdef00  created=2000-01-01  last_seen=2001-02-03\n" {
+        return false
+    }
+
+    full: Vec(u8)
+    if inspection.Users(database, cast(*void)(*full), Capture, true) != sqlite.SQLITE_OK ||
+        TextView(VecSlice(full, 0, full.count)) !=
+            "Users\n0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  key=aa0123456789abcdef00  created=2000-01-01  last_seen=2001-02-03\n" {
+        return false
+    }
+
+    stopped: Vec(u8)
+    if inspection.Users(database, cast(*void)(*stopped), StopAfterFirstWrite, false) == sqlite.SQLITE_OK ||
+        TextView(VecSlice(stopped, 0, stopped.count)) != "Users\n" {
+        return false
+    }
+
+    if sqlite.SqliteExecText(database, DoctorRows) != sqlite.SQLITE_OK {
+        return false
+    }
+    doctor: Vec(u8)
+    user := "\u2003 0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF\t"
+    doctorArgs: [2]string = .["doctor", user]
+    if inspect.Run(database, doctorArgs[:], false, cast(*void)(*doctor), Capture).status != sqlite.SQLITE_OK ||
+        TextView(VecSlice(doctor, 0, doctor.count)) != ExpectedDoctor {
+        return false
+    }
+    detail: Vec(u8)
+    return inspection.User(database, cast(*void)(*detail), Capture, user, false) == sqlite.SQLITE_OK &&
+        TextView(VecSlice(detail, 0, detail.count)) == ExpectedUser
+}
+
+Exists :: (database: *void, query: string) -> bool {
+    statement: *void = null
+    if sqlite.SqlitePrepareText(database, query, -1, *statement, null) != sqlite.SQLITE_OK {
+        return false
+    }
+    defer sqlite.SqliteFinalize(statement)
+    return sqlite.SqliteStep(statement) == sqlite.SQLITE_ROW && sqlite.SqliteColumnInt(statement, 0) == 1
+}
+
+CoreSchemaChecks :: () -> s32 {
+    rejected := sqlite_schema.OpenCore("invalid\x00suffix")
+    if rejected.database != null || rejected.status != sqlite.SQLITE_MISUSE { return 8 }
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK || opened.database == null { return 9 }
+    database := opened.database
+    status: s32 = 0
+    if !diagnostics.Health(database) || !Exists(database, "PRAGMA foreign_keys") ||
+        !Exists(database, "PRAGMA recursive_triggers") || !Exists(database, schema.MeditationKeyReady) {
+        status = 10
+    } else if sqlite.SqliteExecText(database, LegacyRows) != sqlite.SQLITE_OK ||
+        sqlite_schema.Initialize(database) != sqlite.SQLITE_OK || sqlite_schema.Initialize(database) != sqlite.SQLITE_OK {
+        status = 11
+    } else if !Exists(database, "SELECT COUNT(*)=1 FROM server_social_snapshots WHERE user_id_hash='legacy' AND kind='public' AND server_version=17") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM sqlite_schema WHERE name='server_social_cache'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_storage_plans WHERE user_id='legacy' AND size='1gb'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM sqlite_schema WHERE name='server_state_hashes_forget_server_meditation_logs_insert'") {
+        status = 12
+    } else if sqlite.SqliteExecText(database, "DELETE FROM server_users WHERE user_id_hash='legacy'") != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_storage_plans") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_social_snapshots") {
+        status = 13
+    }
+    if sqlite.SqliteClose(database) != sqlite.SQLITE_OK { return 14 }
+    return status
+}
+
+FeatureSchemaChecks :: () -> bool {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return false }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    created := sqlite.SqliteExecText(database, BeforeFeatureMigration)
+    if created != sqlite.SQLITE_OK {
+        print("legacy feature fixture failed: %\n", created)
+        return false
+    }
+    migration := startup.InitializeFeatures(database)
+    if migration != sqlite.SQLITE_OK {
+        print("initial feature migration failed: %\n", migration)
+        return false
+    }
+    if !Exists(database, "SELECT COUNT(*)=1 FROM referral_state WHERE id=1") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM token_assets WHERE asset_id='waozi:token' AND display_name='Dew' AND decimals=6") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_apps WHERE app_id='inbe' AND display_name='Inner Breeze' AND json_array_length(features_json)=4 AND json_array_length(legacy_protocols_json)=2") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_apps WHERE app_id='entity' AND legacy_protocols_json='null'") ||
+        !Exists(database, "SELECT COUNT(*)=10 FROM server_app_collections WHERE app_id='inbe'") ||
+        !Exists(database, "SELECT COUNT(*)=2 FROM token_app_permissions WHERE app_id='inbe' AND legacy_unsigned_until=1819756800") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM sqlite_schema WHERE name='server_record_page_order'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM sqlite_schema WHERE name='trusted_node_peers'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='early' AND alias='Player'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='late' AND alias IS NULL") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_alias_case_collisions WHERE account_id='late' AND retained_account_id='early'") {
+        print("feature schema or alias ownership mismatch\n")
+        return false
+    }
+    if sqlite.SqliteExecText(database, "UPDATE server_users SET alias='PLAYER' WHERE user_id_hash='late'") == sqlite.SQLITE_OK {
+        return false
+    }
+    updated := sqlite.SqliteExecText(database, AfterFeatureMigration)
+    if updated != sqlite.SQLITE_OK {
+        print("updated feature fixture failed: %\n", updated)
+        return false
+    }
+    if !Exists(database, "SELECT used_bytes=18 FROM server_storage_usage WHERE user_id_hash='late'") ||
+        sqlite.SqliteExecText(database, "UPDATE server_storage_usage_version SET version=4; UPDATE server_storage_usage SET used_bytes=999") != sqlite.SQLITE_OK ||
+        startup.InitializeFeatures(database) != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT version=5 FROM server_storage_usage_version") ||
+        !Exists(database, "SELECT used_bytes=18 FROM server_storage_usage WHERE user_id_hash='late'") ||
+        !Exists(database, "SELECT used_bytes=0 FROM server_storage_usage WHERE user_id_hash='early'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_apps WHERE app_id='inbe' AND display_name='Signed Inbe'") {
+        print("storage usage migration mismatch\n")
+        return false
+    }
+    return Exists(database, "SELECT COUNT(*)=0 FROM server_record_packing") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM game_legacy_snapshots WHERE account_id='early' AND ciphertext='frozen'") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM game_legacy_snapshots")
+}
+
+TimestampMigrationChecks :: () -> bool {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return false }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if sqlite.SqliteExecText(database, LegacyTimestamps) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database,
+            "CREATE TRIGGER reject_timestamp BEFORE UPDATE OF last_seen_at ON server_users BEGIN SELECT RAISE(ABORT,'blocked'); END") != sqlite.SQLITE_OK {
+        return false
+    }
+    if timestamps.Canonicalize(database) == sqlite.SQLITE_OK || !sqlite.SqliteGetAutocommit(database) ||
+        !Exists(database, "SELECT user_version=0 FROM pragma_user_version") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='legacy' AND created_at='2000-01-01 00:00:00'") ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER reject_timestamp") != sqlite.SQLITE_OK {
+        return false
+    }
+    return timestamps.Canonicalize(database) == sqlite.SQLITE_OK &&
+        timestamps.Canonicalize(database) == sqlite.SQLITE_OK &&
+        Exists(database, "SELECT user_version=1 FROM pragma_user_version") &&
+        Exists(database, "SELECT COUNT(*)=0 FROM sqlite_temp_schema WHERE name='mesh_timestamp_rewrites'") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='legacy' AND created_at='2000-01-01T00:00:00.000000000Z' AND last_seen_at='1999-12-31T23:15:00.000000001Z'") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='invalid' AND created_at='as originally stored' AND last_seen_at=''") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='edge' AND created_at='-0001-12-30T23:00:00.000000000Z' AND last_seen_at='10000-01-02T00:59:59.000000000Z'")
+}
+
+DiskConnections :: (path: string) -> bool {
+    missing := sqlite_schema.OpenExisting(path)
+    if missing.database != null {
+        unused sqlite.SqliteClose(missing.database)
+        return false
+    }
+    if missing.status == sqlite.SQLITE_OK { return false }
+    opened := sqlite_schema.OpenCore(path)
+    if opened.status != sqlite.SQLITE_OK { return false }
+    writer := opened.database
+    defer sqlite.SqliteClose(writer)
+    existing := sqlite_schema.OpenExisting(path)
+    if existing.status != sqlite.SQLITE_OK { return false }
+    reader := existing.database
+    defer sqlite.SqliteClose(reader)
+    if !Exists(reader, "SELECT journal_mode='wal' FROM pragma_journal_mode") ||
+        !Exists(reader, "PRAGMA foreign_keys") || !Exists(reader, "PRAGMA recursive_triggers") ||
+        sqlite.SqliteBusyTimeout(reader, 0) != sqlite.SQLITE_OK {
+        return false
+    }
+    if sqlite.SqliteExecText(writer, "BEGIN IMMEDIATE; INSERT INTO server_users(user_id_hash,public_key) VALUES('disk',x'BB')") != sqlite.SQLITE_OK ||
+        !Exists(reader, "SELECT COUNT(*)=0 FROM server_users") ||
+        sqlite.SqliteExecText(reader, "BEGIN IMMEDIATE") != sqlite.SQLITE_BUSY ||
+        sqlite.SqliteExecText(writer, "COMMIT") != sqlite.SQLITE_OK {
+        return false
+    }
+    return Exists(reader, "SELECT COUNT(*)=1 FROM server_users WHERE user_id_hash='disk'")
+}
+
+#scope_export
+#program_export
+HabitMigrationChecks :: () -> bool {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return false }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if sqlite.SqliteExecText(database, LegacyHabits) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "CREATE TRIGGER reject_habit BEFORE INSERT ON server_habits BEGIN SELECT RAISE(ABORT,'blocked'); END") != sqlite.SQLITE_OK {
+        return false
+    }
+    if habits.AllAccounts(database) == sqlite.SQLITE_OK || !sqlite.SqliteGetAutocommit(database) ||
+        !Exists(database, "SELECT COUNT(*)=2 FROM server_habit_id_migrations") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habits WHERE id='rename-this'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_sync_ops WHERE entity_id='old-id' AND op_id='op1'") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_sync_state") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM sqlite_temp_schema WHERE name LIKE 'mesh_habit_%'") ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER reject_habit") != sqlite.SQLITE_OK {
+        return false
+    }
+    if startup.InitializeFeatures(database) != sqlite.SQLITE_OK || habits.AllAccounts(database) != sqlite.SQLITE_OK {
+        return false
+    }
+    if !Exists(database, "SELECT COUNT(*)=0 FROM sqlite_temp_schema WHERE name LIKE 'mesh_habit_%'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habits WHERE user_id_hash='first' AND id='12345678-1234-4567-89ab-123456789abc' AND name='Legacy Name' AND sync_activity=5 AND sort_order=1") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habit_days WHERE user_id_hash='first' AND habit_id='12345678-1234-4567-89ab-123456789abc' AND count=8 AND server_version=4") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habits WHERE user_id_hash='first' AND id='12345678-1234-4567-89ab-000000000099' AND updated_at='2000-01-01T00:00:00.000000001Z' AND server_version=9") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habit_days WHERE user_id_hash='first' AND habit_id='12345678-1234-4567-89ab-000000000099' AND count=2") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_habit_days WHERE habit_id IN ('zero','deleted','old-id')") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_sync_ops WHERE op_id='op1' AND entity_id='12345678-1234-4567-89ab-123456789abc' AND json_extract(payload_json,'$.id')=entity_id AND json_extract(payload_json,'$.habit_id')=entity_id AND json_extract(payload_json,'$.extra[0]')=3") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_sync_ops WHERE op_id='op2' AND entity_id='12345678-1234-4567-89ab-123456789abc' AND payload_json='[1,2]'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_habits WHERE user_id_hash='second' AND id='12345678-1234-4567-89ab-000000000001' AND name='Old Id'") ||
+        !Exists(database, "SELECT COUNT(*)=2 FROM server_sync_state WHERE server_version=1") {
+        return false
+    }
+    generated := identifiers.ForRead(database, "first", "rename-this")
+    if generated.status != sqlite.SQLITE_OK || !generated.mapped { return false }
+    id := TextView(VecSlice(generated.value, 0, generated.value.count))
+    return habit_id.IsCanonical(id) && id[14] == #char "4" &&
+        (id[19] == #char "8" || id[19] == #char "9" || id[19] == #char "a" || id[19] == #char "b") &&
+        Exists(database, "SELECT COUNT(*)=1 FROM server_habits h JOIN server_habit_id_migrations m ON m.user_id_hash=h.user_id_hash AND m.new_id=h.id WHERE m.old_id='rename-this' AND m.source='protocol-v3-canonical'")
+}
+
+AccountStateChecks :: () -> bool {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return false }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    user := "native-account"
+    now := "2000-01-01T00:00:00.000000001Z"
+    key: [3]u8 = .[0, 1, 255]
+    missing := account.CurrentVersion(database, user)
+    if missing.status != sqlite.SQLITE_OK || missing.found ||
+        account.NextVersion(database, user).status != sqlite.SQLITE_MISUSE ||
+        account.Register(database, user, key[:], now) != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT typeof(public_key)='blob' AND hex(public_key)='0001FF' FROM server_users") ||
+        !Exists(database, "SELECT server_version=0 FROM server_sync_state") {
+        return false
+    }
+    changedKey: [1]u8 = .[99]
+    if account.Register(database, user, changedKey[:], now) != sqlite.SQLITE_OK ||
+        !Exists(database, "SELECT hex(public_key)='0001FF' AND last_seen_at='2000-01-01T00:00:00.000000001Z' FROM server_users") ||
+        sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK ||
+        account.Touch(database, "absent", now) != sqlite.SQLITE_DONE ||
+        account.Touch(database, user, now) != sqlite.SQLITE_OK || account.NextVersion(database, user).value != 1 ||
+        sqlite.SqliteExecText(database, "ROLLBACK") != sqlite.SQLITE_OK || account.CurrentVersion(database, user).value != 0 {
+        return false
+    }
+    if sqlite.SqliteExecText(database, AccountCopies) != sqlite.SQLITE_OK ||
+        account.Delete(database, user) == sqlite.SQLITE_OK || account.Tombstoned(database, user).value != 0 ||
+        !sqlite.SqliteGetAutocommit(database) ||
+        !Exists(database, "SELECT disabled_at='' FROM monero_account_addresses") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_account_passkeys") ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER reject_account_delete") != sqlite.SQLITE_OK {
+        return false
+    }
+    if account.Delete(database, user) != sqlite.SQLITE_OK || account.Tombstoned(database, user).value != 1 ||
+        !Exists(database, "SELECT disabled_at!='' FROM monero_account_addresses") ||
+        !Exists(database, "SELECT 0=(SELECT COUNT(*) FROM server_account_passkeys)+(SELECT COUNT(*) FROM server_account_google)+(SELECT COUNT(*) FROM server_account_backups)+(SELECT COUNT(*) FROM server_chat_usage)+(SELECT COUNT(*) FROM server_users)+(SELECT COUNT(*) FROM server_sync_state)") {
+        return false
+    }
+    return account.Register(database, user, key[:], now) == sqlite.SQLITE_OK &&
+        account.Tombstoned(database, user).value == 0 && account.CurrentVersion(database, user).found
+}
+
+HoldUser :: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+HoldPath :: (base: string, suffix: string) -> Vec(u8) {
+    path: Vec(u8)
+    if !BuilderAppend(path, base) || !BuilderAppend(path, suffix) { return .{} }
+    return path
+}
+
+CreateHold :: (path: string) -> bool {
+    database: *void = null
+    status := sqlite.SqliteOpenText(path, *database, sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE)
+    if status != sqlite.SQLITE_OK {
+        if database != null { unused sqlite.SqliteClose(database) }
+        return false
+    }
+    defer sqlite.SqliteClose(database)
+    return sqlite.SqliteExecText(database, HoldFixture) == sqlite.SQLITE_OK
+}
+
+HeldAccountChecks :: (path: string) -> s32 {
+    folder := HoldPath(path, ".held")
+    live := HoldPath(path, ".blobs")
+    file := HoldPath(path, ".held/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.db")
+    heldBlobs := HoldPath(path, ".held/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee.blobs")
+    liveBlobs := HoldPath(path, ".blobs/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee")
+    name := TextView(VecSlice(file, 0, file.count))
+    heldFolder := TextView(VecSlice(heldBlobs, 0, heldBlobs.count))
+    liveFolder := TextView(VecSlice(liveBlobs, 0, liveBlobs.count))
+    if !files.CreatePrivateDirectory(TextView(VecSlice(folder, 0, folder.count))) ||
+        !files.CreatePrivateDirectory(TextView(VecSlice(live, 0, live.count))) ||
+        !files.CreatePrivateDirectory(heldFolder) || !CreateHold(name) { return 21 }
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return 22 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if sqlite.SqliteExecText(database, HoldLiveFixture) != sqlite.SQLITE_OK ||
+        holds.HeldUntil(database, HoldUser).value != 200 { return 23 }
+    rejected := holds.Restore(database, path, HoldUser)
+    if rejected.restored || rejected.databaseError == sqlite.SQLITE_OK || !sqlite.SqliteGetAutocommit(database) ||
+        !files.PathExists(name) || !files.DirectoryExists(heldFolder) || files.DirectoryExists(liveFolder) ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM server_users") || account.Tombstoned(database, HoldUser).value != 1 ||
+        holds.HeldUntil(database, HoldUser).value != 200 ||
+        sqlite.SqliteExecText(database, "DROP TRIGGER fail_hold_restore") != sqlite.SQLITE_OK { return 24 }
+    restored := holds.Restore(database, path, HoldUser)
+    if !restored.restored || restored.databaseError != sqlite.SQLITE_OK || restored.error != "" || restored.cleanupError != "" ||
+        files.PathExists(name) || files.DirectoryExists(heldFolder) || !files.DirectoryExists(liveFolder) ||
+        holds.HeldUntil(database, HoldUser).value != 0 || account.Tombstoned(database, HoldUser).value != 0 { return 25 }
+    if !Exists(database, "SELECT alias IS NULL AND hex(public_key)='010002' FROM server_users WHERE user_id_hash<>'other'") ||
+        !Exists(database, "SELECT alias='Reclaimed' FROM server_users WHERE user_id_hash='other'") ||
+        !Exists(database, "SELECT sort_order=0 AND name='Restored' FROM server_habits WHERE id='restored'") ||
+        !Exists(database, "SELECT COUNT(*)=1 AND SUM(data='keep')=1 FROM future_children") { return 26 }
+    repeated := holds.Restore(database, path, HoldUser)
+    if repeated.restored || repeated.databaseError != sqlite.SQLITE_OK || repeated.error != "" { return 27 }
+    return 0
+}
+
+RecordPageChecks :: () -> s32 {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return 28 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if sqlite.SqliteExecText(database, packing.Schema) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, RecordPageFixture) != sqlite.SQLITE_OK { return 29 }
+    request: pages.RecordPageRequest = .{user = "page-owner", app = "pageapp", throughVersion = 5}
+    first := pages.Read(database, request)
+    if first.status != sqlite.SQLITE_OK || !first.more || first.cursor.version != 5 ||
+        TextView(first.cursor.id) != "record-016" || json.JsonCount(*first.records, first.records.root) != 16 { return 30 }
+    request.afterVersion = first.cursor.version
+    request.afterCollection = TextView(first.cursor.collection)
+    request.afterID = TextView(first.cursor.id)
+    request.encoding = "gzip-v1"
+    second := pages.Read(database, request)
+    if second.status != sqlite.SQLITE_OK || second.more || json.JsonCount(*second.records, second.records.root) != 1 { return 31 }
+    row := json.JsonFirst(*second.records, second.records.root)
+    if !json.JsonIs(*second.records, json.JsonMember(*second.records, row, "id"), "record-017") ||
+        !json.JsonIs(*second.records, json.JsonMember(*second.records, row, "ciphertext"), "packed") { return 32 }
+    request.afterCollection = "private.pageapp.v1.records.media"
+    request.afterID = "record-017"
+    request.throughVersion = 6
+    request.limit = 1
+    filtered := pages.Read(database, request)
+    if filtered.status != sqlite.SQLITE_OK || !filtered.more || filtered.cursor.version != 5 ||
+        TextView(filtered.cursor.id) != "zz-tombstone" || json.JsonCount(*filtered.records, filtered.records.root) != 0 { return 33 }
+    request.contentFreeDeletions = true
+    modern := pages.Read(database, request)
+    if modern.status != sqlite.SQLITE_OK || !modern.more || json.JsonCount(*modern.records, modern.records.root) != 1 { return 34 }
+    request.afterID = "zz-tombstone"
+    last := pages.Read(database, request)
+    if last.status != sqlite.SQLITE_OK || last.more || json.JsonCount(*last.records, last.records.root) != 1 { return 35 }
+    entity := json.JsonFirst(*last.records, last.records.root)
+    if !json.JsonIs(*last.records, json.JsonMember(*last.records, entity, "id"), "shared-entity") { return 36 }
+    return 0
+}
+
+RecordWriteChecks :: () -> s32 {
+    opened := sqlite_schema.OpenCore(":memory:")
+    if opened.status != sqlite.SQLITE_OK { return 37 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if startup.InitializeFeatures(database) != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, "INSERT INTO server_users(user_id_hash,public_key) VALUES('owner',X'01')") != sqlite.SQLITE_OK { return 38 }
+
+    now := time_value.Parse("2026-01-02T00:00:00Z")
+    records: [2]protocol.EncryptedRecord
+    records[0] = .{Collection = "private.pageapp.v1.records.media", ID = "first", KeyID = "key",
+        Nonce = "identity-nonce", Ciphertext = "identity-content", UpdatedAt = "2026-01-01T20:00:00.123456789-04:00",
+        PackedNonce = "packed-nonce", PackedCiphertext = "packed-content"}
+    rejected := writes.Apply(database, "owner", records[:1], 5, now, 0)
+    if !rejected.invalidRecord || account.CurrentVersion(database, "owner").value != 0 { return 39 }
+    inserted := writes.Apply(database, "owner", records[:1], 6, now, 1000)
+    if inserted.status != sqlite.SQLITE_OK || inserted.applied != 1 || inserted.storageFull || inserted.usedBytes <= 0 ||
+        !Exists(database, "SELECT updated_at='2026-01-02T00:00:00.123456789Z' FROM server_encrypted_records") ||
+        !Exists(database, "SELECT ciphertext='packed-content' FROM server_record_packing") { return 40 }
+
+    records[0].UpdatedAt = "2026-01-01T00:00:00Z"
+    records[0].Ciphertext = "stale-identity"
+    records[0].PackedCiphertext = "stale-packed"
+    stale := writes.Apply(database, "owner", records[:1], 6, now, 1000)
+    if stale.status != sqlite.SQLITE_OK || stale.applied != 0 || stale.usedBytes != inserted.usedBytes ||
+        account.CurrentVersion(database, "owner").value != 2 ||
+        !Exists(database, "SELECT ciphertext='packed-content' FROM server_record_packing") { return 41 }
+
+    records[0].UpdatedAt = "2026-02-03T00:00:00Z"
+    records[0].Ciphertext = "a much larger authoritative ciphertext that would grow this account"
+    over := writes.Apply(database, "owner", records[:1], 6, now, inserted.usedBytes)
+    if over.status != sqlite.SQLITE_OK || !over.storageFull || over.usedBytes != inserted.usedBytes ||
+        account.CurrentVersion(database, "owner").value != 2 || !sqlite.SqliteGetAutocommit(database) ||
+        !Exists(database, "SELECT ciphertext='identity-content' FROM server_encrypted_records") ||
+        !Exists(database, "SELECT ciphertext='packed-content' FROM server_record_packing") { return 42 }
+
+    records[0].Ciphertext = "short"
+    records[0].PackedCiphertext = "this optional representation cannot fit in the remaining allowance"
+    packedOver := writes.Apply(database, "owner", records[:1], 6, now, inserted.usedBytes)
+    if packedOver.status != sqlite.SQLITE_OK || packedOver.storageFull || packedOver.applied != 1 ||
+        packedOver.usedBytes >= inserted.usedBytes ||
+        !Exists(database, "SELECT ciphertext='short' AND updated_at='2026-01-02T00:05:00.000000000Z' FROM server_encrypted_records") ||
+        !Exists(database, "SELECT COUNT(*)=0 FROM server_record_packing") { return 43 }
+
+    records[0].Ciphertext = "will roll back"
+    records[0].PackedCiphertext = ""
+    records[0].PackedNonce = ""
+    records[1] = records[0]
+    records[1].ID = "rollback"
+    if sqlite.SqliteExecText(database, "CREATE TRIGGER fail_record BEFORE INSERT ON server_encrypted_records WHEN new.id='rollback' BEGIN SELECT RAISE(ABORT,'fixture failure'); END") != sqlite.SQLITE_OK { return 44 }
+    failed := writes.Apply(database, "owner", records[:], 6, now, 1000)
+    if failed.status == sqlite.SQLITE_OK || failed.applied != 0 || account.CurrentVersion(database, "owner").value != 3 ||
+        !sqlite.SqliteGetAutocommit(database) || !Exists(database, "SELECT COUNT(*)=1 AND SUM(ciphertext='short')=1 FROM server_encrypted_records") ||
+        !Exists(database, "SELECT used_bytes>0 FROM server_storage_usage WHERE user_id_hash='owner'") { return 45 }
+
+    // A legacy timestamp beyond the allowed future skew must not freeze a row.
+    if sqlite.SqliteExecText(database, "UPDATE server_encrypted_records SET updated_at='2060-01-01T00:00:00.000000000Z'") != sqlite.SQLITE_OK { return 46 }
+    records[0].UpdatedAt = "2026-01-02T00:00:00Z"
+    records[0].DeletedAt = 1767312000
+    records[0].Ciphertext = ""
+    records[0].Nonce = ""
+    deleted := writes.Apply(database, "owner", records[:1], 6, now, 1)
+    if deleted.status != sqlite.SQLITE_OK || deleted.storageFull || deleted.applied != 1 ||
+        deleted.usedBytes >= packedOver.usedBytes || account.CurrentVersion(database, "owner").value != 4 ||
+        !Exists(database, "SELECT deleted_at=1767312000 AND ciphertext='' AND updated_at='2026-01-02T00:00:00.000000000Z' FROM server_encrypted_records") { return 47 }
+    return 0
+}
+
+Main :: () -> s32 {
+    diskPath := environment.EnvironmentText("MESH_TEST_SQLITE_PATH")
+    if diskPath != "" {
+        if !DiskConnections(diskPath) { return 16 }
+        heldStatus := HeldAccountChecks(diskPath)
+        if heldStatus != 0 { return heldStatus }
+    }
+    schemaStatus := CoreSchemaChecks()
+    if schemaStatus != 0 { return schemaStatus }
+    if !FeatureSchemaChecks() { return 17 }
+    if !TimestampMigrationChecks() { return 18 }
+    if !HabitMigrationChecks() { return 19 }
+    if !AccountStateChecks() { return 20 }
+    pageStatus := RecordPageChecks()
+    if pageStatus != 0 { return pageStatus }
+    writeStatus := RecordWriteChecks()
+    if writeStatus != 0 { return writeStatus }
+    database: *void = null
+    flags: s32 = sqlite.SQLITE_OPEN_READWRITE | sqlite.SQLITE_OPEN_CREATE
+    opened := sqlite.SqliteOpenText(":memory:", *database, flags)
+    if opened != sqlite.SQLITE_OK || database == null {
+        if database != null {
+            sqlite.SqliteClose(database)
+        }
+        return 1
+    }
+
+    status: s32 = 0
+    if diagnostics.Health(null) || diagnostics.Health(database) {
+        status = 2
+    } else if sqlite.SqliteExecText(database, "CREATE VIEW server_users AS SELECT 1") != sqlite.SQLITE_OK ||
+        diagnostics.Health(database) {
+        status = 3
+    } else if sqlite.SqliteExecText(database, "DROP VIEW server_users") != sqlite.SQLITE_OK ||
+        sqlite.SqliteExecText(database, schema.Tables()[0]) != sqlite.SQLITE_OK || !diagnostics.Health(database) {
+        status = 4
+    } else if !InspectionChecks(database) {
+        status = 6
+    } else if !SessionChecks(database) {
+        status = 7
+    } else if !LegacySessionChecks(database) {
+        status = 15
+    }
+    if sqlite.SqliteClose(database) != sqlite.SQLITE_OK {
+        return 5
+    }
+    return status
+}
+
+#scope_file
+IssuedSession :: #string ISSUED_SQL_END
+INSERT INTO server_auth_sessions(token_hash,user_id_hash,session_id,issued_at,expires_at,created_at)
+SELECT '1beca3a85196adc17bf5355832d234063cb4a1e5d0058f05628b56ce14a9f9ea',user_id_hash,
+       '1111111111111111111111111111111111111111111111111111111111111111',100,200,'2000-01-01'
+FROM server_users;
+ISSUED_SQL_END;
+
+ExpectedSummary :: #string SUMMARY_END
+Mesh data summary
+server_users             1
+server_habits            0
+server_habit_days        0
+server_sessions          0
+server_session_rounds    0
+server_meditation_logs   0
+server_encrypted_records 0
+server_encrypted_payloads 0
+server_sync_audit        0
+SUMMARY_END;
+
+DoctorRows :: #string DOCTOR_SQL_END
+INSERT INTO server_sync_state SELECT user_id_hash, 17 FROM server_users;
+INSERT INTO server_clients(user_id_hash,client_id,protocol_version,last_seen_server_version,last_client_clock)
+  SELECT user_id_hash,'tablet',4,13,8 FROM server_users;
+INSERT INTO server_sync_audit(user_id_hash,client_id,protocol_version,server_version,remote_ops,full_snapshot_required,encrypted_payload,encrypted_payload_bytes,created_at)
+  SELECT user_id_hash,'tablet',4,17,8,1,1,100,'2002-01-01' FROM server_users;
+INSERT INTO server_habits(user_id_hash,id,name,sync_mode,sync_activity,updated_at)
+  SELECT user_id_hash,'habit','瞑想"' || char(10,0,160,983040) || CAST(x'FF' AS TEXT),1,2,'2002-01-01' FROM server_users;
+INSERT INTO server_sessions(user_id_hash,id,started_at,local_date,topic,activity,updated_at)
+  SELECT user_id_hash,'session','2002-01-01',20020101,'自然',3,'2002-01-01' FROM server_users;
+DOCTOR_SQL_END;
+
+ExpectedDoctor :: #string DOCTOR_END
+Mesh doctor 0123456789ab...89abcdef
+status=ok server_version=17 compacted_through=0
+created=2000-01-01 last_seen=2001-02-03
+server_habits                1
+server_habit_days            0
+server_sessions              1
+server_meditation_logs       0
+server_encrypted_records     0
+server_encrypted_payloads    0
+server_sync_ops              0
+server_clients               1
+server_sync_audit            1
+
+Warnings
+- 1 legacy clients below protocol 5 seen recently
+
+Clients
+tablet protocol=4 status=legacy last_login=- last_sync=- seen=13 clock=8
+
+Recent sync audit
+tablet protocol=4 version=17 remote_ops=8 full_snapshot=true reason=- encrypted_payload=true bytes=100 at=2002-01-01
+DOCTOR_END;
+
+ExpectedUser :: #string USER_END
+User 0123456789ab...89abcdef
+public_key=aa0123456789...abcdef00
+created=2000-01-01
+last_seen=2001-02-03
+server_habits            1
+server_habit_days        0
+server_sessions          1
+server_session_rounds    0
+server_meditation_logs   0
+server_encrypted_records 0
+
+Habits
+habit  "瞑想\"\n\x00\u00a0\U000f0000\xff"  sync=1/2  deleted=0  updated=2002-01-01
+
+Recent sessions
+session  started=2002-01-01  local_date=20020101  topic=自然  activity=3  deleted=0  updated=2002-01-01
+USER_END;
+
+LegacyRows :: #string LEGACY_DONE
+INSERT INTO server_users(user_id_hash,public_key) VALUES('legacy',x'AA');
+CREATE TABLE server_social_cache(user_id_hash TEXT,kind TEXT,json TEXT,updated_at TEXT,server_version INTEGER);
+INSERT INTO server_social_cache VALUES('legacy','public','{}','2000-01-01',17);
+ALTER TABLE server_storage_plans DROP COLUMN size;
+INSERT INTO server_storage_plans(user_id,period,expires_at) VALUES('legacy','yearly',0);
+LEGACY_DONE;
+
+LegacySessions :: #string LEGACY_SESSIONS_END
+INSERT INTO server_auth_settings(name,value) VALUES
+ ('legacy_v1_started','1970-01-01T00:01:41.000000001Z'),
+ ('legacy_v1_deadline','1970-01-01 00:03:30');
+UPDATE server_users SET created_at='1970-01-01T01:01:40.999999999+01:00';
+LEGACY_SESSIONS_END;
+
+BeforeFeatureMigration :: #string BEFORE_FEATURE_END
+INSERT INTO server_users(user_id_hash,public_key,alias,created_at) VALUES
+ ('early',x'01',' Player ','2020-01-01'), ('late',x'02','player','2021-01-01');
+INSERT INTO server_encrypted_records(user_id_hash,collection,id,key_id,ciphertext,updated_at,server_version)
+ VALUES('early','private.entity.v1.game-progress','fd65a3d7ac3d5ceb2d4d96cc5224a740','entity-v1','frozen','2020-01-01',1);
+BEFORE_FEATURE_END;
+
+AfterFeatureMigration :: #string AFTER_FEATURE_END
+INSERT INTO server_record_packing(user_id_hash,collection,id,nonce,ciphertext)
+ SELECT user_id_hash,collection,id,'packed-nonce','packed-data' FROM server_encrypted_records;
+UPDATE server_encrypted_records SET ciphertext='replaced' WHERE user_id_hash='early';
+INSERT INTO server_encrypted_records(user_id_hash,collection,id,key_id,ciphertext,updated_at,server_version)
+ VALUES('late','private.entity.v1.game-progress','fd65a3d7ac3d5ceb2d4d96cc5224a740','entity-v1','new','2021-01-01',2);
+INSERT INTO server_encrypted_records(user_id_hash,collection,id,ciphertext,updated_at,server_version)
+ VALUES('late','custom','billable','data','2021-01-01',3);
+UPDATE server_apps SET display_name='Signed Inbe' WHERE app_id='inbe';
+INSERT INTO server_app_manifests(app_id,manifest_version,manifest_json,manifest_hash,manifest_signature,approval_signature,expires_at,status)
+ VALUES('inbe',1,'{}','hash','signature','approval',201,'active');
+AFTER_FEATURE_END;
+
+LegacyTimestamps :: #string LEGACY_TIMESTAMPS_END
+INSERT INTO server_users(user_id_hash,public_key,created_at,last_seen_at) VALUES
+ ('legacy',x'01','2000-01-01 00:00:00','2000-01-01T00:15:00.000000001+01:00'),
+ ('invalid',x'02','as originally stored',''),
+ ('edge',x'03','0000-01-01T00:00:00+24:60','9999-12-31T23:59:59-24:60');
+LEGACY_TIMESTAMPS_END;
+
+LegacyHabits :: #string LEGACY_HABITS_END
+INSERT INTO server_users(user_id_hash,public_key) VALUES('first',x'01'), ('second',x'02');
+INSERT INTO server_habit_id_migrations(user_id_hash,old_id,new_id,source) VALUES
+ ('first','old-id','12345678-1234-4567-89ab-123456789abc','fixture'),
+ ('second','old-id','12345678-1234-4567-89ab-000000000001','fixture');
+INSERT INTO server_habits(user_id_hash,id,name,sync_activity,sort_order,updated_at) VALUES
+ ('first','old-id','Legacy Name',1,1,'2000-01-01 00:00:00'),
+ ('first','12345678-1234-4567-89ab-123456789abc','',4,2,'2000-01-01 00:00:00'),
+ ('first','rename-this','Rename Me',0,3,'2000-01-01 00:00:00');
+INSERT INTO server_habit_days(user_id_hash,habit_id,local_date,completed,count,updated_at,server_version) VALUES
+ ('first','old-id',20200101,1,8,'2000-01-01 00:00:00',4),
+ ('first','12345678-1234-4567-89ab-123456789abc',20200101,1,1,'2000-01-01 00:00:00',1),
+ ('first','12345678-1234-4567-89ab-000000000099',20200101,1,2,'2000-01-01T00:00:00.000000001Z',9),
+ ('first','zero',20200101,0,0,'2000-01-01 00:00:00',1),
+ ('first','deleted',20200101,1,3,'2000-01-01 00:00:00',1),
+ ('second','old-id',20200101,1,3,'invalid time',7);
+INSERT INTO server_sync_ops(user_id_hash,op_id,client_id,seq,entity_type,entity_id,op_type,payload_json,created_at) VALUES
+ ('first','op1','test',1,'habit_day','old-id','upsert','{"id":"old-id","habit_id":"old-id","extra":[3]}','2000-01-01 00:00:00'),
+ ('first','op2','test',2,'habit','old-id','upsert','[1,2]','2000-01-01 00:00:00'),
+ ('first','op3','test',3,'habit','deleted','delete','','2000-01-01 00:00:00');
+LEGACY_HABITS_END;
+
+AccountCopies :: #string ACCOUNT_COPIES_END
+INSERT INTO monero_account_addresses(account_id,address_index,address,allocation_id) VALUES('native-account',1,'address','allocation');
+INSERT INTO server_chat_usage VALUES('native-account','2000-01-01',2);
+INSERT INTO server_account_backups(user_id_hash,backup,salt,verifier,updated_at) VALUES('native-account','backup','salt','verifier',100);
+INSERT INTO server_account_passkeys VALUES('native-account','credential','wrapper','verifier','label',100);
+INSERT INTO server_account_google VALUES('subject','native-account',100);
+CREATE TRIGGER reject_account_delete BEFORE DELETE ON server_account_google BEGIN SELECT RAISE(ABORT,'blocked'); END;
+ACCOUNT_COPIES_END;
+
+HoldFixture :: #string HOLD_FIXTURE_END
+CREATE TABLE server_users(user_id_hash TEXT, public_key BLOB, alias TEXT);
+INSERT INTO server_users VALUES('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',x'010002','reclaimed');
+CREATE TABLE server_habits(user_id_hash TEXT,id TEXT,name TEXT,updated_at TEXT);
+INSERT INTO server_habits SELECT user_id_hash,'restored','Restored','2000-01-01' FROM server_users;
+CREATE TABLE future_children(user_id_hash TEXT,other TEXT,data TEXT);
+INSERT INTO future_children SELECT user_id_hash,'other','keep' FROM server_users;
+INSERT INTO future_children SELECT user_id_hash,'missing','skip' FROM server_users;
+HOLD_FIXTURE_END;
+
+HoldLiveFixture :: #string HOLD_LIVE_END
+INSERT INTO server_users(user_id_hash,public_key,alias) VALUES('other',x'FF','Reclaimed');
+INSERT INTO server_account_holds VALUES('eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',100,200);
+INSERT INTO server_account_tombstones(user_id_hash) SELECT user_id_hash FROM server_account_holds;
+CREATE TABLE future_children(user_id_hash TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,other TEXT REFERENCES server_users(user_id_hash),data TEXT);
+CREATE TRIGGER fail_hold_restore BEFORE INSERT ON future_children BEGIN SELECT RAISE(ABORT,'blocked'); END;
+HOLD_LIVE_END;
+
+RecordPageFixture :: #string PAGE_FIXTURE_END
+INSERT INTO server_users(user_id_hash,public_key) VALUES('page-owner',x'01'),('different-owner',x'02');
+INSERT INTO server_apps(app_id,display_name) VALUES('pageapp','Page app'),('entity','Entity');
+INSERT INTO server_app_collections(app_id,collection_prefix) VALUES('pageapp','private.pageapp.v1.records.*'),('entity','private.entity.v1.records');
+WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<17)
+INSERT INTO server_encrypted_records(user_id_hash,collection,id,nonce,ciphertext,updated_at,server_version)
+ SELECT 'page-owner','private.pageapp.v1.records.media',printf('record-%03d',n),'nonce',printf('%.*c',262144,'x'),'2000-01-01',5 FROM sequence;
+INSERT INTO server_encrypted_records(user_id_hash,collection,id,updated_at,server_version,deleted_at) VALUES
+ ('page-owner','private.pageapp.v1.records.media','zz-tombstone','2000-01-01',5,100),
+ ('page-owner','private.other.v1.records','foreign-app','2000-01-01',5,0),
+ ('different-owner','private.pageapp.v1.records.media','foreign-user','2000-01-01',5,0),
+ ('page-owner','private.entity.v1.records','shared-entity','2000-01-01',6,100),
+ ('page-owner','private.pageapp.v1.records.media','future','2000-01-01',7,0);
+INSERT INTO server_record_packing VALUES('page-owner','private.pageapp.v1.records.media','record-017','packed-nonce','packed');
+PAGE_FIXTURE_END;

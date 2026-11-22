@@ -1,0 +1,72 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    ledger :: #import "typed_ops_native";
+    typed :: #import "typed_view_native";
+    encrypted :: #import "typed_records_native";
+    output :: #import "sync_response_native";
+    friends :: #import "friend_snapshots_native";
+    input :: #import "typed_request_native";
+    protocol :: #import "protocol";
+    json :: #import "std/json_document";
+
+    Counts :: (document: *json.JsonDocument, row: s32, applied: protocol.SyncResult) -> bool {
+        return output.IntegerField(document, row, "habits", cast(s64)applied.Habits) &&
+            output.IntegerField(document, row, "habit_days", cast(s64)applied.HabitDays) &&
+            output.IntegerField(document, row, "sessions", cast(s64)applied.Sessions) &&
+            output.IntegerField(document, row, "meditation_logs", cast(s64)applied.MeditationLogs) &&
+            output.IntegerField(document, row, "social_cache", cast(s64)applied.SocialCache) &&
+            (applied.EncryptedRecords == 0 || output.IntegerField(document, row, "encrypted_records", cast(s64)applied.EncryptedRecords))
+    }
+
+    Profile :: (database: *void, user: string, document: *json.JsonDocument, root: s32) -> bool {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        rows := sql.Prepare(database, "SELECT COALESCE(alias,''),profile_icon FROM server_users WHERE user_id_hash=?1", arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        if sqlite.SqliteStep(rows.value) != sqlite.SQLITE_ROW { return false }
+        icon := sqlite.SqliteColumnInt64(rows.value, 1)
+        return output.TextIfPresent(document, root, "account_alias", sql.ColumnText(rows.value, 0)) &&
+            (icon == 0 || output.IntegerField(document, root, "profile_icon", icon))
+    }
+
+    Attach :: (database: *void, user: string, since: s64, full: bool, now: string, request: *input.Request,
+        document: *json.JsonDocument, root: s32, counts: s32) -> bool {
+        changes := json.JsonNewObject(document)
+        clean := request.protocolVersion >= 3
+        include := request.protocolVersion < 5 || request.legacy
+        if changes < 0 || !typed.Attach(database, user, since, clean, include, document, changes, document, counts) { return false }
+        social := friends.Build(database, user, now, document)
+        if social < 0 || !output.IntegerField(document, counts, "social_cache", cast(s64)json.JsonCount(document, social)) ||
+            !json.JsonSet(document, changes, "social_cache", social) ||
+            !encrypted.Attach(database, user, since, request.contentFreeDeletions, document, changes, counts) ||
+            !json.JsonSet(document, root, "changes", changes) { return false }
+        if !clean { return true }
+        data := json.JsonNewObject(document)
+        if data < 0 { return false }
+        tables: [4]string = .["habits", "habit_days", "sessions", "meditation_logs"]
+        for name: tables {
+            array := json.JsonMember(document, changes, name)
+            if !json.JsonSet(document, data, name, json.JsonCopy(document, document, array)) { return false }
+        }
+        array := json.JsonMember(document, changes, "habit_days")
+        day := json.JsonFirst(document, array)
+        while day >= 0 {
+            if !json.JsonRemove(document, day, "habit_name") { return false }
+            day = json.JsonNext(document, day)
+        }
+        if !json.JsonSet(document, data, "social", json.JsonCopy(document, document, social)) { return false }
+        keys: [2]string = .["friends", "friend_requests"]
+        node := json.JsonFirst(document, social)
+        for key: keys {
+            value := json.JsonMember(document, node, "json")
+            if value < 0 || !json.JsonSet(document, data, key, json.JsonCopy(document, document, value)) { return false }
+            node = json.JsonNext(document, node)
+        }
+        if full {
+            records := json.JsonMember(document, changes, "encrypted_records")
+            if records >= 0 && !json.JsonSet(document, data, "encrypted_records", json.JsonCopy(document, document, records)) { return false }
+        }
+        return json.JsonSet(document, root, "data", data) && ledger.AttachLogs(database, user, request.clock, document, root)
+    }
+}

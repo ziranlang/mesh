@@ -1,0 +1,13 @@
+Schema :: #string SQL
+CREATE TABLE IF NOT EXISTS game_legacy_migration (id INTEGER PRIMARY KEY CHECK(id=1));
+CREATE TABLE IF NOT EXISTS game_legacy_snapshots (
+ account_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ ciphertext TEXT NOT NULL, server_version INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game_legacy_progress (
+ account_id TEXT PRIMARY KEY REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
+ unlocked INTEGER NOT NULL, completed TEXT NOT NULL, snapshot TEXT NOT NULL, migrated_at INTEGER NOT NULL
+);
+SQL;
+InsertMarker :: "INSERT INTO game_legacy_migration(id) VALUES(1) ON CONFLICT DO NOTHING";
+FreezeRecords :: "INSERT INTO game_legacy_snapshots(account_id,ciphertext,server_version) SELECT user_id_hash,ciphertext,server_version FROM server_encrypted_records WHERE collection='private.entity.v1.game-progress' AND id='fd65a3d7ac3d5ceb2d4d96cc5224a740' AND key_id='entity-v1' AND deleted_at=0 AND ciphertext<>'' ON CONFLICT DO NOTHING";

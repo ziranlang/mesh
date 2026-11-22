@@ -1,0 +1,85 @@
+#if TARGET == .C && OS == .LINUX {
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    network :: #import "network_scope_native";
+    transfer :: #import "peer_http_native";
+    #import "std/vec"
+
+    #scope_file
+    mhd :: #system_library "microhttpd";
+    libc :: #system_library "c";
+    ConnectionFD :: 6;
+    PollDisconnect :: 0x2018; // POLLRDHUP | POLLHUP | POLLERR on Linux.
+    SocketPoll :: struct {
+        fd: s32
+        events: s16
+        returnedEvents: s16
+    }
+    ConnectionInfo :: (connection: *void, kind: s32, arguments: ..any) -> *s32 #foreign mhd "MHD_get_connection_info";
+    Poll :: (descriptor: *SocketPoll, count: usize, timeout: s32) -> s32 #foreign libc "poll";
+
+    Disconnected :: (context: *void) -> bool {
+        fd := cast(*s32)context
+        watched: SocketPoll = .{fd = <<fd, events = 0x2000}
+        return Poll(*watched, 1, 0) > 0 && (watched.returnedEvents & PollDisconnect) != 0
+    }
+
+    #scope_export
+    DefaultEndpoint :: "https://api.z.ai/api/paas/v4/chat/completions";
+    DefaultModel :: "glm-4.7-flash";
+
+    Request :: (connection: *void, endpoint: string, apiKey: string, body: []u8,
+        waitSeconds: s64, responseLimit: s64, response: *transfer.Response) -> bool {
+        address := ifx endpoint == "" then DefaultEndpoint else endpoint
+        authorization: Vec(u8)
+        if !BuilderAppend(authorization, "Bearer ") || !BuilderAppend(authorization, apiKey) {
+            return false
+        }
+        headers: [1]http.HeaderValue = .[.{name = "Authorization", value = TextView(VecSlice(authorization, 0, authorization.count))}]
+        options: transfer.Options = .{headers = headers[:], timeout = waitSeconds, maximum = responseLimit}
+        fd := ConnectionInfo(connection, ConnectionFD)
+        if fd != null && <<fd >= 0 {
+            options.stopping = Disconnected
+            options.context = cast(*void)fd
+        }
+        // The peer transport removes a trailing slash before appending a path.
+        // Reapply the endpoint's trailing slashes without altering its query.
+        pathEnd := address.count
+        for byte, index: address {
+            if byte == #char "?" || byte == #char "#" {
+                pathEnd = index
+                break
+            }
+        }
+        suffixStart := pathEnd
+        while suffixStart > 0 && address[suffixStart - 1] == #char "/" {
+            suffixStart -= 1
+        }
+        scope: network.Scope
+        return transfer.Request(*scope, address, address[suffixStart:pathEnd], body, options, response) && response.status == 200
+    }
+
+    NewRequest :: (document: *json.JsonDocument, model: string, outputTokens: s64, thinkingTokens: s64) -> s32 {
+        root := json.JsonNewObject(document)
+        thinking := json.JsonNewObject(document)
+        glm5 := model.count >= 5 && model[:5] == "glm-5"
+        budget := ifx glm5 then outputTokens + thinkingTokens else outputTokens
+        if !json.JsonSet(document, root, "model", json.JsonNewStringCopy(document, model)) ||
+            !json.JsonSet(document, root, "max_tokens", json.JsonNewInteger(document, budget)) ||
+            !json.JsonSet(document, thinking, "type", json.JsonNewString(document, ifx glm5 then "enabled" else "disabled")) ||
+            !json.JsonSet(document, root, "thinking", thinking) {
+            return -1
+        }
+        if glm5 && !json.JsonSet(document, root, "reasoning_effort", json.JsonNewString(document, "low")) {
+            return -1
+        }
+        return root
+    }
+
+    AppendTextMessage :: (document: *json.JsonDocument, messages: s32, role: string, text: string) -> bool {
+        item := json.JsonNewObject(document)
+        return json.JsonSet(document, item, "role", json.JsonNewStringCopy(document, role)) &&
+            json.JsonSet(document, item, "content", json.JsonNewStringCopy(document, text)) &&
+            json.JsonAppend(document, messages, item)
+    }
+}

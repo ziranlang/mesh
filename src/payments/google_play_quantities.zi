@@ -1,3 +1,4 @@
+play_schema :: #import "google_play_schema";
 #import "std/go_types"
 sql :: #import "std/sql_go";
 ctx :: #import "std/context_go";
@@ -14,27 +15,7 @@ GoogleRefundQuantity :: struct {
 
 #scope_export
 SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS google_play_purchase_quantities(
- purchase_token TEXT PRIMARY KEY,paid_quantity INTEGER NOT NULL CHECK(paid_quantity>0),
- refunded_quantity INTEGER NOT NULL DEFAULT 0 CHECK(refunded_quantity>=0 AND refunded_quantity<=paid_quantity)
-);
-CREATE TABLE IF NOT EXISTS google_play_purchase_proofs(
- purchase_token TEXT PRIMARY KEY,payment_kind TEXT NOT NULL CHECK(payment_kind IN ('paid','test','promo','rewarded')),
- snapshot_refunded INTEGER NOT NULL DEFAULT -1 CHECK(snapshot_refunded>=-1),verified_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS google_play_snapshot_watch(
- purchase_token TEXT PRIMARY KEY,last_attempt INTEGER NOT NULL DEFAULT 0
-);
-CREATE INDEX IF NOT EXISTS google_play_snapshot_watch_pending ON google_play_snapshot_watch(last_attempt,purchase_token);
-CREATE TABLE IF NOT EXISTS google_play_proof_attempts(
- purchase_token TEXT PRIMARY KEY,last_attempt INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS google_play_refund_events(
- purchase_token TEXT NOT NULL,voided_millis INTEGER NOT NULL,voided_quantity INTEGER NOT NULL,
- receipt_id TEXT NOT NULL,PRIMARY KEY(purchase_token,voided_millis,voided_quantity)
-);
-SQL
+    return play_schema.Quantities
 }
 
 RecordTx :: (transaction: *sql.Transaction, context: ctx.Context, token: string, quantity: s64) -> Error {

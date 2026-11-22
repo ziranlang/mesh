@@ -1,0 +1,62 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+config :: #import "config";
+auth :: #import "http_auth";
+sync_request :: #import "sync_request";
+http :: #import "std/http_go";
+ctx :: #import "std/context_go";
+io :: #import "std/io_go";
+os :: #system_library "go:os";
+
+#scope_file
+Unsetenv :: (name: string) -> Error #foreign os;
+
+#scope_export
+#program_export "TestMeshEnvironmentPreservesInstalledConfiguration"
+MeshEnvironmentPreservesInstalledConfiguration :: (test: *testing.Test) {
+    testing.Setenv(test, "DAOCHI_DB", "/var/lib/daochi/daochi.db")
+    testing.Setenv(test, "DAOCHI_NODE_IDENTITY_KEY_FILE", "/etc/daochi/node.key")
+    testing.Setenv(test, "MESH_DB", "")
+    testing.Setenv(test, "MESH_NODE_IDENTITY_KEY_FILE", "")
+    if Unsetenv("MESH_DB") != null || Unsetenv("MESH_NODE_IDENTITY_KEY_FILE") != null {
+        testing.Fatal(test, "could not unset the Mesh environment")
+    }
+    db := config.EnvString("MESH_DB", "missing")
+    key := config.EnvString("MESH_NODE_IDENTITY_KEY_FILE", "missing")
+    if db != "/var/lib/daochi/daochi.db" || key != "/etc/daochi/node.key" {
+        arguments: [2]Any = .[db, key]
+        testing.Fatalf(test, "installed paths changed: database %q, key %q", arguments[:])
+    }
+    testing.Setenv(test, "MESH_DB", "/existing/selected.db")
+    if config.EnvString("MESH_DB", "missing") != "/existing/selected.db" {
+        testing.Fatal(test, "Mesh config did not prefer the database selected by the owner")
+    }
+    testing.Setenv(test, "MESH_DB", "")
+    if config.EnvString("MESH_DB", "fallback") != "fallback" {
+        testing.Fatal(test, "explicit empty Mesh value must not load legacy state")
+    }
+}
+
+#program_export "TestMeshAndDaochiHeadersShareSignatureBytes"
+MeshAndDaochiHeadersShareSignatureBytes :: (test: *testing.Test) {
+    user := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    user_headers: [2]string = .["X-Mesh-User", "X-Daochi-User"]
+    signature_headers: [2]string = .["X-Mesh-Signature", "X-Daochi-Signature"]
+    for index: 0..1 {
+        body: io.Reader
+        request := http.NewRequest(ctx.Background(), "POST", "/api/v1/sync/login", body)
+        if request.error != null {
+            arguments: [1]Any = .[request.error]
+            testing.Fatalf(test, "build request: %v", arguments[:])
+        }
+        header := http.Headers(request.value)
+        http.SetHeader(header, user_headers[index], user)
+        http.SetHeader(header, signature_headers[index], "proof")
+        account := auth.UserHeader(request.value)
+        signature := sync_request.SignatureHeader(request.value)
+        if account.value != user || signature.value != "proof" || signature.context != "daochi-sync-v1" {
+            arguments: [3]Any = .[user_headers[index], account, signature]
+            testing.Fatalf(test, "%s changed signed headers: %+v, %+v", arguments[:])
+        }
+    }
+}

@@ -27,6 +27,7 @@ sql :: #import "std/sql_go";
 clock :: #import "std/time_go";
 text :: #import "std/text_go";
 errors :: #import "std/errors_go";
+wire_text :: #import "wire_text";
 strings :: #system_library "go:strings";
 hex :: #system_library "go:encoding/hex";
 time :: #system_library "go:time";
@@ -49,8 +50,6 @@ AccountAccess :: struct {
 }
 
 #scope_file
-TrimSpace :: (value: string) -> string #foreign strings;
-TrimPrefix :: (value: string, prefix: string) -> string #foreign strings "TrimPrefix";
 ToLower :: (value: string) -> string #foreign strings;
 Join :: (parts: []string, separator: string) -> string #foreign strings;
 EncodeHex :: (value: []u8) -> string #foreign hex "EncodeToString";
@@ -87,15 +86,18 @@ RequestSignature :: (access: AccountAccess, request: *http.Request, user: string
         http.Method(request), url.Path(http.RequestURL(request)), body)
 }
 
-Deleted :: (writer: http.ResponseWriter) {
-    value: Map(string, string)
-    MapSet(value, "status", "deleted")
+AccountStatusResponse :: struct {
+    status: string #go_tag "json:\"status\""
+}
+
+WriteStatus :: (writer: http.ResponseWriter, status: string) {
+    value: AccountStatusResponse = .{status = status}
     response.JSON(writer, cast(isize)200, value)
 }
 
 #scope_export
 Challenge :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Request) {
-    user := ToLower(TrimSpace(url.Value(url.Query(http.RequestURL(request)), "user_id")))
+    user := ToLower(wire_text.TrimSpace(url.Value(url.Query(http.RequestURL(request)), "user_id")))
     if !identity.ValidUserID(user) {
         response.Error(writer, cast(isize)400, "invalid user_id")
         return
@@ -218,19 +220,15 @@ Login :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Req
     result.ProfileIcon = icon.value
     response.JSON(writer, cast(isize)200, result)
 }
-LogoutResponse :: struct {
-    status: string #go_tag "json:\"status\""
-}
-
 Logout :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Request) {
     user := http_auth.BearerUser(access.database, request, access.configuration.TokenSecret)
     if user.authentication.error != null || user.authentication.status != cast(isize)0 {
         http_auth.Respond(writer, access.counters, user.authentication)
         return
     }
-    authorization := TrimSpace(http.HeaderValue(http.Headers(request), "Authorization"))
+    authorization := wire_text.TrimSpace(http.HeaderValue(http.Headers(request), "Authorization"))
     error := sessions.RevokeBearer(access.database, http.Context(request), user.value,
-        TrimPrefix(authorization, "Bearer "))
+        wire_text.TrimPrefix(authorization, "Bearer "))
     if errors.Is(error, sql.NoRows()) {
         response.Error(writer, cast(isize)401, "invalid bearer token")
         return
@@ -240,9 +238,7 @@ Logout :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Re
         response.Error(writer, cast(isize)500, "logout failed")
         return
     }
-    result: LogoutResponse
-    result.status = "ok"
-    response.JSON(writer, cast(isize)200, result)
+    WriteStatus(writer, "ok")
 }
 
 Delete :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Request) {
@@ -269,7 +265,7 @@ Delete :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Re
         response.Error(writer, cast(isize)500, "delete failed")
         return
     }
-    Deleted(writer)
+    WriteStatus(writer, "deleted")
 }
 
 DeleteWithKey :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Request) {
@@ -318,5 +314,5 @@ DeleteWithKey :: (access: AccountAccess, writer: http.ResponseWriter, request: *
         response.Error(writer, cast(isize)500, "delete failed")
         return
     }
-    Deleted(writer)
+    WriteStatus(writer, "deleted")
 }

@@ -1,0 +1,93 @@
+calendar :: #import "std/calendar";
+
+TimestampValue :: struct {
+    seconds: s64
+    nanoseconds: s32
+    valid: bool
+}
+
+#scope_file
+ReadDigits :: (value: string, start: s64, count: s64) -> s32 {
+    if start + count > value.count { return -1 }
+    number: s32 = 0
+    index := start
+    while index < start + count {
+        digit := cast(s32)value[index] - 48
+        if digit < 0 || digit > 9 { return -1 }
+        number = 10 * number + digit
+        index += 1
+    }
+    return number
+}
+
+#scope_export
+DaysBeforeYear :: (year: s64) -> s64 {
+    return year * 365 + (year + 3) / 4 - (year + 99) / 100 + (year + 399) / 400
+}
+
+// SQLite stores legacy UTC timestamps without an offset. Mesh also accepts
+// RFC3339 offsets and preserves nanosecond ordering when comparing accounts.
+Parse :: (value: string) -> TimestampValue {
+    if value.count < 18 || value[4] != #char "-" || value[7] != #char "-" { return .{} }
+    rfc3339 := value[10] == #char "T"
+    if !rfc3339 && value[10] != #char " " { return .{} }
+    year := ReadDigits(value, 0, 4)
+    month := ReadDigits(value, 5, 2)
+    day := ReadDigits(value, 8, 2)
+    if year < 0 { return .{} }
+    // The Gregorian calendar in year zero has the same month lengths as 2000.
+    calendarYear := ifx year == 0 then 2000 else year
+    dayOfYear := calendar.DayOfYear(calendarYear, month, day)
+    if dayOfYear < 0 { return .{} }
+    hourLength: s64 = ifx value[12] == #char ":" then 1 else 2
+    hour := ReadDigits(value, 11, hourLength)
+    minuteStart := 12 + hourLength
+    secondStart := minuteStart + 3
+    if value.count < secondStart + 2 || value[minuteStart - 1] != #char ":" ||
+        value[secondStart - 1] != #char ":" { return .{} }
+    minute := ReadDigits(value, minuteStart, 2)
+    second := ReadDigits(value, secondStart, 2)
+    if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 { return .{} }
+
+    index := secondStart + 2
+    nanos: s32 = 0
+    if index < value.count && (value[index] == #char "." || value[index] == #char ",") {
+        index += 1
+        fractionStart := index
+        while index < value.count {
+            digit := cast(s32)value[index] - 48
+            if digit < 0 || digit > 9 { break }
+            if index - fractionStart < 9 { nanos = 10 * nanos + digit }
+            index += 1
+        }
+        digits := index - fractionStart
+        if digits == 0 { return .{} }
+        while digits < 9 {
+            nanos *= 10
+            digits += 1
+        }
+    }
+
+    offset: s32 = 0
+    if !rfc3339 {
+        if index != value.count { return .{} }
+    } else if index + 1 == value.count && value[index] == #char "Z" {
+        offset = 0
+    } else {
+        if index + 6 != value.count || value[index + 3] != #char ":" { return .{} }
+        negative := value[index] == #char "-"
+        if !negative && value[index] != #char "+" { return .{} }
+        offsetHour := ReadDigits(value, index + 1, 2)
+        offsetMinute := ReadDigits(value, index + 4, 2)
+        if offsetHour < 0 || offsetHour > 24 || offsetMinute < 0 || offsetMinute > 60 { return .{} }
+        offset = offsetHour * 3600 + offsetMinute * 60
+        if negative { offset = -offset }
+    }
+    days := DaysBeforeYear(cast(s64)year) - DaysBeforeYear(1970) + cast(s64)dayOfYear
+    seconds := days * 86400 + cast(s64)(hour * 3600 + minute * 60 + second - offset)
+    return .{seconds = seconds, nanoseconds = nanos, valid = true}
+}
+
+Before :: (left: TimestampValue, right: TimestampValue) -> bool {
+    return left.seconds < right.seconds || (left.seconds == right.seconds && left.nanoseconds < right.nanoseconds)
+}

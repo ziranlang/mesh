@@ -1,0 +1,192 @@
+#import "std/vec"
+wire_text :: #import "wire_text";
+
+BinaryBytes :: struct {
+    value: Vec(u8)
+    error: string
+}
+
+#scope_file
+AllocationError :: "binary field allocation failed";
+Base64Error :: "invalid base64";
+
+HexDigit :: (value: u8) -> s32 {
+    if value >= cast(u8)48 && value <= cast(u8)57 {
+        return cast(s32)value - 48
+    }
+    if value >= cast(u8)97 && value <= cast(u8)102 {
+        return cast(s32)value - 87
+    }
+    if value >= cast(u8)65 && value <= cast(u8)70 {
+        return cast(s32)value - 55
+    }
+    return -1
+}
+
+#scope_export
+IsHex :: (value: string) -> bool {
+    index: s64 = 0
+    while index < value.count {
+        if HexDigit(value[index]) < 0 {
+            return false
+        }
+        index += 1
+    }
+    return true
+}
+
+#scope_file
+Base64Digit :: (value: u8, url: bool) -> s32 {
+    if value >= cast(u8)65 && value <= cast(u8)90 {
+        return cast(s32)value - 65
+    }
+    if value >= cast(u8)97 && value <= cast(u8)122 {
+        return cast(s32)value - 71
+    }
+    if value >= cast(u8)48 && value <= cast(u8)57 {
+        return cast(s32)value + 4
+    }
+    if url {
+        if value == cast(u8)45 {
+            return 62
+        }
+        if value == cast(u8)95 {
+            return 63
+        }
+    } else {
+        if value == cast(u8)43 {
+            return 62
+        }
+        if value == cast(u8)47 {
+            return 63
+        }
+    }
+    return -1
+}
+
+#scope_export
+// Match Go's non-strict encodings: CR/LF are ignored, unused terminal bits
+// need not be zero, and padded URL encoding does not accept unpadded input.
+DecodeBase64 :: (value: string, url: bool, padded: bool) -> BinaryBytes {
+    output: Vec(u8)
+    index: s64 = 0
+    digits: s32 = 0
+    padding: s32 = 0
+    accumulator: u32 = cast(u32)0
+    while index < value.count {
+        byte: u8 = value[index]
+        index += 1
+        if byte == cast(u8)10 || byte == cast(u8)13 {
+            continue
+        }
+        if byte == cast(u8)61 {
+            if !padded || digits < 2 || padding >= 4 - digits {
+                return .{error = Base64Error}
+            }
+            padding += 1
+            continue
+        }
+        if padding != 0 {
+            return .{error = Base64Error}
+        }
+        digit: s32 = Base64Digit(byte, url)
+        if digit < 0 {
+            return .{error = Base64Error}
+        }
+        accumulator = (accumulator << cast(u32)6) | cast(u32)digit
+        digits += 1
+        if digits == 4 {
+            if !VecPush(output, cast(u8)(accumulator >> cast(u32)16)) ||
+               !VecPush(output, cast(u8)(accumulator >> cast(u32)8)) ||
+               !VecPush(output, cast(u8)accumulator) {
+                return .{error = AllocationError}
+            }
+            digits = 0
+            accumulator = cast(u32)0
+        }
+    }
+    if digits == 1 || (padded && digits != 0 && padding != 4 - digits) {
+        return .{error = Base64Error}
+    }
+    if digits == 2 || digits == 3 {
+        shift: u32 = cast(u32)(digits * 6 - 8)
+        if !VecPush(output, cast(u8)(accumulator >> shift)) {
+            return .{error = AllocationError}
+        }
+    }
+    if digits == 3 && !VecPush(output, cast(u8)(accumulator >> cast(u32)2)) {
+        return .{error = AllocationError}
+    }
+    return .{value = output}
+}
+
+DecodeBinaryField :: (input: string) -> BinaryBytes {
+    value: string = wire_text.TrimSpace(input)
+    if value.count == 0 {
+        return .{error = "empty binary field"}
+    }
+    if value.count % 2 == 0 && IsHex(value) {
+        output: Vec(u8)
+        index: s64 = 0
+        while index < value.count {
+            byte: u8 = cast(u8)(HexDigit(value[index]) * 16 + HexDigit(value[index + 1]))
+            if !VecPush(output, byte) {
+                return .{error = AllocationError}
+            }
+            index += 2
+        }
+        return .{value = output}
+    }
+    standard := DecodeBase64(value, false, true)
+    if standard.error == "" {
+        return standard
+    }
+    raw := DecodeBase64(value, false, false)
+    if raw.error == "" {
+        return raw
+    }
+    url := DecodeBase64(value, true, true)
+    if url.error == "" {
+        return url
+    }
+    return .{error = "field is neither hex nor base64"}
+}
+
+EncodeBase64 :: (value: string, url: bool, padded: bool) -> BinaryBytes {
+    alphabet: string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    if url {
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    }
+    output: Vec(u8)
+    index: s64 = 0
+    while index < value.count {
+        remaining: s64 = value.count - index
+        group: u32 = cast(u32)value[index] << cast(u32)16
+        if remaining > 1 {
+            group |= cast(u32)value[index + 1] << cast(u32)8
+        }
+        if remaining > 2 {
+            group |= cast(u32)value[index + 2]
+        }
+        if !VecPush(output, alphabet[cast(s64)(group >> cast(u32)18)]) ||
+           !VecPush(output, alphabet[cast(s64)((group >> cast(u32)12) & cast(u32)63)]) {
+            return .{error = AllocationError}
+        }
+        if remaining > 1 {
+            if !VecPush(output, alphabet[cast(s64)((group >> cast(u32)6) & cast(u32)63)]) {
+                return .{error = AllocationError}
+            }
+        } else if padded && !VecPush(output, cast(u8)61) {
+            return .{error = AllocationError}
+        }
+        if remaining > 2 {
+            if !VecPush(output, alphabet[cast(s64)(group & cast(u32)63)]) {
+                return .{error = AllocationError}
+            }
+        } else if padded && !VecPush(output, cast(u8)61) {
+            return .{error = AllocationError}
+        }
+        index += 3
+    }
+    return .{value = output}
+}

@@ -1,0 +1,99 @@
+#if TARGET == .C {
+    sqlite :: #import "sqlite/SQLite";
+    seed :: #import "builtin_app_seed";
+    registration :: #import "app_registration_sql";
+    #import "std/vec"
+
+    #scope_file
+    AppValues :: #string VALUES_END
+SELECT json_extract(data,'$.app_id'), json_extract(data,'$.display_name'),
+       json_extract(data,'$.description'), COALESCE(json_extract(data,'$.homepage_url'),''),
+       json_extract(data,'$.source_url'), '', json_extract(data,'$.status'),
+       json_extract(data,'$.app_schema_version'), json_extract(data,'$.min_supported_client_version'),
+       json_extract(data,'$.current_client_version'), COALESCE(json_extract(data,'$.compatibility_until'),''),
+       json_extract(data,'$.features'), COALESCE(json_extract(data,'$.legacy_protocols'),'null')
+FROM (SELECT ?1 AS data) WHERE true
+VALUES_END;
+
+    ClearCollections :: "DELETE FROM server_app_collections WHERE app_id=json_extract(?1,'$.app_id')";
+    InsertCollections :: #string COLLECTIONS_END
+INSERT INTO server_app_collections(app_id,collection_prefix,visibility,schema_version,description)
+SELECT json_extract(?1,'$.app_id'), json_extract(value,'$.collection_prefix'),
+       json_extract(value,'$.visibility'), json_extract(value,'$.schema_version'), json_extract(value,'$.description')
+FROM json_each(?1,'$.collections')
+COLLECTIONS_END;
+
+    ClearCapabilities :: "DELETE FROM server_app_capabilities WHERE app_id=json_extract(?1,'$.app_id')";
+    InsertCapabilities :: #string CAPABILITIES_END
+INSERT OR IGNORE INTO server_app_capabilities(app_id,capability)
+SELECT json_extract(?1,'$.app_id'), value FROM json_each(?1,'$.capabilities')
+CAPABILITIES_END;
+
+    ClearPolicies :: "DELETE FROM token_app_permissions WHERE app_id=json_extract(?1,'$.app_id')";
+    InsertPolicies :: #string POLICIES_END
+INSERT INTO token_app_permissions(app_id,asset_id,permission,status,legacy_unsigned_until)
+SELECT json_extract(?1,'$.app_id'), json_extract(value,'$.asset_id'), json_extract(value,'$.permission'),
+       json_extract(value,'$.status'), json_extract(value,'$.legacy_unsigned_until')
+FROM json_each(?1,'$.token_policies')
+POLICIES_END;
+
+    ManifestResult :: struct {
+        active: bool
+        status: s32
+    }
+
+    ActiveManifest :: (database: *void, appID: string) -> ManifestResult {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, seed.ActiveManifest, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        defer sqlite.SqliteFinalize(statement)
+        status = sqlite.SqliteBindTextString(statement, 1, appID, -1)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        status = sqlite.SqliteStep(statement)
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        return .{active = sqlite.SqliteColumnInt(statement, 0) != 0}
+    }
+
+    Write :: (database: *void, query: string, manifest: string) -> s32 {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, query, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return status }
+        defer sqlite.SqliteFinalize(statement)
+        status = sqlite.SqliteBindTextString(statement, 1, manifest, -1)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteStep(statement)
+        return ifx status == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else status
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    SeedRegistration :: (database: *void, appID: string, manifest: string) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        registered := ActiveManifest(database, appID)
+        if registered.status != sqlite.SQLITE_OK { return registered.status }
+        if !registered.active {
+            insert := registration.Write(AppValues)
+            if insert.count == 0 { return sqlite.SQLITE_NOMEM }
+            changes: [7]string = .[TextView(VecSlice(insert, 0, insert.count)),
+                ClearCollections, InsertCollections, ClearCapabilities, InsertCapabilities, ClearPolicies, InsertPolicies]
+            for change: changes {
+                status = Write(database, change, manifest)
+                if status != sqlite.SQLITE_OK { return status }
+            }
+        }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    #scope_export
+    Seed :: (database: *void) -> s32 {
+        status := SeedRegistration(database, "inbe", seed.Inbe)
+        if status != sqlite.SQLITE_OK { return status }
+        return SeedRegistration(database, "entity", seed.Entity)
+    }
+}

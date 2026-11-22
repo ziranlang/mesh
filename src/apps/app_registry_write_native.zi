@@ -1,0 +1,183 @@
+#if TARGET == .C && OS == .LINUX {
+    schema :: #import "app_registration_sql";
+    json :: #import "std/json_document";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    fields :: #import "sync_json_fields";
+    #import "std/vec"
+
+    ManifestWrite :: struct {
+        status: s32
+        outdated: bool
+    }
+
+    #scope_file
+    AppText :: (document: *json.JsonDocument, node: s32, key: string) -> Text {
+        return json.JsonString(document, json.JsonMember(document, node, key))
+    }
+
+    AppInteger :: (document: *json.JsonDocument, node: s32, key: string) -> s64 {
+        return fields.Number(document, json.JsonMember(document, node, key))
+    }
+
+    AppRow :: (database: *void, document: *json.JsonDocument, root: s32) -> s32 {
+        names: [11]string = .["app_id", "display_name", "description", "homepage_url", "source_url", "public_key",
+            "status", "app_schema_version", "min_supported_client_version", "current_client_version", "compatibility_until"]
+        query := schema.Write(schema.Parameters)
+        if query.count == 0 { return sqlite.SQLITE_NOMEM }
+        none: []sql.Argument
+        prepared := sql.Prepare(database, TextView(VecSlice(query, 0, query.count)), none)
+        if prepared.status != sqlite.SQLITE_OK { return prepared.status }
+        defer sqlite.SqliteFinalize(prepared.value)
+        for name, index: names {
+            slot := cast(s32)(index + 1)
+            status: s32
+            if index == 7 {
+                status = sql.Bind(prepared.value, slot, sql.IntArg(AppInteger(document, root, name)))
+            } else if index == 5 && json.JsonMember(document, root, "keys") >= 0 {
+                first := json.JsonFirst(document, json.JsonMember(document, root, "keys"))
+                key: Text = AppText(document, first, name)
+                status = sql.Bind(prepared.value, slot, sql.TextArg(TextView(key)))
+            } else {
+                field: Text = AppText(document, root, name)
+                status = sql.Bind(prepared.value, slot, sql.TextArg(TextView(field)))
+            }
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        arrays: [2]string = .["features", "legacy_protocols"]
+        for name, index: arrays {
+            node := json.JsonMember(document, root, name)
+            slot := cast(s32)(12 + index)
+            if node < 0 {
+                status := sql.Bind(prepared.value, slot, sql.TextArg("null"))
+                if status != sqlite.SQLITE_OK { return status }
+                continue
+            }
+            encoded: Vec(u8)
+            if !json.JsonWriteInto(*encoded, document, node, json.JsonCompactStyle(false)) {
+                return sqlite.SQLITE_NOMEM
+            }
+            status := sql.Bind(prepared.value, slot, sql.TextArg(TextView(VecSlice(encoded, 0, encoded.count))))
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        stepped := sqlite.SqliteStep(prepared.value)
+        return ifx stepped == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else stepped
+    }
+
+    WriteCollections :: (database: *void, document: *json.JsonDocument, root: s32, id: string) -> s32 {
+        node := json.JsonFirst(document, json.JsonMember(document, root, "collections"))
+        while node >= 0 {
+            prefix: Text = AppText(document, node, "collection_prefix")
+            scope: Text = AppText(document, node, "visibility")
+            description: Text = AppText(document, node, "description")
+            args: [5]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(prefix)), sql.TextArg(TextView(scope)),
+                sql.IntArg(AppInteger(document, node, "schema_version")), sql.TextArg(TextView(description))]
+            status := sql.Execute(database, schema.InsertAppCollectionSQL, args[:])
+            if status != sqlite.SQLITE_OK { return status }
+            node = json.JsonNext(document, node)
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    WriteCapabilities :: (database: *void, document: *json.JsonDocument, root: s32, id: string) -> s32 {
+        node := json.JsonFirst(document, json.JsonMember(document, root, "capabilities"))
+        while node >= 0 {
+            capability: Text = json.JsonString(document, node)
+            args: [2]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(capability))]
+            status := sql.Execute(database, schema.InsertAppCapabilitySQL, args[:])
+            if status != sqlite.SQLITE_OK { return status }
+            node = json.JsonNext(document, node)
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    WritePolicies :: (database: *void, document: *json.JsonDocument, root: s32, id: string) -> s32 {
+        node := json.JsonFirst(document, json.JsonMember(document, root, "token_policies"))
+        while node >= 0 {
+            asset: Text = AppText(document, node, "asset_id")
+            permission: Text = AppText(document, node, "permission")
+            policyStatus: Text = AppText(document, node, "status")
+            args: [5]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(asset)), sql.TextArg(TextView(permission)),
+                sql.TextArg(TextView(policyStatus)), sql.IntArg(AppInteger(document, node, "legacy_unsigned_until"))]
+            status := sql.Execute(database, schema.InsertAppTokenPolicySQL, args[:])
+            if status != sqlite.SQLITE_OK { return status }
+            node = json.JsonNext(document, node)
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    StoreKeys :: (database: *void, document: *json.JsonDocument, root: s32, id: string) -> s32 {
+        args: [1]sql.Argument = .[sql.TextArg(id)]
+        cleared := sql.Execute(database, schema.ClearAppKeysSQL, args[:])
+        if cleared != sqlite.SQLITE_OK { return cleared }
+        node := json.JsonFirst(document, json.JsonMember(document, root, "keys"))
+        while node >= 0 {
+            keyID: Text = AppText(document, node, "key_id")
+            algorithm: Text = AppText(document, node, "algorithm")
+            public: Text = AppText(document, node, "public_key")
+            purposeText: Text = AppText(document, node, "purpose")
+            statusText: Text = AppText(document, node, "status")
+            purpose := TextView(purposeText)
+            status := TextView(statusText)
+            args: [7]sql.Argument = .[sql.TextArg(id), sql.TextArg(TextView(keyID)), sql.TextArg(TextView(algorithm)),
+                sql.TextArg(TextView(public)), sql.TextArg(ifx purpose == "" then "signing" else purpose),
+                sql.TextArg(ifx status == "" then "active" else status), sql.IntArg(AppInteger(document, node, "expires_at"))]
+            written := sql.Execute(database, schema.KeyInsertSQL, args[:])
+            if written != sqlite.SQLITE_OK { return written }
+            node = json.JsonNext(document, node)
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    Installed :: (database: *void, id: string) -> sql.IntegerResult {
+        args: [1]sql.Argument = .[sql.TextArg(id)]
+        read := sql.Prepare(database, schema.InstalledManifestSQL, args[:])
+        if read.status != sqlite.SQLITE_OK { return .{status = read.status} }
+        defer sqlite.SqliteFinalize(read.value)
+        status := sqlite.SqliteStep(read.value)
+        if status == sqlite.SQLITE_DONE { return .{} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, sql.ColumnText(read.value, 0)) { return .{status = sqlite.SQLITE_MISUSE} }
+        name: [1]string = .["manifest_sequence"]
+        kind: [1]json.JsonKind = .[.Number]
+        node: [1]s32
+        if !fields.Read(*document, document.root, name[:], kind[:], node[:]) { return .{status = sqlite.SQLITE_MISUSE} }
+        return .{found = true, value = fields.Number(*document, node[0])}
+    }
+
+    // Both the registrations and their scoped records are replaced together.
+    Upsert :: (database: *void, document: *json.JsonDocument, root: s32, id: string) -> s32 {
+        status := AppRow(database, document, root)
+        if status != sqlite.SQLITE_OK { return status }
+        remove: [3]string = .[schema.ClearAppCollectionsSQL,
+            schema.ClearAppCapabilitiesSQL, schema.ClearAppTokenPoliciesSQL]
+        args: [1]sql.Argument = .[sql.TextArg(id)]
+        for query: remove {
+            status = sql.Execute(database, query, args[:])
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        status = WriteCollections(database, document, root, id)
+        if status != sqlite.SQLITE_OK { return status }
+        status = WriteCapabilities(database, document, root, id)
+        if status != sqlite.SQLITE_OK { return status }
+        return WritePolicies(database, document, root, id)
+    }
+
+    UpsertSigned :: (database: *void, document: *json.JsonDocument, root: s32, id: string, canonical: string,
+        hash: string, signature: string, approval: string) -> ManifestWrite {
+        installed := Installed(database, id)
+        if installed.status != sqlite.SQLITE_OK { return .{status = installed.status} }
+        if installed.found && AppInteger(document, root, "manifest_sequence") < installed.value { return .{outdated = true} }
+        status := Upsert(database, document, root, id)
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        appStatus: Text = AppText(document, root, "status")
+        args: [8]sql.Argument = .[sql.TextArg(id), sql.IntArg(AppInteger(document, root, "manifest_version")),
+            sql.TextArg(canonical), sql.TextArg(hash), sql.TextArg(signature), sql.TextArg(approval),
+            sql.IntArg(AppInteger(document, root, "expires_at")), sql.TextArg(TextView(appStatus))]
+        status = sql.Execute(database, schema.ManifestInsertSQL, args[:])
+        if status != sqlite.SQLITE_OK { return .{status = status} }
+        return .{status = StoreKeys(database, document, root, id)}
+    }
+}

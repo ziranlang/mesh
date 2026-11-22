@@ -1,0 +1,238 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    authorization :: #import "authorization_native";
+    #import "authorization_native"
+    authorizationHTTP :: #import "authorization_http_native";
+    session :: #import "delegate_session_native";
+    transport :: #import "http_server_native";
+    websocket :: #import "websocket_native";
+    response :: #import "http_json_native";
+    hub :: #import "sync_hub_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    wire :: #import "wire_text";
+    binary :: #import "binary_codec";
+    clock :: #import "std/timer";
+    calendar :: #import "std/date_time_linux";
+    mutex :: #import "std/mutex_linux";
+    sockets :: #import "std/socket_linux";
+    numbers :: #import "std/number_text";
+    #import "std/vec"
+
+    DelegatedSocketPath :: "/api/v1/delegated/ws";
+    DelegateSocketProofLimit :: 4096;
+
+    Watch :: struct {
+        accounts: *access.AccountAccess
+        notifications: *hub.Hub
+        node: [64]u8
+        audience: [DelegateSocketProofLimit]u8
+        audienceLength: s64
+        collection: [64]u8
+        collectionLength: s64
+        grantID: [32]u8
+        sessionID: [32]u8
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    Poll :: (fds: *sockets.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+    CheckInterval :: 500;
+    PingInterval :: 30000;
+    ReadIdle :: 90000;
+    FrameReadTime :: 1000;
+    FrameWriteTime :: 10000;
+    SocketUnavailable :: "delegate socket unavailable";
+    CredentialPrefix :: "Delegate ds1.";
+
+    SocketHeaders :: struct {
+        proof: Vec(u8)
+        credential: Vec(u8)
+        valid: bool
+    }
+
+    CollectionVersion :: struct {
+        version: s64
+        active: bool
+    }
+
+    Copy :: (target: []u8, value: string) {
+        for byte, index: value { target[index] = byte }
+    }
+
+    // Browser clients carry the same proof and session ID in unselected
+    // subprotocol tokens. Reject competing credentials from either channel.
+    ReadHeaders :: (connection: *void) -> SocketHeaders {
+        result: SocketHeaders
+        direct := session.Header(connection, "X-Mesh-Delegate", "X-Daochi-Delegate")
+        if !BuilderAppend(result.proof, direct) || !BuilderAppend(result.credential, transport.Header(connection, "Authorization")) {
+            return .{}
+        }
+        remaining := transport.Header(connection, "Sec-WebSocket-Protocol")
+        while remaining != "" {
+            item := wire.Cut(remaining, #char ",")
+            remaining = item.after
+            namespace := wire.Cut(wire.TrimSpace(item.before), #char ".")
+            if namespace.before != "mesh" && namespace.before != "daochi" { continue }
+            field := wire.Cut(namespace.after, #char ".")
+            if !field.found || wire.Cut(field.after, #char ".").found { continue }
+            if field.before == "delegate" {
+                if result.proof.count != 0 || field.after.count > (DelegateSocketProofLimit * 4 + 2) / 3 { return .{} }
+                decoded := binary.DecodeBase64(field.after, true, false)
+                if decoded.error != "" || decoded.value.count > DelegateSocketProofLimit { return .{} }
+                result.proof = decoded.value
+            } else if field.before == "session" {
+                if result.credential.count != 0 || !authorization.HexID(field.after, 32) ||
+                    !BuilderAppend(result.credential, CredentialPrefix) || !BuilderAppend(result.credential, field.after) { return .{} }
+            }
+        }
+        result.valid = result.proof.count != 0 && result.credential.count != 0
+        return result
+    }
+
+    Error :: (state: *access.AccountAccess, connection: *void, method: string, status: u32, message: string) -> s32 {
+        return response.ErrorReply(connection, method, status, message, state.configuration.zstdResponses)
+    }
+
+    Reserve :: (state: *access.AccountAccess, connection: *void, watching: *Watch, method: string, node: string, audience: string) -> authorization.Failure {
+        unavailable: authorization.Failure = .{status = 503, message = SocketUnavailable}
+        headers := ReadHeaders(connection)
+        if !headers.valid { return .{status = 401, message = "delegate socket proof required"} }
+        if node.count != watching.node.count || audience.count > watching.audience.count || !mutex.Lock(*state.databaseLock) {
+            return unavailable
+        }
+        defer mutex.Unlock(*state.databaseLock)
+        database := state.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK { return unavailable }
+        defer authorization.Rollback(database)
+        credential := TextView(VecSlice(headers.credential, 0, headers.credential.count))
+        target := transport.RequestTarget(connection)
+        principal := session.AuthenticateTx(.{database = database, node = node, audience = audience, now = calendar.UnixMilliseconds() / 1000},
+            .{method = method, path = DelegatedSocketPath, target = target, credential = credential,
+              proof = TextView(VecSlice(headers.proof, 0, headers.proof.count)),
+              user = session.Header(connection, "X-Mesh-User", "X-Daochi-User")})
+        if principal.failure.status != 0 { return principal.failure }
+        collection := transport.QueryArgument(connection, "collection")
+        allowed := false
+        for *scope: principal.grant.scopes {
+            if TextView(scope.collection) == collection && scope.read { allowed = true }
+        }
+        if !allowed || collection.count > watching.collection.count { return .{status = 403, message = "delegate socket scope mismatch"} }
+        grantID := principal.grant.id
+        if !authorization.HexID(TextView(grantID), watching.grantID.count) || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return unavailable
+        }
+        Copy(watching.grantID[:], TextView(grantID))
+        Copy(watching.sessionID[:], credential[CredentialPrefix.count:])
+        Copy(watching.collection[:], collection)
+        Copy(watching.node[:], node)
+        Copy(watching.audience[:], audience)
+        watching.collectionLength = collection.count
+        watching.audienceLength = audience.count
+        return .{}
+    }
+
+    Current :: (watching: *Watch) -> CollectionVersion {
+        state := watching.accounts
+        if !mutex.Lock(*state.databaseLock) { return .{} }
+        defer mutex.Unlock(*state.databaseLock)
+        database := state.configuration.database
+        if sqlite.SqliteExecText(database, "BEGIN") != sqlite.SQLITE_OK { return .{} }
+        defer authorization.Rollback(database)
+        snapshot := <<watching
+        sessionID := TextView(snapshot.sessionID[:])
+        grantID := TextView(snapshot.grantID[:])
+        now := calendar.UnixMilliseconds() / 1000
+        arguments: [3]sql.Argument = .[sql.TextArg(sessionID), sql.TextArg(grantID), sql.IntArg(now)]
+        active := sql.ReadInteger(database, "SELECT EXISTS(SELECT 1 FROM server_authorization_sessions WHERE session_id=?1 AND grant_id=?2 AND expires_at>?3)", arguments[:])
+        if active.status != sqlite.SQLITE_OK || active.value != 1 { return .{} }
+        grant := authorization.ActiveGrant(database, grantID, TextView(snapshot.node[:]), TextView(snapshot.audience[:snapshot.audienceLength]), now)
+        if grant.failure.status != 0 { return .{} }
+        collection := TextView(snapshot.collection[:snapshot.collectionLength])
+        for *scope: grant.grant.scopes {
+            if TextView(scope.collection) != collection || !scope.read { continue }
+            scopeArguments: [3]sql.Argument = .[sql.TextArg(TextView(grant.grant.account)), sql.TextArg(collection), sql.TextArg(TextView(scope.keyID))]
+            version := sql.ReadInteger(database, "SELECT COALESCE(MAX(server_version),0) FROM server_encrypted_records WHERE user_id_hash=?1 AND collection=?2 AND key_id=?3", scopeArguments[:])
+            if version.status != sqlite.SQLITE_OK || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return .{} }
+            return .{version = version.value, active = true}
+        }
+        return .{}
+    }
+
+    Stopping :: (notifications: *hub.Hub) -> bool {
+        if !mutex.Lock(*notifications.lock) { return true }
+        defer mutex.Unlock(*notifications.lock)
+        return notifications.stopping
+    }
+
+    Send :: (stream: *websocket.Stream, collection: string, version: s64) -> bool {
+        bytes: Vec(u8)
+        digits: [24]u8
+        return BuilderAppend(bytes, "{\"type\":\"collection_changed\",\"collection\":\"") && BuilderAppend(bytes, collection) &&
+            BuilderAppend(bytes, "\",\"version\":") && BuilderAppend(bytes, numbers.FormatInteger(version, digits[:])) &&
+            BuilderAppend(bytes, "}") && websocket.WriteFrame(stream, 1, VecSlice(bytes, 0, bytes.count))
+    }
+
+    Upgraded :: (context: *void, connection: *void, request: *void, buffered: *u8, count: usize, fd: s32, upgrade: *void) {
+        defer transport.CloseUpgrade(upgrade)
+        watching := cast(*Watch)context
+        collectionBytes := watching.collection
+        collection := TextView(collectionBytes[:watching.collectionLength])
+        now := clock.MonotonicMilliseconds()
+        stream := websocket.Open(fd, buffered, count, now + FrameReadTime, now + FrameWriteTime)
+        lastRead := now
+        checked := now
+        nextPing := now + PingInterval
+        sent: s64 = -1
+        peer: sockets.LinuxPollFd = .{fd = fd, events = 1}
+        while true {
+            now = clock.MonotonicMilliseconds()
+            if now < 0 || now - lastRead >= ReadIdle || Stopping(watching.notifications) { return }
+            if now >= checked {
+                current := Current(watching)
+                if !current.active { return }
+                stream.writeDeadline = now + FrameWriteTime
+                if current.version != sent {
+                    if !Send(*stream, collection, current.version) { return }
+                    sent = current.version
+                } else if now >= nextPing {
+                    empty: []u8
+                    if !websocket.WriteFrame(*stream, 9, empty) { return }
+                    nextPing = now + PingInterval
+                }
+                checked = now + CheckInterval
+            }
+            if stream.consumed >= stream.bufferedCount {
+                ready := Poll(*peer, 1, CheckInterval)
+                if ready < 0 && sockets.LinuxErrno() != 4 { return }
+                if ready <= 0 { continue }
+                if (peer.revents & 1) == 0 {
+                    if (peer.revents & 56) != 0 { return }
+                    continue
+                }
+            }
+            stream.readDeadline = clock.MonotonicMilliseconds() + FrameReadTime
+            frame := websocket.ReadClientFrame(*stream)
+            if frame.error != "" || frame.closed { return }
+            lastRead = clock.MonotonicMilliseconds()
+        }
+    }
+
+    #scope_export
+    Handle :: (state: *access.AccountAccess, notifications: *hub.Hub, watching: *Watch, connection: *void,
+        method: string, node: string, audience: string) -> s32 {
+        if method != "GET" && method != "HEAD" {
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            body: Text = TextCopy("Method Not Allowed\n")
+            return transport.WriteWithHeaders(connection, 405, "text/plain; charset=utf-8", VecSlice(body.bytes, 0, body.bytes.count), headers[:])
+        }
+        if !authorizationHTTP.Guard(state, connection) { return Error(state, connection, method, 429, "authorization rate limit exceeded") }
+        failure := Reserve(state, connection, watching, method, node, audience)
+        if failure.status != 0 { return Error(state, connection, method, failure.status, failure.message) }
+        watching.accounts = state
+        watching.notifications = notifications
+        // The listener bounds concurrent upgrades. Use the hub only for shutdown;
+        // account-wide versions and notifications never enter this stream.
+        return websocket.Accept(connection, cast(*void)watching, Upgraded)
+    }
+}

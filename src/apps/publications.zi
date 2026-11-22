@@ -231,21 +231,6 @@ ReadList :: (transaction: *sql.Transaction, context: ctx.Context, viewer: string
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS server_publications (
- id TEXT PRIMARY KEY,
- author TEXT NOT NULL REFERENCES server_users(user_id_hash) ON DELETE CASCADE,
- format TEXT NOT NULL, title TEXT NOT NULL,
- visibility TEXT NOT NULL CHECK(visibility IN ('public','friends','private')),
- levels INTEGER NOT NULL DEFAULT 0, document TEXT NOT NULL,
- created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS server_publications_author ON server_publications(author,updated_at);
-CREATE INDEX IF NOT EXISTS server_publications_recent ON server_publications(visibility,format,updated_at);
-SQL;
-}
-
 // A format names the kind of document, such as a game's level format.
 ValidFormat :: (value: string) -> bool {
     if value.count < 1 || value.count > MaximumPublicationFormatBytes {

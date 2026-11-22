@@ -1,0 +1,58 @@
+#import "std/vec"
+
+#scope_file
+InsertColumns :: #string SQL_END
+INSERT INTO server_apps(app_id,display_name,description,homepage_url,source_url,public_key,status,app_schema_version,min_supported_client_version,current_client_version,compatibility_until,features_json,legacy_protocols_json)
+SQL_END;
+
+UpdateExisting :: #string SQL_END
+ON CONFLICT(app_id) DO UPDATE SET
+ display_name=excluded.display_name,
+ description=excluded.description,
+ homepage_url=excluded.homepage_url,
+ source_url=excluded.source_url,
+ public_key=excluded.public_key,
+ status=excluded.status,
+ app_schema_version=excluded.app_schema_version,
+ min_supported_client_version=excluded.min_supported_client_version,
+ current_client_version=excluded.current_client_version,
+ compatibility_until=excluded.compatibility_until,
+ features_json=excluded.features_json,
+ legacy_protocols_json=excluded.legacy_protocols_json,
+ updated_at=CURRENT_TIMESTAMP
+SQL_END;
+
+#scope_export
+Parameters :: "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)\n";
+
+Write :: (values: string) -> Vec(u8) {
+    statement: Vec(u8)
+    if !BuilderAppend(statement, InsertColumns) || !BuilderAppend(statement, values) ||
+        !BuilderAppend(statement, UpdateExisting) { return .{} }
+    return statement
+}
+
+ClearAppCollectionsSQL :: "DELETE FROM server_app_collections WHERE app_id=?1";
+ClearAppCapabilitiesSQL :: "DELETE FROM server_app_capabilities WHERE app_id=?1";
+ClearAppTokenPoliciesSQL :: "DELETE FROM token_app_permissions WHERE app_id=?1";
+InsertAppCollectionSQL :: "INSERT INTO server_app_collections(app_id,collection_prefix,visibility,schema_version,description) VALUES(?1,?2,?3,?4,?5)";
+InsertAppCapabilitySQL :: "INSERT OR IGNORE INTO server_app_capabilities(app_id,capability) VALUES(?1,?2)";
+InsertAppTokenPolicySQL :: "INSERT INTO token_app_permissions(app_id,asset_id,permission,status,legacy_unsigned_until) VALUES(?1,?2,?3,?4,?5)";
+
+ManifestInsertSQL :: #string SQL_END
+
+INSERT INTO server_app_manifests(app_id,manifest_version,manifest_json,manifest_hash,manifest_signature,approval_signature,expires_at,status)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+ON CONFLICT(app_id) DO UPDATE SET
+ manifest_version=excluded.manifest_version,
+ manifest_json=excluded.manifest_json,
+ manifest_hash=excluded.manifest_hash,
+ manifest_signature=excluded.manifest_signature,
+ approval_signature=excluded.approval_signature,
+ expires_at=excluded.expires_at,
+ status=excluded.status,
+ updated_at=CURRENT_TIMESTAMP
+SQL_END;
+KeyInsertSQL :: "INSERT INTO server_app_keys(app_id,key_id,algorithm,public_key,purpose,status,expires_at) VALUES(?1,?2,?3,?4,?5,?6,?7)";
+InstalledManifestSQL :: "SELECT manifest_json FROM server_app_manifests WHERE app_id=?1";
+ClearAppKeysSQL :: "DELETE FROM server_app_keys WHERE app_id=?1";

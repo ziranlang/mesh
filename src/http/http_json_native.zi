@@ -1,0 +1,74 @@
+#if TARGET == .C && OS == .LINUX {
+    coding :: #import "content_coding_native";
+    transport :: #import "http_server_native";
+    json :: #import "std/json_document";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    ReadResult :: struct {
+        status: u32
+        error: string
+        decoded: bool
+        length: s64
+    }
+
+    Body :: struct {
+        scratch: Vec(u8)
+        document: json.JsonDocument
+    }
+
+    Decode :: (connection: *void, body: []u8, overflow: bool, limit: s64, zstd: bool, target: *Body) -> ReadResult {
+        if overflow { return .{status = 400, error = "request body too large"} }
+        encoding := wire.TrimSpace(transport.Header(connection, "Content-Encoding"))
+        if encoding != "" && !wire.MatchesToken(encoding, "identity") {
+            if !VecResizeBounded(target.scratch, limit, limit) { return .{status = 503, error = "could not decode request body"} }
+            decoded := coding.Decode(body, encoding, zstd, limit, VecSlice(target.scratch, 0, limit))
+            if decoded.error != "" { return .{status = 400, error = decoded.error} }
+            return .{decoded = true, length = decoded.bytes.count}
+        }
+        return .{length = body.count}
+    }
+
+    // For an uncompressed request the document borrows the uploaded bytes.
+    Read :: (connection: *void, body: []u8, overflow: bool, limit: s64, zstd: bool,
+        target: *Body, allowEmpty: bool = false) -> ReadResult {
+        decoded := false
+        length: s64 = 0
+        {
+            loaded := Decode(connection, body, overflow, limit, zstd, target)
+            if loaded.status != 0 { return loaded }
+            decoded = loaded.decoded
+            length = loaded.length
+        }
+        source := ifx decoded then VecSlice(target.scratch, 0, length) else body
+        if source.count == 0 && allowEmpty { return .{} }
+        if !json.JsonRead(*target.document, TextView(source)) { return .{status = 400, error = "invalid json"} }
+        return .{}
+    }
+
+    Reply :: (connection: *void, method: string, status: u32, document: *json.JsonDocument, root: s32, zstd: bool) -> s32 {
+        buffer: Vec(u8)
+        if !json.JsonWriteInto(*buffer, document, root, json.JsonCompactStyle(false)) || !BuilderAppend(buffer, "\n") {
+            return 0
+        }
+        return coding.WriteJSON(connection, method, status, VecSlice(buffer, 0, buffer.count), zstd)
+    }
+
+    ReplyWithHeaders :: (connection: *void, status: u32, document: *json.JsonDocument, root: s32,
+        headers: []transport.HeaderValue) -> s32 {
+        buffer: Vec(u8)
+        if !json.JsonWriteInto(*buffer, document, root, json.JsonCompactStyle(false)) || !BuilderAppend(buffer, "\n") {
+            return 0
+        }
+        return transport.WriteWithHeaders(connection, status, "application/json", VecSlice(buffer, 0, buffer.count), headers)
+    }
+
+    ErrorReply :: (connection: *void, method: string, status: u32, message: string, zstd: bool) -> s32 {
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "error", json.JsonNewString(*document, message)) {
+            return 0
+        }
+        return Reply(connection, method, status, *document, root, zstd)
+    }
+}

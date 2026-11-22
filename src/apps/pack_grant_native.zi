@@ -1,0 +1,34 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    ed :: #import "device_signature_native";
+    identity :: #import "identity";
+    wire :: #import "wire_text";
+    numbers :: #import "std/number_text";
+    #import "std/vec"
+
+    #scope_file
+    Canonical :: (encoded: string, decoded: []u8) -> bool {
+        canonical := binary.EncodeBase64(TextView(decoded), true, false)
+        return canonical.error == "" && TextView(VecSlice(canonical.value, 0, canonical.value.count)) == encoded
+    }
+
+    #scope_export
+    Valid :: (publicKey: []u8, grant: string, product: string, now: s64) -> bool {
+        if publicKey.count != 32 || !identity.ValidNamespace(product) || grant.count > 512 { return false }
+        parts := wire.Cut(grant, #char ".")
+        if !parts.found || parts.after.count != 86 { return false }
+        payload := binary.DecodeBase64(parts.before, true, false)
+        signature := binary.DecodeBase64(parts.after, true, false)
+        if payload.error != "" || signature.error != "" { return false }
+        content := VecSlice(payload.value, 0, payload.value.count)
+        proof := VecSlice(signature.value, 0, signature.value.count)
+        if !Canonical(parts.before, content) || !Canonical(parts.after, proof) { return false }
+        prefix := wire.Cut(TextView(content), #char "\n")
+        named := wire.Cut(prefix.after, #char "\n")
+        if !prefix.found || !named.found || prefix.before != "daochi-pack-grant-v1" || named.before != product { return false }
+        expiry, count := numbers.IntegerPrefix(named.after)
+        digits: [24]u8
+        return count == named.after.count && expiry > now && numbers.FormatInteger(expiry, digits[:]) == named.after &&
+            ed.Verify(publicKey, content, proof)
+    }
+}

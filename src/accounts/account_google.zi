@@ -309,10 +309,6 @@ Methods :: (google: AccountGoogle, writer: http.ResponseWriter, request: *http.R
     response.JSON(writer, 200, output)
 }
 
-SchemaSQL :: () -> string {
-    return "CREATE TABLE IF NOT EXISTS server_account_google(subject_hash TEXT PRIMARY KEY,user_id_hash TEXT NOT NULL UNIQUE,created_at INTEGER NOT NULL);"
-}
-
 // Forgets Google's certificates. Tests use it between fake keys.
 ResetCertificates :: () {
     Lock(*certificates_lock)

@@ -1,0 +1,10 @@
+#if TARGET == .C {
+    sha :: #import "crypto/sha256";
+
+    Compute :: (key: []u8, payload: string, tag: []u8) -> bool {
+        if key.count == 0 || tag.count != 32 {
+            return false
+        }
+        return sha.HmacSha256Text(*key[0], key.count, payload, *tag[0]) == 1
+    }
+}

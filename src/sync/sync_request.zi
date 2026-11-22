@@ -1,5 +1,7 @@
 wire :: #import "wire_headers";
 #import "std/go_types"
+#import "std/vec"
+exported_key :: #import "exported_account_key";
 #import "protocol"
 #import "sync_types"
 body :: #import "http_body";
@@ -59,12 +61,6 @@ PayloadLimitResult :: struct {
 }
 
 #scope_file
-KeyValuePair :: struct {
-    key: string
-    value: string
-    found: bool
-}
-
 EnvelopeHeader :: struct {
     V: isize #go_tag "json:\"v\""
     Nonce: string #go_tag "json:\"nonce\""
@@ -73,10 +69,7 @@ EnvelopeHeader :: struct {
 
 TrimSpace :: (value: string) -> string #foreign strings;
 ToLower :: (value: string) -> string #foreign strings;
-Split :: (value: string, separator: string) -> []string #foreign strings;
-ReplaceAll :: (value: string, old: string, replacement: string) -> string #foreign strings;
 Join :: (values: []string, separator: string) -> string #foreign strings;
-Cut :: (value: string, separator: string) -> KeyValuePair #go_results #foreign strings;
 Atoi :: (value: string) -> PayloadLimitResult #go_results #foreign strconv;
 AllocateHabits :: (count: isize) -> []Habit #foreign builtin "make";
 AllocateHabitDays :: (count: isize) -> []HabitDay #foreign builtin "make";
@@ -248,53 +241,15 @@ NormalizeMeditationDurations :: (logs: []MeditationLog) {
 
 ParseExportedKey :: (value: string) -> ExportedAccountKeyResult {
     result: ExportedAccountKeyResult
-    lines := Split(ReplaceAll(value, "\r\n", "\n"), "\n")
-    if lines.count == 0 {
-        result.error = errors.New("invalid account key file")
+    parsed := exported_key.Parse(value)
+    if parsed.error != "" {
+        result.error = errors.New(parsed.error)
         return result
     }
-    header := TrimSpace(lines[0])
-    if header != "ksync-account-key-v1" && header != "lyra-account-key-v1" &&
-        header != "account-key-v1" && header != "inbe-sync-key-v1" {
-        result.error = errors.New("invalid account key file")
-        return result
+    if parsed.hasPublicID {
+        result.value.publicID = text.FromBytes(parsed.publicID[:])
     }
-    algorithmOK := false
-    publicID := ""
-    privateKeyText := ""
-    for line: lines[1:] {
-        part := Cut(TrimSpace(line), "=")
-        if !part.found {
-            continue
-        }
-        key := TrimSpace(part.key)
-        if key == "algorithm" {
-            algorithmOK = TrimSpace(part.value) == "ML-DSA-44"
-        } else if key == "public_id" {
-            publicID = ToLower(TrimSpace(part.value))
-        } else if key == "private_key" {
-            privateKeyText = TrimSpace(part.value)
-        }
-    }
-    if !algorithmOK {
-        result.error = errors.New("account key algorithm must be ML-DSA-44")
-        return result
-    }
-    if publicID != "" && !identity.ValidUserID(publicID) {
-        result.error = errors.New("invalid public_id")
-        return result
-    }
-    decoded := codec.DecodeBinaryField(privateKeyText)
-    if decoded.error != "" {
-        result.error = errors.New("invalid private_key")
-        return result
-    }
-    if decoded.value.count != codec.mlDSA44PrivateKeySize {
-        result.error = errors.New("wrong private_key size")
-        return result
-    }
-    result.value.publicID = publicID
-    result.value.privateKey = text.ToBytes(decoded.value)
+    result.value.privateKey = text.ToBytes(TextView(VecSlice(parsed.privateKey, 0, parsed.privateKey.count)))
     return result
 }
 

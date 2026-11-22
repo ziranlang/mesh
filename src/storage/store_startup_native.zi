@@ -1,0 +1,125 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    referrals :: #import "referral_schema";
+    aliases :: #import "alias_case_schema";
+    rewards :: #import "reward_migration_schema";
+    packing :: #import "record_packing_schema";
+    trust :: #import "trust_schema";
+    timestamps :: #import "store_timestamps_native";
+    habits :: #import "habit_migration_native";
+    token_seed :: #import "token_asset_seed";
+    app_seed :: #import "builtin_app_seed_native";
+    core :: #import "schema_sql";
+    usage :: #import "storage_usage_schema";
+    schema :: #import "sqlite_schema";
+    #import "std/vec"
+
+    #scope_file
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    NormalizeAliases :: (database: *void) -> s32 {
+        statements := aliases.Build()
+        if statements.count == 0 { return sqlite.SQLITE_NOMEM }
+        started := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if started != sqlite.SQLITE_OK { return started }
+        defer RollbackIfActive(database)
+        status := sqlite.SqliteExecText(database, TextView(VecSlice(statements, 0, statements.count)))
+        if status != sqlite.SQLITE_OK { return status }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    FreezeRewards :: (database: *void) -> s32 {
+        status := sqlite.SqliteExecText(database, rewards.Schema)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        status = sqlite.SqliteExecText(database, rewards.InsertMarker)
+        if status != sqlite.SQLITE_OK { return status }
+        if sqlite.SqliteChanges(database) == 1 {
+            status = sqlite.SqliteExecText(database, rewards.FreezeRecords)
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    WriteAccountingVersion :: (database: *void) -> s32 {
+        statement: *void = null
+        status := sqlite.SqlitePrepareText(database, usage.WriteVersion, -1, *statement, null)
+        if status != sqlite.SQLITE_OK { return status }
+        defer sqlite.SqliteFinalize(statement)
+        status = sqlite.SqliteBindInt(statement, 1, usage.Version)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteStep(statement)
+        return ifx status == sqlite.SQLITE_DONE then sqlite.SQLITE_OK else status
+    }
+
+    EnsureAccounting :: (database: *void) -> s32 {
+        status := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if status != sqlite.SQLITE_OK { return status }
+        defer RollbackIfActive(database)
+        tables := schema.QueryInteger(database, usage.ExistingTables)
+        if tables.status != sqlite.SQLITE_OK { return tables.status }
+        version: s32 = 0
+        if tables.value == 2 {
+            installed := schema.QueryInteger(database, usage.ExistingVersion)
+            if installed.status != sqlite.SQLITE_OK { return installed.status }
+            version = installed.value
+        }
+        if version > usage.Version {
+            // A downgraded binary must preserve newer accounting expressions.
+            return sqlite.SqliteExecText(database, "COMMIT")
+        }
+        rebuild := version != usage.Version
+        if rebuild {
+            drops := usage.DropTriggers()
+            if drops.count == 0 { return sqlite.SQLITE_NOMEM }
+            status = sqlite.SqliteExecText(database, TextView(VecSlice(drops, 0, drops.count)))
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        triggers := usage.Build()
+        if triggers.count == 0 { return sqlite.SQLITE_NOMEM }
+        status = sqlite.SqliteExecText(database, TextView(VecSlice(triggers, 0, triggers.count)))
+        if status != sqlite.SQLITE_OK { return status }
+        if rebuild {
+            backfill := usage.Backfill()
+            if backfill.count == 0 { return sqlite.SQLITE_NOMEM }
+            status = sqlite.SqliteExecText(database, TextView(VecSlice(backfill, 0, backfill.count)))
+            if status != sqlite.SQLITE_OK { return status }
+            status = WriteAccountingVersion(database)
+            if status != sqlite.SQLITE_OK { return status }
+        }
+        return sqlite.SqliteExecText(database, "COMMIT")
+    }
+
+    #scope_export
+    // Run after the core migrations, with exclusive use of this connection.
+    InitializeFeatures :: (database: *void) -> s32 {
+        if database == null || !sqlite.SqliteGetAutocommit(database) { return sqlite.SQLITE_MISUSE }
+        status := sqlite.SqliteExecText(database, referrals.SchemaSQL())
+        if status != sqlite.SQLITE_OK { return status }
+        status = NormalizeAliases(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = FreezeRewards(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, packing.Schema)
+        if status != sqlite.SQLITE_OK { return status }
+        status = EnsureAccounting(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, core.RecordPageIndex)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, trust.Schema)
+        if status != sqlite.SQLITE_OK { return status }
+        status = timestamps.Canonicalize(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = habits.AllAccounts(database)
+        if status != sqlite.SQLITE_OK { return status }
+        status = sqlite.SqliteExecText(database, token_seed.SQL)
+        if status != sqlite.SQLITE_OK { return status }
+        return app_seed.Seed(database)
+    }
+}

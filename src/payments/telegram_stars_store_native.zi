@@ -1,0 +1,312 @@
+#if TARGET == .C && OS == .LINUX {
+    issuer :: #import "token_issuer_native";
+    numbers :: #import "std/number_text";
+    signing :: #import "token_signing_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    writes :: #import "token_writes_native";
+    #import "std/vec"
+
+    Currency :: "XTR";
+    Provider :: "telegram_stars";
+    PayloadPrefix :: "entity_stars.";
+    InvoiceLifetime :: 900;
+
+    Merchant :: struct {
+        bot: s64
+        node: string
+        audience: string
+    }
+
+    Invoice :: struct {
+        id: Text
+        account: Text
+        app: Text
+        bot: s64
+        buyer: s64
+        node: Text
+        audience: Text
+        requestID: Text
+        product: Text
+        title: Text
+        amount: s64
+        units: s64
+        expires: s64
+        state: Text
+        link: Text
+        checkout: Text
+        charge: Text
+    }
+
+    Record :: struct {
+        invoice: Invoice
+        found: bool
+        status: s32
+    }
+
+    Payment :: struct {
+        invoiceID: string
+        buyer: s64
+        amount: s64
+        currency: string
+        charge: string
+    }
+
+    Outcome :: struct {
+        accepted: bool
+        status: s32
+    }
+
+    #scope_file
+    Columns :: "SELECT invoice_id,account_id,app_id,bot_id,buyer_id,node_id,audience,request_id,product_id,title,amount,units,expires_at,state,invoice_url,checkout_id,charge_id FROM telegram_stars_invoices ";
+
+    Select :: (database: *void, filter: string, arguments: []sql.Argument) -> Record {
+        query: Vec(u8)
+        if !BuilderAppend(query, Columns) || !BuilderAppend(query, filter) || !VecPush(query, cast(u8)0) {
+            return .{status = sqlite.SQLITE_NOMEM}
+        }
+        prepared := sql.Prepare(database, TextView(VecSlice(query, 0, query.count - 1)), arguments)
+        if prepared.status != sqlite.SQLITE_OK {
+            return .{status = prepared.status}
+        }
+        row := prepared.value
+        defer sqlite.SqliteFinalize(row)
+        status := sqlite.SqliteStep(row)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = status}
+        }
+        return .{found = true, invoice = .{id = TextCopy(sql.ColumnText(row, 0)), account = TextCopy(sql.ColumnText(row, 1)),
+            app = TextCopy(sql.ColumnText(row, 2)), bot = sqlite.SqliteColumnInt64(row, 3), buyer = sqlite.SqliteColumnInt64(row, 4),
+            node = TextCopy(sql.ColumnText(row, 5)), audience = TextCopy(sql.ColumnText(row, 6)), requestID = TextCopy(sql.ColumnText(row, 7)),
+            product = TextCopy(sql.ColumnText(row, 8)), title = TextCopy(sql.ColumnText(row, 9)), amount = sqlite.SqliteColumnInt64(row, 10),
+            units = sqlite.SqliteColumnInt64(row, 11), expires = sqlite.SqliteColumnInt64(row, 12), state = TextCopy(sql.ColumnText(row, 13)),
+            link = TextCopy(sql.ColumnText(row, 14)), checkout = TextCopy(sql.ColumnText(row, 15)), charge = TextCopy(sql.ColumnText(row, 16))}}
+    }
+
+    Changed :: (database: *void, query: string, arguments: []sql.Argument) -> Outcome {
+        status := sql.Execute(database, query, arguments)
+        return .{status = status, accepted = status == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1}
+    }
+
+    Commit :: (database: *void) -> Outcome {
+        status := sqlite.SqliteExecText(database, "COMMIT")
+        return .{accepted = status == sqlite.SQLITE_OK, status = status}
+    }
+
+    #scope_export
+    BindLaunch :: (database: *void, merchant: Merchant, digest: string, account: string, app: string,
+        buyer: s64, expires: s64, now: s64) -> Outcome {
+        cutoff: [1]sql.Argument = .[sql.IntArg(now)]
+        removed := sql.Execute(database, "DELETE FROM telegram_stars_launches WHERE expires_at<=?1", cutoff[:])
+        if removed != sqlite.SQLITE_OK {
+            return .{status = removed}
+        }
+        args: [8]sql.Argument = .[sql.TextArg(digest), sql.TextArg(account), sql.TextArg(app), sql.IntArg(merchant.bot),
+            sql.IntArg(buyer), sql.TextArg(merchant.node), sql.TextArg(merchant.audience), sql.IntArg(expires)]
+        return Changed(database, #string SQL
+INSERT INTO telegram_stars_launches(digest,account_id,app_id,bot_id,buyer_id,node_id,audience,expires_at)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+ON CONFLICT(digest) DO UPDATE SET expires_at=excluded.expires_at
+WHERE account_id=excluded.account_id AND app_id=excluded.app_id AND bot_id=excluded.bot_id
+AND buyer_id=excluded.buyer_id AND node_id=excluded.node_id AND audience=excluded.audience
+SQL, args[:])
+    }
+
+    State :: (state: string, expiry: s64, now: s64) -> string {
+        return ifx state == "pending" && expiry <= now then "expired" else state
+    }
+
+    ForRequest :: (database: *void, desired: *Invoice) -> Record {
+        args: [6]sql.Argument = .[sql.TextArg(TextView(desired.account)), sql.TextArg(TextView(desired.app)), sql.IntArg(desired.bot),
+            sql.TextArg(TextView(desired.node)), sql.TextArg(TextView(desired.audience)), sql.TextArg(TextView(desired.requestID))]
+        return Select(database, "WHERE account_id=?1 AND app_id=?2 AND bot_id=?3 AND node_id=?4 AND audience=?5 AND request_id=?6", args[:])
+    }
+
+    Reserve :: (database: *void, desired: *Invoice) -> Record {
+        args: [13]sql.Argument = .[sql.TextArg(TextView(desired.id)), sql.TextArg(TextView(desired.account)), sql.TextArg(TextView(desired.app)),
+            sql.IntArg(desired.bot), sql.IntArg(desired.buyer), sql.TextArg(TextView(desired.node)), sql.TextArg(TextView(desired.audience)),
+            sql.TextArg(TextView(desired.requestID)), sql.TextArg(TextView(desired.product)), sql.TextArg(TextView(desired.title)),
+            sql.IntArg(desired.amount), sql.IntArg(desired.units), sql.IntArg(desired.expires)]
+        status := sql.Execute(database, #string SQL
+INSERT INTO telegram_stars_invoices(invoice_id,account_id,app_id,bot_id,buyer_id,node_id,audience,request_id,product_id,title,amount,units,expires_at)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+ON CONFLICT(account_id,app_id,bot_id,node_id,audience,request_id) DO NOTHING
+SQL, args[:])
+        if status != sqlite.SQLITE_OK {
+            return .{status = status}
+        }
+        return ForRequest(database, desired)
+    }
+
+    Read :: (database: *void, id: string) -> Record {
+        args: [1]sql.Argument = .[sql.TextArg(id)]
+        return Select(database, "WHERE invoice_id=?1", args[:])
+    }
+
+    ClaimLink :: (database: *void, id: string, now: s64) -> Outcome {
+        args: [3]sql.Argument = .[sql.TextArg(id), sql.IntArg(now), sql.IntArg(now - 20)]
+        return Changed(database, #string SQL
+UPDATE telegram_stars_invoices SET link_attempt=?2
+WHERE invoice_id=?1 AND state='pending' AND invoice_url='' AND link_attempt<=?3 AND expires_at>?2
+SQL, args[:])
+    }
+
+    StoreLink :: (database: *void, id: string, attempt: s64, link: string) -> Outcome {
+        args: [4]sql.Argument = .[sql.TextArg(id), sql.IntArg(attempt), sql.TextArg(link), sql.IntArg(ifx link == "" then 0 else attempt)]
+        return Changed(database, #string SQL
+UPDATE telegram_stars_invoices SET invoice_url=?3,link_attempt=?4
+WHERE invoice_id=?1 AND link_attempt=?2 AND invoice_url='' AND state='pending'
+SQL, args[:])
+    }
+
+    Cancel :: (database: *void, id: string, now: s64) -> Outcome {
+        args: [2]sql.Argument = .[sql.TextArg(id), sql.IntArg(now)]
+        return Changed(database, #string SQL
+UPDATE telegram_stars_invoices SET state='cancelled'
+WHERE invoice_id=?1 AND state='pending' AND checkout_id='' AND expires_at>?2
+SQL, args[:])
+    }
+
+    LinkedBuyer :: (database: *void, account: string, app: string, now: s64) -> sql.IntegerResult {
+        args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(app), sql.IntArg(now)]
+        return sql.ReadInteger(database, #string SQL
+SELECT b.telegram_id FROM server_lumi_telegram b JOIN server_apps a ON a.app_id=?2 AND a.status='active'
+WHERE b.account_id=?1 AND NOT EXISTS(SELECT 1 FROM server_app_manifests m WHERE m.app_id=a.app_id AND
+    (m.status<>'active' OR (m.expires_at>0 AND m.expires_at<=?3)))
+SQL, args[:])
+    }
+
+    Approve :: (database: *void, merchant: Merchant, payment: Payment, checkout: string, now: s64) -> Outcome {
+        args: [8]sql.Argument = .[sql.TextArg(payment.invoiceID), sql.IntArg(merchant.bot), sql.TextArg(merchant.node),
+            sql.TextArg(merchant.audience), sql.IntArg(payment.buyer), sql.IntArg(payment.amount), sql.TextArg(checkout), sql.IntArg(now)]
+        return Changed(database, #string SQL
+UPDATE telegram_stars_invoices SET checkout_id=?7
+WHERE invoice_id=?1 AND bot_id=?2 AND node_id=?3 AND audience=?4 AND buyer_id=?5 AND amount=?6
+AND state='pending' AND invoice_url<>'' AND (checkout_id='' OR checkout_id=?7) AND expires_at>?8
+AND EXISTS(SELECT 1 FROM server_lumi_telegram b WHERE b.account_id=telegram_stars_invoices.account_id AND b.telegram_id=buyer_id)
+AND EXISTS(SELECT 1 FROM server_users u WHERE u.user_id_hash=telegram_stars_invoices.account_id)
+AND EXISTS(SELECT 1 FROM server_apps a WHERE a.app_id=telegram_stars_invoices.app_id AND a.status='active'
+    AND NOT EXISTS(SELECT 1 FROM server_app_manifests m WHERE m.app_id=a.app_id AND
+        (m.status<>'active' OR (m.expires_at>0 AND m.expires_at<=?8))))
+SQL, args[:])
+    }
+
+    #scope_file
+    Charge :: (database: *void, invoice: *Invoice, charge: string) -> Outcome {
+        args: [2]sql.Argument = .[sql.TextArg(TextView(invoice.id)), sql.TextArg(charge)]
+        return Changed(database, #string SQL
+UPDATE telegram_stars_invoices SET charge_id=?2
+WHERE invoice_id=?1 AND NOT EXISTS(SELECT 1 FROM telegram_stars_invoices other
+    WHERE other.bot_id=telegram_stars_invoices.bot_id AND other.charge_id=?2)
+SQL, args[:])
+    }
+
+    Credit :: (database: *void, signer: *issuer.Issuer, invoice: *Invoice,
+        event: signing.Event, at: string, charge: string) -> Outcome {
+        reserved := Charge(database, invoice, charge)
+        if reserved.status != sqlite.SQLITE_OK || !reserved.accepted {
+            return reserved
+        }
+        args: [1]sql.Argument = .[sql.TextArg(event.account)]
+        account := sql.ReadInteger(database, "SELECT 1 FROM server_users WHERE user_id_hash=?1", args[:])
+        if account.status != sqlite.SQLITE_OK || !account.found {
+            return .{status = account.status}
+        }
+        credit := writes.CreditPayment(database, signer, Provider, event.reference, event, at)
+        if credit.status != 200 {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        return .{accepted = credit.created}
+    }
+
+    SettlementInvoice :: (database: *void, payloadless: bool, id: string, key: []sql.Argument) -> Record {
+        if payloadless {
+            return Select(database, "WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4", key[:4])
+        }
+        return Read(database, id)
+    }
+
+    #scope_export
+    // The caller serializes this database connection. A charge, its signed
+    // ledger credit/reversal, and the invoice state are committed together.
+    Settle :: (database: *void, signer: *issuer.Issuer, merchant: Merchant, payment: Payment, refund: bool) -> Outcome {
+        opened := sqlite.SqliteExecText(database, "BEGIN IMMEDIATE")
+        if opened != sqlite.SQLITE_OK {
+            return .{status = opened}
+        }
+        defer writes.Rollback(database)
+        key: [6]sql.Argument = .[sql.IntArg(merchant.bot), sql.TextArg(merchant.node), sql.TextArg(merchant.audience),
+            sql.TextArg(payment.charge), sql.IntArg(payment.buyer), sql.IntArg(payment.amount)]
+        payloadless := refund && payment.invoiceID == ""
+        record := SettlementInvoice(database, payloadless, payment.invoiceID, key[:])
+        if payloadless && record.status == sqlite.SQLITE_OK && !record.found {
+            // Retain refunds without a payload until their charge is known.
+            status := sql.Execute(database, #string SQL
+INSERT INTO telegram_stars_history_refunds(bot_id,node_id,audience,charge_id,buyer_id,amount)
+SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM telegram_stars_invoices
+    WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND buyer_id=?5 AND amount=?6
+    AND checkout_id<>'' AND charge_id='' AND state='pending') ON CONFLICT DO NOTHING
+SQL, key[:])
+            if status != sqlite.SQLITE_OK {
+                return .{status = status}
+            }
+            return .{status = Commit(database).status}
+        }
+        if record.status != sqlite.SQLITE_OK || !record.found {
+            return .{status = record.status}
+        }
+        invoice := *record.invoice
+        state := TextView(invoice.state)
+        charge := TextView(invoice.charge)
+        if payment.buyer != invoice.buyer || payment.amount != invoice.amount || payment.currency != Currency ||
+            TextView(invoice.checkout) == "" || state == "cancelled" || merchant.bot != invoice.bot || merchant.node != TextView(invoice.node) ||
+            merchant.audience != TextView(invoice.audience) || (charge != "" && charge != payment.charge) {
+            return .{}
+        }
+        if !refund && state == "pending" {
+            held := sql.ReadInteger(database, "SELECT 1 FROM telegram_stars_history_refunds WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4 AND buyer_id=?5 AND amount=?6", key[:])
+            if held.status != sqlite.SQLITE_OK {
+                return .{status = held.status}
+            }
+            refund = held.found
+        }
+        if state == "refunded" || (state == "credited" && !refund) {
+            return Commit(database)
+        }
+        reference: Vec(u8)
+        digits: [24]u8
+        atBuffer: [31]u8
+        at := signing.WireTime(signing.Now(), true, atBuffer[:])
+        if at == "" || !BuilderAppend(reference, numbers.FormatInteger(merchant.bot, digits[:])) ||
+            !BuilderAppend(reference, ":") || !BuilderAppend(reference, payment.charge) {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        event: signing.Event = .{account = TextView(invoice.account), app = TextView(invoice.app), kind = "credit",
+            amount = invoice.units, source = Provider, reference = TextView(VecSlice(reference, 0, reference.count))}
+        if state == "pending" {
+            credited := Credit(database, signer, invoice, event, at, payment.charge)
+            if credited.status != sqlite.SQLITE_OK || !credited.accepted {
+                return credited
+            }
+        }
+        if refund {
+            reversal := writes.RefundPayment(database, signer, Provider, event.reference, event, at)
+            if reversal.status != 200 {
+                return .{status = sqlite.SQLITE_MISUSE}
+            }
+            removed := sql.Execute(database, "DELETE FROM telegram_stars_history_refunds WHERE bot_id=?1 AND node_id=?2 AND audience=?3 AND charge_id=?4 AND buyer_id=?5 AND amount=?6", key[:])
+            if removed != sqlite.SQLITE_OK {
+                return .{status = removed}
+            }
+        }
+        args: [2]sql.Argument = .[sql.TextArg(TextView(invoice.id)), sql.TextArg(ifx refund then "refunded" else "credited")]
+        changed := Changed(database, "UPDATE telegram_stars_invoices SET state=?2 WHERE invoice_id=?1", args[:])
+        if changed.status != sqlite.SQLITE_OK || !changed.accepted {
+            return changed
+        }
+        return Commit(database)
+    }
+}

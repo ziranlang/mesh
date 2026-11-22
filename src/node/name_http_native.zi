@@ -1,0 +1,138 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    claim :: #import "name_claim_native";
+    fields :: #import "sync_json_fields";
+    identity :: #import "identity";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    reply :: #import "http_json_native";
+    rules :: #import "name_rules";
+    store :: #import "name_store_native";
+    transport :: #import "http_server_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    SpacePath :: "/api/v1/namespaces";
+    ClaimPath :: "/api/v1/namespaces/claims";
+    ResolvePath :: "/api/v1/namespaces/resolve";
+
+    Error :: (access: *accounts.AccountAccess, connection: *void, method: string, status: u32, message: string) -> s32 {
+        return reply.ErrorReply(connection, method, status, message, access.configuration.zstdResponses)
+    }
+
+    Create :: (access: *accounts.AccountAccess, connection: *void, input: *json.JsonDocument, now: s64) -> s32 {
+        names: [1]string = .["display_name"]
+        kinds: [1]json.JsonKind = .[.String]
+        nodes: [1]s32
+        if !fields.Read(input, input.root, names[:], kinds[:], nodes[:]) {
+            return Error(access, connection, "POST", 400, "invalid trust space")
+        }
+        configured: Text = json.JsonString(input, nodes[0])
+        name := wire.TrimSpace(TextView(configured))
+        if name == "" { return Error(access, connection, "POST", 400, "invalid trust space") }
+        id: [65]u8
+        if !mutex.Lock(*access.databaseLock) { return Error(access, connection, "POST", 503, "trust space creation failed") }
+        created := store.Create(access.configuration.database, name, now, id[:])
+        mutex.Unlock(*access.databaseLock)
+        if !created { return Error(access, connection, "POST", 500, "trust space creation failed") }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !fields.SetString(*document, root, "display_name", name) ||
+            !fields.SetString(*document, root, "space_id", TextView(id[:64])) { return 0 }
+        return reply.Reply(connection, "POST", 201, *document, root, access.configuration.zstdResponses)
+    }
+
+    Register :: (access: *accounts.AccountAccess, connection: *void, input: *json.JsonDocument, now: s64) -> s32 {
+        names: [8]string = .["version", "space_id", "name", "node_id", "sequence", "expires_at", "services", "signature"]
+        kinds: [8]json.JsonKind = .[.Number, .String, .String, .String, .Number, .Number, .Array, .String]
+        nodes: [8]s32
+        if !fields.Read(input, input.root, names[:], kinds[:], nodes[:]) {
+            return Error(access, connection, "POST", 400, "invalid name claim")
+        }
+        space: Text = json.JsonString(input, nodes[1])
+        rawName: Text = json.JsonString(input, nodes[2])
+        node: Text = json.JsonString(input, nodes[3])
+        name: Text = claim.NormalizeName(TextView(rawName))
+        spaceID := wire.TrimSpace(TextView(space))
+        nodeID := wire.TrimSpace(TextView(node))
+        label := TextView(name)
+        if !identity.ValidUserID(spaceID) || !rules.Valid(label) || !identity.ValidUserID(nodeID) {
+            return Error(access, connection, "POST", 400, "invalid space, name, or node ID")
+        }
+        seconds := now / 1000
+        requested := fields.Number(input, nodes[5])
+        expiry := ifx requested == 0 then seconds + 31536000 else requested
+        if expiry <= seconds || expiry > seconds + 31622400 {
+            return Error(access, connection, "POST", 400, "invalid name expiry")
+        }
+        document: json.JsonDocument
+        services := claim.ReadServices(*document, input, nodes[6], true)
+        if services.error != "" { return Error(access, connection, "POST", 400, services.error) }
+        if services.node < 0 { return 0 }
+        root := json.JsonNewObject(*document)
+        if !json.JsonSet(*document, root, "version", json.JsonNewInteger(*document, 1)) ||
+            !fields.SetString(*document, root, "space_id", spaceID) ||
+            !fields.SetString(*document, root, "name", label) ||
+            !fields.SetString(*document, root, "node_id", nodeID) ||
+            !json.JsonSet(*document, root, "expires_at", json.JsonNewInteger(*document, expiry)) { return 0 }
+        if json.JsonCount(*document, services.node) > 0 &&
+            !json.JsonSet(*document, root, "services", services.node) { return 0 }
+        if !mutex.Lock(*access.databaseLock) { return Error(access, connection, "POST", 503, "name claim could not be stored") }
+        problem := store.Register(access.configuration.database, *document, root, services.node, now)
+        mutex.Unlock(*access.databaseLock)
+        if problem != "" { return Error(access, connection, "POST", 400, problem) }
+        return reply.Reply(connection, "POST", 200, *document, root, access.configuration.zstdResponses)
+    }
+
+    Resolve :: (access: *accounts.AccountAccess, connection: *void, method: string) -> s32 {
+        space := wire.TrimSpace(transport.QueryArgument(connection, "space_id"))
+        name: Text = claim.NormalizeName(transport.QueryArgument(connection, "name"))
+        label := TextView(name)
+        if !identity.ValidUserID(space) || !rules.Valid(label) {
+            return Error(access, connection, method, 400, "invalid space or name")
+        }
+        document: json.JsonDocument
+        now := calendar.UnixMilliseconds() / 1000
+        if !mutex.Lock(*access.databaseLock) { return Error(access, connection, method, 503, "name resolution failed") }
+        found := store.Resolve(access.configuration.database, *document, space, label, now)
+        mutex.Unlock(*access.databaseLock)
+        if found.failed { return Error(access, connection, method, 500, "name resolution failed") }
+        if found.node < 0 { return Error(access, connection, method, 404, "name not found") }
+        root := json.JsonNewObject(*document)
+        uri: Vec(u8)
+        if !BuilderAppend(uri, "mesh://") || !BuilderAppend(uri, space) || !BuilderAppend(uri, "/") ||
+            !BuilderAppend(uri, label) || !json.JsonSet(*document, root, "claim", found.node) ||
+            !json.JsonSet(*document, root, "ttl_seconds", json.JsonNewInteger(*document, found.expiry - now)) ||
+            !fields.SetString(*document, root, "uri", TextView(VecSlice(uri, 0, uri.count))) { return 0 }
+        return reply.Reply(connection, method, 200, *document, root, access.configuration.zstdResponses)
+    }
+
+    #scope_export
+    Handles :: (path: string) -> bool { return path == SpacePath || path == ClaimPath || path == ResolvePath }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, method: string, path: string,
+        admin: string, body: []u8, overflow: bool) -> s32 {
+        resolving := path == ResolvePath
+        if (!resolving && method != "POST") || (resolving && method != "GET" && method != "HEAD") {
+            allowed := ifx resolving then "GET, HEAD" else "POST"
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allowed}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if resolving { return Resolve(access, connection, method) }
+        authorized := auth.LocalOperator(connection, admin)
+        if authorized.status != 0 { return Error(access, connection, method, authorized.status, authorized.problem) }
+        input: reply.Body
+        {
+            loaded := reply.Read(connection, body, overflow, access.configuration.maximumBodyBytes,
+                access.configuration.zstdRequests, *input)
+            if loaded.status != 0 { return Error(access, connection, method, loaded.status, loaded.error) }
+        }
+        now := calendar.UnixMilliseconds()
+        if path == SpacePath { return Create(access, connection, *input.document, now) }
+        return Register(access, connection, *input.document, now)
+    }
+}

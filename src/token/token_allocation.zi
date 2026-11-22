@@ -1,6 +1,7 @@
 // Allocation state accompanies new signed receipts; migration never rewrites history.
 #import "protocol"
 #import "std/go_types"
+features :: #import "schema_features";
 sql :: #import "std/sql_go";
 ctx :: #import "std/context_go";
 errors :: #import "std/errors_go";
@@ -397,56 +398,6 @@ Record :: (transaction: *sql.Transaction, context: ctx.Context, receipt: TokenRe
 }
 
 #scope_export
-SchemaSQL :: () -> string {
-    return #string SQL
-CREATE TABLE IF NOT EXISTS token_allocation_migration (
-    version INTEGER PRIMARY KEY CHECK(version=1),
-    historical_ledger_seq INTEGER NOT NULL
-);
-INSERT OR IGNORE INTO token_allocation_migration(version,historical_ledger_seq)
-SELECT 1,COALESCE(MAX(ledger_seq),0) FROM token_ledger;
-CREATE TABLE IF NOT EXISTS token_google_origins (
-    payment_id TEXT PRIMARY KEY,
-    account_id TEXT NOT NULL,
-    package_name TEXT NOT NULL CHECK(package_name<>''),
-    app_id TEXT NOT NULL CHECK(app_id<>''),
-    amount INTEGER NOT NULL CHECK(amount>0)
-);
-CREATE TABLE IF NOT EXISTS token_allocation_receipts (
-    receipt_id TEXT PRIMARY KEY REFERENCES token_ledger(receipt_id)
-);
-CREATE TABLE IF NOT EXISTS token_allocations (
-    receipt_id TEXT PRIMARY KEY REFERENCES token_ledger(receipt_id),
-    account_id TEXT NOT NULL,
-    asset_id TEXT NOT NULL,
-    app_id TEXT NOT NULL,
-    source_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
-    source_type TEXT NOT NULL,
-    provider_payment_id TEXT NOT NULL,
-    issued INTEGER NOT NULL CHECK(issued>0),
-    remaining INTEGER NOT NULL CHECK(remaining<=issued),
-    ledger_seq INTEGER NOT NULL UNIQUE
-);
-CREATE INDEX IF NOT EXISTS token_allocation_pool ON token_allocations(account_id,asset_id,app_id,ledger_seq);
-CREATE INDEX IF NOT EXISTS token_allocation_source ON token_allocations(account_id,source_receipt_id,source_type);
-CREATE UNIQUE INDEX IF NOT EXISTS token_allocation_google_payment ON token_allocations(provider_payment_id) WHERE source_type='google_play';
-CREATE TABLE IF NOT EXISTS token_allocation_debits (
-    debit_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
-    credit_receipt_id TEXT NOT NULL,
-    units INTEGER NOT NULL CHECK(units>0),
-    PRIMARY KEY(debit_receipt_id,credit_receipt_id)
-);
-CREATE TABLE IF NOT EXISTS token_referral_offsets (
-    account_id TEXT NOT NULL,
-    source_receipt_id TEXT NOT NULL REFERENCES token_ledger(receipt_id),
-    credit_receipt_id TEXT NOT NULL REFERENCES token_allocations(receipt_id),
-    units INTEGER NOT NULL CHECK(units>0),
-    remaining INTEGER NOT NULL CHECK(remaining>=0 AND remaining<=units),
-    PRIMARY KEY(account_id,source_receipt_id,credit_receipt_id)
-);
-SQL;
-}
-
 // Internal server integration only: the caller must verify the provider and
 // resolve package -> title from server configuration before binding anything.
 BindGoogleTx :: (transaction: *sql.Transaction, context: ctx.Context, paymentID: string,
@@ -591,4 +542,9 @@ RecordTx :: (transaction: *sql.Transaction, context: ctx.Context, receipt: Token
         sql.Rollback(transaction)
     }
     return error
+}
+
+#scope_export
+SchemaSQL :: () -> string {
+    return features.TokenAllocations
 }

@@ -1,5 +1,6 @@
 #import "std/go_types"
 identity :: #import "identity";
+account_alias :: #import "account_alias";
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
 errors :: #import "std/errors_go";
@@ -27,7 +28,7 @@ ValidAliasReference :: (value: string) -> bool {
 #scope_export
 Resolve :: (database: *sql.Database, context: ctx.Context, reference: string) -> AccountResult {
     result: AccountResult
-    reference = identity.NormalizeAccountAlias(reference)
+    reference = account_alias.NormalizeAccountAlias(reference)
     arguments: [1]Any
     arguments[0] = reference
     destinations: [1]Any

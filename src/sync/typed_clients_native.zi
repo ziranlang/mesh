@@ -1,0 +1,81 @@
+#if TARGET == .C && OS == .LINUX {
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    protocol :: #import "protocol";
+    queries :: #import "sync_client_queries";
+    output :: #import "sync_response_native";
+    time :: #import "timestamp_value";
+    format :: #import "timestamp_format";
+    json :: #import "std/json_document";
+
+    #scope_file
+    SecondsPerDay :: 86400;
+    ActiveClientDays :: 90;
+    LegacyClientDays :: 180;
+
+    #scope_export
+    Compact :: (database: *void, user: string, version: s64, now: time.TimestampValue) -> bool {
+        if version <= 0 { return true }
+        cutoff := now
+        cutoff.seconds -= ActiveClientDays * SecondsPerDay
+        buffer: [31]u8
+        length := format.UTC(cutoff, buffer[:])
+        if length == 0 { return false }
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(buffer[:length]))]
+        floor := sql.ReadInteger(database, #string SQL_END
+SELECT MIN(last_client_clock) FROM server_clients
+WHERE user_id_hash=?1 AND protocol_version>=2 AND last_client_clock>0 AND last_seen_at>=?2
+SQL_END, arguments[:])
+        if floor.status != sqlite.SQLITE_OK { return false }
+        if floor.value <= 0 { return true }
+        arguments[1] = sql.IntArg(ifx floor.value < version then floor.value else version)
+        return sql.Execute(database, "DELETE FROM server_sync_ops WHERE user_id_hash=?1 AND server_version<=?2", arguments[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, #string SQL_END
+INSERT INTO server_sync_compaction(user_id_hash,compacted_through_version,updated_at)
+VALUES(?1,?2,CURRENT_TIMESTAMP)
+ON CONFLICT(user_id_hash) DO UPDATE SET
+ compacted_through_version=MAX(server_sync_compaction.compacted_through_version,excluded.compacted_through_version),
+ updated_at=CURRENT_TIMESTAMP
+SQL_END, arguments[:]) == sqlite.SQLITE_OK
+    }
+
+    AttachPolicy :: (database: *void, user: string, now: time.TimestampValue, document: *json.JsonDocument, root: s32) -> bool {
+        cutoff := now
+        cutoff.seconds -= LegacyClientDays * SecondsPerDay
+        buffer: [31]u8
+        length := format.UTC(cutoff, buffer[:])
+        if length == 0 { return false }
+        arguments: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(protocol.LatestProtocol), sql.TextArg(TextView(buffer[:length]))]
+        rows := sql.Prepare(database, #string SQL_END
+SELECT MAX(last_sync_at) FROM server_clients
+WHERE user_id_hash=?1 AND protocol_version<?2 AND last_sync_at>=?3
+SQL_END, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        if sqlite.SqliteStep(rows.value) != sqlite.SQLITE_ROW { return false }
+        stored := sql.ColumnText(rows.value, 0)
+        if stored == "" { return output.BooleanField(document, root, "legacy_write_required", false) }
+        latest := time.Parse(stored)
+        return latest.valid && output.BooleanField(document, root, "legacy_write_required", true) &&
+            (latest.seconds == 0 || output.IntegerField(document, root, "legacy_projection_epoch", latest.seconds))
+    }
+
+    AttachLegacy :: (database: *void, user: string, document: *json.JsonDocument, root: s32) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(protocol.LatestProtocol)]
+        rows := sql.Prepare(database, queries.LegacySQL, arguments[:])
+        if rows.status != sqlite.SQLITE_OK { return false }
+        defer sqlite.SqliteFinalize(rows.value)
+        array := json.JsonNewArray(document)
+        if array < 0 { return false }
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                return json.JsonCount(document, array) == 0 || json.JsonSet(document, root, "legacy_clients", array)
+            }
+            if status != sqlite.SQLITE_ROW || !json.JsonAppend(document, array, json.JsonNewStringCopy(document, sql.ColumnText(rows.value, 0))) {
+                return false
+            }
+        }
+        return false
+    }
+}

@@ -1,0 +1,131 @@
+identifiers :: #import "identity";
+wire_text :: #import "wire_text";
+binary :: #import "binary_codec";
+numbers :: #import "std/number_text";
+
+AuthTokenMetadata :: struct {
+    userID: string
+    sessionID: string
+    issuedAt: s64
+    expiresAt: s64
+    version: string
+}
+
+AuthTokenMetadataResult :: struct {
+    value: AuthTokenMetadata
+    error: string
+}
+
+ParsedInteger :: struct {
+    value: s64
+    is_ok: bool
+}
+
+V2Payload :: struct {
+    // Header, 64-byte account, two signed decimals and 64 hex bytes, each
+    // terminated by a newline.
+    bytes: [175]u8
+    count: s64
+}
+
+// The caller validates the account before supplying session entropy.
+FormatV2 :: (user_id: string, expires_at: s64, issued_at: s64, session: [32]u8) -> V2Payload {
+    output: V2Payload
+    if user_id.count != 64 {
+        return output
+    }
+    expiry_buffer: [21]u8
+    issued_buffer: [21]u8
+    fields: [4]string = .["v2", user_id,
+        FormatTimestamp(expires_at, expiry_buffer[:]),
+        FormatTimestamp(issued_at, issued_buffer[:])]
+    offset: s64 = 0
+    for field: fields {
+        for byte: field {
+            output.bytes[offset] = byte
+            offset += 1
+        }
+        output.bytes[offset] = #char "\n"
+        offset += 1
+    }
+    alphabet: string = "0123456789abcdef"
+    for byte: session {
+        output.bytes[offset] = alphabet[byte >> cast(u8)4]
+        output.bytes[offset + 1] = alphabet[byte & cast(u8)0x0f]
+        offset += 2
+    }
+    output.bytes[offset] = #char "\n"
+    output.count = offset + 1
+    return output
+}
+
+#scope_file
+FormatTimestamp :: (value: s64, buffer: []u8) -> string {
+    // The locked standard library negates the input before formatting it.
+    if value == -9223372036854775807 - 1 {
+        return "-9223372036854775808"
+    }
+    return numbers.FormatInteger(value, buffer)
+}
+
+#scope_export
+ParseInteger :: (text: string) -> ParsedInteger {
+    result: ParsedInteger
+    if text.count == 0 {
+        return result
+    }
+    negative: bool = text[0] == cast(u8)45
+    start: s64 = 0
+    if negative || text[0] == cast(u8)43 {
+        start = 1
+    }
+    if start == text.count {
+        return result
+    }
+    limit: u64 = cast(u64)9223372036854775807
+    if negative {
+        limit += cast(u64)1
+    }
+    value: u64 = cast(u64)0
+    while start < text.count {
+        byte: u8 = text[start]
+        if byte < cast(u8)48 || byte > cast(u8)57 {
+            return result
+        }
+        digit: u64 = cast(u64)(byte - cast(u8)48)
+        if value > (limit - digit) / cast(u64)10 {
+            return result
+        }
+        value = value * cast(u64)10 + digit
+        start += 1
+    }
+    result.value = ifx negative && value != 0 then -cast(s64)(value - 1) - 1 else cast(s64)value
+    result.is_ok = true
+    return result
+}
+
+// Takes a payload after authentication. The returned names borrow its bytes.
+Parse :: (payload: string) -> AuthTokenMetadataResult {
+    version := wire_text.Cut(payload, #char "\n")
+    user := wire_text.Cut(version.after, #char "\n")
+    expiry := wire_text.Cut(user.after, #char "\n")
+    if !version.found || !user.found || !expiry.found || !identifiers.ValidUserID(user.before) {
+        return .{error = "invalid token payload"}
+    }
+    expires_at := ParseInteger(expiry.before)
+    if version.before == "v1" {
+        if !expires_at.is_ok { return .{error = "token expired"} }
+        return .{value = .{userID = user.before, expiresAt = expires_at.value, version = "v1"}}
+    }
+
+    issued := wire_text.Cut(expiry.after, #char "\n")
+    session := wire_text.Cut(issued.after, #char "\n")
+    issued_at := ParseInteger(issued.before)
+    if version.before != "v2" || !issued.found || !session.found || session.after != "" ||
+        session.before.count != 64 || !binary.IsHex(session.before) ||
+        !expires_at.is_ok || !issued_at.is_ok || issued_at.value <= 0 {
+        return .{error = "invalid token payload"}
+    }
+    return .{value = .{userID = user.before, sessionID = session.before, issuedAt = issued_at.value,
+        expiresAt = expires_at.value, version = "v2"}}
+}

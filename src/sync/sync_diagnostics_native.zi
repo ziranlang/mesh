@@ -1,0 +1,181 @@
+#if TARGET == .C && OS == .LINUX {
+    access :: #import "account_access_native";
+    state :: #import "account_state_native";
+    hash :: #import "state_hash_native";
+    auth :: #import "http_auth_native";
+    http :: #import "http_server_native";
+    output :: #import "sync_response_native";
+    replies :: #import "http_json_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    diagnostics :: #import "sync_diagnostic_queries";
+    clients :: #import "sync_client_queries";
+    audit :: #import "sync_audit_queries";
+    payloads :: #import "encrypted_payload_queries";
+    counts :: #import "storage_queries";
+    json :: #import "std/json_document";
+    wire :: #import "wire_text";
+    mutex :: #import "std/mutex_linux";
+    calendar :: #import "std/date_time_linux";
+    format :: #import "timestamp_format";
+    #import "std/vec"
+
+    Path :: "/api/v1/sync/diagnostics";
+
+    #scope_file
+    ListKind :: enum { Clients; Audit; Payloads; }
+
+    Applied :: (document: *json.JsonDocument, raw: string) -> s32 {
+        stored: json.JsonDocument
+        read := json.JsonRead(*stored, raw)
+        keys: [6]string = .["meditation_logs", "habits", "habit_days", "sessions", "social_cache", "encrypted_records"]
+        values: [6]s64
+        if read {
+            entry := json.JsonFirst(*stored, stored.root)
+            while entry >= 0 {
+                label: Text = json.JsonKey(*stored, entry)
+                value, valid := json.JsonInteger(*stored, entry)
+                if valid {
+                    for key, index: keys {
+                        if wire.MatchesToken(TextView(label), key) {
+                            values[index] = value
+                            break
+                        }
+                    }
+                }
+                entry = json.JsonNext(*stored, entry)
+            }
+        }
+        object := json.JsonNewObject(document)
+        for key, index: keys {
+            if (index != 5 || values[index] != 0) && !output.IntegerField(document, object, key, values[index]) {
+                return -1
+            }
+        }
+        return object
+    }
+
+    AuditItem :: (document: *json.JsonDocument, row: *void) -> s32 {
+        item := json.JsonNewObject(document)
+        id := sqlite.SqliteColumnInt64(row, 0)
+        payloadBytes := sqlite.SqliteColumnInt64(row, 13)
+        if (id != 0 && !output.IntegerField(document, item, "id", id)) ||
+            !output.TextIfPresent(document, item, "user_id_hash", sql.ColumnText(row, 1)) ||
+            !output.TextIfPresent(document, item, "client_id", sql.ColumnText(row, 2)) ||
+            !output.TextIfPresent(document, item, "app_id", sql.ColumnText(row, 3)) ||
+            !output.IntegerField(document, item, "protocol_version", sqlite.SqliteColumnInt64(row, 4)) ||
+            !output.IntegerField(document, item, "since_server_version", sqlite.SqliteColumnInt64(row, 5)) ||
+            !output.IntegerField(document, item, "client_clock", sqlite.SqliteColumnInt64(row, 6)) ||
+            !output.IntegerField(document, item, "server_version", sqlite.SqliteColumnInt64(row, 7)) ||
+            !json.JsonSet(document, item, "applied", Applied(document, sql.ColumnText(row, 8))) ||
+            !output.IntegerField(document, item, "remote_ops", sqlite.SqliteColumnInt64(row, 9)) ||
+            !output.BooleanField(document, item, "full_snapshot_required", sqlite.SqliteColumnInt64(row, 10) != 0) ||
+            !output.TextIfPresent(document, item, "snapshot_reason", sql.ColumnText(row, 11)) ||
+            !output.BooleanField(document, item, "encrypted_payload", sqlite.SqliteColumnInt64(row, 12) != 0) ||
+            (payloadBytes != 0 && !output.IntegerField(document, item, "encrypted_payload_bytes", payloadBytes)) ||
+            !output.TextIfPresent(document, item, "created_at", sql.ColumnText(row, 14)) {
+            return -1
+        }
+        return item
+    }
+
+    AttachList :: (database: *void, document: *json.JsonDocument, root: s32, user: string,
+        key: string, query: string, limit: s64, kind: ListKind) -> bool {
+        arguments: [2]sql.Argument = .[sql.TextArg(user), sql.IntArg(limit)]
+        rows := sql.Prepare(database, query, arguments[:])
+        if rows.status != sqlite.SQLITE_OK {
+            return false
+        }
+        defer sqlite.SqliteFinalize(rows.value)
+        array := json.JsonNewArray(document)
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                return json.JsonCount(document, array) == 0 || json.JsonSet(document, root, key, array)
+            }
+            if status != sqlite.SQLITE_ROW {
+                return false
+            }
+            item: s32
+            if kind == .Clients {
+                item = json.JsonNewStringCopy(document, sql.ColumnText(rows.value, 0))
+            } else if kind == .Audit {
+                item = AuditItem(document, rows.value)
+            } else {
+                item = output.AttachEncryptedPayload(document, rows.value)
+            }
+            if item < 0 || !json.JsonAppend(document, array, item) {
+                return false
+            }
+        }
+        return false
+    }
+
+    Report :: (database: *void, user: string, document: *json.JsonDocument, root: s32) -> bool {
+        if sqlite.SqliteExecText(database, "BEGIN") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer sqlite.SqliteExecText(database, "ROLLBACK")
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        version := state.CurrentVersion(database, user)
+        compacted := sql.ReadInteger(database, clients.CompactedSQL, arguments[:])
+        digest := hash.State(database, user)
+        encryptedBytes := sql.ReadInteger(database, payloads.Bytes, arguments[:])
+        if version.status != sqlite.SQLITE_OK || compacted.status != sqlite.SQLITE_OK ||
+            digest.status != sqlite.SQLITE_OK || encryptedBytes.status != sqlite.SQLITE_OK {
+            return false
+        }
+        tables := json.JsonNewObject(document)
+        names := diagnostics.CountTables
+        for table: names {
+            query := counts.CountQuery(table, counts.UserFilter)
+            if query.count == 0 {
+                return false
+            }
+            count := sql.ReadInteger(database, TextView(VecSlice(query, 0, query.count)), arguments[:])
+            if count.status != sqlite.SQLITE_OK || !count.found || !output.IntegerField(document, tables, table, count.value) {
+                return false
+            }
+        }
+        return json.JsonSet(document, root, "status", json.JsonNewString(document, "ok")) &&
+            json.JsonSet(document, root, "user_id_hash", json.JsonNewStringCopy(document, user)) &&
+            output.IntegerField(document, root, "server_version", version.value) &&
+            json.JsonSet(document, root, "state_hash", json.JsonNewStringCopy(document, TextView(digest.hex[:64]))) &&
+            output.IntegerField(document, root, "compacted_through_version", compacted.value) &&
+            json.JsonSet(document, root, "table_counts", tables) &&
+            (encryptedBytes.value == 0 || output.IntegerField(document, root, "encrypted_payload_bytes", encryptedBytes.value)) &&
+            output.BooleanField(document, root, "active_websocket_supported", true) &&
+            AttachList(database, document, root, user, "legacy_clients", clients.LegacySQL, 3, .Clients) &&
+            AttachList(database, document, root, user, "recent_sync_audit", audit.RecentSQL, 10, .Audit) &&
+            AttachList(database, document, root, user, "recent_encrypted_payloads", payloads.Recent, 5, .Payloads)
+    }
+
+    #scope_export
+    Handle :: (service: *access.AccountAccess, connection: *void, method: string) -> s32 {
+        if method != "GET" && method != "HEAD" {
+            allow: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            empty: [0]u8
+            return http.WriteWithHeaders(connection, 405, "", empty[:], allow[:])
+        }
+        settings := service.configuration
+        now := calendar.UnixMilliseconds()
+        timestamp: [31]u8
+        length := format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = now >= 0}, timestamp[:])
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        {
+            if length == 0 || !mutex.Lock(*service.databaseLock) {
+                return replies.ErrorReply(connection, method, 500, "diagnostics failed", settings.zstdResponses)
+            }
+            defer mutex.Unlock(*service.databaseLock)
+            checked := auth.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(timestamp[:length]), false)
+            if checked.status != 0 {
+                return replies.ErrorReply(connection, method, checked.status, checked.message, settings.zstdResponses)
+            }
+            if !Report(settings.database, TextView(checked.userID[:]), *document, root) {
+                return replies.ErrorReply(connection, method, 500, "diagnostics failed", settings.zstdResponses)
+            }
+        }
+        return replies.Reply(connection, method, 200, *document, root, settings.zstdResponses)
+    }
+}

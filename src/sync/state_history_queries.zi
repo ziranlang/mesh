@@ -1,0 +1,5 @@
+// Preserve the newest hashes for one account.
+HistoryLimit :: 256;
+RecordSQL :: "\nINSERT INTO server_state_hashes(user_id_hash,server_version,state_hash)\nVALUES(?1,?2,?3)\nON CONFLICT(user_id_hash,server_version) DO UPDATE SET state_hash=excluded.state_hash";
+PruneSQL :: "\nDELETE FROM server_state_hashes\nWHERE user_id_hash=?1 AND server_version <= (\n    SELECT server_version FROM server_state_hashes WHERE user_id_hash=?1\n    ORDER BY server_version DESC LIMIT 1 OFFSET ?2)";
+MatchSQL :: "\nSELECT EXISTS(SELECT 1 FROM server_state_hashes\nWHERE user_id_hash=?1 AND server_version=?2 AND state_hash=lower(?3))";

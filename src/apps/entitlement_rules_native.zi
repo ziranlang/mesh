@@ -1,0 +1,161 @@
+#if TARGET == .C && OS == .LINUX {
+    calendar :: #import "std/calendar";
+    clock :: #import "std/date_time_linux";
+    timestamp :: #import "timestamp_value";
+    issuer :: #import "token_issuer_native";
+    signing :: #import "token_signing_native";
+    ledger :: #import "token_ledger_native";
+    writes :: #import "token_writes_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    UnitsPerDew :: 1000000;
+    MaximumExpiry :: 253402300799;
+    MaxInt :: 9223372036854775807;
+
+    Configuration :: struct {
+        signer: *issuer.Issuer
+        storagePlansEnabled: bool
+        moneroAtomicAmount: s64
+        moneroTokenUnits: s64
+        trialUntil: s64
+        islandLaunchAt: s64
+    }
+
+    Result :: struct {
+        status: u32
+        message: string
+        node: s32
+    }
+
+    Failure :: (status: u32, message: string) -> Result {
+        return .{status = status, message = message, node = -1}
+    }
+
+    Enabled :: (configuration: Configuration) -> bool {
+        return configuration.storagePlansEnabled && configuration.signer != null &&
+            issuer.Status(configuration.signer) == "ok" && Priced(configuration)
+    }
+
+    ConfigurationError :: (configuration: Configuration, stableSecret: bool, directPurchases: bool,
+        walletURL: string, network: string) -> string {
+        if !configuration.storagePlansEnabled { return "" }
+        if !stableSecret { return "storage billing requires a stable token secret" }
+        if configuration.signer == null || issuer.Status(configuration.signer) != "ok" {
+            return "storage billing requires the Dew issuer private key"
+        }
+        if !Priced(configuration) { return "storage billing requires valid fixed XMR prices" }
+        if !directPurchases || walletURL == "" { return "storage billing requires Monero top-ups" }
+        if network != "mainnet" && network != "stagenet" && network != "testnet" {
+            return "storage billing requires an explicit Monero network"
+        }
+        return ""
+    }
+
+    SizeBytes :: (size: string) -> s64 {
+        if size == "1gb" { return 1073741824 }
+        if size == "5gb" { return 5368709120 }
+        return 0
+    }
+
+    Price :: (size: string, period: string) -> s64 {
+        monthly: s64 = 0
+        if size == "1gb" { monthly = 20 * UnitsPerDew }
+        if size == "5gb" { monthly = 60 * UnitsPerDew }
+        if period == "monthly" { return monthly }
+        if period == "yearly" { return 10 * monthly }
+        return 0
+    }
+
+    // Compute ceil(units * atomic / tokens) by tracking quotient and remainder
+    // separately. The intermediate product need not fit in a signed integer.
+    MoneroPrice :: (units: s64, atomic: s64, tokens: s64) -> s64 {
+        if units <= 0 || atomic <= 0 || tokens <= 0 { return 0 }
+        divisor := cast(u64)tokens
+        term := cast(u64)(atomic / tokens)
+        termRemainder := cast(u64)(atomic % tokens)
+        multiplier := cast(u64)units
+        limit := cast(u64)MaxInt
+        quotient: u64 = 0
+        remainder: u64 = 0
+        while multiplier > 0 {
+            if multiplier % 2 != 0 {
+                remainder += termRemainder
+                carry := remainder / divisor
+                remainder %= divisor
+                if term + carry > limit - quotient { return 0 }
+                quotient += term + carry
+            }
+            multiplier >>= 1
+            if multiplier > 0 {
+                termRemainder *= 2
+                carry := termRemainder / divisor
+                termRemainder %= divisor
+                if term > (limit - carry) / 2 { return 0 }
+                term = 2 * term + carry
+            }
+        }
+        if remainder != 0 {
+            if quotient == limit { return 0 }
+            quotient += 1
+        }
+        return cast(s64)quotient
+    }
+
+    Priced :: (configuration: Configuration) -> bool {
+        // A positive representable price for the largest offer implies the
+        // same for each smaller offer at this fixed ratio.
+        return MoneroPrice(Price("5gb", "yearly"), configuration.moneroAtomicAmount, configuration.moneroTokenUnits) > 0
+    }
+
+    ConvertedSeconds :: (remaining: s64, from: string, to: string) -> s64 {
+        source := Price(from, "monthly")
+        target := Price(to, "monthly")
+        if remaining <= 0 || remaining > MaximumExpiry || source == 0 || target == 0 { return 0 }
+        return remaining / target * source + remaining % target * source / target
+    }
+
+    // Prepaid time clamps the day in the new month. Island's launch offer
+    // follows Go AddDate, which carries an out-of-range day into the next month.
+    AddMonths :: (start: s64, months: s32, clamp: bool) -> s64 {
+        if start <= 0 || start > MaximumExpiry { return 0 }
+        value := clock.UtcAt(start)
+        if !value.valid { return 0 }
+        monthIndex := value.month - 1 + months
+        year := value.year + monthIndex / 12
+        month := monthIndex % 12 + 1
+        maximumDay := calendar.DaysInMonth(year, month)
+        day := ifx clamp && value.day > maximumDay then maximumDay else value.day
+        days := timestamp.DaysBeforeYear(cast(s64)year) - timestamp.DaysBeforeYear(1970) +
+            cast(s64)(calendar.DayOfYear(year, month, 1) + day - 1)
+        return days * 86400 + start % 86400
+    }
+
+    TextField :: (document: *json.JsonDocument, node: s32, key: string) -> Text {
+        return json.JsonString(document, json.JsonMember(document, node, key))
+    }
+
+    TextEquals :: (document: *json.JsonDocument, node: s32, key: string, expected: string) -> bool {
+        value: Text = TextField(document, node, key)
+        return TextView(value) == expected
+    }
+
+    // Entitlement spending is part of the caller's SQLite transaction. Check
+    // every receipt field before accepting a replay from a legacy nonce row.
+    Debit :: (database: *void, signer: *issuer.Issuer, event: signing.Event, at: string, nonce: string,
+        document: *json.JsonDocument) -> Result {
+        if signer == null || issuer.Status(signer) != "ok" { return Failure(503, "Dew issuer unavailable") }
+        outcome := writes.Spend(database, signer, event, at, nonce, document)
+        if outcome.error == "insufficient balance" { return Failure(402, outcome.error) }
+        if outcome.status != 200 { return Failure(503, "could not debit Dew") }
+        row := json.JsonMember(document, outcome.node, "receipt")
+        amount, valid := json.JsonInteger(document, json.JsonMember(document, row, "amount_delta"))
+        if !valid || amount != event.amount || !TextEquals(document, row, "account_id", event.account) ||
+            !TextEquals(document, row, "app_id", event.app) || !TextEquals(document, row, "asset_id", ledger.AssetID) ||
+            !TextEquals(document, row, "event_type", event.kind) || !TextEquals(document, row, "source_type", event.source) ||
+            !TextEquals(document, row, "source_ref", event.reference) {
+            return Failure(503, "invalid entitlement receipt")
+        }
+        return .{status = 200, node = row}
+    }
+}

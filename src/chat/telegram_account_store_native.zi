@@ -1,0 +1,130 @@
+#if TARGET == .C && OS == .LINUX {
+    authorization :: #import "authorization_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+
+    Entry :: struct {
+        id: Text
+        mode: Text
+        app: Text
+        node: Text
+        audience: Text
+        bot: s64
+        challenge: Text
+        expiry: s64
+        sender: s64
+        account: Text
+        status: Text
+        client: Text
+        signingKey: Text
+        encryptionKey: Text
+        digest: Text
+        found: bool
+    }
+
+    Binding :: struct {
+        account: Text
+        status: s32
+    }
+
+    Rendezvous :: struct {
+        id: Text
+        app: Text
+        node: Text
+        audience: Text
+        expiry: s64
+        challenge: Text
+        state: Text
+        found: bool
+        status: s32
+    }
+
+    Read :: (database: *void, id: string) -> Entry {
+        arguments: [1]sql.Argument = .[sql.TextArg(id)]
+        row := sql.Prepare(database, #string QUERY
+SELECT entry_id,mode,app_id,node_id,audience,bot_id,challenge,expires_at,telegram_id,account_id,status,client_id,signing_key,encryption_key,init_digest
+FROM server_telegram_account_entries WHERE entry_id=?1
+QUERY, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        if sqlite.SqliteStep(row.value) != sqlite.SQLITE_ROW {
+            return .{}
+        }
+        return .{id = TextCopy(sql.ColumnText(row.value, 0)), mode = TextCopy(sql.ColumnText(row.value, 1)),
+            app = TextCopy(sql.ColumnText(row.value, 2)), node = TextCopy(sql.ColumnText(row.value, 3)),
+            audience = TextCopy(sql.ColumnText(row.value, 4)), bot = sqlite.SqliteColumnInt64(row.value, 5),
+            challenge = TextCopy(sql.ColumnText(row.value, 6)), expiry = sqlite.SqliteColumnInt64(row.value, 7),
+            sender = sqlite.SqliteColumnInt64(row.value, 8), account = TextCopy(sql.ColumnText(row.value, 9)),
+            status = TextCopy(sql.ColumnText(row.value, 10)), client = TextCopy(sql.ColumnText(row.value, 11)),
+            signingKey = TextCopy(sql.ColumnText(row.value, 12)), encryptionKey = TextCopy(sql.ColumnText(row.value, 13)),
+            digest = TextCopy(sql.ColumnText(row.value, 14)), found = true}
+    }
+
+    Issue :: (database: *void, id: []u8, mode: string, node: string, audience: string, bot: s64,
+        sender: s64, now: s64) -> bool {
+        challenge: [33]u8
+        if !authorization.Nonce(id) || !authorization.Nonce(challenge[:]) {
+            return false
+        }
+        arguments: [8]sql.Argument = .[sql.TextArg(TextView(id[:32])), sql.TextArg(mode), sql.TextArg(node),
+            sql.TextArg(audience), sql.IntArg(bot), sql.IntArg(sender), sql.TextArg(TextView(challenge[:32])), sql.IntArg(now + 600)]
+        return sql.Execute(database, #string QUERY
+INSERT INTO server_telegram_account_entries(entry_id,mode,app_id,node_id,audience,bot_id,telegram_id,challenge,expires_at)
+VALUES(?1,?2,'inbe',?3,?4,?5,?6,?7,?8)
+QUERY, arguments[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
+    }
+
+    BoundAccount :: (database: *void, sender: s64) -> Binding {
+        args: [1]sql.Argument = .[sql.IntArg(sender)]
+        row := sql.Prepare(database, "SELECT account_id FROM server_lumi_telegram WHERE telegram_id=?1", args[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = row.status}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = status}
+        }
+        return .{account = TextCopy(sql.ColumnText(row.value, 0))}
+    }
+
+    RequestEligible :: (database: *void, requestID: string, sender: s64, node: string, audience: string, now: s64) -> bool {
+        args: [5]sql.Argument = .[sql.TextArg(requestID), sql.IntArg(sender), sql.TextArg(node), sql.TextArg(audience), sql.IntArg(now)]
+        matched := sql.ReadInteger(database, #string QUERY
+SELECT COUNT(*) FROM server_authorization_requests r
+JOIN server_lumi_telegram t ON t.account_id=r.account_id AND t.telegram_id=r.telegram_id
+WHERE r.request_id=?1 AND r.telegram_id=?2 AND r.node_id=?3 AND r.audience=?4 AND r.expires_at>?5
+AND r.app_id='inbe' AND r.status='pending'
+QUERY, args[:])
+        return matched.status == sqlite.SQLITE_OK && matched.found && matched.value == 1
+    }
+
+    Pending :: (database: *void, account: string, bot: s64, sender: s64, node: string, now: s64) -> Rendezvous {
+        arguments: [5]sql.Argument = .[sql.TextArg(account), sql.IntArg(bot), sql.IntArg(sender), sql.TextArg(node), sql.IntArg(now)]
+        row := sql.Prepare(database, #string QUERY
+SELECT request_id,app_id,node_id,audience,expires_at,claim_nonce,status FROM server_authorization_requests
+WHERE account_id=?1 AND bot_id=?2 AND telegram_id=?3 AND node_id=?4 AND app_id='inbe' AND status='pending' AND expires_at>?5
+ORDER BY expires_at DESC,request_id LIMIT 1
+QUERY, arguments[:])
+        if row.status != sqlite.SQLITE_OK {
+            return .{status = row.status}
+        }
+        defer sqlite.SqliteFinalize(row.value)
+        status := sqlite.SqliteStep(row.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = status}
+        }
+        return .{id = TextCopy(sql.ColumnText(row.value, 0)), app = TextCopy(sql.ColumnText(row.value, 1)),
+            node = TextCopy(sql.ColumnText(row.value, 2)), audience = TextCopy(sql.ColumnText(row.value, 3)),
+            expiry = sqlite.SqliteColumnInt64(row.value, 4), challenge = TextCopy(sql.ColumnText(row.value, 5)),
+            state = TextCopy(sql.ColumnText(row.value, 6)), found = true}
+    }
+}

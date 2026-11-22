@@ -1,0 +1,75 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    scope :: #import "scope";
+
+    AppScope :: struct {
+        status: s32
+        error: string
+    }
+
+    #scope_file
+    ActiveApplication :: #string SQL_END
+SELECT a.status, COALESCE(m.expires_at,0)
+FROM server_apps a LEFT JOIN server_app_manifests m ON m.app_id=a.app_id AND m.status='active'
+WHERE a.app_id=?1
+SQL_END;
+
+    CollectionPrefixes :: "SELECT collection_prefix FROM server_app_collections WHERE app_id=?1";
+
+    #scope_export
+    Active :: (database: *void, app: string, now: s64) -> AppScope {
+        arguments: [1]sql.Argument = .[sql.TextArg(app)]
+        selected := sql.Prepare(database, ActiveApplication, arguments[:])
+        if selected.status != sqlite.SQLITE_OK { return .{status = selected.status} }
+        defer sqlite.SqliteFinalize(selected.value)
+        step := sqlite.SqliteStep(selected.value)
+        if step == sqlite.SQLITE_DONE { return .{error = "unknown app_id"} }
+        if step != sqlite.SQLITE_ROW { return .{status = step} }
+        if sql.ColumnText(selected.value, 0) != "active" { return .{error = "app_id inactive"} }
+        expires := sqlite.SqliteColumnInt64(selected.value, 1)
+        if expires > 0 && now > expires { return .{error = "app manifest expired"} }
+        return .{}
+    }
+
+    // Legacy compatibility uses the published date window independently of
+    // the signed manifest's expiry.
+    Legacy :: (database: *void, app: string, version: s64, day: string) -> AppScope {
+        arguments: [3]sql.Argument = .[sql.TextArg(app), sql.IntArg(version), sql.TextArg(day)]
+        selected := sql.Prepare(database, #string SQL_END
+SELECT status, compatibility_until>=?3 OR EXISTS (
+ SELECT 1 FROM json_each(legacy_protocols_json) AS legacy
+ WHERE json_extract(legacy.value,'$.status') IN ('active','compatibility')
+ AND (COALESCE(json_extract(legacy.value,'$.version'),0)<=0 OR json_extract(legacy.value,'$.version')>=?2)
+ AND json_extract(legacy.value,'$.valid_until')>=?3)
+FROM server_apps WHERE app_id=?1
+SQL_END, arguments[:])
+        if selected.status != sqlite.SQLITE_OK { return .{status = selected.status} }
+        defer sqlite.SqliteFinalize(selected.value)
+        status := sqlite.SqliteStep(selected.value)
+        if status == sqlite.SQLITE_DONE { return .{error = "unknown app_id"} }
+        if status != sqlite.SQLITE_ROW { return .{status = status} }
+        if sql.ColumnText(selected.value, 0) != "active" { return .{error = "app_id inactive"} }
+        if sqlite.SqliteColumnInt64(selected.value, 1) == 0 { return .{error = "legacy protocol not allowed for app_id"} }
+        return .{}
+    }
+
+    // Entity collections belong to the account and are shared by its signed
+    // apps. Other collections still need both a declaration and the app scope.
+    OwnsSignedCollection :: (database: *void, app: string, collection: string) -> AppScope {
+        owner := scope.CollectionOwnerApp(collection)
+        if owner == "entity" { return .{} }
+        if owner != "" && owner != app { return .{error = "encrypted record collection belongs to another app"} }
+        arguments: [1]sql.Argument = .[sql.TextArg(app)]
+        prefixes := sql.Prepare(database, CollectionPrefixes, arguments[:])
+        if prefixes.status != sqlite.SQLITE_OK { return .{status = prefixes.status} }
+        defer sqlite.SqliteFinalize(prefixes.value)
+        while true {
+            step := sqlite.SqliteStep(prefixes.value)
+            if step == sqlite.SQLITE_DONE { return .{error = "encrypted record collection is not registered for app_id"} }
+            if step != sqlite.SQLITE_ROW { return .{status = step} }
+            if scope.CollectionMatchesPrefix(collection, sql.ColumnText(prefixes.value, 0)) { return .{} }
+        }
+        return .{status = sqlite.SQLITE_MISUSE}
+    }
+}

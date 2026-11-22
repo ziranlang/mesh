@@ -1,0 +1,231 @@
+#if TARGET == .C && OS == .LINUX {
+    authorization :: #import "authorization_native";
+    binary :: #import "binary_codec";
+    hmac :: #import "token_hmac_native";
+    ed25519 :: #import "device_signature_native";
+    numbers :: #import "std/number_text";
+    integers :: #import "token_payload";
+    secure :: #import "std/constant_time";
+    sort :: #import "std/sort";
+    json :: #import "std/json_document";
+    #import "std/hash_map"
+    #import "std/vec"
+
+    Identity :: struct {
+        botID: s64
+        userID: s64
+        authDate: s64
+        startParam: Text
+        chatType: Text
+        digest: [65]u8
+        valid: bool
+    }
+
+    #scope_file
+    CanonicalInteger :: (value: string) -> s64 {
+        parsed := integers.ParseInteger(value)
+        digits: [24]u8
+        if !parsed.is_ok || numbers.FormatInteger(parsed.value, digits[:]) != value { return 0 }
+        return parsed.value
+    }
+
+    HexDigit :: (byte: u8) -> s32 {
+        if byte >= #char "0" && byte <= #char "9" { return cast(s32)(byte - #char "0") }
+        if byte >= #char "a" && byte <= #char "f" { return cast(s32)(byte - #char "a") + 10 }
+        if byte >= #char "A" && byte <= #char "F" { return cast(s32)(byte - #char "A") + 10 }
+        return -1
+    }
+
+    Decoded :: struct {
+        value: Text
+        valid: bool
+    }
+
+    Decode :: (raw: string, name: bool) -> Decoded {
+        bytes: Vec(u8)
+        index: s64 = 0
+        while index < raw.count {
+            byte := raw[index]
+            if byte == #char "+" { byte = 32 }
+            if byte == #char "%" {
+                if index + 2 >= raw.count { return .{} }
+                high := HexDigit(raw[index + 1])
+                low := HexDigit(raw[index + 2])
+                if high < 0 || low < 0 { return .{} }
+                byte = cast(u8)(high * 16 + low)
+                index += 2
+            }
+            if byte == 0 || byte == 10 || byte == 13 || (name && byte == #char "=") || !VecPush(bytes, byte) { return .{} }
+            index += 1
+        }
+        if name && bytes.count == 0 { return .{} }
+        return .{value = BuilderFinish(bytes), valid = true}
+    }
+
+    DecodeSignature :: (value: string) -> binary.BinaryBytes {
+        unpadded := binary.DecodeBase64(value, true, false)
+        if unpadded.error == "" { return unpadded }
+        return binary.DecodeBase64(value, true, true)
+    }
+
+    UserJSONValid :: (document: *json.JsonDocument, node: s32, depth: s64) -> bool {
+        if depth > 32 { return false }
+        kind := json.JsonKindOf(document, node)
+        if kind != .Object && kind != .Array { return true }
+        keys: Vec(Text)
+        child := json.JsonFirst(document, node)
+        while child >= 0 {
+            if kind == .Object {
+                key: Text = json.JsonKey(document, child)
+                {
+                    name := TextView(key)
+                    if name.count == 0 || name.count > 128 { return false }
+                    for byte: name {
+                        if !(byte >= #char "a" && byte <= #char "z") && !(byte >= #char "0" && byte <= #char "9") && byte != #char "_" { return false }
+                    }
+                }
+                if !VecPush(keys, key) { return false }
+            }
+            if !UserJSONValid(document, child, depth + 1) { return false }
+            child = json.JsonNext(document, child)
+        }
+        names: HashMap(string, bool)
+        defer HashMapFree(*names)
+        for *key: keys {
+            name := TextView(key)
+            if HashMapHas(*names, name) { return false }
+            HashMapSet(*names, name, true)
+            if !HashMapHas(*names, name) { return false }
+        }
+        return true
+    }
+
+    LaunchToken :: (value: string) -> bool {
+        if value.count > 512 {
+            return false
+        }
+        for byte: value {
+            if !((byte >= #char "0" && byte <= #char "9") || (byte >= #char "A" && byte <= #char "Z") ||
+                (byte >= #char "a" && byte <= #char "z") || byte == #char "-" || byte == #char "_") {
+                return false
+            }
+        }
+        return true
+    }
+
+    #scope_export
+    ValidJSONKeys :: (document: *json.JsonDocument) -> bool {
+        return UserJSONValid(document, document.root, 0)
+    }
+
+    BotID :: (token: string) -> s64 {
+        colon: s64 = 0
+        while colon < token.count && token[colon] != #char ":" { colon += 1 }
+        if colon + 1 >= token.count { return 0 }
+        for byte: token[colon + 1:] { if byte == #char ":" { return 0 } }
+        value := CanonicalInteger(token[:colon])
+        return ifx value > 0 then value else 0
+    }
+
+    Validate :: (raw: string, token: string, now: s64) -> Identity {
+        botID := BotID(token)
+        if botID == 0 || raw.count < 1 || raw.count > 16384 { return .{} }
+        decoded: Vec(Text)
+        start: s64 = 0
+        while start <= raw.count {
+            finish := start
+            equals: s64 = -1
+            while finish < raw.count && raw[finish] != #char "&" {
+                if raw[finish] == #char "=" {
+                    if equals >= 0 { return .{} }
+                    equals = finish
+                }
+                finish += 1
+            }
+            if equals < 0 { return .{} }
+            name := Decode(raw[start:equals], true)
+            value := Decode(raw[equals + 1:finish], false)
+            if !name.valid || !value.valid || !VecPush(decoded, name.value) || !VecPush(decoded, value.value) { return .{} }
+            start = finish + 1
+        }
+        fields: HashMap(string, s64)
+        defer HashMapFree(*fields)
+        names: Vec(string)
+        index: s64 = 0
+        while index + 1 < decoded.count {
+            key := TextView(decoded[index])
+            if HashMapHas(*fields, key) || !VecPush(names, key) { return .{} }
+            HashMapSet(*fields, key, index + 1)
+            if !HashMapHas(*fields, key) { return .{} }
+            index += 2
+        }
+        hashIndex: s64
+        userIndex: s64
+        dateIndex: s64
+        if !HashMapGet(*fields, "hash", *hashIndex) || !HashMapGet(*fields, "user", *userIndex) ||
+            !HashMapGet(*fields, "auth_date", *dateIndex) { return .{} }
+        encoded := TextView(decoded[hashIndex])
+        if !authorization.HexID(encoded, 64) { return .{} }
+        ordered := VecSlice(names, 0, names.count)
+        sort.SortText(ordered)
+        data: Vec(u8)
+        signatureData: Vec(u8)
+        digits: [24]u8
+        identity := numbers.FormatInteger(botID, digits[:])
+        if !BuilderAppend(signatureData, identity) || !BuilderAppend(signatureData, ":WebAppData\n") { return .{} }
+        first := true
+        signatureFirst := true
+        for name: ordered {
+            if name == "hash" { continue }
+            offset: s64
+            if !HashMapGet(*fields, name, *offset) { return .{} }
+            value := TextView(decoded[offset])
+            if (!first && !BuilderAppend(data, "\n")) ||
+                !BuilderAppend(data, name) || !BuilderAppend(data, "=") || !BuilderAppend(data, value) { return .{} }
+            first = false
+            if name == "signature" { continue }
+            if (!signatureFirst && !BuilderAppend(signatureData, "\n")) || !BuilderAppend(signatureData, name) ||
+                !BuilderAppend(signatureData, "=") || !BuilderAppend(signatureData, value) { return .{} }
+            signatureFirst = false
+        }
+        label: [10]u8 = .[87, 101, 98, 65, 112, 112, 68, 97, 116, 97]
+        secret: [32]u8
+        tag: [32]u8
+        payload := TextView(VecSlice(data, 0, data.count))
+        expected := binary.DecodeBinaryField(encoded)
+        if expected.error != "" || !hmac.Compute(label[:], token, secret[:]) ||
+            !hmac.Compute(secret[:], payload, tag[:]) ||
+            !secure.ConstantTimeTextEqual(TextView(tag[:]), TextView(VecSlice(expected.value, 0, expected.value.count))) { return .{} }
+        signatureIndex: s64
+        if HashMapGet(*fields, "signature", *signatureIndex) {
+            production := binary.DecodeBinaryField("e7bf03a2fa4602af4580703d88dda5bb59f32ed8b02a56c187fe7d34caed242d")
+            signature := DecodeSignature(TextView(decoded[signatureIndex]))
+            if production.error != "" || signature.error != "" || !ed25519.Verify(VecSlice(production.value, 0, production.value.count),
+                VecSlice(signatureData, 0, signatureData.count), VecSlice(signature.value, 0, signature.value.count)) { return .{} }
+        }
+        date := CanonicalInteger(TextView(decoded[dateIndex]))
+        document: json.JsonDocument
+        if date <= now - 300 || date > now || !json.JsonRead(*document, TextView(decoded[userIndex])) ||
+            json.JsonKindOf(*document, document.root) != .Object || !UserJSONValid(*document, document.root, 0) { return .{} }
+        id := authorization.Integer(*document, json.JsonMember(*document, document.root, "id"))
+        isBot := json.JsonKindOf(*document, json.JsonMember(*document, document.root, "is_bot"))
+        if id <= 0 || id > 4503599627370495 || (isBot != .False && isBot != .Missing && isBot != .Null) { return .{} }
+        replay: Vec(u8)
+        result: Identity = .{botID = botID, userID = id, authDate = date}
+        if !BuilderAppend(replay, identity) || !BuilderAppend(replay, "\n") || !BuilderAppend(replay, payload) ||
+            !authorization.Digest(TextView(VecSlice(replay, 0, replay.count)), result.digest[:]) { return .{} }
+        parameterIndex: s64
+        if HashMapGet(*fields, "start_param", *parameterIndex) && LaunchToken(TextView(decoded[parameterIndex])) {
+            result.startParam = TextCopy(TextView(decoded[parameterIndex]))
+        }
+        chatIndex: s64
+        if HashMapGet(*fields, "chat_type", *chatIndex) {
+            chat := TextView(decoded[chatIndex])
+            if chat == "sender" || chat == "private" || chat == "group" || chat == "supergroup" || chat == "channel" {
+                result.chatType = TextCopy(chat)
+            }
+        }
+        result.valid = true
+        return result
+    }
+}

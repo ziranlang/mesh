@@ -1,0 +1,222 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    queries :: #import "device_key_queries";
+    sessions :: #import "auth_sessions_native";
+    keys :: #import "account_keys_native";
+    auth :: #import "account_signature_native";
+    identity :: #import "identity";
+    binary :: #import "binary_codec";
+    codec :: #import "codec";
+    wire :: #import "wire_text";
+    format :: #import "timestamp_format";
+    time :: #import "timestamp_value";
+    numbers :: #import "std/number_text";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    DeviceResult :: struct {
+        status: u32
+        message: string
+    }
+
+    #scope_file
+    Invalid :: (revoke: bool) -> DeviceResult {
+        return .{status = 400, message = ifx revoke then "invalid device revocation" else "invalid device registration"}
+    }
+
+    Failed :: (revoke: bool) -> DeviceResult {
+        return .{status = 500, message = ifx revoke then "device revocation failed" else "device registration failed"}
+    }
+
+    Rollback :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    AppendLine :: (output: *Vec(u8), line: string) -> bool {
+        return BuilderAppend(<<output, line) && BuilderAppend(<<output, "\n")
+    }
+
+    SetText :: (document: *json.JsonDocument, node: s32, field: string, value: string) -> bool {
+        return json.JsonSet(document, node, field, json.JsonNewStringCopy(document, value))
+    }
+
+    RevokeSessions :: (database: *void, account: string, auditTime: string, arguments: []sql.Argument) -> s32 {
+        prepared := sql.Prepare(database, queries.DeviceClientSQL, arguments)
+        if prepared.status != sqlite.SQLITE_OK {
+            return prepared.status
+        }
+        defer sqlite.SqliteFinalize(prepared.value)
+        status := sqlite.SqliteStep(prepared.value)
+        if status != sqlite.SQLITE_ROW {
+            return status
+        }
+        status = sessions.RevokeDevice(database, account, sql.ColumnText(prepared.value, 0))
+        if status != sqlite.SQLITE_OK {
+            return status
+        }
+        return sessions.RevokeLegacy(database, account, auditTime)
+    }
+
+    #scope_export
+    List :: (database: *void, account: string, document: *json.JsonDocument, root: s32) -> DeviceResult {
+        failure: DeviceResult = .{status = 500, message = "device list failed"}
+        args: [1]sql.Argument = .[sql.TextArg(account)]
+        prepared := sql.Prepare(database, queries.ListAccountDevicesSQL, args[:])
+        if prepared.status != sqlite.SQLITE_OK {
+            return failure
+        }
+        defer sqlite.SqliteFinalize(prepared.value)
+        fieldNames: [8]string = .["account_id", "app_id", "device_key_id", "client_id", "public_key",
+            "created_at", "last_used_at", "revoked_at"]
+        devices := json.JsonNewArray(document)
+        anyDevices := false
+        while true {
+            status := sqlite.SqliteStep(prepared.value)
+            if status == sqlite.SQLITE_DONE {
+                break
+            }
+            if status != sqlite.SQLITE_ROW {
+                return failure
+            }
+            anyDevices = true
+            node := json.JsonNewObject(document)
+            if !json.JsonAppend(document, devices, node) {
+                return failure
+            }
+            for name, index: fieldNames {
+                fieldText := sql.ColumnText(prepared.value, cast(s32)index)
+                if index >= 5 && fieldText == "" {
+                    continue
+                }
+                if !SetText(document, node, name, fieldText) {
+                    return failure
+                }
+            }
+        }
+        // Go serializes a nil device slice as JSON null.
+        if !json.JsonSet(document, root, "devices", ifx anyDevices then devices else json.JsonNewNull(document)) {
+            return failure
+        }
+        return .{}
+    }
+
+    Change :: (database: *void, verify: auth.VerifySignature, account: string, input: []u8,
+        revoke: bool, now: time.TimestampValue, document: *json.JsonDocument, root: s32) -> DeviceResult {
+        request: json.JsonDocument
+        if !json.JsonRead(*request, TextView(input)) || json.JsonKindOf(*request, request.root) != .Object {
+            return Invalid(revoke)
+        }
+        names: [6]string = .["app_id", "device_key_id", "client_id", "public_key", "nonce", "signature"]
+        fields: [6]s32 = .[-1, -1, -1, -1, -1, -1]
+        expires: s64 = 0
+        node := json.JsonFirst(*request, request.root)
+        while node >= 0 {
+            kind := json.JsonKindOf(*request, node)
+            if kind != .Null {
+                name: Text = json.JsonKey(*request, node)
+                key := TextView(name)
+                if wire.MatchesToken(key, "expires_at") {
+                    value, valid := json.JsonInteger(*request, node)
+                    if !valid {
+                        return Invalid(revoke)
+                    }
+                    expires = value
+                } else {
+                    for field, index: names {
+                        if revoke && (index == 2 || index == 3) {
+                            continue
+                        }
+                        if !wire.MatchesToken(key, field) {
+                            continue
+                        }
+                        if kind != .String {
+                            return Invalid(revoke)
+                        }
+                        fields[index] = node
+                        break
+                    }
+                }
+            }
+            node = json.JsonNext(*request, node)
+        }
+        appText: Text = json.JsonString(*request, fields[0])
+        idText: Text = json.JsonString(*request, fields[1])
+        clientText: Text = json.JsonString(*request, fields[2])
+        keyText: Text = json.JsonString(*request, fields[3])
+        nonceText: Text = json.JsonString(*request, fields[4])
+        signatureText: Text = json.JsonString(*request, fields[5])
+        app := wire.TrimSpace(TextView(appText))
+        id := wire.TrimSpace(TextView(idText))
+        client := wire.TrimSpace(TextView(clientText))
+        nonce := wire.TrimSpace(TextView(nonceText))
+        deviceKey: [64]u8
+        if !identity.ValidNamespace(app) || !identity.ValidClientID(id) || !identity.ValidClientID(nonce) ||
+            expires <= now.seconds || expires - now.seconds > 900 ||
+            (!revoke && (!identity.ValidClientID(client) || !identity.NormalizeUserID(wire.TrimSpace(TextView(keyText)), deviceKey[:]))) {
+            return Invalid(revoke)
+        }
+        publicKey := TextView(deviceKey[:])
+        accountKey := keys.Read(database, account)
+        if accountKey.status != sqlite.SQLITE_OK {
+            return .{status = 500, message = "authentication failed"}
+        }
+        if !accountKey.found {
+            return .{status = 401, message = "sync account not found"}
+        }
+        signature := binary.DecodeBinaryField(TextView(signatureText))
+        if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
+            return .{status = 400, message = ifx revoke then "invalid device revocation signature" else "invalid device registration signature"}
+        }
+        message: Vec(u8)
+        expiry: [24]u8
+        context := ifx revoke then "daochi-device-revocation-v1" else "daochi-device-registration-v1"
+        if !AppendLine(*message, context) || !AppendLine(*message, account) || !AppendLine(*message, app) || !AppendLine(*message, id) ||
+            (!revoke && (!AppendLine(*message, client) || !AppendLine(*message, publicKey))) ||
+            !AppendLine(*message, nonce) || !AppendLine(*message, numbers.FormatInteger(expires, expiry[:])) { return Failed(revoke) }
+        if accountKey.count != codec.mlDSA44PublicKeySize || !verify(accountKey.bytes[:], VecSlice(message, 0, message.count),
+            VecSlice(signature.value, 0, signature.value.count)) {
+            return .{status = 401, message = ifx revoke then "device revocation rejected" else "device registration rejected"}
+        }
+        created: [31]u8
+        expired: [31]u8
+        createdCount := format.UTC(now, created[:])
+        cutoffCount := format.UTC(.{seconds = now.seconds - 1800, nanoseconds = now.nanoseconds, valid = true}, expired[:])
+        if createdCount == 0 || cutoffCount == 0 || sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return Failed(revoke)
+        }
+        defer Rollback(database)
+        createdAt := TextView(created[:createdCount])
+        cutoff: [1]sql.Argument = .[sql.TextArg(TextView(expired[:cutoffCount]))]
+        nonceArgs: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(nonce), sql.TextArg(createdAt)]
+        if sql.Execute(database, queries.DeleteDeviceNoncesSQL, cutoff[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, queries.InsertDeviceNonceSQL, nonceArgs[:]) != sqlite.SQLITE_OK { return Failed(revoke) }
+        if sqlite.SqliteChanges(database) != 1 {
+            return .{status = 409, message = ifx revoke then "device revocation replay" else "device registration replay"}
+        }
+        if revoke {
+            args: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(app), sql.TextArg(id), sql.TextArg(createdAt)]
+            if sql.Execute(database, queries.RevokeAccountDeviceSQL, args[:]) != sqlite.SQLITE_OK || sqlite.SqliteChanges(database) != 1 ||
+                RevokeSessions(database, account, createdAt, args[:3]) != sqlite.SQLITE_OK ||
+                !SetText(document, root, "status", "revoked") { return Failed(revoke) }
+        } else {
+            args: [6]sql.Argument = .[sql.TextArg(account), sql.TextArg(app), sql.TextArg(id), sql.TextArg(client),
+                sql.TextArg(publicKey), sql.TextArg(createdAt)]
+            if sql.Execute(database, queries.RegisterDeviceSQL, args[:]) != sqlite.SQLITE_OK {
+                return Failed(revoke)
+            }
+            if sqlite.SqliteChanges(database) != 1 {
+                return .{status = 409, message = "device key revoked"}
+            }
+            if !SetText(document, root, "account_id", account) || !SetText(document, root, "app_id", app) ||
+                !SetText(document, root, "device_key_id", id) || !SetText(document, root, "client_id", client) ||
+                !SetText(document, root, "public_key", publicKey) { return Failed(revoke) }
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Failed(revoke)
+        }
+        return .{}
+    }
+}

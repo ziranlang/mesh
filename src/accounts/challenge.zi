@@ -6,6 +6,7 @@
 #import "std/text_go"
 #import "codec"
 clock :: #import "std/time_go";
+limits :: #import "challenge_limits";
 errors :: #import "std/errors_go";
 builtin :: #system_library "go:builtin";
 strings :: #system_library "go:strings";
@@ -13,7 +14,6 @@ strings :: #system_library "go:strings";
 // Sign-ins of one account may overlap, such as an app's sync and its live
 // updates right after the account is attached. Each keeps its own challenge,
 // up to this many per account, instead of a newer one replacing it.
-MaxOutstanding :: 8
 
 Challenge :: struct {
     User: string
@@ -77,7 +77,7 @@ Bound :: (store: *ChallengeStore, userID: string) {
                 oldestExpiry = item.ExpiresAt
             }
         }
-        if count < cast(isize)MaxOutstanding {
+        if count < cast(isize)limits.MaxOutstanding {
             return
         }
         MapDelete(store.byUser, oldest)
@@ -98,12 +98,11 @@ New :: (ttl: clock.Duration) -> *ChallengeStore {
     return store
 }
 
-MaxOutstandingChallenges :: 65536;
 ErrChallengesBusy: Error = errors.New("too many outstanding challenges");
 
 Issue :: (store: *ChallengeStore, userID: string) -> IssuedChallenge {
     result: IssuedChallenge
-    nonce := AllocateNonce(cast(isize)32)
+    nonce := AllocateNonce(cast(isize)limits.NonceSize)
     random := Fill(nonce)
     if random.error != null {
         result.Error = random.error
@@ -114,7 +113,7 @@ Issue :: (store: *ChallengeStore, userID: string) -> IssuedChallenge {
     Prune(store, clock.Now())
     // Every issue scans the store under one lock, so it must stay bounded
     // however many accounts a flood of requests names.
-    if MapCount(store.byUser) >= MaxOutstandingChallenges {
+    if MapCount(store.byUser) >= limits.MaxOutstandingChallenges {
         result.Error = ErrChallengesBusy
         return result
     }

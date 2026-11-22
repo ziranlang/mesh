@@ -1,0 +1,30 @@
+RecordPageLimit :: 200;
+RecordPageBytes :: 4194304;
+
+// Preserve progress when a previously imported record exceeds one page.
+Room :: (count: s64, limit: s64, existingBytes: s64, nextBytes: s64) -> bool {
+    return count < limit && (count == 0 || nextBytes <= RecordPageBytes - existingBytes)
+}
+
+// A page holds the requesting app's records and the account's entity
+// records, which every app of the account shares.
+RecordPageQuery :: #string SQL_END
+
+SELECT r.collection,r.id,r.key_id,
+       CASE WHEN ?8='gzip-v1' AND p.nonce IS NOT NULL THEN p.nonce ELSE r.nonce END,
+       CASE WHEN ?8='gzip-v1' AND p.ciphertext IS NOT NULL THEN p.ciphertext ELSE r.ciphertext END,
+       r.updated_at,
+       r.deleted_at,r.content_hash,r.schema_version,r.parent_id,r.server_version,r.free_bytes
+FROM server_encrypted_records r
+LEFT JOIN server_record_packing p
+  ON p.user_id_hash=r.user_id_hash AND p.collection=r.collection AND p.id=r.id
+WHERE r.user_id_hash=?1 AND r.server_version>=?3 AND r.server_version<=?6
+  AND (r.server_version>?3 OR (r.server_version=?3 AND ?4!='' AND
+       (r.collection>?4 OR (r.collection=?4 AND r.id>?5))))
+  AND EXISTS (SELECT 1 FROM server_app_collections c WHERE (c.app_id=?2 OR c.app_id='entity')
+       AND (r.collection=c.collection_prefix OR
+            (substr(c.collection_prefix,-2)='.*' AND
+             substr(r.collection,1,length(c.collection_prefix)-1)=
+             substr(c.collection_prefix,1,length(c.collection_prefix)-1))))
+ORDER BY r.server_version,r.collection,r.id LIMIT ?7
+SQL_END;

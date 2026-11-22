@@ -1,0 +1,94 @@
+name: Cloudflare Pages
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesh-pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Check Site
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/master'
+    runs-on: alpha-ubuntu24.04
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Check Site
+        run: |
+          set -euo pipefail
+          test -f site/index.html
+          test -f site/protocol.html
+          test -f site/mesh.html
+          test -f site/apps.html
+          test -f site/tokens.html
+          test -f site/styles.css
+          test -f site/_headers
+          python3 -B scripts/test_mesh_site.py
+
+      - name: Upload Site Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mesh-site
+          path: site
+          if-no-files-found: error
+          include-hidden-files: true
+
+  deploy:
+    name: Deploy Site
+    needs: build
+    # Fork submissions can build the site. Deployment credentials are for same-repository previews and master.
+    if: >-
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name != 'pull_request' && github.ref == 'refs/heads/master')
+    runs-on: alpha-ubuntu24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout the revision for the canonical-domain verifier
+        if: github.event_name != 'pull_request'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Download Site Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: mesh-site
+          path: site
+      - name: Prepare Wrangler
+        run: npm exec --yes --package=wrangler@4.152.0 -- wrangler --version
+      - name: Deploy to Cloudflare Pages
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          WRANGLER_SEND_METRICS: 'false'
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          test -s site/index.html
+          : "${CLOUDFLARE_API_TOKEN:?Missing Pages deployment token}"
+          : "${CLOUDFLARE_ACCOUNT_ID:?Missing Cloudflare account ID}"
+          branch=master
+          if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+            branch="pr-$PR_NUMBER"
+          else
+            test "$GITHUB_REF" = refs/heads/master
+          fi
+          npm exec --offline --yes --package=wrangler@4.152.0 -- wrangler pages deploy site \
+            --project-name=mesh --branch="$branch" --commit-hash="$GITHUB_SHA"
+      # Project and DNS setup is handled separately by scripts/provision_mesh_site.py.
+      - name: Verify canonical site bytes
+        if: github.event_name != 'pull_request'
+        run: python3 -B scripts/verify_mesh_site.py

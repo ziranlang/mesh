@@ -1,0 +1,13 @@
+CountOtherPasskeysSQL :: "SELECT COUNT(*) FROM server_account_passkeys WHERE user_id_hash=?1 AND credential<>?2";
+OpenAccountPasskeySQL :: "SELECT verifier,wrapper FROM server_account_passkeys WHERE user_id_hash=?1 AND credential=?2";
+ListAccountPasskeysSQL :: "SELECT credential,label,created_at FROM server_account_passkeys WHERE user_id_hash=?1 ORDER BY created_at,credential";
+RemoveAccountPasskeySQL :: "DELETE FROM server_account_passkeys WHERE user_id_hash=?1 AND credential=?2";
+
+// Check the account and limit in the write, including when another connection
+// changes one of them between the request's initial count and this statement.
+StoreAccountPasskeySQL :: #string SQL_END
+INSERT INTO server_account_passkeys(user_id_hash,credential,wrapper,verifier,label,created_at)
+SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=?1)
+AND (SELECT COUNT(*) FROM server_account_passkeys WHERE user_id_hash=?1 AND credential<>?2)<?7
+ON CONFLICT(user_id_hash,credential) DO UPDATE SET wrapper=excluded.wrapper,verifier=excluded.verifier,label=excluded.label
+SQL_END;

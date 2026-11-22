@@ -1,0 +1,125 @@
+PageSections :: () -> [6]string {
+    parts: [6]string
+    parts[0] = #string PAGE_SECTION_0
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mesh</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+Mono:ital,wght@0,300;0,400;0,600;1,400&family=Cormorant+Garamond:ital,wght@0,500;0,600;1,500&display=swap');
+body{font-family:"Noto Sans Mono",ui-monospace,Menlo,monospace;margin:0;line-height:1.85;color:#4a4038;background:linear-gradient(180deg,#f7ede2 0%,#f2e2d0 60%,#f7ede2 100%);font-size:13.5px}
+main{max-width:1040px;margin:0 auto;padding:44px 20px 28px}
+.hero{padding:54px 0 42px;border-bottom:1px solid #d8cdbd}
+.eyebrow{margin:0 0 10px;color:#7b5b2a;font-size:.78rem;font-weight:750;letter-spacing:.15em;text-transform:uppercase}
+h1{margin:0;color:#14262b;font-family:"Cormorant Garamond",Georgia,serif;font-size:clamp(3.4rem,9vw,6.6rem);font-weight:600;line-height:.92;letter-spacing:0}
+h2{font-family:"Cormorant Garamond",Georgia,serif}
+.lead{max-width:760px;margin:22px 0 0;color:#4f5d62;font-size:1.22rem}
+.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:28px}
+.button{display:inline-flex;align-items:center;min-height:40px;padding:0 15px;border:1px solid #19353b;border-radius:6px;background:#19353b;color:white;text-decoration:none;font-weight:750}
+.button.secondary{background:white;color:#19353b;border-color:#c9baa8}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px;margin:28px 0}
+.card,.endpoint{background:white;border:1px solid #d8cdbd;border-radius:8px;padding:18px}
+.card h2,.endpoint h2{margin:0 0 8px;font-size:1.05rem}
+.card p{margin:0;color:#59676c}
+.section-title{margin:38px 0 14px}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+pre{overflow:auto;background:#14262b;color:#f9fafb;padding:16px;border-radius:8px}
+.endpoint{margin:10px 0}
+.method{display:inline-block;min-width:56px;font-weight:700}
+.security{display:grid;gap:12px;margin:20px 0}
+.security p{margin:0;color:#59676c}
+.security strong{display:block;color:#18202a}
+.status{border-top:1px solid #d8cdbd;margin-top:22px;padding-top:14px;display:flex;gap:18px;align-items:center;color:#5c6675;font-size:.9rem;flex-wrap:wrap}
+.status strong{color:#18202a;font-weight:650}
+.status-error{border-top:1px solid #d8cdbd;margin-top:22px;padding-top:14px;color:#5c6675}
+.footer{border-top:1px solid #d8cdbd;margin-top:28px;padding-top:18px;color:#667075;font-size:.9rem}
+a{color:#0b625d}
+@media (max-width:640px){.status{gap:10px}}
+</style>
+</head>
+<body>
+<main>
+<section class="hero">
+<p class="eyebrow">Offline-first keys for mesh-native sync</p>
+<h1>Mesh</h1>
+<p class="lead">Device-created account keys, post-quantum proof of account authority, encrypted records, and remote events for native and web apps. Server-assisted today, built toward a mesh-native network.</p>
+<div class="actions"><a class="button" href="/openapi.json">OpenAPI JSON</a><a class="button secondary" href="/healthz">Health check</a><a class="button secondary" href="/readyz">Readiness</a></div>
+</section>
+PAGE_SECTION_0;
+    parts[1] = #string PAGE_SECTION_1
+<section class="grid" aria-label="Mesh capabilities">
+<article class="card"><h2>Offline-first keys</h2><p>Clients create the durable ML-DSA-44 account key locally. The relay sees the public key, account hash, and signatures, not the private key.</p></article>
+<article class="card"><h2>Post-quantum account authority</h2><p>The durable account key is ML-DSA-44. Clients prove control with short-lived challenges before receiving operational bearer tokens.</p></article>
+<article class="card"><h2>App-owned records</h2><p>Applications keep ownership of their data while the relay stores versions, opaque encrypted payloads, and shared projections.</p></article>
+<article class="card"><h2>Remote events</h2><p>WebSocket events wake clients when fresh sync data is available without exposing bearer tokens through URLs.</p></article>
+<article class="card"><h2>Trusted mesh</h2><p>Signed pairing, local discovery, scoped replication, and trust-space names keep approved app data available through home and neighbor nodes.</p></article>
+</section>
+<section class="security" aria-label="Security posture">
+<p><strong>Key creation starts offline.</strong> A device can create its account key before the first network request; first login registers the public key, and later logins prove control with fresh signatures.</p>
+<p><strong>Private records stay client encrypted.</strong> Mesh validates metadata and versions ciphertext, but plaintext and record encryption choices remain with clients and apps.</p>
+<p><strong>The post-quantum proof is account authority.</strong> Mesh uses ML-DSA-44 signatures for identity and account authorization; app manifest keys and token issuer keys are separate Ed25519 authorities.</p>
+</section>
+<h2 class="section-title">Implementation guides</h2>
+<section class="grid" aria-label="Mesh implementation guides">
+<article class="card"><h2>Encrypted record profile</h2><p>Recommended private-record envelope, nonce rules, AAD, key rotation, and test-vector shape.</p></article>
+<article class="card"><h2>Developer quickstart</h2><p>Shortest path from account key to login, signed app manifest, encrypted sync, and diagnostics.</p></article>
+<article class="card"><h2>Small node operations</h2><p>Low-resource deployment targets, trust inspection checklist, and rollout checks for home or modest nodes.</p></article>
+</section>
+<h2 class="section-title">API surface</h2>
+<p>Protocol v5 makes encrypted records the primary private-data surface while legacy typed rows remain available for compatibility. Protocol v1 through v5 remain valid through 2027-09-01.</p>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/apps</code><p>Lists registered apps, collection prefixes, visibility classes, and capabilities.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/apps</code><p>Registers or updates an app when the admin token is set and <code>X-Mesh-Admin</code> matches it. <code>X-Ksync-Admin</code> remains accepted for compatibility.</p></section>
+PAGE_SECTION_1;
+    parts[2] = #string PAGE_SECTION_2
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/challenge?user_id=&lt;sha256-public-key-hex&gt;</code><p>Issues a single-use 32-byte challenge nonce encoded as lowercase hex.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/sync/login</code><p>Verifies the challenge signature and returns a cacheable bearer token plus server clock time.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/ws</code><p>Upgrades to a WebSocket event stream authenticated with <code>Authorization: Bearer &lt;token&gt;</code>, or browser subprotocols <code>mesh-sync-v1, bearer.&lt;token&gt;</code>.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/sync</code><p>Applies typed local changes or stores an encrypted envelope, then returns remote changes newer than the requested server version.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/sync/diagnostics</code><p>Returns bearer-authenticated sync state, table counts, compaction position, legacy client hints, and recent sync audit metadata.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/node/pairing/invites</code><p>Creates a short-lived signed pairing payload with explicit replication scope.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/node/pairing/accept</code><p>Verifies and consumes a pairing invite, then pins the peer identity and approved scope.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/node/pairing/complete</code><p>Authenticates the accepting node back to the inviter and completes reciprocal trust.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/node/peers</code><p>Lists paired nodes and their approved addresses and replication policies.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/namespaces</code><p>Creates a local trust-space authority for signed mesh-native names.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/namespaces/claims</code><p>Signs or updates a name claim in a locally controlled trust space.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/namespaces/resolve</code><p>Resolves a trust-space name to signed service endpoints.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/node/mesh/export</code><p>Exports policy-filtered signed app manifests, encrypted records, deletion tombstones, and names to an authenticated peer node.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/node/mesh/import</code><p>Verifies and imports policy-filtered app manifests, encrypted records, deletion tombstones, and names from an authenticated peer node.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/issuer</code><p>Returns the configured token issuer key.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/products</code><p>Lists configured token products and direct payment prices when direct purchases are enabled.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/balance</code><p>Returns the bearer-authenticated account's token balance computed from signed ledger events.</p></section>
+PAGE_SECTION_2;
+    parts[3] = #string PAGE_SECTION_3
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/activity</code><p>Returns the account's Dew balance and full newest-first activity history across every app for the profile's Dew screen.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/tokens/spend</code><p>Debits tokens with app policy and idempotency enforcement.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/tokens/gifts</code><p>Sends Dew to a friend; the debit and the friend's credit commit together.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/rewards</code><p>Lists the game rewards the node gives and their Dew.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/rewards</code><p>Claims a game reward for the account; each reward credits an account once.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/tokens/purchases/monero/invoices</code><p>Creates a bearer-authenticated invoice for a configured token product.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/purchases/monero/invoices/{id}</code><p>Returns invoice status and settles a confirmed payment against the authenticated account.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/purchases/monero/address</code><p>Returns the authenticated account's permanent Monero purchase address.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/purchases/monero/address/{recipient}</code><p>Resolves an alias or public ID and returns the recipient's permanent Monero gift address.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/tokens/purchases/monero/deposits</code><p>Returns the authenticated account's detected and credited Monero deposits.</p></section>
+<section class="endpoint"><span class="method">GET/POST</span><code>/api/v1/account/app-grants</code><p>Lists or creates bearer-authenticated grants for sharing registered app collection prefixes across apps.</p></section>
+<section class="endpoint"><span class="method">GET</span><code>/api/v1/account/app-records</code><p>Returns encrypted records from a granted collection prefix for cross-app use.</p></section>
+<section class="endpoint"><span class="method">GET/POST</span><code>/api/v1/friends</code><p>Bearer-authenticated friend requests, accepted friends, and app-neutral shared profile stats.</p></section>
+<section class="endpoint"><span class="method">GET/POST</span><code>/api/v1/publications</code><p>Publishes level collections and finds the newest public ones or the ones an author lets the caller see.</p></section>
+<section class="endpoint"><span class="method">GET/DELETE</span><code>/api/v1/publications/{id}</code><p>Fetches a visible publication with its document, or lets its author unpublish it.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete</code><p>Deletes all remote data for the signed sync account without uploading the private key. It is kept on hold for 30 days, restorable with the same key, then deleted permanently.</p></section>
+<section class="endpoint"><span class="method">DELETE</span><code>/api/v1/account</code><p>Legacy signed deletion endpoint kept for older clients.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Deletes all remote data for the sync account after verifying exported account key text, with the same 30-day hold.</p></section>
+<h2>Signed Message</h2>
+<pre>daochi-sync-v1
+&lt;HTTP_METHOD&gt;
+&lt;HTTP_PATH&gt;
+&lt;sha256 hex of exact raw request body bytes&gt;
+&lt;challenge nonce hex&gt;</pre>
+PAGE_SECTION_3;
+    parts[4] = "<p>Signed requests use <code>X-Mesh-User</code>, <code>X-Mesh-Signature</code>, and <code>Content-Type: application/json</code>. The older Ksync and Inbe signature headers remain accepted for shipped clients.</p>\n"
+    parts[5] = "\n<footer class=\"footer\">&copy; 2026 <a href=\"https://ziran-lang.org\">Ziran</a></footer>\n</main>\n</body>\n</html>"
+    return parts
+}
+
+StatsUnavailable :: "<p class=\"status-error\">Stats are temporarily unavailable.</p>";

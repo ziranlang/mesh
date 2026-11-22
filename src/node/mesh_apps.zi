@@ -1,3 +1,4 @@
+schema :: #import "trust_schema";
 #import "std/go_types"
 #import "authentication"
 #import "protocol"
@@ -64,7 +65,7 @@ Export :: (database: *sql.Database, context: ctx.Context, meshPolicy: NodeSyncPo
         return result
     }
     allowed := sets.Normalize(meshPolicy.Apps)
-    queried := Query(database, context, ExportAppsSQL)
+    queried := Query(database, context, schema.ExportAppsSQL)
     result.error = queried.error
     if result.error != null {
         return result
@@ -180,11 +181,6 @@ LoadVersion :: (database: *sql.Database, context: ctx.Context, appID: string) ->
 }
 
 #scope_file
-ExportAppsSQL :: #string SQL_END
-SELECT app_id,manifest_json,manifest_signature,approval_signature
-FROM server_app_manifests
-ORDER BY app_id
-SQL_END;
 VersionSQL :: #string SQL_END
 SELECT manifest_version,manifest_hash
 FROM server_app_manifests

@@ -1,0 +1,93 @@
+#if TARGET == .C && OS == .LINUX {
+    queries :: #import "state_hash_queries";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    sha :: #import "crypto/sha256";
+    numbers :: #import "std/number_text";
+    wire :: #import "wire_text";
+
+    StateHash :: struct {
+        hex: [65]u8
+        status: s32
+    }
+
+    #scope_file
+    TypeMismatch :: 20;
+
+    HashQuery :: struct {
+        query: string
+        format: string
+    }
+
+    WriteTable :: (database: *void, user: string, source: HashQuery, digest: *sha.Sha256Context) -> s32 {
+        arguments: [1]sql.Argument = .[sql.TextArg(user)]
+        rows := sql.Prepare(database, source.query, arguments[:])
+        if rows.status != sqlite.SQLITE_OK {
+            return rows.status
+        }
+        defer sqlite.SqliteFinalize(rows.value)
+        columns := sqlite.SqliteColumnCount(rows.value)
+        pattern := wire.Cut(source.format[:source.format.count - 1], #char "\t")
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                return sqlite.SQLITE_OK
+            }
+            if status != sqlite.SQLITE_ROW {
+                return status
+            }
+            sha.Sha256UpdateText(digest, pattern.before)
+            remaining := pattern.after
+            column: s32 = 0
+            while column < columns {
+                item := wire.Cut(remaining, #char "\t")
+                remaining = item.after
+                sha.Sha256UpdateText(digest, "\t")
+                stored := sqlite.SqliteColumnType(rows.value, column)
+                if item.before == "%d" && stored == sqlite.SQLITE_INTEGER {
+                    scratch: [24]u8
+                    sha.Sha256UpdateText(digest, numbers.FormatInteger(sqlite.SqliteColumnInt64(rows.value, column), scratch[:]))
+                } else if item.before == "%s" && stored != sqlite.SQLITE_NULL {
+                    sha.Sha256UpdateText(digest, sql.ColumnText(rows.value, column))
+                } else {
+                    return TypeMismatch
+                }
+                column += 1
+            }
+            if remaining != "" {
+                return TypeMismatch
+            }
+            sha.Sha256UpdateText(digest, "\n")
+        }
+        return sqlite.SQLITE_OK
+    }
+
+    #scope_export
+    // Stream the canonical account-state hash from the caller's read snapshot.
+    State :: (database: *void, user: string) -> StateHash {
+        tables: [7]HashQuery = .[
+            .{query = queries.HabitsSQL, format = queries.HabitsFormat},
+            .{query = queries.HabitDaysSQL, format = queries.HabitDaysFormat},
+            .{query = queries.SessionsSQL, format = queries.SessionsFormat},
+            .{query = queries.AllRoundsSQL, format = queries.RoundsFormat},
+            .{query = queries.MeditationsSQL, format = queries.MeditationsFormat},
+            .{query = queries.SocialSQL, format = queries.SocialFormat},
+            .{query = queries.RecordsSQL, format = queries.RecordsFormat},
+        ]
+        digest: sha.Sha256Context
+        sha.Sha256Initialize(*digest)
+        for table: tables {
+            status := WriteTable(database, user, table, *digest)
+            if status != sqlite.SQLITE_OK {
+                return .{status = status}
+            }
+        }
+        raw: [32]u8
+        sha.Sha256Finish(*digest, *raw[0])
+        result: StateHash
+        if sha.BytesToHex(*raw[0], raw.count, *result.hex[0], result.hex.count) != 1 {
+            result.status = sqlite.SQLITE_MISUSE
+        }
+        return result
+    }
+}

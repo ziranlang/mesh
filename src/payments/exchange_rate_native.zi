@@ -1,0 +1,269 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    http :: #import "http_server_native";
+    transfer :: #import "peer_http_native";
+    network :: #import "network_scope_native";
+    json :: #import "std/json_document";
+    float_text :: #import "std/float_text";
+    text :: #import "std/text_tools";
+    calendar :: #import "std/date_time_linux";
+    timer :: #import "std/timer_linux";
+    socket :: #import "std/socket_linux";
+    mutex :: #import "std/mutex_linux";
+    thread :: #import "std/thread_linux";
+    #import "std/vec"
+
+    RateConfiguration :: struct {
+        database: *void
+        databaseLock: *mutex.Mutex
+        enabled: bool
+        intervalSeconds: s64
+        upstreams: [3]string
+    }
+
+    RateSnapshot :: struct {
+        cents: s64
+        updatedAt: s64
+        sources: Text
+    }
+
+    ExchangeRateState :: struct {
+        configuration: RateConfiguration
+        cents: s64
+        updatedAt: s64
+        sources: [4096]u8
+        sourceCount: s64
+        lock: mutex.Mutex
+        worker: thread.Thread
+        stopFD: s32
+        ready: bool
+    }
+
+    #scope_file
+    c :: #system_library "c";
+    math :: #system_library "m";
+    Round :: (value: float64) -> float64 #foreign math "round";
+    EventFD :: (initial: u32, flags: s32) -> s32 #foreign c "eventfd";
+    Signal :: (fd: s32, value: u64) -> s32 #foreign c "eventfd_write";
+    CloseFD :: (fd: s32) -> s32 #foreign c "close";
+    Poll :: (descriptors: *socket.LinuxPollFd, count: usize, timeout: s32) -> s32 #foreign c "poll";
+
+    Pair :: "XMR/USD";
+    FreshSeconds :: 7200;
+    FutureTolerance :: 300;
+    MinimumCents :: 100;
+    MaximumCents :: 10000000;
+    ReplyLimit :: 65536;
+    WakeFlags :: 0x80800; // EFD_CLOEXEC | EFD_NONBLOCK
+    Read :: "SELECT usd_cents,updated_at,sources FROM exchange_rates WHERE pair=?1";
+    Write :: "INSERT INTO exchange_rates(pair,usd_cents,updated_at,sources) VALUES(?1,?2,?3,?4) ON CONFLICT(pair) DO UPDATE SET usd_cents=excluded.usd_cents,updated_at=excluded.updated_at,sources=excluded.sources";
+    Names: [3]string = .["coingecko", "kraken", "coinpaprika"];
+    Defaults: [3]string = .["https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=usd",
+        "https://api.kraken.com/0/public/Ticker?pair=XMRUSD",
+        "https://api.coinpaprika.com/v1/tickers/xmr-monero?quotes=USD"];
+
+    Member :: (document: *json.JsonDocument, node: s32, name: string, kind: json.JsonKind) -> s32 {
+        value := json.JsonMember(document, node, name)
+        return ifx json.JsonKindOf(document, value) == kind then value else -1
+    }
+
+    PriceText :: (document: *json.JsonDocument, source: s64) -> Text {
+        root := document.root
+        if source == 0 {
+            quote := Member(document, root, "monero", .Object)
+            return json.JsonNumberText(document, Member(document, quote, "usd", .Number))
+        }
+        if source == 1 {
+            problems := json.JsonMember(document, root, "error")
+            kind := json.JsonKindOf(document, problems)
+            if problems >= 0 && kind != .Null && (kind != .Array || json.JsonCount(document, problems) != 0) { return .{} }
+            result := Member(document, root, "result", .Object)
+            ticker := Member(document, result, "XXMRZUSD", .Object)
+            price := json.JsonFirst(document, Member(document, ticker, "c", .Array))
+            return json.JsonString(document, price)
+        }
+        quotes := Member(document, root, "quotes", .Object)
+        usd := Member(document, quotes, "USD", .Object)
+        return json.JsonNumberText(document, Member(document, usd, "price", .Number))
+    }
+
+    Wait :: (state: *ExchangeRateState, milliseconds: s32) -> bool {
+        descriptor: socket.LinuxPollFd = .{fd = state.stopFD, events = 1}
+        return Poll(*descriptor, 1, milliseconds) != 0
+    }
+
+    Stopping :: (context: *void) -> bool { return Wait(cast(*ExchangeRateState)context, 0) }
+
+    Fetch :: (state: *ExchangeRateState, index: s64) -> s64 {
+        destination := state.configuration.upstreams[index]
+        if destination == "" { destination = Defaults[index] }
+        headers: [2]http.HeaderValue = .[.{name = "Accept", value = "application/json"}, .{name = "User-Agent", value = "mesh-rates/1"}]
+        options: transfer.Options = .{headers = headers[:], timeout = 10, maximum = ReplyLimit,
+            stopping = Stopping, context = cast(*void)state}
+        scope: network.Scope
+        payload: transfer.Response
+        if !transfer.Get(*scope, destination, options, *payload) || payload.status < 200 || payload.status >= 300 { return 0 }
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(VecSlice(payload.bytes, 0, payload.bytes.count))) { return 0 }
+        quoted: Text = PriceText(*document, index)
+        price, valid := float_text.ParseFloat64(TextView(quoted))
+        if !valid || !(price >= 1.0 && price <= 100000.0) { return 0 }
+        return cast(s64)Round(price * 100.0)
+    }
+
+    Median :: (prices: []s64) -> s64 {
+        copy: [3]s64
+        for price, index: prices {
+            position := index
+            while position > 0 && copy[position - 1] > price {
+                copy[position] = copy[position - 1]
+                position -= 1
+            }
+            copy[position] = price
+        }
+        if prices.count == 2 { return (copy[0] + copy[1]) / 2 }
+        return copy[1]
+    }
+
+    Load :: (state: *ExchangeRateState) {
+        parameters: [1]sql.Argument = .[sql.TextArg(Pair)]
+        prepared := sql.Prepare(state.configuration.database, Read, parameters[:])
+        if prepared.status != sqlite.SQLITE_OK { return }
+        defer sqlite.SqliteFinalize(prepared.value)
+        if sqlite.SqliteStep(prepared.value) != sqlite.SQLITE_ROW { return }
+        sources := sql.ColumnText(prepared.value, 2)
+        if sources.count > state.sources.count { return }
+        Remember(state, sqlite.SqliteColumnInt64(prepared.value, 0), sqlite.SqliteColumnInt64(prepared.value, 1), sources)
+    }
+
+    Remember :: (state: *ExchangeRateState, cents: s64, now: s64, sources: string) {
+        state.cents = cents
+        state.updatedAt = now
+        state.sourceCount = sources.count
+        for index: 0..sources.count - 1 { state.sources[index] = cast(u8)sources[index] }
+    }
+
+    Save :: (state: *ExchangeRateState, cents: s64, now: s64, sources: string) {
+        databaseLock := state.configuration.databaseLock
+        if !mutex.Lock(databaseLock) { return }
+        defer mutex.Unlock(databaseLock)
+        if Stopping(cast(*void)state) || !mutex.Lock(*state.lock) { return }
+        defer mutex.Unlock(*state.lock)
+        parameters: [4]sql.Argument = .[sql.TextArg(Pair), sql.IntArg(cents), sql.IntArg(now), sql.TextArg(sources)]
+        if sql.Execute(state.configuration.database, Write, parameters[:]) == sqlite.SQLITE_OK {
+            Remember(state, cents, now, sources)
+        }
+    }
+
+    Refresh :: (state: *ExchangeRateState) {
+        now := calendar.UnixMilliseconds() / 1000
+        all: [3]s64
+        quotes: [3]s64
+        count: s64 = 0
+        for index: 0..2 {
+            price := Fetch(state, index)
+            if Stopping(cast(*void)state) { return }
+            all[index] = price
+            if price > 0 {
+                quotes[count] = price
+                count += 1
+            }
+        }
+        if count < 2 { return }
+        middle := Median(quotes[:count])
+        count = 0
+        sources: Vec(u8)
+        for price, index: all {
+            difference := ifx price > middle then price - middle else middle - price
+            if difference * 10 <= middle {
+                if (count > 0 && !VecPush(sources, #char ",")) || !BuilderAppend(sources, Names[index]) { return }
+                quotes[count] = price
+                count += 1
+            }
+        }
+        if count >= 2 { Save(state, Median(quotes[:count]), now, TextView(VecSlice(sources, 0, sources.count))) }
+    }
+
+    Run :: (context: *void) {
+        state := cast(*ExchangeRateState)context
+        interval := state.configuration.intervalSeconds * 1000
+        while !Stopping(context) {
+            start := timer.MonotonicMilliseconds()
+            Refresh(state)
+            remaining := interval - (timer.MonotonicMilliseconds() - start)
+            if remaining > 0 && Wait(state, cast(s32)remaining) { return }
+        }
+    }
+
+    #scope_export
+    Open :: (state: *ExchangeRateState, configuration: RateConfiguration) -> bool {
+        if !configuration.enabled { return true }
+        if configuration.intervalSeconds < 1 || configuration.intervalSeconds > 2147483 || !mutex.Open(*state.lock) { return false }
+        state.configuration = configuration
+        state.stopFD = EventFD(0, WakeFlags)
+        if state.stopFD < 0 {
+            unused mutex.Close(*state.lock)
+            return false
+        }
+        Load(state)
+        state.ready = true
+        if thread.ThreadStart(*state.worker, Run, cast(*void)state) { return true }
+        Close(state)
+        return false
+    }
+
+    Stop :: (state: *ExchangeRateState) {
+        if state.ready && thread.ThreadRunning(*state.worker) {
+            unused Signal(state.stopFD, 1)
+            thread.ThreadWait(*state.worker)
+        }
+    }
+
+    Close :: (state: *ExchangeRateState) {
+        if !state.ready { return }
+        Stop(state)
+        unused CloseFD(state.stopFD)
+        unused mutex.Close(*state.lock)
+        state.ready = false
+    }
+
+    // USD cents are informational and never used for the Dew exchange ratio.
+    Current :: (state: *ExchangeRateState, now: s64) -> RateSnapshot {
+        if state == null || !state.ready || !mutex.Lock(*state.lock) { return .{} }
+        defer mutex.Unlock(*state.lock)
+        cents := state.cents
+        updatedAt := state.updatedAt
+        if cents < MinimumCents || cents > MaximumCents || updatedAt <= 0 || now <= 0 ||
+            now - updatedAt > FreshSeconds || updatedAt - now > FutureTolerance { return .{} }
+        return .{cents = cents, updatedAt = updatedAt, sources = TextCopy(TextView(state.sources[:state.sourceCount]))}
+    }
+
+    Handle :: (state: *ExchangeRateState, connection: *void, verb: string, atomicAmount: s64, tokenUnits: s64) -> s32 {
+        if verb != "GET" && verb != "HEAD" {
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]
+            empty: []u8
+            return http.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        rate := Current(state, calendar.UnixMilliseconds() / 1000)
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        sources := json.JsonNewArray(*document)
+        if rate.cents > 0 {
+            names := text.TextSplit(TextView(rate.sources), ",")
+            for name: VecSlice(names, 0, names.count) {
+                if !json.JsonAppend(*document, sources, json.JsonNewStringCopy(*document, name)) { return 0 }
+            }
+        }
+        priced := atomicAmount > 0 && tokenUnits > 0
+        if !json.JsonSet(*document, root, "xmr_usd_cents", json.JsonNewInteger(*document, rate.cents)) ||
+            !json.JsonSet(*document, root, "updated_at", json.JsonNewInteger(*document, rate.updatedAt)) ||
+            !json.JsonSet(*document, root, "sources", sources) ||
+            !json.JsonSet(*document, root, "xmr_atomic_units", json.JsonNewInteger(*document, ifx priced then atomicAmount else 0)) ||
+            !json.JsonSet(*document, root, "token_units", json.JsonNewInteger(*document, ifx priced then tokenUnits else 0)) { return 0 }
+        body: Text = json.JsonWrite(*document, root, json.JsonCompactStyle(false))
+        if body.bytes.count == 0 { return 0 }
+        headers: [1]http.HeaderValue = .[.{name = "Cache-Control", value = "public, max-age=300"}]
+        return http.WriteWithHeaders(connection, 200, "application/json", VecSlice(body.bytes, 0, body.bytes.count), headers[:])
+    }
+}

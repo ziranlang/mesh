@@ -1,0 +1,421 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    auth :: #import "http_auth_native";
+    calendar :: #import "std/date_time_linux";
+    coding :: #import "encoding_preferences";
+    fields :: #import "sync_json_fields";
+    format :: #import "timestamp_format";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    limits :: #import "server_limits";
+    mutex :: #import "std/mutex_linux";
+    replies :: #import "http_json_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    ReportRoute :: "/api/v1/feedback";
+    InboxRoute :: "/api/v1/admin/feedback";
+    ReplyRoute :: "/api/v1/admin/feedback/reply";
+    Unavailable :: "feedback unavailable";
+
+    SubmitReport :: #string SQL_END
+INSERT INTO server_app_feedback(account_id,id,app_id,title,message,context)
+SELECT ?1,?2,?3,?4,?5,?6 WHERE
+    (SELECT COUNT(*) FROM server_app_feedback WHERE account_id=?1 AND created_at>=date('now'))<20
+ON CONFLICT(account_id,id) DO NOTHING
+SQL_END;
+
+    AccountReports :: #string SQL_END
+SELECT f.id,f.app_id,f.title,f.message,f.context,
+    COALESCE((SELECT r.reply FROM server_app_feedback_replies r WHERE r.account_id=f.account_id AND r.report_id=f.id
+        ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1),f.reply),f.created_at
+FROM server_app_feedback f WHERE f.account_id=?1
+ORDER BY f.created_at DESC,f.id DESC LIMIT 100
+SQL_END;
+
+    OperatorInbox :: #string SQL_END
+SELECT f.id,f.app_id,f.title,f.message,f.context,
+    COALESCE((SELECT r.reply FROM server_app_feedback_replies r WHERE r.account_id=f.account_id AND r.report_id=f.id
+        ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1),f.reply),f.created_at,f.account_id,COALESCE(u.alias,'')
+FROM server_app_feedback f LEFT JOIN server_users u ON u.user_id_hash=f.account_id
+ORDER BY f.created_at DESC,f.id DESC LIMIT 100
+SQL_END;
+
+    ReplyPage :: #string SQL_END
+SELECT id,app_id,title,'','',reply,created_at FROM (
+    SELECT id,app_id,title,reply,created_at,0 AS position FROM server_app_feedback WHERE account_id=?1 AND reply<>''
+    UNION ALL
+    SELECT r.id,f.app_id,f.title,r.reply,r.created_at,r.rowid AS position
+    FROM server_app_feedback_replies r JOIN server_app_feedback f ON f.account_id=r.account_id AND f.id=r.report_id
+    WHERE r.account_id=?1
+) ORDER BY created_at,position,id LIMIT 2 OFFSET ?2
+SQL_END;
+
+    AppendReply :: #string SQL_END
+INSERT INTO server_app_feedback_replies(account_id,report_id,id,reply)
+SELECT ?1,?2,?3,?4 WHERE EXISTS(SELECT 1 FROM server_app_feedback WHERE account_id=?1 AND id=?2)
+ON CONFLICT(account_id,id) DO NOTHING
+SQL_END;
+
+    Input :: struct {
+        id: Text
+        appID: Text
+        title: Text
+        message: Text
+        context: Text
+        accountID: Text
+        reply: Text
+        replyID: Text
+        valid: bool
+    }
+
+    Result :: struct {
+        status: u32
+        problem: string
+        root: s32
+    }
+
+    ReadInput :: (connection: *void, body: []u8, overflow: bool, limit: s64, zstd: bool) -> Input {
+        if overflow || body.count > limit {
+            return .{}
+        }
+        {
+            encoding: [limits.MaxHeaderBytes]u8
+            count := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+            if count < 0 || coding.Request(TextView(encoding[:count])) == .Unsupported {
+                return .{}
+            }
+        }
+        request: replies.Body
+        decoded := replies.Decode(connection, body, overflow, limit, zstd, *request)
+        if decoded.status != 0 {
+            return .{}
+        }
+        if decoded.decoded {
+            return ParseInput(TextView(VecSlice(request.scratch, 0, decoded.length)))
+        }
+        return ParseInput(TextView(body))
+    }
+
+    ParseInput :: (data: string) -> Input {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, data) {
+            return .{}
+        }
+        keys: [10]string = .["id", "app_id", "title", "message", "context", "account_id", "reply", "reply_id", "account_alias", "created_at"]
+        kinds: [10]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .String, .String, .String, .String]
+        members: [10]s32
+        root := document.root
+        if !fields.Read(*document, root, keys[:], kinds[:], members[:]) {
+            return .{}
+        }
+        input: Input
+        input.id = json.JsonString(*document, members[0])
+        input.appID = json.JsonString(*document, members[1])
+        input.title = json.JsonString(*document, members[2])
+        input.message = json.JsonString(*document, members[3])
+        input.context = json.JsonString(*document, members[4])
+        input.accountID = json.JsonString(*document, members[5])
+        input.reply = json.JsonString(*document, members[6])
+        input.replyID = json.JsonString(*document, members[7])
+        input.valid = true
+        return input
+    }
+
+    ValidReplyID :: (id: string) -> bool {
+        if id.count != 64 {
+            return false
+        }
+        for byte: id {
+            digit := byte >= #char "0" && byte <= #char "9"
+            letter := byte >= #char "a" && byte <= #char "f"
+            if !digit && !letter {
+                return false
+            }
+        }
+        return true
+    }
+
+    ReadOffset :: (value: string) -> s64 {
+        if value.count > 6 {
+            return -1
+        }
+        offset: s64 = 0
+        for byte: value {
+            if byte < #char "0" || byte > #char "9" {
+                return -1
+            }
+            offset = offset * 10 + cast(s64)(byte - #char "0")
+        }
+        return offset
+    }
+
+    RollbackIfActive :: (database: *void) {
+        if !sqlite.SqliteGetAutocommit(database) {
+            unused sqlite.SqliteExecText(database, "ROLLBACK")
+        }
+    }
+
+    // The write and its retry lookup share a transaction across connections.
+    StoreReport :: (database: *void, account: string, input: *Input) -> Result {
+        args: [6]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(input.id)),
+            sql.TextArg(TextView(input.appID)), sql.TextArg(TextView(input.title)),
+            sql.TextArg(TextView(input.message)), sql.TextArg(TextView(input.context))]
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        defer RollbackIfActive(database)
+        if sql.Execute(database, SubmitReport, args[:]) != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        exists := sql.ReadInteger(database, "SELECT 1 FROM server_app_feedback WHERE account_id=?1 AND id=?2", args[:2])
+        if exists.status != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        if !exists.found {
+            return .{status = 429, problem = "daily feedback allowance reached"}
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        return .{}
+    }
+
+    Submit :: (settings: accounts.Configuration, connection: *void, body: []u8, overflow: bool,
+        account: string, document: *json.JsonDocument) -> Result {
+        input := ReadInput(connection, body, overflow, BodyLimit(ReportRoute), settings.zstdRequests)
+        if !input.valid {
+            return .{status = 400, problem = "invalid feedback"}
+        }
+        title := TextView(input.title)
+        message := TextView(input.message)
+        if TextView(input.id).count != 64 || TextView(input.appID) != "inbe" ||
+            wire.TrimSpace(title) == "" || title.count > 160 || wire.TrimSpace(message) == "" ||
+            message.count > 32768 || TextView(input.context).count > 2048 {
+            return .{status = 400, problem = "invalid feedback"}
+        }
+        stored := StoreReport(settings.database, account, *input)
+        if stored.status != 0 {
+            return stored
+        }
+        return .{root = json.JsonNewStringCopy(document, TextView(input.id))}
+    }
+
+    ReplyMatch :: (database: *void, account: string, id: string, replyID: string, reply: string) -> Result {
+        keys: [2]sql.Argument = .[sql.TextArg(account), sql.TextArg(replyID)]
+        found := sql.Prepare(database, "SELECT report_id,reply FROM server_app_feedback_replies WHERE account_id=?1 AND id=?2", keys[:])
+        if found.status != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        defer sqlite.SqliteFinalize(found.value)
+        status := sqlite.SqliteStep(found.value)
+        if status == sqlite.SQLITE_DONE {
+            return .{status = 404, problem = "feedback not found"}
+        }
+        if status != sqlite.SQLITE_ROW {
+            return .{status = 503, problem = Unavailable}
+        }
+        if sql.ColumnText(found.value, 0) != id || sql.ColumnText(found.value, 1) != reply {
+            return .{status = 409, problem = "reply ID already used"}
+        }
+        return .{}
+    }
+
+    StoreReply :: (database: *void, account: string, id: string, replyID: string, reply: string) -> Result {
+        if replyID == "" {
+            args: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(reply)]
+            if sql.Execute(database, "UPDATE server_app_feedback SET reply=?3 WHERE account_id=?1 AND id=?2", args[:]) != sqlite.SQLITE_OK {
+                return .{status = 503, problem = Unavailable}
+            }
+            if sqlite.SqliteChanges(database) == 0 {
+                return .{status = 404, problem = "feedback not found"}
+            }
+            return .{}
+        }
+        args: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(id), sql.TextArg(replyID), sql.TextArg(reply)]
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        defer RollbackIfActive(database)
+        if sql.Execute(database, AppendReply, args[:]) != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        match := ReplyMatch(database, account, id, replyID, reply)
+        if match.status != 0 {
+            return match
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        return .{}
+    }
+
+    Reply :: (settings: accounts.Configuration, connection: *void, body: []u8, overflow: bool,
+        document: *json.JsonDocument) -> Result {
+        input := ReadInput(connection, body, overflow, BodyLimit(ReplyRoute), settings.zstdRequests)
+        if !input.valid {
+            return .{status = 400, problem = "invalid feedback reply"}
+        }
+        account := TextView(input.accountID)
+        id := TextView(input.id)
+        reply := TextView(input.reply)
+        replyID := TextView(input.replyID)
+        if id.count != 64 || account.count != 64 || wire.TrimSpace(reply) == "" || reply.count > 4096 ||
+            (replyID != "" && !ValidReplyID(replyID)) {
+            return .{status = 400, problem = "invalid feedback reply"}
+        }
+        stored := StoreReply(settings.database, account, id, replyID, reply)
+        if stored.status != 0 {
+            return stored
+        }
+        return .{root = json.JsonNewStringCopy(document, id)}
+    }
+
+    List :: (database: *void, connection: *void, account: string, operatorInbox: bool,
+        document: *json.JsonDocument) -> Result {
+        args: [2]sql.Argument = .[sql.TextArg(account), sql.IntArg(0)]
+        query := AccountReports
+        count: s64 = 1
+        if operatorInbox {
+            query = OperatorInbox
+            count = 0
+        } else if http.QueryArgument(connection, "replies") == "1" {
+            offset := ReadOffset(http.QueryArgument(connection, "offset"))
+            if offset < 0 {
+                return .{status = 400, problem = "invalid feedback offset"}
+            }
+            args[1] = sql.IntArg(offset)
+            query = ReplyPage
+            count = 2
+        }
+        rows := sql.Prepare(database, query, args[:count])
+        if rows.status != sqlite.SQLITE_OK {
+            return .{status = 503, problem = Unavailable}
+        }
+        defer sqlite.SqliteFinalize(rows.value)
+        root := json.JsonNewObject(document)
+        array: s32 = -1
+        keys: [9]string = .["id", "app_id", "title", "message", "context", "reply", "created_at", "account_id", "account_alias"]
+        columns: s64 = ifx operatorInbox then 9 else 7
+        while true {
+            status := sqlite.SqliteStep(rows.value)
+            if status == sqlite.SQLITE_DONE {
+                break
+            }
+            if status != sqlite.SQLITE_ROW {
+                return .{status = 503, problem = Unavailable}
+            }
+            if array < 0 {
+                array = json.JsonNewArray(document)
+                if array < 0 {
+                    return .{status = 503, problem = Unavailable}
+                }
+            }
+            item := json.JsonNewObject(document)
+            for key, column: keys[:columns] {
+                cell := sql.ColumnText(rows.value, cast(s32)column)
+                if column >= 7 && cell == "" {
+                    continue
+                }
+                if !fields.SetString(document, item, key, cell) {
+                    return .{status = 503, problem = Unavailable}
+                }
+            }
+            if !json.JsonAppend(document, array, item) {
+                return .{status = 503, problem = Unavailable}
+            }
+        }
+        if array < 0 {
+            array = json.JsonNewNull(document)
+        }
+        if !json.JsonSet(document, root, "feedback", array) {
+            return .{status = 503, problem = Unavailable}
+        }
+        return .{root = root}
+    }
+
+    Process :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        body: []u8, overflow: bool, document: *json.JsonDocument) -> Result {
+        settings := access.configuration
+        if !mutex.Lock(*access.databaseLock) {
+            return .{status = 503, problem = Unavailable}
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        if route == InboxRoute {
+            return List(settings.database, connection, "", true, document)
+        }
+        if route == ReplyRoute {
+            return Reply(settings, connection, body, overflow, document)
+        }
+        now := calendar.UnixMilliseconds()
+        audit: [32]u8
+        count := format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, audit[:])
+        if now < 0 || count == 0 {
+            return .{status = 500, problem = "authentication failed"}
+        }
+        authenticated := auth.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
+        if authenticated.status != 0 {
+            return .{status = authenticated.status, problem = authenticated.message}
+        }
+        account := TextView(authenticated.userID[:])
+        if verb == "POST" {
+            return Submit(settings, connection, body, overflow, account, document)
+        }
+        return List(settings.database, connection, account, false, document)
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == ReportRoute || route == InboxRoute || route == ReplyRoute
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return verb == "POST" && (route == ReportRoute || route == ReplyRoute)
+    }
+
+    BodyLimit :: (route: string) -> s64 {
+        if route == ReportRoute {
+            return 262144
+        }
+        if route == ReplyRoute {
+            return 8192
+        }
+        return 0
+    }
+
+    // adminToken is the configured feedback token, falling back to the admin token.
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string,
+        adminToken: string, body: []u8, overflow: bool) -> s32 {
+        empty: [0]u8
+        if !Handles(route) {
+            return http.Write(connection, 404, "", empty[:])
+        }
+        listing := route != ReplyRoute && (verb == "GET" || verb == "HEAD")
+        if !listing && !ReadsBody(route, verb) {
+            allow := ifx route == ReportRoute then "GET, HEAD, POST" else ifx route == InboxRoute then "GET, HEAD" else "POST"
+            headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+            return http.WriteWithHeaders(connection, 405, "", empty[:], headers[:])
+        }
+        zstd := access.configuration.zstdResponses
+        if route != ReportRoute {
+            if adminToken == "" {
+                return replies.ErrorReply(connection, verb, 403, "admin disabled", zstd)
+            }
+            if !auth.AdminMatches(connection, adminToken) {
+                return replies.ErrorReply(connection, verb, 401, "admin token required", zstd)
+            }
+        }
+        document: json.JsonDocument
+        result := Process(access, connection, verb, route, body, overflow, *document)
+        if result.status != 0 {
+            return replies.ErrorReply(connection, verb, result.status, result.problem, zstd)
+        }
+        if result.root < 0 {
+            return replies.ErrorReply(connection, verb, 503, Unavailable, zstd)
+        }
+        return replies.Reply(connection, verb, 200, *document, result.root, zstd)
+    }
+}

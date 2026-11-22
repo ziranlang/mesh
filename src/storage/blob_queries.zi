@@ -1,0 +1,14 @@
+BlobStoredSQL :: "SELECT EXISTS(SELECT 1 FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3)";
+BlobTrashedSQL :: "SELECT EXISTS(SELECT 1 FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3 AND trashed_at<>0)";
+BlobSizeSQL :: "SELECT size FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3";
+// Storing a blob again takes it out of the trash.
+BlobRecordSQL :: #string SQL_END
+INSERT INTO server_blobs(user_id_hash,app_id,hash,size) VALUES(?1,?2,?3,?4)
+ON CONFLICT(user_id_hash,app_id,hash) DO UPDATE SET trashed_at=0 WHERE trashed_at<>0
+SQL_END;
+BlobForgetSQL :: "DELETE FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3";
+BlobTrashSQL :: "UPDATE server_blobs SET trashed_at=?4 WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3 AND trashed_at=0";
+BlobRestoreSQL :: "UPDATE server_blobs SET trashed_at=0 WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3";
+TrashedBlobsSQL :: "SELECT user_id_hash,app_id,hash FROM server_blobs WHERE trashed_at<>0 AND trashed_at<=?1";
+ForgetTrashedSQL :: "DELETE FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3 AND trashed_at<>0 AND trashed_at<=?4";
+BlobStateSQL :: "SELECT size,trashed_at FROM server_blobs WHERE user_id_hash=?1 AND app_id=?2 AND hash=?3";

@@ -1,0 +1,18 @@
+wire_text :: #import "wire_text";
+go_strings :: #system_library "go:strings";
+
+#scope_file
+ToLower :: (value: string) -> string #foreign go_strings;
+
+#scope_export
+NormalizeAccountAlias :: (value: string) -> string {
+    // Unicode lowercasing can turn lookalikes such as the Kelvin sign or
+    // dotted capital I into ASCII. Keep non-ASCII input invalid, including
+    // invisible edge spaces, before folding the permitted ASCII case.
+    for byte: value {
+        if byte > cast(u8)127 {
+            return value
+        }
+    }
+    return wire_text.TrimPrefix(ToLower(wire_text.TrimSpace(value)), "@")
+}

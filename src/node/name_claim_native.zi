@@ -1,0 +1,97 @@
+#if TARGET == .C && OS == .LINUX {
+    binary :: #import "binary_codec";
+    client :: #import "peer_http_native";
+    fields :: #import "sync_json_fields";
+    keys :: #import "device_signature_native";
+    policy :: #import "mesh_policy_native";
+    rules :: #import "name_rules";
+    sha :: #import "crypto/sha256";
+    json :: #import "std/json_document";
+    numbers :: #import "std/number_text";
+    unicode :: #import "std/unicode";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    Services :: struct {
+        node: s32
+        error: string
+    }
+
+    NormalizeName :: (name: string) -> Text { return unicode.Lower(wire.TrimSpace(name)) }
+
+    ReadServices :: (output: *json.JsonDocument, source: *json.JsonDocument, list: s32, validate: bool) -> Services {
+        invalid: Services = .{node = -1, error = "invalid name claim"}
+        kind := json.JsonKindOf(source, list)
+        if kind == .Null || kind == .Missing { return .{node = json.JsonNewNull(output)} }
+        if kind != .Array { return invalid }
+        array := json.JsonNewArray(output)
+        names: [3]string = .["service", "endpoints", "capabilities"]
+        kinds: [3]json.JsonKind = .[.String, .Array, .Array]
+        item := json.JsonFirst(source, list)
+        while item >= 0 {
+            nodes: [3]s32
+            if !fields.Read(source, item, names[:], kinds[:], nodes[:]) { return invalid }
+            service: Text = json.JsonString(source, nodes[0])
+            if validate {
+                name: Text = NormalizeName(TextView(service))
+                if !rules.Valid(TextView(name)) { return .{node = -1, error = "invalid service name"} }
+                endpoint := json.JsonFirst(source, nodes[1])
+                if endpoint < 0 { return .{node = -1, error = "invalid service endpoint"} }
+                while endpoint >= 0 {
+                    address: Text = json.JsonString(source, endpoint)
+                    if !client.ValidAddress(TextView(address)) { return .{node = -1, error = "invalid service endpoint"} }
+                    endpoint = json.JsonNext(source, endpoint)
+                }
+            }
+            object := json.JsonNewObject(output)
+            endpoints := ifx nodes[1] < 0 then json.JsonNewNull(output) else policy.StringList(output, source, nodes[1])
+            if !fields.SetString(output, object, "service", TextView(service)) ||
+                !json.JsonSet(output, object, "endpoints", endpoints) { return invalid }
+            if json.JsonCount(source, nodes[2]) > 0 &&
+                !json.JsonSet(output, object, "capabilities", policy.StringList(output, source, nodes[2])) { return invalid }
+            if !json.JsonAppend(output, array, object) { return invalid }
+            item = json.JsonNext(source, item)
+        }
+        return .{node = array}
+    }
+
+    #scope_file
+    Message :: (document: *json.JsonDocument, root: s32, services: string, output: *Vec(u8)) -> bool {
+        if !BuilderAppend(<<output, "daochi-name-claim-v1\n1\n") { return false }
+        names: [3]string = .["space_id", "name", "node_id"]
+        for name: names {
+            value: Text = fields.StringField(document, root, name)
+            if !BuilderAppend(<<output, TextView(value)) || !BuilderAppend(<<output, "\n") { return false }
+        }
+        numeric: [2]string = .["sequence", "expires_at"]
+        decimal: [24]u8
+        for name: numeric {
+            value := fields.Number(document, json.JsonMember(document, root, name))
+            if !BuilderAppend(<<output, numbers.FormatInteger(value, decimal[:])) ||
+                !BuilderAppend(<<output, "\n") { return false }
+        }
+        digest := sha.Sha256Of(services)
+        hex: [65]u8
+        return sha.BytesToHex(*digest[0], digest.count, *hex[0], hex.count) == 1 &&
+            BuilderAppend(<<output, TextView(hex[:64])) && BuilderAppend(<<output, "\n")
+    }
+
+    #scope_export
+    Sign :: (document: *json.JsonDocument, root: s32, services: string, seed: []u8) -> bool {
+        message: Vec(u8)
+        raw: [64]u8
+        if !Message(document, root, services, *message) ||
+            !keys.Sign(seed, VecSlice(message, 0, message.count), raw[:]) { return false }
+        signature := binary.EncodeBase64(TextView(raw[:]), true, false)
+        return signature.error == "" &&
+            fields.SetString(document, root, "signature", TextView(VecSlice(signature.value, 0, signature.value.count)))
+    }
+
+    Verify :: (document: *json.JsonDocument, root: s32, services: string, public: []u8) -> bool {
+        encoded: Text = fields.StringField(document, root, "signature")
+        signature := binary.DecodeBase64(TextView(encoded), true, false)
+        message: Vec(u8)
+        return signature.error == "" && Message(document, root, services, *message) &&
+            keys.Verify(public, VecSlice(message, 0, message.count), VecSlice(signature.value, 0, signature.value.count))
+    }
+}

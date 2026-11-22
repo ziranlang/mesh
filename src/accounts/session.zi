@@ -17,6 +17,7 @@ http :: #import "std/http_go";
 url :: #import "std/url_go";
 clock :: #import "std/time_go";
 identity :: #import "identity";
+wire_text :: #import "wire_text";
 strings :: #system_library "go:strings";
 numbers :: #system_library "go:strconv";
 native_url :: #system_library "go:net/url";
@@ -68,7 +69,6 @@ Join :: (values: []string, separator: string) -> string #foreign strings;
 FormatInteger :: (value: s64, base: isize) -> string #foreign numbers "FormatInt";
 RawQuery :: (value: *url.URL) -> string #go_field #foreign native_url "(*URL).RawQuery";
 Split :: (value: string, separator: string) -> []string #foreign strings;
-TrimSpace :: (value: string) -> string #foreign strings;
 
 #scope_export
 ChallengeMessage :: (value: SessionChallenge) -> string {
@@ -124,7 +124,7 @@ SocketHeaders :: (request: *http.Request) -> bool {
     proof := wire.Value(headers, "X-Mesh-Delegate")
     credential := wire.Value(headers, "Authorization")
     for protocol: Split(wire.Value(headers, "Sec-WebSocket-Protocol"), ",") {
-        fields := Split(TrimSpace(protocol), ".")
+        fields := Split(wire_text.TrimSpace(protocol), ".")
         if fields.count == 3 && (fields[0] == "mesh" || fields[0] == "daochi") && fields[1] == "delegate" {
             decoded := codec.DecodeBase64(fields[2], true, false)
             if decoded.error != "" || proof != "" || decoded.value.count > 4096 {

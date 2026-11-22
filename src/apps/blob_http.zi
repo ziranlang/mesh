@@ -24,6 +24,7 @@ fmt :: #system_library "go:fmt";
 paths :: #import "path_component";
 rooted :: #import "rooted_files";
 random :: #system_library "go:crypto/rand";
+rules :: #import "blob_rules";
 
 MaxBlobBytes :: 16777216;
 Written :: struct { count: isize; error: Error; }
@@ -37,14 +38,7 @@ WriteResponse :: (writer: http.ResponseWriter, value: []u8) -> Written #go_resul
 Length :: (value: s64) -> string #foreign fmt "Sprint";
 Concat :: (a: string, b: string) -> string #foreign fmt "Sprint";
 
-ValidHash :: (hash: string) -> bool {
-    if hash.count != 64 { return false }
-    for i: 0..63 {
-        byte := hash[i]
-        if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) { return false }
-    }
-    return true
-}
+ValidHash :: (hash: string) -> bool { return rules.ValidHash(hash) }
 
 CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign os "(*Root).Close";
 

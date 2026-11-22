@@ -5,6 +5,7 @@ signing :: #import "signing";
 signature :: #import "ml_dsa44";
 text :: #import "std/text_go";
 errors :: #import "std/errors_go";
+wire_text :: #import "wire_text";
 go_hex :: #system_library "go:encoding/hex";
 go_strconv :: #system_library "go:strconv";
 go_strings :: #system_library "go:strings";
@@ -67,7 +68,6 @@ HexResult :: struct {
 
 #scope_file
 DecodeHex :: (value: string) -> HexResult #go_results #foreign go_hex "DecodeString";
-TrimSpace :: (value: string) -> string #foreign go_strings;
 Join :: (values: []string, separator: string) -> string #foreign go_strings;
 FormatInteger :: (value: s64, base: isize) -> string #foreign go_strconv "FormatInt";
 
@@ -75,7 +75,7 @@ ValidContentHash :: (value: string) -> bool {
     if !identity.ValidUserID(value) {
         return false
     }
-    return identity.ValidUserID(TrimSpace(value))
+    return identity.ValidUserID(wire_text.TrimSpace(value))
 }
 
 ValidMutation :: (mutation: RecordProvenanceMutation) -> bool {
@@ -184,7 +184,7 @@ VerifyRecordProvenance :: (mutation: RecordProvenanceMutation,
         result.Error = errors.New("delegated writer trust is not explicit")
         return result
     }
-    decodedKey := DecodeHex(TrimSpace(publicKeyText))
+    decodedKey := DecodeHex(wire_text.TrimSpace(publicKeyText))
     if decodedKey.error != null ||
     decodedKey.value.count != codec.mlDSA44PublicKeySize {
         result.Error = errors.New("invalid record owner public key")
@@ -209,7 +209,7 @@ VerifyRecordProvenance :: (mutation: RecordProvenanceMutation,
         }
     }
 
-    signed := TrimSpace(mutation.Signature) != ""
+    signed := wire_text.TrimSpace(mutation.Signature) != ""
     if authorization.Role == cast(RecordWriterRole)WRITER_TRANSPORT_ONLY && !signed {
         result.Error = errors.New("transport-only writer requires an owner signature")
         return result

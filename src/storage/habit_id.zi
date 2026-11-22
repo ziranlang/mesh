@@ -8,8 +8,9 @@ json :: #import "std/json_go";
 text :: #import "std/text_go";
 errors :: #import "std/errors_go";
 random :: #import "std/random_go";
+identifiers :: #import "habit_id_text";
+queries :: #import "habit_id_queries";
 strings :: #system_library "go:strings";
-format :: #system_library "go:fmt";
 
 HabitIDResult :: struct {
     value: string
@@ -24,39 +25,20 @@ PayloadIDs :: struct {
 }
 TrimSpace :: (value: string) -> string #foreign strings;
 ToLower :: (value: string) -> string #foreign strings;
-FormatUUID :: (pattern: string, first: []u8, second: []u8, third: []u8,
-    fourth: []u8, fifth: []u8) -> string #foreign format "Sprintf";
 
 Mapping :: (transaction: *sql.Transaction, context: ctx.Context, userID: string, id: string) -> HabitIDResult {
     result: HabitIDResult
     arguments: [2]Any = .[userID, id]
     destinations: [1]Any = .[*result.value]
     row := sql.QueryRowTx(transaction, context,
-        "\nSELECT new_id\nFROM server_habit_id_migrations\nWHERE user_id_hash=?1 AND old_id=?2", arguments[:])
+        queries.Lookup, arguments[:])
     result.error = sql.ScanRow(row, destinations[:])
     return result
 }
 
 #scope_export
 IsCanonical :: (id: string) -> bool {
-    if id.count != 36 {
-        return false
-    }
-    index: s64 = 0
-    while index < id.count {
-        byte := id[index]
-        if index == 8 || index == 13 || index == 18 || index == 23 {
-            if byte != cast(u8)(#char "-") {
-                return false
-            }
-        } else if !((byte >= cast(u8)(#char "0") && byte <= cast(u8)(#char "9")) ||
-            (byte >= cast(u8)(#char "a") && byte <= cast(u8)(#char "f")) ||
-            (byte >= cast(u8)(#char "A") && byte <= cast(u8)(#char "F"))) {
-            return false
-        }
-        index += 1
-    }
-    return true
+    return identifiers.IsCanonical(id)
 }
 
 New :: () -> HabitIDResult {
@@ -67,10 +49,8 @@ New :: () -> HabitIDResult {
     if result.error != null {
         return result
     }
-    bytes[6] = (bytes[6] & cast(u8)0x0f) | cast(u8)0x40
-    bytes[8] = (bytes[8] & cast(u8)0x3f) | cast(u8)0x80
-    result.value = FormatUUID("%08x-%04x-%04x-%04x-%012x",
-        bytes[0:4], bytes[4:6], bytes[6:8], bytes[8:10], bytes[10:16])
+    formatted := identifiers.Version4(bytes)
+    result.value = text.FromBytes(formatted[:])
     return result
 }
 
@@ -103,7 +83,7 @@ ForWrite :: (transaction: *sql.Transaction, context: ctx.Context, userID: string
     }
     arguments: [4]Any = .[userID, normalized, generated.value, source]
     written := sql.ExecTx(transaction, context,
-        "\nINSERT OR REPLACE INTO server_habit_id_migrations(user_id_hash,old_id,new_id,source)\nVALUES(?1,?2,?3,?4)", arguments[:])
+        queries.Save, arguments[:])
     result.error = written.error
     if result.error == null {
         result.value = generated.value

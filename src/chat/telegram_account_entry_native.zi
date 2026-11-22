@@ -1,0 +1,603 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    address :: #import "client_address_native";
+    auth :: #import "http_auth_native";
+    authorization :: #import "authorization_native";
+    calendar :: #import "std/date_time_linux";
+    clock :: #import "std/timer";
+    coding :: #import "encoding_preferences";
+    entries :: #import "telegram_account_store_native";
+    format :: #import "timestamp_format";
+    http :: #import "http_server_native";
+    json :: #import "std/json_document";
+    limiting :: #import "rate_limit_native";
+    limits :: #import "server_limits";
+    lumi :: #import "lumi_telegram_store_native";
+    mutex :: #import "std/mutex_linux";
+    numbers :: #import "std/number_text";
+    replies :: #import "http_json_native";
+    session :: #import "delegate_session_native";
+    signed :: #import "signed_tx_native";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    telegram :: #import "delegate_telegram_native";
+    wire :: #import "wire_text";
+    #import "std/vec"
+
+    #scope_file
+    EnvironmentRoute :: "/api/v1/telegram/environment";
+    InfoRoute :: "/api/v1/telegram/entry";
+    VerifyRoute :: "/api/v1/telegram/entry/verify";
+    StatusRoute :: "/api/v1/telegram/entry/status";
+    RendezvousRoute :: "/api/v1/telegram/entry/rendezvous";
+    CancelRoute :: "/api/v1/telegram/entry/cancel";
+    BindRoute :: "/api/v1/telegram/account/bind";
+    Unavailable :: "Telegram entry unavailable";
+    BindingUnavailable :: "Telegram binding unavailable";
+    OwnerRequestUnavailable :: "Owner request unavailable";
+
+    Request :: struct {
+        settings: accounts.Configuration
+        connection: *void
+        verb: string
+        route: string
+        node: string
+        audience: string
+        token: string
+        bot: s64
+        now: s64
+    }
+
+    Input :: struct {
+        id: Text
+        client: Text
+        signingKey: Text
+        encryptionKey: Text
+        initData: Text
+        proof: Text
+        nonce: Text
+        expiry: s64
+        valid: bool
+    }
+
+    Error :: (request: Request, status: u32, message: string) -> s32 {
+        return replies.ErrorReply(request.connection, request.verb, status, message, request.settings.zstdResponses)
+    }
+
+    Reply :: (request: Request, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
+        if root < 0 {
+            return Error(request, 503, Unavailable)
+        }
+        return replies.Reply(request.connection, request.verb, status, document, root, request.settings.zstdResponses)
+    }
+
+    Truth :: (request: Request, status: u32) -> s32 {
+        document: json.JsonDocument
+        return Reply(request, status, *document, json.JsonNewBool(*document, true))
+    }
+
+    Allow :: (access: *accounts.AccountAccess, connection: *void) -> bool {
+        ip := address.FromRequest(connection)
+        key: Vec(u8)
+        return BuilderAppend(key, "telegram-entry:") && BuilderAppend(key, TextView(ip.bytes[:ip.count])) &&
+            limiting.Allow(*access.limiter, TextView(VecSlice(key, 0, key.count)), 120, 60000, clock.MonotonicMilliseconds())
+    }
+
+    Parse :: (route: string, source: []u8) -> Input {
+        document: json.JsonDocument
+        if !json.JsonRead(*document, TextView(source)) {
+            return .{}
+        }
+        names: [7]string = .["entry_id", "client_id", "signing_key", "encryption_key", "proof", "init_data", "expires_at"]
+        kinds: [7]json.JsonKind = .[.String, .String, .String, .String, .String, .String, .Number]
+        found: [7]s32
+        count: s64 = 7
+        if route == InfoRoute {
+            count = 1
+        } else if route == VerifyRoute {
+            count = 6
+        } else {
+            names[5] = "nonce"
+        }
+        if !authorization.ReadFields(*document, document.root, names[:count], kinds[:count], found[:count]) {
+            return .{}
+        }
+        result: Input = .{id = json.JsonString(*document, found[0])}
+        if !authorization.HexID(TextView(result.id), 32) {
+            return .{}
+        }
+        if route != InfoRoute {
+            result.client = json.JsonString(*document, found[1])
+            result.signingKey = json.JsonString(*document, found[2])
+            result.encryptionKey = json.JsonString(*document, found[3])
+            result.proof = json.JsonString(*document, found[4])
+            if !authorization.HexID(TextView(result.client), 64) || !authorization.HexID(TextView(result.signingKey), 64) ||
+                !authorization.HexID(TextView(result.encryptionKey), 2368) {
+                return .{}
+            }
+            if route == VerifyRoute {
+                result.initData = json.JsonString(*document, found[5])
+            } else {
+                result.nonce = json.JsonString(*document, found[5])
+                result.expiry = authorization.Integer(*document, found[6])
+            }
+        }
+        result.valid = true
+        return result
+    }
+
+    Environment :: (request: Request) -> s32 {
+        if !authorization.HexID(request.node, 64) || request.audience == "" || request.bot <= 0 {
+            return Error(request, 503, "Telegram environment unavailable")
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        if !authorization.PutText(*document, root, "app_id", "inbe") ||
+            !authorization.PutText(*document, root, "node_id", request.node) ||
+            !authorization.PutText(*document, root, "audience", request.audience) ||
+            !authorization.PutText(*document, root, "environment", "production") ||
+            !authorization.PutInt(*document, root, "bot_id", request.bot) {
+            return Error(request, 503, "Telegram environment unavailable")
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    Current :: (request: Request, entry: *entries.Entry) -> bool {
+        return TextView(entry.app) == "inbe" && TextView(entry.node) == request.node &&
+            TextView(entry.audience) == request.audience && entry.expiry > request.now && entry.bot > 0 && entry.bot == request.bot
+    }
+
+    Metadata :: (document: *json.JsonDocument, entry: *entries.Entry) -> s32 {
+        root := json.JsonNewObject(document)
+        names: [6]string = .["entry_id", "mode", "app_id", "node_id", "audience", "challenge"]
+        values: [6]string = .[TextView(entry.id), TextView(entry.mode), TextView(entry.app),
+            TextView(entry.node), TextView(entry.audience), TextView(entry.challenge)]
+        for name, index: names {
+            if !authorization.PutText(document, root, name, values[index]) {
+                return -1
+            }
+        }
+        if !authorization.PutInt(document, root, "bot_id", entry.bot) || !authorization.PutInt(document, root, "expires_at", entry.expiry) {
+            return -1
+        }
+        return root
+    }
+
+    EntryReply :: (request: Request, entry: *entries.Entry, private: bool) -> s32 {
+        document: json.JsonDocument
+        info := Metadata(*document, entry)
+        if !private || info < 0 {
+            return Reply(request, 200, *document, info)
+        }
+        root := json.JsonNewObject(*document)
+        names: [6]string = .["account_id", "status", "client_id", "signing_key", "encryption_key", "init_digest"]
+        values: [6]string = .[TextView(entry.account), TextView(entry.status), TextView(entry.client), TextView(entry.signingKey),
+            TextView(entry.encryptionKey), TextView(entry.digest)]
+        for name, index: names {
+            if !authorization.PutText(*document, root, name, values[index]) {
+                return Error(request, 503, Unavailable)
+            }
+        }
+        if !authorization.PutInt(*document, root, "telegram_id", entry.sender) || !json.JsonSet(*document, root, "info", info) {
+            return Error(request, 503, Unavailable)
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    Info :: (request: Request, entry: *entries.Entry) -> s32 {
+        state := TextView(entry.status)
+        if !Current(request, entry) || (state != "pending" && state != "verified" && state != "bound") {
+            return Error(request, 404, Unavailable)
+        }
+        if sqlite.SqliteExecText(request.settings.database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        return EntryReply(request, entry, false)
+    }
+
+    VerifyProof :: (entry: *entries.Entry, input: *Input, digest: string) -> bool {
+        bot: [24]u8
+        expiry: [24]u8
+        values: [13]string = .["daochi-telegram-entry-verify-v1", TextView(entry.id), TextView(entry.mode), TextView(entry.app),
+            TextView(entry.node), TextView(entry.audience), numbers.FormatInteger(entry.bot, bot[:]), TextView(entry.challenge),
+            numbers.FormatInteger(entry.expiry, expiry[:]), TextView(input.client), TextView(input.signingKey),
+            TextView(input.encryptionKey), digest]
+        message: Vec(u8)
+        return authorization.AppendLines(*message, values[:]) &&
+            session.VerifyKeyProof(TextView(input.signingKey), VecSlice(message, 0, message.count), TextView(input.proof))
+    }
+
+    Verify :: (request: Request, entry: *entries.Entry, input: *Input) -> s32 {
+        if !Current(request, entry) || TextView(entry.status) != "pending" {
+            return Error(request, 409, "Telegram entry expired or already verified")
+        }
+        verified := telegram.Validate(TextView(input.initData), request.token, request.now)
+        digest := TextView(verified.digest[:64])
+        if !verified.valid || verified.botID != entry.bot || verified.userID != entry.sender || !VerifyProof(entry, input, digest) {
+            return Error(request, 401, "Telegram sender and delegate proof required")
+        }
+        database := request.settings.database
+        replay: [2]sql.Argument = .[sql.TextArg(digest), sql.IntArg(verified.authDate + 300)]
+        historical := sql.ReadInteger(database, "SELECT COUNT(*) FROM server_telegram_init_claims WHERE digest=?1", replay[:1])
+        if historical.status != sqlite.SQLITE_OK || !historical.found {
+            return Error(request, 503, "Telegram proof unavailable")
+        }
+        if historical.value != 0 {
+            return Error(request, 409, "Telegram initData already claimed")
+        }
+        cutoff: [1]sql.Argument = .[sql.IntArg(request.now)]
+        if sql.Execute(database, "DELETE FROM server_telegram_init_replays WHERE expires_at<?1", cutoff[:]) != sqlite.SQLITE_OK ||
+            sql.Execute(database, "INSERT INTO server_telegram_init_replays(digest,expires_at) VALUES(?1,?2) ON CONFLICT(digest) DO NOTHING", replay[:]) != sqlite.SQLITE_OK {
+            return Error(request, 503, "Telegram proof unavailable")
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return Error(request, 409, "Telegram initData already claimed")
+        }
+        binding := entries.BoundAccount(database, entry.sender)
+        if binding.status != sqlite.SQLITE_OK {
+            return Error(request, 503, BindingUnavailable)
+        }
+        arguments: [8]sql.Argument = .[sql.TextArg(TextView(input.id)), sql.TextArg(TextView(binding.account)), sql.TextArg(TextView(input.client)),
+            sql.TextArg(TextView(input.signingKey)), sql.TextArg(TextView(input.encryptionKey)), sql.TextArg(digest), sql.IntArg(request.now), sql.IntArg(entry.expiry)]
+        if sql.Execute(database, #string QUERY
+UPDATE server_telegram_account_entries SET status='verified',account_id=?2,client_id=?3,signing_key=?4,encryption_key=?5,init_digest=?6,verified_at=?7
+WHERE entry_id=?1 AND status='pending' AND expires_at=?8 AND expires_at>?7
+QUERY, arguments[:]) != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return Error(request, 409, "Telegram entry already verified")
+        }
+        updated := entries.Read(database, TextView(input.id))
+        if TextView(updated.status) != "verified" || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        return EntryReply(request, *updated, true)
+    }
+
+    ActionProof :: (entry: *entries.Entry, input: *Input, action: string, account: string, now: s64) -> bool {
+        if TextView(input.client) != TextView(entry.client) || TextView(input.signingKey) != TextView(entry.signingKey) ||
+            TextView(input.encryptionKey) != TextView(entry.encryptionKey) || input.expiry <= now || input.expiry > now + 60 ||
+            input.expiry > entry.expiry || !authorization.HexID(TextView(input.nonce), 32) {
+            return false
+        }
+        bot: [24]u8
+        entryExpiry: [24]u8
+        expiry: [24]u8
+        values: [15]string = .["daochi-telegram-entry-action-v1", action, TextView(entry.id), TextView(entry.mode), TextView(entry.app),
+            TextView(entry.node), TextView(entry.audience), numbers.FormatInteger(entry.bot, bot[:]), TextView(entry.challenge),
+            numbers.FormatInteger(entry.expiry, entryExpiry[:]), TextView(input.client), TextView(input.signingKey), TextView(input.encryptionKey),
+            numbers.FormatInteger(input.expiry, expiry[:]), TextView(input.nonce)]
+        message: Vec(u8)
+        if !authorization.AppendLines(*message, values[:]) {
+            return false
+        }
+        if action == "bind" {
+            binding: [3]string = .["", account, TextView(entry.digest)]
+            if !authorization.AppendLines(*message, binding[:]) {
+                return false
+            }
+        }
+        return session.VerifyKeyProof(TextView(entry.signingKey), VecSlice(message, 0, message.count), TextView(input.proof))
+    }
+
+    ClaimNonce :: (database: *void, input: *Input, now: s64) -> bool {
+        cutoff: [1]sql.Argument = .[sql.IntArg(now)]
+        arguments: [3]sql.Argument = .[sql.TextArg(TextView(input.id)), sql.TextArg(TextView(input.nonce)), sql.IntArg(input.expiry)]
+        return sql.Execute(database, "DELETE FROM server_telegram_entry_nonces WHERE expires_at<?1", cutoff[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, "INSERT INTO server_telegram_entry_nonces(entry_id,nonce,expires_at) VALUES(?1,?2,?3) ON CONFLICT(entry_id,nonce) DO NOTHING", arguments[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteChanges(database) == 1
+    }
+
+    Owner :: (request: Request, raw: []u8, auditTime: string) -> auth.BearerAuthentication {
+        database := request.settings.database
+        result := auth.Authenticate(database, request.connection, request.settings.secret, request.now, auditTime, false)
+        if result.status != 0 {
+            return result
+        }
+        proof := wire.TrimSpace(session.Header(request.connection, "X-Mesh-Tx", "X-Daochi-Tx"))
+        if proof == "" {
+            return .{status = 401, message = "signed transaction required"}
+        }
+        envelope := signed.Read(proof)
+        if !envelope.valid {
+            return .{status = 400, message = "invalid signed transaction"}
+        }
+        if envelope.version != 6 {
+            return .{status = 400, message = "owner protocol v6 required"}
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return .{status = 500, message = "authentication failed"}
+        }
+        defer lumi.Rollback(database)
+        checked := signed.VerifyTx(database, request.settings.verify, proof, TextView(result.userID[:]), "inbe",
+            request.verb, request.route, raw, request.now, auditTime)
+        if checked.databaseError != sqlite.SQLITE_OK {
+            return .{status = 500, message = "authentication failed"}
+        }
+        if checked.status != 0 {
+            return .{status = checked.status, message = checked.message}
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return .{status = 500, message = "authentication failed"}
+        }
+        return result
+    }
+
+    WriteBinding :: (request: Request, entry: *entries.Entry, account: string) -> s32 {
+        database := request.settings.database
+        if TextView(entry.account) != "" && TextView(entry.account) != account {
+            return Error(request, 409, "Telegram entry belongs to another account")
+        }
+        binding: [3]sql.Argument = .[sql.TextArg(account), sql.IntArg(entry.sender), sql.IntArg(request.now)]
+        conflicts := sql.ReadInteger(database, #string QUERY
+SELECT COUNT(*) FROM server_lumi_telegram WHERE (account_id=?1 AND telegram_id<>?2) OR (telegram_id=?2 AND account_id<>?1)
+QUERY, binding[:2])
+        if conflicts.status != sqlite.SQLITE_OK || !conflicts.found {
+            return Error(request, 503, BindingUnavailable)
+        }
+        if conflicts.value != 0 {
+            return Error(request, 409, "conflicting Telegram account")
+        }
+        if sql.Execute(database, #string QUERY
+INSERT INTO server_lumi_telegram(account_id,telegram_id,linked_at) VALUES(?1,?2,?3)
+ON CONFLICT(account_id) DO UPDATE SET telegram_id=excluded.telegram_id WHERE server_lumi_telegram.telegram_id=excluded.telegram_id
+QUERY, binding[:]) != sqlite.SQLITE_OK {
+            return Error(request, 503, BindingUnavailable)
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return Error(request, 409, "conflicting Telegram account")
+        }
+        id := TextView(entry.id)
+        arguments: [3]sql.Argument = .[sql.TextArg(id), sql.TextArg(account), sql.IntArg(request.now)]
+        if sql.Execute(database, #string QUERY
+UPDATE server_telegram_account_entries SET status='bound',account_id=?2,bound_at=?3
+WHERE entry_id=?1 AND status='verified' AND expires_at>?3 AND (account_id='' OR account_id=?2)
+QUERY, arguments[:]) != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return Error(request, 409, "Telegram entry already bound")
+        }
+        updated := entries.Read(database, id)
+        if TextView(updated.status) != "bound" || sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        return EntryReply(request, *updated, true)
+    }
+
+    Cancel :: (request: Request, entry: *entries.Entry) -> s32 {
+        database := request.settings.database
+        arguments: [2]sql.Argument = .[sql.TextArg(TextView(entry.id)), sql.IntArg(request.now)]
+        if sql.Execute(database, #string QUERY
+UPDATE server_telegram_account_entries SET status='cancelled' WHERE entry_id=?1 AND status IN ('verified','bound') AND expires_at>?2
+QUERY, arguments[:]) != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        if sqlite.SqliteChanges(database) != 1 {
+            return Error(request, 409, "Telegram entry already finished")
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        return Truth(request, 200)
+    }
+
+    Rendezvous :: (request: Request, entry: *entries.Entry) -> s32 {
+        database := request.settings.database
+        binding := entries.BoundAccount(database, entry.sender)
+        account := TextView(binding.account)
+        if binding.status != sqlite.SQLITE_OK {
+            return Error(request, 503, BindingUnavailable)
+        }
+        previouslyBound := TextView(entry.account)
+        if previouslyBound != "" && previouslyBound != account {
+            return Error(request, 409, "Telegram account changed")
+        }
+        if account != "" && previouslyBound == "" {
+            arguments: [2]sql.Argument = .[sql.TextArg(TextView(entry.id)), sql.TextArg(account)]
+            if sql.Execute(database, #string QUERY
+UPDATE server_telegram_account_entries SET account_id=?2 WHERE entry_id=?1 AND account_id='' AND status='verified'
+QUERY, arguments[:]) != sqlite.SQLITE_OK {
+                return Error(request, 503, BindingUnavailable)
+            }
+            if sqlite.SqliteChanges(database) != 1 {
+                return Error(request, 409, "Telegram account changed")
+            }
+        }
+        pending := entries.Pending(database, account, entry.bot, entry.sender, request.node, request.now)
+        if pending.status != sqlite.SQLITE_OK {
+            return Error(request, 503, OwnerRequestUnavailable)
+        }
+        if pending.found && TextView(pending.audience) != request.audience {
+            return Error(request, 409, "Owner request belongs to another node")
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, OwnerRequestUnavailable)
+        }
+        if !pending.found {
+            return Truth(request, 202)
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        names: [7]string = .["request_id", "grant_id", "app_id", "node_id", "audience", "challenge", "status"]
+        values: [7]string = .[TextView(pending.id), "", TextView(pending.app), TextView(pending.node),
+            TextView(pending.audience), TextView(pending.challenge), TextView(pending.state)]
+        for name, index: names {
+            if !authorization.PutText(*document, root, name, values[index]) {
+                return Error(request, 503, OwnerRequestUnavailable)
+            }
+        }
+        if !authorization.PutInt(*document, root, "expires_at", pending.expiry) {
+            return Error(request, 503, OwnerRequestUnavailable)
+        }
+        return Reply(request, 200, *document, root)
+    }
+
+    Action :: (request: Request, entry: *entries.Entry, input: *Input, account: string) -> s32 {
+        route := request.route
+        state := TextView(entry.status)
+        action := "status"
+        problem := "verified delegate proof required"
+        if route == BindRoute {
+            if !Current(request, entry) || state != "verified" {
+                return Error(request, 409, "Telegram entry expired or already bound")
+            }
+            action = "bind"
+            problem = "verified delegate binding proof required"
+        } else if route == RendezvousRoute {
+            if state != "verified" && state != "bound" {
+                return Error(request, 401, problem)
+            }
+            action = "request"
+        } else if route == CancelRoute {
+            action = "cancel"
+        }
+        if !Current(request, entry) || !ActionProof(entry, input, action, account, request.now) {
+            return Error(request, 401, problem)
+        }
+        database := request.settings.database
+        if !ClaimNonce(database, input, request.now) {
+            return Error(request, 409, "Telegram entry proof already used")
+        }
+        if route == BindRoute {
+            return WriteBinding(request, entry, account)
+        }
+        if route == CancelRoute {
+            return Cancel(request, entry)
+        }
+        if route == RendezvousRoute {
+            return Rendezvous(request, entry)
+        }
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        return EntryReply(request, entry, true)
+    }
+
+    Dispatch :: (request: Request, input: *Input, account: string) -> s32 {
+        database := request.settings.database
+        begin := ifx request.route == InfoRoute then "BEGIN" else "BEGIN IMMEDIATE"
+        if sqlite.SqliteExecText(database, begin) != sqlite.SQLITE_OK {
+            return Error(request, 503, Unavailable)
+        }
+        defer lumi.Rollback(database)
+        entry := entries.Read(database, TextView(input.id))
+        if !entry.found {
+            return Error(request, 404, Unavailable)
+        }
+        request.now = calendar.UnixMilliseconds() / 1000
+        if request.route == InfoRoute {
+            return Info(request, *entry)
+        }
+        if request.route == VerifyRoute {
+            return Verify(request, *entry, input)
+        }
+        return Action(request, *entry, input, account)
+    }
+
+    InvalidBody :: (route: string) -> string {
+        if route == InfoRoute {
+            return "invalid Telegram entry"
+        }
+        if route == VerifyRoute {
+            return "invalid Telegram entry proof"
+        }
+        return "invalid Telegram entry action"
+    }
+
+    MethodNotAllowed :: (connection: *void, allow: string) -> s32 {
+        headers: [1]http.HeaderValue = .[.{name = "Allow", value = allow}]
+        body: Text = TextCopy("Method Not Allowed\n")
+        return http.WriteWithHeaders(connection, 405, "text/plain; charset=utf-8", VecSlice(body.bytes, 0, body.bytes.count), headers[:])
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == EnvironmentRoute || route == InfoRoute || route == VerifyRoute || route == StatusRoute ||
+            route == RendezvousRoute || route == CancelRoute || route == BindRoute
+    }
+
+    ReadsBody :: (route: string, verb: string) -> bool {
+        return verb == "POST" && route != EnvironmentRoute && Handles(route)
+    }
+
+    BodyLimit :: (route: string) -> s64 {
+        if route == InfoRoute {
+            return 1024
+        }
+        if route == VerifyRoute {
+            return 24576
+        }
+        return ifx ReadsBody(route, "POST") then 8192 else 0
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, verb: string, route: string, raw: []u8, overflow: bool,
+        nodeID: string, audience: string, botToken: string) -> s32 {
+        if !Handles(route) {
+            return 0
+        }
+        if route == EnvironmentRoute {
+            if verb != "GET" && verb != "HEAD" {
+                return MethodNotAllowed(connection, "GET, HEAD")
+            }
+        } else if verb != "POST" {
+            return MethodNotAllowed(connection, "POST")
+        }
+        request: Request = .{settings = access.configuration, connection = connection, verb = verb, route = route,
+            node = nodeID, audience = audience, token = botToken, bot = telegram.BotID(botToken)}
+        if route != EnvironmentRoute && route != InfoRoute {
+            if !mutex.Lock(*access.databaseLock) {
+                return Error(request, 503, BindingUnavailable)
+            }
+            ready := lumi.Ensure(request.settings.database)
+            mutex.Unlock(*access.databaseLock)
+            if !ready {
+                return Error(request, 503, BindingUnavailable)
+            }
+        }
+        if !Allow(access, connection) {
+            return Error(request, 429, "Telegram entry rate limit exceeded")
+        }
+        if route == EnvironmentRoute {
+            return Environment(request)
+        }
+        maximum := BodyLimit(route)
+        invalid := InvalidBody(route)
+        encoding: [limits.MaxHeaderBytes]u8
+        length := http.JoinHeader(connection, "Content-Encoding", encoding[:])
+        if overflow || raw.count > maximum || length < 0 || coding.Request(TextView(encoding[:length])) == .Unsupported {
+            return Error(request, 400, invalid)
+        }
+        decoded: replies.Body
+        read := replies.Decode(connection, raw, overflow, maximum, request.settings.zstdRequests, *decoded)
+        if read.status != 0 {
+            return Error(request, 400, invalid)
+        }
+        source := ifx read.decoded then VecSlice(decoded.scratch, 0, read.length) else raw
+        input := Parse(route, source)
+        if !input.valid {
+            return Error(request, 400, invalid)
+        }
+        if !mutex.Lock(*access.databaseLock) {
+            return Error(request, 503, Unavailable)
+        }
+        defer mutex.Unlock(*access.databaseLock)
+        account: auth.BearerAuthentication
+        if route == BindRoute {
+            milliseconds := calendar.UnixMilliseconds()
+            request.now = milliseconds / 1000
+            audit: [31]u8
+            length := format.UTC(.{seconds = request.now, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}, audit[:])
+            if length == 0 {
+                return Error(request, 500, "authentication failed")
+            }
+            account = Owner(request, source, TextView(audit[:length]))
+            if account.status != 0 {
+                return Error(request, account.status, account.message)
+            }
+        }
+        owner := ifx route == BindRoute then TextView(account.userID[:]) else ""
+        return Dispatch(request, *input, owner)
+    }
+}

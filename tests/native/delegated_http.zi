@@ -1,0 +1,110 @@
+transport :: #import "http_server_native";
+account :: #import "account_access_native";
+authorizations :: #import "authorization_http_native";
+delegated :: #import "delegated_sync_native";
+sockets :: #import "sync_ws_native";
+notifications :: #import "sync_hub_native";
+uploads :: #import "http_upload_native";
+ml_dsa44 :: #import "ml_dsa44_native";
+environment :: #import "std/environment_linux";
+text :: #import "std/byte_text_linux";
+sqlite :: #import "sqlite/SQLite";
+schema :: #import "sqlite_schema";
+startup :: #import "store_startup_native";
+#import "std/vec"
+
+#scope_file
+c :: #system_library "c";
+Flush :: (stream: *void) -> s32 #foreign c "fflush";
+GetChar :: () -> s32 #foreign c "getchar";
+Allocate :: (count: usize, size: usize) -> *void #foreign c "calloc";
+Free :: (value: *void) #foreign c "free";
+
+Fixture :: struct {
+    account: account.AccountAccess
+    hub: notifications.Hub
+}
+
+Request :: struct {
+    upload: uploads.Upload
+    socket: sockets.UpgradeRequest
+}
+
+NodeID :: "1111111111111111111111111111111111111111111111111111111111111111";
+Audience :: "http://127.0.0.1";
+BotToken :: "42:fixture";
+
+Completed :: (context: *void, connection: *void, request: **void, reason: s32) {
+    current := cast(*Request)(<<request)
+    if current == null { return }
+    sockets.Complete(*current.socket)
+    VecFree(current.upload.bytes)
+    Free(cast(*void)current)
+    <<request = null
+}
+
+Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
+    version: *u8, chunk: *u8, size: *usize, request: **void) -> s32 {
+    current := cast(*Request)(<<request)
+    if current == null {
+        current = cast(*Request)Allocate(1, size_of(Request))
+        if current == null { return 0 }
+        <<request = cast(*void)current
+        return 1
+    }
+    fixture := cast(*Fixture)context
+    state := *fixture.account
+    upload := *current.upload
+    route := text.TextFromCString(path)
+    verb := text.TextFromCString(method)
+    if <<size > 0 {
+        limit := ifx authorizations.Handles(route) then authorizations.BodyLimit(route) else state.configuration.maximumBodyBytes
+        uploads.Append(upload, chunk, <<size, limit)
+        <<size = 0
+        return 1
+    }
+    raw := VecSlice(upload.bytes, 0, upload.bytes.count)
+    if authorizations.Handles(route) {
+        return authorizations.Handle(state, connection, verb, route, raw, upload.overflow || upload.unavailable, NodeID, Audience, BotToken)
+    }
+    if delegated.Handles(route) {
+        return delegated.Handle(state, connection, verb, route, raw, upload.overflow || upload.unavailable, NodeID, Audience, transport.RequestTarget(connection))
+    }
+    if sockets.HandlesDelegated(route) {
+        return sockets.HandleDelegated(state, *fixture.hub, *current.socket, connection, verb, NodeID, Audience)
+    }
+    if route == "/api/v1/sync/ws" {
+        return sockets.Handle(state, *fixture.hub, *current.socket, connection, verb)
+    }
+    empty: [0]u8
+    return transport.Write(connection, 404, "", empty[:])
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    path := environment.EnvironmentText("MESH_TEST_HTTP_DATABASE")
+    if path == "" { return 1 }
+    opened := schema.OpenCore(path)
+    if opened.status != sqlite.SQLITE_OK { return 2 }
+    database := opened.database
+    defer sqlite.SqliteClose(database)
+    if startup.InitializeFeatures(database) != sqlite.SQLITE_OK { return 3 }
+    fixture: Fixture
+    secret: [32]u8
+    settings: account.Configuration = .{database = database, path = path, secret = secret[:], challengeSeconds = 60,
+        tokenSeconds = 3600, maximumBodyBytes = 1048576, zstdRequests = true, zstdResponses = true, verify = ml_dsa44.Verify}
+    if !account.Open(*fixture.account, settings) { return 4 }
+    defer account.Close(*fixture.account)
+    if !notifications.Open(*fixture.hub) { return 5 }
+    defer notifications.Close(*fixture.hub)
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    daemon := transport.Start(loopback, 0, 8, cast(*void)(*fixture), Dispatch, Completed)
+    if daemon == null { return 6 }
+    defer transport.Stop(daemon)
+    defer notifications.Stop(*fixture.hub)
+    print("%\n", transport.BoundPort(daemon))
+    unused Flush(null)
+    unused GetChar()
+    return 0
+}

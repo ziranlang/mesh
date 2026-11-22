@@ -1,0 +1,135 @@
+#if TARGET == .C && OS == .LINUX {
+    limits :: #import "challenge_limits";
+    identity :: #import "identity";
+    random :: #import "std/random_linux";
+    mutex :: #import "std/mutex_linux";
+    #import "std/constant_time"
+    #import "std/vec"
+
+    Challenge :: struct {
+        user: [64]u8
+        nonce: [limits.NonceSize]u8
+        expiresAt: s64
+    }
+
+    ChallengeStore :: struct {
+        lock: mutex.Mutex
+        entries: Vec(Challenge)
+        ttlMilliseconds: s64
+    }
+
+    Status :: enum { OK; Invalid; Busy; Unavailable; }
+
+    Issued :: struct {
+        nonce: [limits.NonceSize]u8
+        status: Status
+    }
+
+    Pending :: struct {
+        challenges: [limits.MaxOutstanding]Challenge
+        count: s64
+        status: Status
+    }
+
+    #scope_file
+    Compact :: (entries: []Challenge, now: s64) -> s64 {
+        kept: s64 = 0
+        for entry, index: entries {
+            if entry.expiresAt < now { continue }
+            if kept != index { entries[kept] = entry }
+            kept += 1
+        }
+        return kept
+    }
+
+    ShiftLeft :: (entries: []Challenge, index: s64) {
+        at := index + 1
+        while at < entries.count {
+            entries[at - 1] = entries[at]
+            at += 1
+        }
+    }
+
+    EvictionIndex :: (entries: []Challenge, user: string) -> s64 {
+        oldest: s64 = -1
+        count: s64 = 0
+        for entry, index: entries {
+            if TextView(entry.user[:]) != user { continue }
+            count += 1
+            if oldest < 0 { oldest = index }
+        }
+        return ifx count >= limits.MaxOutstanding then oldest else -1
+    }
+
+    #scope_export
+    // Keep the store at one address. Join its request workers before closing.
+    Open :: (store: *ChallengeStore, ttlMilliseconds: s64) -> bool {
+        if store == null || ttlMilliseconds <= 0 || !mutex.Open(*store.lock) { return false }
+        store.ttlMilliseconds = ttlMilliseconds
+        return true
+    }
+
+    Close :: (store: *ChallengeStore) -> bool {
+        if store == null || !mutex.Close(*store.lock) { return false }
+        unused VecResize(store.entries, 0)
+        return true
+    }
+
+    Issue :: (store: *ChallengeStore, user: string, now: s64) -> Issued {
+        if store == null || !identity.ValidUserID(user) || now < 0 || now > 9223372036854775807 - store.ttlMilliseconds {
+            return .{status = .Invalid}
+        }
+        item: Challenge
+        if !random.FillSecure(item.nonce[:]) { return .{status = .Unavailable} }
+        for byte, index: user { item.user[index] = byte }
+        item.expiresAt = now + store.ttlMilliseconds
+        if !mutex.Lock(*store.lock) { return .{status = .Unavailable} }
+        defer mutex.Unlock(*store.lock)
+        count := Compact(VecSlice(store.entries, 0, store.entries.count), now)
+        unused VecResize(store.entries, count)
+        if count >= limits.MaxOutstandingChallenges { return .{status = .Busy} }
+        evict := EvictionIndex(VecSlice(store.entries, 0, count), user)
+        if evict >= 0 {
+            ShiftLeft(VecSlice(store.entries, 0, count), evict)
+            unused VecResize(store.entries, count - 1)
+        }
+        if !VecPush(store.entries, item) { return .{status = .Unavailable} }
+        return .{nonce = item.nonce}
+    }
+
+    Outstanding :: (store: *ChallengeStore, user: string, now: s64) -> Pending {
+        if store == null || !mutex.Lock(*store.lock) { return .{status = .Unavailable} }
+        defer mutex.Unlock(*store.lock)
+        result: Pending
+        entries := VecSlice(store.entries, 0, store.entries.count)
+        index := entries.count
+        while index > 0 && result.count < limits.MaxOutstanding {
+            index -= 1
+            entry := entries[index]
+            if entry.expiresAt >= now && TextView(entry.user[:]) == user {
+                result.challenges[result.count] = entry
+                result.count += 1
+            }
+        }
+        return result
+    }
+
+    Take :: (store: *ChallengeStore, user: string, nonce: []u8, now: s64) -> bool {
+        if store == null || nonce.count != limits.NonceSize || !mutex.Lock(*store.lock) { return false }
+        defer mutex.Unlock(*store.lock)
+        count := store.entries.count
+        found: s64 = -1
+        expired := false
+        for entry, index: VecSlice(store.entries, 0, count) {
+            if TextView(entry.user[:]) == user && ConstantTimeEqual(entry.nonce[:], nonce) {
+                found = index
+                expired = entry.expiresAt < now
+                break
+            }
+        }
+        if found < 0 { return false }
+        ShiftLeft(VecSlice(store.entries, 0, count), found)
+        unused VecResize(store.entries, count - 1)
+        return !expired
+    }
+}

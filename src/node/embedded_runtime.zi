@@ -5,6 +5,7 @@ core :: #import "embedded";
 profile :: #import "embedded_profile";
 mesh :: #import "mesh";
 startup :: #import "startup";
+http_server :: #import "http_server";
 middleware :: #import "middleware";
 ctx :: #import "std/context_go";
 http :: #import "std/http_go";
@@ -21,20 +22,28 @@ go_sync :: #system_library "go:sync";
 go_testing :: #system_library "go:net/http/httptest";
 go_json :: #system_library "go:encoding/json";
 go_io :: #system_library "go:io";
+go_bytes :: #system_library "go:bytes";
 strings :: #system_library "go:strings";
 builtin :: #system_library "go:builtin";
 
 #scope_file
-Listener :: #type #foreign go_net "Listener";
+MaxResponseCapacity :: 2097152;
 Address :: #type #foreign go_net "Addr";
 Recorder :: #type #foreign go_testing "ResponseRecorder";
 RawMessage :: #type #foreign go_json "RawMessage";
 StringReader :: #type #foreign strings "Reader";
+BytesReader :: #type #foreign go_bytes "Reader";
+ReadResult :: struct {
+    count: isize
+    error: Error
+}
+NewBytesReader :: (value: []u8) -> *BytesReader #foreign go_bytes "NewReader";
+ReadBytes :: (reader: *BytesReader, output: []u8) -> ReadResult #go_results #foreign go_bytes "(*Reader).Read";
 
 Node :: struct {
     core: core.EmbeddedCore
     root: string
-    server: *startup.HTTPServer
+    server: *http_server.HTTPServer
     cancel: ctx.CancelFunc
     workers: startup.WorkerGroup
     references: isize
@@ -46,7 +55,7 @@ RouteFilter :: struct {
 }
 
 ListenResult :: struct {
-    value: Listener
+    value: http_server.Listener
     error: Error
 }
 StartResult :: struct {
@@ -58,7 +67,7 @@ Reply :: struct {
     body: RawMessage #go_tag "json:\"body\""
 }
 ListenerTask :: struct {
-    listener: Listener
+    listener: http_server.Listener
     node: *Node
     context: ctx.Context
 }
@@ -77,10 +86,8 @@ WaitWorkers :: (group: *startup.WorkerGroup) #foreign go_sync "(*WaitGroup).Wait
 Work :: #type (task: ListenerTask) -> void;
 Spawn :: (callback: Work, task: ListenerTask) #foreign builtin "spawn";
 Listen :: (network: string, address: string) -> ListenResult #go_results #foreign go_net;
-ListenerAddress :: (listener: Listener) -> Address #foreign go_net "Listener.Addr";
+ListenerAddress :: (listener: http_server.Listener) -> Address #foreign go_net "Listener.Addr";
 AddressString :: (address: Address) -> string #foreign go_net "Addr.String";
-Serve :: (server: *startup.HTTPServer, listener: Listener) -> Error #foreign go_http "(*Server).Serve";
-CloseServer :: (server: *startup.HTTPServer) -> Error #foreign go_http "(*Server).Close";
 ServeHTTP :: (handler: middleware.Handler, writer: http.ResponseWriter, request: *http.Request) #foreign go_http "Handler.ServeHTTP";
 NotFound :: (writer: http.ResponseWriter, request: *http.Request) #foreign go_http;
 SetRemoteAddress :: (request: *http.Request, address: string) #go_field #foreign go_http "(*Request).RemoteAddr";
@@ -94,7 +101,7 @@ CloseBodyAtReturn :: (body: io.ReadCloser) #go_defer #foreign go_io "ReadCloser.
 
 RunServer :: (task: ListenerTask) {
     CompleteAtReturn(*task.node.workers)
-    unused Serve(task.node.server, task.listener)
+    unused http_server.Serve(task.node.server, task.listener)
 }
 
 RunMesh :: (task: ListenerTask) {
@@ -128,7 +135,7 @@ ResumeNode :: (node: *Node) -> Error {
     addr := AddressString(ListenerAddress(opened.value))
     node.core.server.cfg.Addr = addr
     node.core.server.cfg.BaseURL = startup.LocalHTTPURL(addr)
-    node.server = startup.NewHTTPServer(addr, Handler(node.core))
+    node.server = http_server.New(addr, Handler(node.core))
     lifetime := ctx.WithCancel(ctx.Background())
     node.cancel = lifetime.cancel
     task: ListenerTask = .{listener = opened.value, node = node, context = lifetime.value}
@@ -143,7 +150,7 @@ SuspendNode :: (node: *Node) {
         return
     }
     ctx.Cancel(node.cancel)
-    unused CloseServer(node.server)
+    unused http_server.Close(node.server)
     WaitWorkers(*node.workers)
     node.server = null
 }
@@ -296,4 +303,21 @@ Request :: (handle: s64, method: string, route: string, data: string) -> json.JS
     }
     reply: Reply = .{status = http.StatusCode(response), body = cast(RawMessage)payload}
     return json.Marshal(reply)
+}
+
+ResponseCapacityAllowed :: (capacity: s64) -> bool {
+    return capacity >= 1 && capacity <= MaxResponseCapacity
+}
+
+// Write a complete NUL-terminated ABI response or leave the buffer untouched.
+WriteRequest :: (handle: s64, method: string, route: string, data: string, output: []u8) -> s32 {
+    if !ResponseCapacityAllowed(output.count) { return 0 }
+    result := Request(handle, method, route, data)
+    length := result.value.count
+    if result.error != null || length >= output.count { return 0 }
+    if length > 0 {
+        ReadBytes(NewBytesReader(result.value), output[:length])
+    }
+    output[length] = 0
+    return cast(s32)length
 }

@@ -1,0 +1,90 @@
+#if TARGET == .C && OS == .LINUX {
+    manifest :: #import "app_registration_fields_native";
+    proofs :: #import "app_manifest_proof_native";
+    storage :: #import "app_registry_write_native";
+    app_network :: #import "app_network_native";
+    network :: #import "network_scope_native";
+    policy :: #import "mesh_policy_native";
+    fields :: #import "sync_json_fields";
+    json :: #import "std/json_document";
+    sql :: #import "sqlite_statement_native";
+    sqlite :: #import "sqlite/SQLite";
+    #import "std/vec"
+
+    Result :: struct {
+        applied: s64
+        status: u32
+        error: string
+    }
+
+    #scope_file
+    ManifestVersionQuery :: "SELECT manifest_version,manifest_hash FROM server_app_manifests WHERE app_id=?1";
+    ImportFailed :: "mesh app registry import failed";
+
+    Apply :: (database: *void, scope: *network.Scope, approvalKey: []u8, filters: *json.JsonDocument,
+        allowed: s32, input: *json.JsonDocument, registration: s32, now: s64) -> Result {
+        names: [3]string = .["manifest", "manifest_signature", "approval_signature"]
+        kinds: [3]json.JsonKind = .[.Object, .String, .String]
+        nodes: [3]s32
+        if !fields.Read(input, registration, names[:], kinds[:], nodes[:]) {
+            return .{status = 400, error = "invalid mesh app registration"}
+        }
+        document: json.JsonDocument
+        root := json.JsonNewObject(*document)
+        problem := manifest.Read(input, nodes[0], *document, root, now, true)
+        if problem != "" { return .{status = 400, error = problem} }
+        id: Text = fields.StringField(*document, root, "app_id")
+        app := TextView(id)
+        if !app_network.Allowed(scope, *document, root) {
+            return .{status = 403, error = "app manifest forbids this node network scope"}
+        }
+        if !policy.Includes(filters, allowed, app, true) { return .{status = 400, error = "app exceeds mesh policy"} }
+        signature: Text = json.JsonString(input, nodes[1])
+        approval: Text = json.JsonString(input, nodes[2])
+        canonical: Vec(u8)
+        hash: [65]u8
+        verified := proofs.Verify(*document, root, app, TextView(signature), TextView(approval), approvalKey, now, *canonical, hash[:])
+        if verified.status != 0 { return .{status = 400, error = verified.problem} }
+        args: [1]sql.Argument = .[sql.TextArg(app)]
+        current := sql.Prepare(database, ManifestVersionQuery, args[:])
+        failure: Result = .{status = 400, error = ImportFailed}
+        if current.status != sqlite.SQLITE_OK { return failure }
+        {
+            defer sqlite.SqliteFinalize(current.value)
+            selected := sqlite.SqliteStep(current.value)
+            if selected == sqlite.SQLITE_ROW {
+                version := fields.Number(*document, json.JsonMember(*document, root, "manifest_version"))
+                previous := sqlite.SqliteColumnInt64(current.value, 0)
+                if version < previous { return .{} }
+                if version == previous {
+                    if TextView(hash[:64]) == sql.ColumnText(current.value, 1) { return .{} }
+                    installed := storage.Installed(database, app)
+                    if installed.status != sqlite.SQLITE_OK { return failure }
+                    sequence := fields.Number(*document, json.JsonMember(*document, root, "manifest_sequence"))
+                    if sequence < installed.value { return .{} }
+                    if sequence == installed.value { return .{status = 400, error = "conflicting app manifest"} }
+                }
+            } else if selected != sqlite.SQLITE_DONE { return failure }
+        }
+        written := storage.UpsertSigned(database, *document, root, app, TextView(VecSlice(canonical, 0, canonical.count)),
+            TextView(hash[:64]), TextView(signature), TextView(approval))
+        if written.status != sqlite.SQLITE_OK { return failure }
+        return .{applied = ifx written.outdated then 0 else 1}
+    }
+
+    #scope_export
+    Import :: (database: *void, scope: *network.Scope, approvalKey: []u8, filters: *json.JsonDocument, filter: s32,
+        input: *json.JsonDocument, apps: s32, now: s64) -> Result {
+        if !policy.Includes(filters, json.JsonMember(filters, filter, "data"), "app_registry", true) { return .{} }
+        allowed := json.JsonMember(filters, filter, "apps")
+        count: s64 = 0
+        item := json.JsonFirst(input, apps)
+        while item >= 0 {
+            result := Apply(database, scope, approvalKey, filters, allowed, input, item, now)
+            if result.status != 0 { return result }
+            count += result.applied
+            item = json.JsonNext(input, item)
+        }
+        return .{applied = count}
+    }
+}

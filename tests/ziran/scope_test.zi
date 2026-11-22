@@ -1,0 +1,97 @@
+#import "std/go_types"
+#import "protocol"
+testing :: #import "testing_test";
+scope :: #import "scope";
+
+#scope_file
+PrefixCase :: struct {
+    prefix: string
+    valid: bool
+}
+OwnerCase :: struct {
+    appID: string
+    prefix: string
+    visibility: string
+    owns: bool
+}
+MatchCase :: struct {
+    collection: string
+    prefix: string
+    matches: bool
+}
+
+#program_export "TestZiranCollectionScopeContracts"
+CollectionScopeContracts :: (test: *testing.Test) {
+    prefixes: [16]PrefixCase = .[
+        .{prefix = "inbe.habits", valid = true},
+        .{prefix = "inbe.habit_days", valid = true},
+        .{prefix = "inbe.sessions", valid = true},
+        .{prefix = "account.v1.*", valid = true},
+        .{prefix = "account.v1.profile", valid = true},
+        .{prefix = "private.ukuvota.v1.records.*", valid = true},
+        .{prefix = "friends.ukuvota.v9999.records", valid = true},
+        .{prefix = "\u2003public.ukuvota.v1.records.*\u2003", valid = true},
+        .{prefix = "private.ukuvota.v1.*", valid = true},
+        .{prefix = "", valid = false},
+        .{prefix = "account.v0.*", valid = false},
+        .{prefix = "account.v1.profile.*", valid = false},
+        .{prefix = "private.ukuvota.v10000.*", valid = false},
+        .{prefix = "private.ukuvota.v1..*", valid = false},
+        .{prefix = "private.ukuvota.*", valid = false},
+        .{prefix = "private.ukuvota.v1.records*", valid = false}
+    ]
+    for item: prefixes {
+        actual := scope.ValidCollectionPrefix(item.prefix)
+        if actual != item.valid {
+            arguments: [3]Any = .[item.prefix, actual, item.valid]
+            testing.Fatalf(test, "prefix %q: got %v, want %v", arguments[:])
+        }
+    }
+    owners: [6]OwnerCase = .[
+        .{appID = "ukuvota", prefix = "private.ukuvota.v1.records.*", visibility = "private", owns = true},
+        .{appID = "ukuvota", prefix = "private.other.v1.records.*", visibility = "private", owns = false},
+        .{appID = "ukuvota", prefix = "public.ukuvota.v1.records.*", visibility = "private", owns = false},
+        .{appID = "inbe", prefix = "inbe.habits", visibility = "private", owns = true},
+        .{appID = "inbe", prefix = "inbe.habits", visibility = "public", owns = false},
+        .{appID = "ukuvota", prefix = "inbe.habits", visibility = "private", owns = false}
+    ]
+    for item: owners {
+        collection: AppCollection = .{CollectionPrefix = item.prefix, Visibility = item.visibility}
+        actual := scope.AppOwnsDeclaredScope(item.appID, collection)
+        if actual != item.owns {
+            arguments: [4]Any = .[item.appID, collection, actual, item.owns]
+            testing.Fatalf(test, "app %q scope %#v: got %v, want %v", arguments[:])
+        }
+    }
+}
+
+#program_export "TestZiranCollectionPrefixesKeepBoundariesAndSQLEscapes"
+CollectionPrefixesKeepBoundariesAndSQLEscapes :: (test: *testing.Test) {
+    matches: [5]MatchCase = .[
+        .{collection = "private.app.v1.records", prefix = "private.app.v1.records", matches = true},
+        .{collection = "private.app.v1.records.one", prefix = "private.app.v1.records.*", matches = true},
+        .{collection = "private.app.v1.records", prefix = "private.app.v1.records.*", matches = false},
+        .{collection = "private.app.v1.records_extra.one", prefix = "private.app.v1.records.*", matches = false},
+        .{collection = "private.other.v1.records.one", prefix = "private.app.v1.records.*", matches = false}
+    ]
+    for item: matches {
+        actual := scope.CollectionMatchesPrefix(item.collection, item.prefix)
+        if actual != item.matches {
+            arguments: [4]Any = .[item.collection, item.prefix, actual, item.matches]
+            testing.Fatalf(test, "collection %q prefix %q: got %v, want %v", arguments[:])
+        }
+    }
+    pattern := scope.LikePatternForCollectionPrefix("private.app_name.v1.rec%\\ords.*")
+    escaped := TextView(VecSlice(pattern, 0, pattern.count))
+    if escaped != "private.app\\_name.v1.rec\\%\\\\ords.%" {
+        arguments: [1]Any = .[escaped]
+        testing.Fatalf(test, "SQL wildcard escaping = %q", arguments[:])
+    }
+    collections: [1]AppCollection = .[.{CollectionPrefix = "private.app.v1.records.*"}]
+    empty: []AppCollection
+    if !scope.DeclaresCollection(collections[:], collections[0].CollectionPrefix) ||
+        scope.DeclaresCollection(empty, collections[0].CollectionPrefix) ||
+        scope.DeclaresCollection(collections[:], "private.other.v1.records.*") {
+        testing.Fatal(test, "declared collection matching changed")
+    }
+}

@@ -1,0 +1,319 @@
+#if TARGET == .C && OS == .LINUX {
+    net :: #import "network_scope_native";
+    strings :: #import "std/byte_text_linux";
+    transport :: #import "http_server_native";
+    #import "std/vec"
+
+    StopCheck :: #type (context: *void) -> bool;
+
+    Options :: struct {
+        headers: []transport.HeaderValue
+        timeout: s64
+        maximum: s64
+        stopping: StopCheck
+        context: *void
+    }
+
+    Response :: struct {
+        bytes: Vec(u8)
+        status: isize
+        maximum: s64
+    }
+
+    #scope_file
+    curl :: #system_library "curl";
+    c :: #system_library "c";
+
+    CurlInit :: (flags: isize) -> s32 #foreign curl "curl_global_init";
+    CurlCleanup :: () #foreign curl "curl_global_cleanup";
+    NewURL :: () -> *void #foreign curl "curl_url";
+    FreeURL :: (url: *void) #foreign curl "curl_url_cleanup";
+    SetURL :: (url: *void, part: s32, value: *u8, flags: u32) -> s32 #foreign curl "curl_url_set";
+    GetURL :: (url: *void, part: s32, value: **u8, flags: u32) -> s32 #foreign curl "curl_url_get";
+    FreePart :: (value: *void) #foreign curl "curl_free";
+    NewTransfer :: () -> *void #foreign curl "curl_easy_init";
+    FreeTransfer :: (transfer: *void) #foreign curl "curl_easy_cleanup";
+    SetOption :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_setopt";
+    Perform :: (transfer: *void) -> s32 #foreign curl "curl_easy_perform";
+    GetInfo :: (transfer: *void, option: s32, value: ..any) -> s32 #foreign curl "curl_easy_getinfo";
+    Header :: (list: *void, header: *u8) -> *void #foreign curl "curl_slist_append";
+    FreeHeaders :: (list: *void) #foreign curl "curl_slist_free_all";
+    Socket :: (family: s32, kind: s32, protocol: s32) -> s32 #foreign c "socket";
+    SocketPair :: (family: s32, kind: s32, protocol: s32, descriptors: *s32) -> s32 #foreign c "socketpair";
+    CloseSocket :: (fd: s32) -> s32 #foreign c "close";
+
+    // Stable libcurl URL parts, options and info values from curl/urlapi.h
+    // and curl/curl.h.
+    Url :: 0;
+    Scheme :: 1;
+    Path :: 7;
+    RequestHeaders :: 10023;
+    RequestURL :: 10282;
+    PostFields :: 10015;
+    PostFieldSize :: 60;
+    Timeout :: 13;
+    NoProgress :: 43;
+    NoSignal :: 99;
+    Proxy :: 10004;
+    AcceptEncoding :: 10102;
+    ProgressData :: 10057;
+    ProgressCallback :: 20219;
+    OpenSocketCallback :: 20163;
+    OpenSocketData :: 10164;
+    SocketOptionsCallback :: 20148;
+    RawURL :: 10002;
+    RequestMethod :: 10036;
+    RequestTarget :: 10266;
+    NoBody :: 44;
+    WriteCallback :: 20011;
+    WriteData :: 10001;
+    ResponseCode :: 2097154;
+    PairingResponseLimit :: 2048;
+
+    SocketAddress :: struct {
+        family: s32
+        kind: s32
+        protocol: s32
+        length: u32
+        address: [16]u8
+    }
+
+    OpenSocketHandler :: #type (context: *void, purpose: s32, address: *SocketAddress) -> s32 #c_call;
+    SocketOptionsHandler :: #type (context: *void, fd: s32, purpose: s32) -> s32 #c_call;
+    WriteHandler :: #type (bytes: *u8, size: usize, count: usize, context: *void) -> usize #c_call;
+    ProgressHandler :: #type (context: *void, download: s64, downloaded: s64, upload: s64, uploaded: s64) -> s32 #c_call;
+
+    OpenSocket :: (context: *void, purpose: s32, address: *SocketAddress) -> s32 {
+        if purpose != 0 || address == null ||
+            !((address.family == 2 && address.length >= 16) || (address.family == 10 && address.length >= 28)) {
+            return -1
+        }
+        // libcurl supplies the whole sockaddr, including the IPv6 extension.
+        ip := net.SocketIP(*address.address[0])
+        if !net.AllowsIP(cast(*net.Scope)context, ip.bytes[:ip.count]) { return -1 }
+        return Socket(address.family, address.kind, address.protocol)
+    }
+
+    WriteResponse :: (bytes: *u8, size: usize, count: usize, context: *void) -> usize {
+        response := cast(*Response)context
+        if size != 1 || count > cast(usize)(response.maximum - response.bytes.count) { return 0 }
+        if count == 0 { return 0 }
+        start := response.bytes.count
+        end := start + cast(s64)count
+        if !VecResizeBounded(response.bytes, end, response.maximum) { return 0 }
+        for index: 0..cast(s64)count - 1 { response.bytes[start + index] = bytes[index] }
+        return count
+    }
+
+    TakePrivateSocket :: (context: *void, purpose: s32, address: *SocketAddress) -> s32 {
+        if purpose != 0 { return -1 }
+        storage := cast(*s32)context
+        fd := <<storage
+        <<storage = -1
+        return fd
+    }
+
+    ConnectedSocket :: (context: *void, fd: s32, purpose: s32) -> s32 {
+        return 2 // CURL_SOCKOPT_ALREADY_CONNECTED
+    }
+
+    ReadPrivateResponse :: (bytes: *u8, size: usize, count: usize, context: *void) -> usize {
+        reply := cast(*Response)context
+        if size != 1 { return 0 }
+        remaining := cast(usize)(reply.maximum - reply.bytes.count)
+        length := ifx count < remaining then count else remaining
+        if length != 0 && WriteResponse(bytes, size, length, context) != length { return 0 }
+        return count
+    }
+
+    Progress :: (context: *void, download: s64, downloaded: s64, upload: s64, uploaded: s64) -> s32 {
+        options := cast(*Options)context
+        return ifx options.stopping(options.context) then 1 else 0
+    }
+
+    CString :: (value: string, output: *Vec(u8)) -> bool {
+        for character: value {
+            if character == 0 { return false }
+        }
+        return BuilderAppend(<<output, value) && VecPush(<<output, cast(u8)0)
+    }
+
+    ConfigureURL :: (url: *void, address: string) -> bool {
+        encoded: Vec(u8)
+        if !CString(address, *encoded) { return false }
+        bytes := VecSlice(encoded, 0, encoded.count)
+        if SetURL(url, Url, *bytes[0], 0) != 0 { return false }
+        scheme: *u8
+        if GetURL(url, Scheme, *scheme, 0) != 0 { return false }
+        defer FreePart(cast(*void)scheme)
+        // GetURL returns a NUL-terminated, normalized scheme.
+        return (scheme[0] == 104 && scheme[1] == 116 && scheme[2] == 116 && scheme[3] == 112) &&
+            (scheme[4] == 0 || (scheme[4] == 115 && scheme[5] == 0))
+    }
+
+    AddPath :: (url: *void, suffix: string) -> bool {
+        path: *u8
+        if GetURL(url, Path, *path, 0) != 0 { return false }
+        defer FreePart(cast(*void)path)
+        updated: Vec(u8)
+        length: s64 = 0
+        while path[length] != 0 { length += 1 }
+        while length > 0 && path[length - 1] == 47 { length -= 1 }
+        index: s64 = 0
+        while index < length {
+            if !VecPush(updated, path[index]) { return false }
+            index += 1
+        }
+        if !CString(suffix, *updated) { return false }
+        bytes := VecSlice(updated, 0, updated.count)
+        return SetURL(url, Path, *bytes[0], 0) == 0
+    }
+
+    AppendHeader :: (list: *void, value: transport.HeaderValue) -> *void {
+        raw: Vec(u8)
+        for byte: value.value {
+            if byte == 13 || byte == 10 { return null }
+        }
+        if !BuilderAppend(raw, value.name) || !BuilderAppend(raw, ": ") || !CString(value.value, *raw) { return null }
+        bytes := VecSlice(raw, 0, raw.count)
+        return Header(list, *bytes[0])
+    }
+
+    #scope_export
+    Open :: () -> bool { return CurlInit(3) == 0 }
+    Close :: () { CurlCleanup() }
+
+    // Calls the private dispatcher without opening or connecting to a TCP
+    // socket. The admin header can only reach the other end of the socket pair.
+    PrivateRequest :: (daemon: *void, method: string, target: string, data: string, admin: string,
+        maximum: s64, response: *Response) -> bool {
+        transfer := NewTransfer()
+        if transfer == null { return false }
+        defer FreeTransfer(transfer)
+        encodedMethod: Vec(u8)
+        encodedTarget: Vec(u8)
+        origin: Vec(u8)
+        if !CString(method, *encodedMethod) || !CString(target, *encodedTarget) || !CString("http://127.0.0.1/", *origin) {
+            return false
+        }
+        headers := AppendHeader(null, .{name = "Content-Type", value = "application/json"})
+        if headers == null { return false }
+        defer FreeHeaders(headers)
+        next := AppendHeader(headers, .{name = "X-Mesh-Admin", value = admin})
+        if next == null { return false }
+        headers = next
+        pair: [2]s32
+        if SocketPair(1, 524289, 0, *pair[0]) != 0 { return false } // AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC
+        fd := pair[0]
+        defer { if fd >= 0 { unused CloseSocket(fd) } }
+        if !transport.ConnectPrivate(daemon, pair[1]) { return false }
+        receive: WriteHandler = ReadPrivateResponse
+        open: OpenSocketHandler = TakePrivateSocket
+        connected: SocketOptionsHandler = ConnectedSocket
+        noProxy: [1]u8
+        response.status = 0
+        response.maximum = maximum
+        VecClear(response.bytes)
+        if SetOption(transfer, RawURL, *origin[0]) != 0 || SetOption(transfer, Proxy, *noProxy[0]) != 0 ||
+            SetOption(transfer, RequestTarget, *encodedTarget[0]) != 0 || SetOption(transfer, RequestMethod, *encodedMethod[0]) != 0 ||
+            SetOption(transfer, RequestHeaders, headers) != 0 || SetOption(transfer, Timeout, cast(isize)15) != 0 ||
+            SetOption(transfer, NoSignal, cast(isize)1) != 0 || SetOption(transfer, OpenSocketCallback, open) != 0 ||
+            SetOption(transfer, OpenSocketData, *fd) != 0 || SetOption(transfer, SocketOptionsCallback, connected) != 0 ||
+            SetOption(transfer, WriteCallback, receive) != 0 || SetOption(transfer, WriteData, response) != 0 { return false }
+        requestBody: Vec(u8)
+        if data.count > 0 {
+            if !CString(data, *requestBody) || SetOption(transfer, PostFields, *requestBody[0]) != 0 ||
+                SetOption(transfer, PostFieldSize, cast(isize)data.count) != 0 {
+                return false
+            }
+        }
+        if method == "HEAD" && SetOption(transfer, NoBody, cast(isize)1) != 0 { return false }
+        return Perform(transfer) == 0 && GetInfo(transfer, ResponseCode, *response.status) == 0
+    }
+
+    ValidAddress :: (address: string) -> bool {
+        url := NewURL()
+        if url == null { return false }
+        defer FreeURL(url)
+        return ConfigureURL(url, address)
+    }
+
+    TargetPath :: (address: string, suffix: string) -> Text {
+        url := NewURL()
+        if url == null { return .{} }
+        defer FreeURL(url)
+        if !ConfigureURL(url, address) || !AddPath(url, suffix) { return .{} }
+        path: *u8
+        if GetURL(url, Path, *path, 0) != 0 { return .{} }
+        defer FreePart(cast(*void)path)
+        return TextCopy(strings.TextFromCString(path))
+    }
+
+    #scope_file
+    Transfer :: (scope: *net.Scope, address: string, path: string, body: []u8, post: bool,
+        options: Options, response: *Response) -> bool {
+        if options.maximum <= 0 || options.timeout <= 0 { return false }
+        url := NewURL()
+        if url == null { return false }
+        defer FreeURL(url)
+        if !ConfigureURL(url, address) || (post && !AddPath(url, path)) { return false }
+        transfer := NewTransfer()
+        if transfer == null { return false }
+        defer FreeTransfer(transfer)
+        headers: *void
+        defer { if headers != null { FreeHeaders(headers) } }
+        if post {
+            headers = AppendHeader(null, .{name = "Content-Type", value = "application/json"})
+            if headers == null { return false }
+            if SetOption(transfer, PostFields, *body[0]) != 0 ||
+                SetOption(transfer, PostFieldSize, cast(isize)body.count) != 0 { return false }
+        }
+        for value: options.headers {
+            next := AppendHeader(headers, value)
+            if next == null { return false }
+            headers = next
+        }
+        response.status = 0
+        response.maximum = options.maximum
+        VecClear(response.bytes)
+        receive: WriteHandler = WriteResponse
+        automaticEncoding: [1]u8
+        if SetOption(transfer, RequestURL, url) != 0 || SetOption(transfer, RequestHeaders, headers) != 0 ||
+            SetOption(transfer, Timeout, cast(isize)options.timeout) != 0 || SetOption(transfer, NoSignal, cast(isize)1) != 0 ||
+            SetOption(transfer, WriteCallback, receive) != 0 || SetOption(transfer, WriteData, response) != 0 ||
+            SetOption(transfer, AcceptEncoding, *automaticEncoding[0]) != 0 { return false }
+        cancellation := options
+        if options.stopping != null {
+            progress: ProgressHandler = Progress
+            if SetOption(transfer, NoProgress, cast(isize)0) != 0 || SetOption(transfer, ProgressCallback, progress) != 0 ||
+                SetOption(transfer, ProgressData, *cancellation) != 0 { return false }
+        }
+        if scope.lanOnly {
+            noProxy: [1]u8
+            open: OpenSocketHandler = OpenSocket
+            if SetOption(transfer, Proxy, *noProxy[0]) != 0 ||
+                SetOption(transfer, OpenSocketCallback, open) != 0 ||
+                SetOption(transfer, OpenSocketData, scope) != 0 { return false }
+        }
+        if Perform(transfer) != 0 { return false }
+        return GetInfo(transfer, ResponseCode, *response.status) == 0
+    }
+
+    #scope_export
+    // A request goes only to its configured endpoint. LAN mode also checks
+    // each resolved address before creating a socket.
+    Request :: (scope: *net.Scope, address: string, path: string, body: []u8, options: Options, response: *Response) -> bool {
+        return body.count > 0 && Transfer(scope, address, path, body, true, options, response)
+    }
+
+    Get :: (scope: *net.Scope, address: string, options: Options, response: *Response) -> bool {
+        empty: []u8
+        return Transfer(scope, address, "", empty, false, options, response)
+    }
+
+    Post :: (scope: *net.Scope, address: string, path: string, body: []u8) -> bool {
+        response: Response
+        return Request(scope, address, path, body, .{timeout = 10, maximum = PairingResponseLimit}, *response) &&
+            response.status >= 200 && response.status < 300
+    }
+}

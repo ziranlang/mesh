@@ -1,0 +1,80 @@
+#if TARGET == .C && OS == .LINUX {
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    rules :: #import "record_page_rules";
+    validation :: #import "record_validation";
+    rows :: #import "record_rows_native";
+    json :: #import "std/json_document";
+    #import "std/vec"
+
+    RecordPageRequest :: struct {
+        user: string
+        app: string
+        afterVersion: s64
+        afterCollection: string
+        afterID: string
+        throughVersion: s64
+        limit: s64
+        encoding: string
+        contentFreeDeletions: bool
+    }
+
+    RecordPageCursor :: struct {
+        version: s64
+        collection: Text
+        id: Text
+    }
+
+    RecordPageResult :: struct {
+        records: json.JsonDocument
+        cursor: RecordPageCursor
+        more: bool
+        status: s32
+    }
+
+    #scope_export
+    // Query after checking account access and app scope. The cursor advances
+    // over every scanned row, even a tombstone an older client cannot read.
+    Read :: (database: *void, request: RecordPageRequest) -> RecordPageResult {
+        if database == null || request.limit < 0 || request.limit > rules.RecordPageLimit {
+            return .{status = sqlite.SQLITE_MISUSE}
+        }
+        limit := ifx request.limit == 0 then rules.RecordPageLimit else request.limit
+        arguments: [8]sql.Argument = .[
+            sql.TextArg(request.user), sql.TextArg(request.app), sql.IntArg(request.afterVersion),
+            sql.TextArg(request.afterCollection), sql.TextArg(request.afterID), sql.IntArg(request.throughVersion),
+            sql.IntArg(limit + 1), sql.TextArg(request.encoding)]
+        opened := sql.Prepare(database, rules.RecordPageQuery, arguments[:])
+        if opened.status != sqlite.SQLITE_OK { return .{status = opened.status} }
+        defer sqlite.SqliteFinalize(opened.value)
+        page: RecordPageResult
+        page.records.root = json.JsonNewArray(*page.records)
+        if page.records.root < 0 { return .{status = sqlite.SQLITE_NOMEM} }
+        last: RecordPageCursor
+        bytes: s64 = 0
+        count: s64 = 0
+        while true {
+            stepped := sqlite.SqliteStep(opened.value)
+            if stepped == sqlite.SQLITE_DONE { return page }
+            if stepped != sqlite.SQLITE_ROW { return .{status = stepped} }
+            item := rows.Read(opened.value, 11)
+            if !rules.Room(count, limit, bytes, item.Ciphertext.count) {
+                page.more = true
+                page.cursor = last
+                return page
+            }
+            if (request.contentFreeDeletions || validation.ReadableByLegacy(item)) && !rows.Append(*page.records, page.records.root, item) {
+                return .{status = sqlite.SQLITE_NOMEM}
+            }
+            last.version = sqlite.SqliteColumnInt64(opened.value, 10)
+            last.collection = TextCopy(item.Collection)
+            last.id = TextCopy(item.ID)
+            if last.collection.bytes.count != item.Collection.count || last.id.bytes.count != item.ID.count {
+                return .{status = sqlite.SQLITE_NOMEM}
+            }
+            bytes += item.Ciphertext.count
+            count += 1
+        }
+        return page
+    }
+}

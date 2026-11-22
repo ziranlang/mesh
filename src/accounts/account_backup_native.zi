@@ -1,0 +1,249 @@
+#if TARGET == .C && OS == .LINUX {
+    accounts :: #import "account_access_native";
+    bearer :: #import "http_auth_native";
+    recovery :: #import "account_recovery_http_native";
+    store :: #import "account_backup_store_native";
+    decoys :: #import "account_backup_decoy_native";
+    lookup :: #import "account_lookup_native";
+    queries :: #import "account_backup_queries";
+    rules :: #import "account_backup_rules";
+    transport :: #import "http_server_native";
+    strict :: #import "strict_json_native";
+    sha :: #import "crypto/sha256";
+    hmac :: #import "token_hmac_native";
+    oqs :: #import "oqs/Oqs";
+    calendar :: #import "std/date_time_linux";
+    json :: #import "std/json_document";
+    mutex :: #import "std/mutex_linux";
+    sqlite :: #import "sqlite/SQLite";
+    sql :: #import "sqlite_statement_native";
+    #import "std/vec"
+
+    #scope_file
+    BackupSaltPath :: "/api/v1/account-backup/salt";
+    BackupOpenPath :: "/api/v1/account-backup/open";
+    BackupPath :: "/api/v1/account/backup";
+    BackupShortRequest :: 1024;
+    BackupStoreRequest :: rules.BackupMaximumBytes + BackupShortRequest;
+    BackupUnavailable :: "account backup unavailable";
+
+    ReferenceKey :: struct {
+        bytes: [74]u8
+        count: s64
+    }
+
+    Target :: struct {
+        account: lookup.AccountLookup
+        key: ReferenceKey
+    }
+
+    Key :: (prefix: string, name: string) -> ReferenceKey {
+        result: ReferenceKey
+        if prefix.count + name.count > result.bytes.count { return result }
+        for byte, index: prefix { result.bytes[index] = byte }
+        for byte, index: name { result.bytes[prefix.count + index] = byte }
+        result.count = prefix.count + name.count
+        return result
+    }
+
+    Find :: (database: *void, reference: string) -> Target {
+        first: [64]u8
+        second: [64]u8
+        normalized := lookup.Normalize(reference, first[:])
+        // The compatibility lookup normalizes once when forming the reference
+        // key and again when resolving it against the account table.
+        result: Target = .{account = lookup.ResolveNormalized(database, lookup.Normalize(normalized, second[:]))}
+        if result.account.status == sqlite.SQLITE_OK {
+            if result.account.found {
+                result.key = Key("account:", TextView(result.account.id[:]))
+            } else {
+                result.key = Key("reference:", normalized)
+            }
+        }
+        return result
+    }
+
+    SaltReply :: (connection: *void, salt: string) -> s32 {
+        response: json.JsonDocument
+        object := json.JsonNewObject(*response)
+        if !json.JsonSet(*response, object, "salt", json.JsonNewString(*response, salt)) { return 0 }
+        return recovery.Reply(connection, 200, *response, object)
+    }
+
+    Salt :: (database: *void, connection: *void, target: *Target) -> s32 {
+        if target.account.found {
+            saved := store.ReadSalt(database, TextView(target.account.id[:]))
+            if saved.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+            if saved.found { return SaltReply(connection, TextView(saved.salt[:])) }
+        }
+        secret: [32]u8
+        tag: [32]u8
+        defer oqs.Cleanse(secret[:])
+        defer oqs.Cleanse(tag[:])
+        message: Vec(u8)
+        key := TextView(target.key.bytes[:target.key.count])
+        if store.NodeSecret(database, secret[:]) != sqlite.SQLITE_OK ||
+            !BuilderAppend(message, "account-backup-salt\n") || !BuilderAppend(message, key) ||
+            !hmac.Compute(secret[:], TextView(VecSlice(message, 0, message.count)), tag[:]) {
+            return recovery.ErrorReply(connection, 500, BackupUnavailable)
+        }
+        hex: [33]u8
+        if sha.BytesToHex(*tag[0], 16, *hex[0], hex.count) != 1 {
+            return recovery.ErrorReply(connection, 500, BackupUnavailable)
+        }
+        return SaltReply(connection, TextView(hex[:32]))
+    }
+
+    Rejected :: (connection: *void, attempts: *decoys.Decoys, target: *Target, now: s64) -> s32 {
+        retry := decoys.RecordFailure(attempts, TextView(target.key.bytes[:target.key.count]), now)
+        if retry > 0 { return recovery.ErrorReply(connection, 429, "too many attempts", retry) }
+        return recovery.ErrorReply(connection, 403, "wrong username or password")
+    }
+
+    Open :: (database: *void, connection: *void, attempts: *decoys.Decoys, target: *Target, digest: string, now: s64) -> s32 {
+        if !target.account.found { return Rejected(connection, attempts, target, now) }
+        account := TextView(target.account.id[:])
+        attempt := store.Open(database, account, digest, now)
+        if attempt.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+        if attempt.missing { return Rejected(connection, attempts, target, now) }
+        if attempt.retryAfter > 0 { return recovery.ErrorReply(connection, 429, "too many attempts", attempt.retryAfter) }
+        if !attempt.opened { return recovery.ErrorReply(connection, 403, "wrong username or password") }
+        response: json.JsonDocument
+        object := json.JsonNewObject(*response)
+        backup := TextView(VecSlice(attempt.backup, 0, attempt.backup.count))
+        if !json.JsonSet(*response, object, "account_id", json.JsonNewString(*response, account)) ||
+            !json.JsonSet(*response, object, "backup", json.JsonNewString(*response, backup)) {
+            return 0
+        }
+        return recovery.Reply(connection, 200, *response, object)
+    }
+
+    // Only the hexadecimal salt and verification fields accept ASCII capitals.
+    NormalizeHex :: (value: string, output: []u8) -> bool {
+        if value.count != output.count { return false }
+        for byte, index: value {
+            output[index] = ifx byte >= #char "A" && byte <= #char "F" then byte + 32 else byte
+        }
+        return true
+    }
+
+    StatusReply :: (connection: *void, stored: bool, updated: s64) -> s32 {
+        response: json.JsonDocument
+        object := json.JsonNewObject(*response)
+        if !json.JsonSet(*response, object, "stored", json.JsonNewBool(*response, stored)) ||
+            !json.JsonSet(*response, object, "updated_at", json.JsonNewInteger(*response, updated)) {
+            return 0
+        }
+        return recovery.Reply(connection, 200, *response, object)
+    }
+
+    Put :: (database: *void, connection: *void, attempts: *decoys.Decoys, account: string, now: s64, input: []u8) -> s32 {
+        document: json.JsonDocument
+        names: [3]string = .["backup", "salt", "verifier"]
+        fields: [3]s32
+        if !strict.ReadStringFields(*document, input, names[:], fields[:]) {
+            return recovery.ErrorReply(connection, 400, "invalid account backup")
+        }
+        backup: Text = json.JsonString(*document, fields[0])
+        saltInput: Text = json.JsonString(*document, fields[1])
+        verifierInput: Text = json.JsonString(*document, fields[2])
+        salt: [32]u8
+        verifier: [64]u8
+        if !NormalizeHex(TextView(saltInput), salt[:]) || !NormalizeHex(TextView(verifierInput), verifier[:]) ||
+            !rules.BackupSealValid(TextView(backup), TextView(salt[:]), TextView(verifier[:])) {
+            return recovery.ErrorReply(connection, 400, "invalid account backup")
+        }
+        key := Key("account:", account)
+        args: [5]sql.Argument = .[sql.TextArg(account), sql.TextArg(TextView(backup)), sql.TextArg(TextView(salt[:])),
+            sql.TextArg(TextView(verifier[:])), sql.IntArg(now)]
+        if sql.Execute(database, queries.StoreBackupSQL, args[:]) != sqlite.SQLITE_OK {
+            return recovery.ErrorReply(connection, 500, BackupUnavailable)
+        }
+        if sqlite.SqliteChanges(database) == 0 { return recovery.ErrorReply(connection, 401, "sync account not found") }
+        decoys.Forget(attempts, TextView(key.bytes[:key.count]))
+        return StatusReply(connection, true, now)
+    }
+
+    Delete :: (database: *void, connection: *void, attempts: *decoys.Decoys, account: string, now: s64) -> s32 {
+        key := Key("account:", account)
+        removed := store.Remove(database, account)
+        if removed.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+        if removed.deleted {
+            decoys.Keep(attempts, TextView(key.bytes[:key.count]), removed.failures, removed.lockedUntil, now)
+        }
+        return recovery.BooleanReply(connection, "deleted", removed.deleted)
+    }
+
+    Anonymous :: (access: *accounts.AccountAccess, connection: *void, attempts: *decoys.Decoys,
+        salt: bool, input: []u8, overflow: bool) -> s32 {
+        route := ifx salt then "account-backup-salt:" else "account-backup-open:"
+        if !recovery.AllowAddress(access, connection, route, ifx salt then 60 else 20) {
+            return recovery.ErrorReply(connection, 429, "too many attempts", rules.BackupFirstLockSeconds)
+        }
+        settings := access.configuration
+        scratch: [BackupShortRequest]u8
+        decoded := recovery.DecodeBody(connection, input, overflow, settings.zstdRequests, scratch[:])
+        document: json.JsonDocument
+        names: [2]string = .["account", "proof"]
+        fields: [2]s32
+        count := ifx salt then 1 else 2
+        if decoded.error != "" || !strict.ReadStringFields(*document, decoded.bytes, names[:count], fields[:count]) {
+            return recovery.ErrorReply(connection, 400, "invalid account")
+        }
+        referenceText: Text = json.JsonString(*document, fields[0])
+        reference := TextView(referenceText)
+        if reference.count == 0 || reference.count > 64 { return recovery.ErrorReply(connection, 400, "invalid account") }
+        digest: [65]u8
+        defer oqs.Cleanse(digest[:])
+        if !salt {
+            proof: Text = json.JsonString(*document, fields[1])
+            if !recovery.ProofDigest(TextView(proof), digest[:]) { return recovery.ErrorReply(connection, 400, "invalid proof") }
+        }
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || !mutex.Lock(*access.databaseLock) { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+        defer mutex.Unlock(*access.databaseLock)
+        target := Find(settings.database, reference)
+        if target.key.count == 0 { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+        if salt { return Salt(settings.database, connection, *target) }
+        return Open(settings.database, connection, attempts, *target, TextView(digest[:64]), now)
+    }
+
+    #scope_export
+    Handles :: (route: string) -> bool {
+        return route == BackupSaltPath || route == BackupOpenPath || route == BackupPath
+    }
+
+    RequestBytes :: (route: string) -> s64 {
+        return ifx route == BackupPath then BackupStoreRequest else BackupShortRequest
+    }
+
+    Handle :: (access: *accounts.AccountAccess, connection: *void, attempts: *decoys.Decoys, method: string,
+        route: string, input: []u8, overflow: bool) -> s32 {
+        private := route == BackupPath
+        if method != "POST" && (!private || (method != "GET" && method != "HEAD" && method != "DELETE")) {
+            allow := ifx private then "DELETE, GET, HEAD, POST" else "POST"
+            headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allow}]
+            empty: []u8
+            return transport.WriteWithHeaders(connection, 405, "", empty, headers[:])
+        }
+        if !private { return Anonymous(access, connection, attempts, route == BackupSaltPath, input, overflow) }
+        settings := access.configuration
+        now := calendar.UnixMilliseconds() / 1000
+        if now <= 0 || !mutex.Lock(*access.databaseLock) { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+        defer mutex.Unlock(*access.databaseLock)
+        actor := bearer.Authenticate(settings.database, connection, settings.secret, now, "", false)
+        if actor.status != 0 { return recovery.ErrorReply(connection, actor.status, actor.message) }
+        account := TextView(actor.userID[:])
+        if method == "DELETE" { return Delete(settings.database, connection, attempts, account, now) }
+        if method != "POST" {
+            args: [1]sql.Argument = .[sql.TextArg(account)]
+            saved := sql.ReadInteger(settings.database, queries.ReadBackupStatusSQL, args[:])
+            if saved.status != sqlite.SQLITE_OK { return recovery.ErrorReply(connection, 500, BackupUnavailable) }
+            return StatusReply(connection, saved.found, saved.value)
+        }
+        scratch: [BackupStoreRequest]u8
+        decoded := recovery.DecodeBody(connection, input, overflow, settings.zstdRequests, scratch[:])
+        if decoded.error != "" { return recovery.ErrorReply(connection, 400, "invalid account backup") }
+        return Put(settings.database, connection, attempts, account, now, decoded.bytes)
+    }
+}
