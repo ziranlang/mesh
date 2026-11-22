@@ -224,6 +224,24 @@ class DeploymentInputTest(unittest.TestCase):
             self.assertEqual((ssh_directory / "known_hosts").stat().st_mode & 0o777, 0o600)
             self.assertIn("StrictHostKeyChecking yes", (ssh_directory / "config").read_text())
 
+    def test_custom_ssh_directory_keeps_identity_and_host_keys_local(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            trusted = self.write_host_key(root, "host")
+            ssh_directory = root / "job ssh"
+            deployment_inputs.configure_ssh(
+                "deployment.test", "deploy", [trusted], ssh_directory
+            )
+            configuration = subprocess.check_output(
+                ["ssh", "-G", "-F", str(ssh_directory / "config"), "mesh-origin"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            options = dict(row.split(" ", 1) for row in configuration.splitlines())
+            self.assertEqual(options["identityfile"], str(ssh_directory / "id_ed25519"))
+            self.assertEqual(options["userknownhostsfile"], str(ssh_directory / "known_hosts"))
+            self.assertEqual(options["stricthostkeychecking"], "true")
+
     def test_presented_host_key_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             trusted = self.write_host_key(Path(temporary), "trusted")
@@ -276,6 +294,11 @@ class DeploymentInputTest(unittest.TestCase):
         self.assertEqual(deploy_checkout.get("with"), {"submodules": "recursive"})
         self.assertNotIn("ssh-keyscan", workflow_text)
         self.assertNotIn("--exclude='vendor/liboqs'", workflow_text)
+        for path in (workflow_path, Path(".gitea/workflows/ci.yml")):
+            package = path.read_text()
+            self.assertIn("git ls-files -z --recurse-submodules", package)
+            self.assertIn("tar --null --no-recursion --files-from=", package)
+        self.assertIn("*.node-key", Path(".dockerignore").read_text().splitlines())
         self.assertNotIn('cp -a "/opt/mesh-src/$keep"', workflow_text)
         step_names = [step.get("name") for step in checkouts]
         self.assertLess(

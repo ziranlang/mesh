@@ -8,6 +8,7 @@ work
 .env.*
 *.db
 *.db-*
+*.node-key
 *.sqlite
 *.sqlite-*
 *.key

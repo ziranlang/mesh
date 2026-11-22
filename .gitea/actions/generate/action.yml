@@ -1,0 +1,19 @@
+name: Generate the server's Go
+description: Sets up the Ziran pinned in ziran.lock and generates the Go from the Zi sources. Run it after setup-go.
+runs:
+  using: composite
+  steps:
+    # Go ignores the dot folder, and the deploy and image leave it out.
+    - name: Set up the pinned Ziran
+      id: ziran
+      uses: https://git.waozi.xyz/ziranlang/ziran/.github/actions/setup@4135e07fae33bcd0c00dd66b5716fdfe19c1fca5
+      with:
+        path: .ziran
+    # Packages the build fetches stay outside the checkout, where go ./...
+    # would compile their files.
+    - name: Generate the Go
+      shell: bash
+      env:
+        XDG_CACHE_HOME: ${{ runner.temp }}/ziran-cache
+        ZIRAN: ${{ steps.ziran.outputs.ziran }}
+      run: make generate ZIRAN="$ZIRAN"

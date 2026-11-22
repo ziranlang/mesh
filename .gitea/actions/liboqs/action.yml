@@ -1,0 +1,8 @@
+name: Build pinned liboqs
+description: Builds and verifies the native library from the checked-out submodule.
+runs:
+  using: composite
+  steps:
+    - name: Build liboqs
+      shell: bash
+      run: make liboqs

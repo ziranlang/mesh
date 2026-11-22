@@ -1,6 +1,6 @@
 # Daochi to Mesh
 
-Mesh's canonical source is https://github.com/ziranlang/mesh and website is
+Mesh's canonical source is https://git.waozi.xyz/ziranlang/mesh and website is
 https://mesh.ziran-lang.org. The production API remains https://api.waozi.xyz.
 The package name is Mesh, executable `mesh`, and Go module `mesh`.
 
@@ -69,8 +69,19 @@ starting with empty state. Stop the old container first; never run two writers
 on one volume. For a genuinely fresh installation, explicitly create a volume
 with `docker volume create mesh-data` and set `MESH_DATA_VOLUME=mesh-data`.
 
-GitHub Actions prefer `MESH_*` secrets/variables and fall back to existing
-`DAOCHI_*` names preserved by the repository transfer. Pages uses project
+Gitea Actions builds and verifies production deployments from `ziranlang/mesh`
+`master`. The `build-mesh` runner uses a repository-scoped Build slot and a
+rootless container engine. Set `MESH_CONTAINER_RUNNER` and `MESH_DEPLOY_RUNNER`
+to that label. Enable `MESH_DEPLOY_READY` after the origin's root-owned
+`deploy/gitea-origin.py` is installed as the new SSH key's forced command.
+The key may request deployment of an artifact from the active canonical Gitea
+run. The origin checks required job conclusions and the revision independently,
+verifies the native build inputs and resulting binary, and checks local and
+public readiness after install. The deploy job supplies a short-lived Gitea
+job token with Actions and contents read access. It uses the pinned origin host
+key and leaves the existing node credentials in place.
+
+GitHub retains a manual API recovery workflow with the legacy secret names. Pages uses project
 `mesh` and provisions `mesh.ziran-lang.org` with `CLOUDFLARE_DNS_API_TOKEN`
 (falling back to `CLOUDFLARE_API_TOKEN`). This provisioning token needs Pages
 Edit, Zone Read and DNS Edit for ziran-lang.org. Site uploads continue using

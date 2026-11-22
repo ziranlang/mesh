@@ -51,6 +51,11 @@ commands. Do not hand-edit lockfiles or downstream dependency source copies.
 
 ## Tests
 
+Gitea runs the Linux build, race tests, container smoke and scan, source
+analysis and deployment gates. The deployment workflow and origin admission
+fixtures run with `python3 -B scripts/test_gitea_workflow.py` and
+`python3 -B scripts/test_gitea_origin.py`.
+
 `make test-ziran` runs the application suite against generated Go from source
 and saved `.zir`. It also runs `make test-ziran-native`, which builds and runs
 tests for binary fields, token signing and payloads, account and habit identifiers, path
@@ -208,9 +213,37 @@ record envelopes and compression before encryption.
 
 ## Deployment verification
 
-Use the existing GitHub deployment workflow and its backup, readiness and
-rollback path. Builds stamp `version.zi` through the native Go string variable;
-an unstamped development build reports `dev`. Confirm the actual installed
-`build_version` through `/api/v1/node` and verify readiness and negotiated
-responses separately from GitHub CI. A build or a pushed commit does not prove
-the installed service changed.
+The [canonical Mesh repository](https://git.waozi.xyz/ziranlang/mesh) contains
+`.gitea/workflows/ci.yml` for master pushes, weekly security checks and manual
+runs on Build. Production deployment requires the build-policy, lint, Go test
+and race, container, vulnerability, static analysis and dependency license
+checks. The deploy job accepts only the canonical repository's `master` and
+checks the current remote revision before transferring source to the origin.
+GitHub mirrors source. Its legacy API workflow requires manual dispatch for
+recovery during the transition.
+
+The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker and
+an isolated `MESH_DEPLOY_RUNNER` with access to the production origin. Set the
+repository variable `MESH_DEPLOY_READY` to `true` after verifying the runner and
+provisioning the scoped `MESH_SSH_KEY`, `MESH_SSH_HOST`, `MESH_SSH_HOST_KEY` and
+`MESH_SSH_USER` secrets. The workflow uses strict host-key verification and a
+job-private SSH directory. The production host retains its existing node and
+Google Play credentials. Restrict production workflow writes and manual runs to
+trusted maintainers. The shared Build jobs take master pushes and manual or
+scheduled runs. Fork code needs an isolated PR executor before adding a PR trigger.
+
+Website publishing follows site paths and uses its separate Cloudflare credential.
+Enable the Gitea Pages deploy job with `MESH_PAGES_READY` after provisioning that
+credential and retiring the mirror’s site trigger.
+
+Gosec checks high-severity, high-confidence findings in generated Go and the
+native adapters. Go-licenses checks linked Go dependencies for forbidden and
+unknown licenses. These checks replace the GitHub-native CodeQL and dependency
+review integrations, with different rules and coverage. The container scan
+retains its high and critical Trivy gate. SARIF reports are Gitea job artifacts.
+
+The existing installer backs up the database and configuration and rolls back on
+readiness or revision failure. Builds stamp `version.zi` through the native Go
+string variable. An unstamped development build reports `dev`. Verify the live
+`build_version` through `/api/v1/node` and readiness through `/readyz` over
+public HTTPS and link both observations to the exact Gitea run.

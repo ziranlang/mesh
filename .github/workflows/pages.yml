@@ -4,7 +4,15 @@ on:
   push:
     branches:
       - master
+    paths:
+      - 'site/**'
+      - 'scripts/*mesh_site.py'
+      - 'scripts/test_provision_mesh_site.py'
   pull_request:
+    paths:
+      - 'site/**'
+      - 'scripts/*mesh_site.py'
+      - 'scripts/test_provision_mesh_site.py'
   workflow_dispatch:
 
 permissions:

@@ -1,8 +1,6 @@
 name: deploy
 
 on:
-  push:
-    branches: [master]
   workflow_dispatch:
 
 concurrency:
@@ -83,8 +81,10 @@ jobs:
           expected_source_commit="${{ github.sha }}"
           expected_digest="${{ steps.liboqs.outputs.liboqs_digest }}"
           expected_entries="${{ steps.liboqs.outputs.liboqs_entries }}"
-          tar --exclude='.git' --exclude='.ziran' --exclude='build' --exclude='*.db' \
-              -czf - . | \
+          git ls-files -z --recurse-submodules > "$RUNNER_TEMP/mesh-source-files"
+          find . -maxdepth 1 -type f \( -name '*.zi.go' -o -name '*.zi_test.go' \) \
+            -print0 >> "$RUNNER_TEMP/mesh-source-files"
+          tar --null --no-recursion --files-from="$RUNNER_TEMP/mesh-source-files" -czf - | \
             ssh mesh-origin '
               set -e
               rm -rf /opt/mesh-src.new

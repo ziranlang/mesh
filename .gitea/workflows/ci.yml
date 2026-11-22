@@ -1,0 +1,382 @@
+name: Mesh CI and deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+  schedule:
+    - cron: '27 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mesh-production
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-policy:
+    runs-on: build-ubuntu24.04
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - name: Install workflow validation tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/mesh-validation"
+          "$RUNNER_TEMP/mesh-validation/bin/pip" install 'PyYAML==6.0.2' 'shellcheck-py==0.11.0.1'
+          echo "$RUNNER_TEMP/mesh-validation/bin" >> "$GITHUB_PATH"
+      - name: Test Mesh migration and site
+        run: |
+          mkdir -p build/test-tmp
+          TMPDIR="$PWD/build/test-tmp" python3 -m unittest discover -s scripts -p 'test_mesh*.py'
+          python3 -B scripts/test_migrate_env.py
+          python3 -B scripts/test_provision_mesh_site.py
+      - name: Validate workflow permissions and dependencies
+        run: |
+          python3 -B scripts/test_gitea_workflow.py
+          python3 -B scripts/test_gitea_origin.py
+          shellcheck deploy/install.sh deploy/rollback.sh
+      - name: Verify immutable build and deployment policy
+        run: |
+          python3 -B scripts/verify_build_inputs.py
+          python3 -B scripts/test_build_inputs.py
+          python3 -B scripts/test_check_sarif.py
+          python3 -B scripts/test_bootstrap_ssh.py
+          python3 -B scripts/test_deployment_inputs.py
+          python3 -B scripts/test_deploy_install.py
+          python3 -B scripts/test_migrate_env.py
+
+  lint:
+    runs-on: build-ubuntu24.04
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Build the vendored liboqs
+        uses: ./.gitea/actions/liboqs
+
+      - name: Install golangci-lint
+        env:
+          GOLANGCI_LINT_VERSION: "2.14.0"
+          GOLANGCI_LINT_SHA256: "ab90aeb7b066f92a33415b638a50fe5344bbb75a0d32ad30cc248d88f81032ab"
+        run: |
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/golangci-lint.tar.gz" \
+            "https://github.com/golangci/golangci-lint/releases/download/v${GOLANGCI_LINT_VERSION}/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64.tar.gz"
+          printf '%s  %s\n' "$GOLANGCI_LINT_SHA256" "$RUNNER_TEMP/golangci-lint.tar.gz" | sha256sum --check --strict
+          tar --extract --gzip --file "$RUNNER_TEMP/golangci-lint.tar.gz" --directory "$RUNNER_TEMP"
+          install -m 0755 "$RUNNER_TEMP/golangci-lint-${GOLANGCI_LINT_VERSION}-linux-amd64/golangci-lint" "$RUNNER_TEMP/golangci-lint"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Lint
+        run: golangci-lint run --timeout=5m
+        env:
+          CGO_ENABLED: "1"
+          GOFLAGS: "-mod=mod"
+          CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
+          CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
+
+  test:
+    runs-on: build-ubuntu24.04
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Build the vendored liboqs
+        uses: ./.gitea/actions/liboqs
+
+      - name: Check formatting
+        run: test -z "$(git ls-files -z '*.go' | xargs -0 gofmt -l)"
+
+      - name: Check generated diff hygiene
+        run: git diff --check
+
+      - name: Test
+        run: make test
+
+      - name: Race test
+        run: make test GOFLAGS="-mod=mod -race"
+
+      - name: Report coverage
+        run: |
+          make test TEST_FLAGS="-coverprofile=coverage.out"
+          go tool cover -func=coverage.out | tail -1
+
+  container:
+    runs-on: ${{ vars.MESH_CONTAINER_RUNNER || 'build-ubuntu24.04' }}
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Build container image
+        run: docker build --pull --build-arg VERSION="ci-$GITHUB_SHA" -t "mesh:ci-$GITHUB_RUN_ID" .
+
+      - name: Verify container starts as a non-root user
+        env:
+          EXPECTED_VERSION: ci-${{ github.sha }}
+        run: |
+          MESH_TOKEN_SECRET_HEX=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+          export MESH_TOKEN_SECRET_HEX
+          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e MESH_TOKEN_SECRET_HEX -e MESH_DB=/data/test.db -e MESH_ADDR=:8080 -p 127.0.0.1::8080 "mesh:ci-$GITHUB_RUN_ID")
+          trap 'docker logs "$container"; docker rm -f "$container"' EXIT
+          test "$(docker inspect --format '{{.Config.User}}' "$container")" = '65532:65532'
+          port=$(docker port "$container" 8080/tcp)
+          export CONTAINER_URL="http://$port"
+          python3 - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.error
+          import urllib.request
+
+          base = os.environ['CONTAINER_URL']
+          for attempt in range(60):
+              try:
+                  with urllib.request.urlopen(base + '/readyz', timeout=2) as response:
+                      if response.status == 200:
+                          break
+              except (urllib.error.URLError, TimeoutError):
+                  pass
+              time.sleep(1)
+          else:
+              raise SystemExit('container did not become ready')
+          with urllib.request.urlopen(base + '/api/v1/node', timeout=2) as response:
+              node = json.load(response)
+          assert node['build_version'] == os.environ['EXPECTED_VERSION'], node
+          PY
+
+      - name: Scan image
+        uses: https://github.com/aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: mesh:ci-${{ github.run_id }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: '1'
+          ignore-unfixed: false
+          limit-severities-for-sarif: true
+      - name: Preserve the scan report
+        if: always()
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: trivy-sarif
+          path: trivy-results.sarif
+          if-no-files-found: error
+      - name: Remove the job image
+        if: always()
+        run: docker image rm "mesh:ci-$GITHUB_RUN_ID"
+
+  govulncheck:
+    runs-on: build-ubuntu24.04
+    strategy:
+      matrix:
+        cgo: ['0', '1']
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Build native cryptography for the production scan
+        if: matrix.cgo == '1'
+        uses: ./.gitea/actions/liboqs
+
+      - name: Install the pinned vulnerability scanner
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: '-mod=mod'
+        run: |
+          GOBIN="$RUNNER_TEMP" go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan the generated application packages
+        env:
+          CGO_ENABLED: ${{ matrix.cgo }}
+          GOFLAGS: "-mod=mod"
+          CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
+          CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
+        run: |
+          test -s server.zi.go
+          test -s google_play_reconciliation.zi.go
+          govulncheck -scan=package . ./native
+
+  source-security:
+    runs-on: build-ubuntu24.04
+    steps:
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Build the vendored liboqs
+        uses: ./.gitea/actions/liboqs
+
+      - name: Install pinned source and license scanners
+        env:
+          CGO_ENABLED: '0'
+          GOFLAGS: '-mod=mod'
+        run: |
+          export GOBIN="$RUNNER_TEMP"
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          go install github.com/google/go-licenses/v2@v2.0.1
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+      - name: Scan generated Go and check dependency licenses
+        env:
+          CGO_ENABLED: '1'
+          GOFLAGS: '-mod=mod'
+          CGO_CFLAGS: '-I${{ github.workspace }}/build/liboqs/install/include'
+          CGO_LDFLAGS: '-L${{ github.workspace }}/build/liboqs/install/lib -loqs'
+        run: |
+          gosec -quiet -severity high -confidence high -fmt=sarif -out gosec.sarif . ./native
+          GOROOT="$(go env GOROOT)" go-licenses check --ignore mesh . ./native
+      - name: Preserve the source scan report
+        if: always()
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gosec-sarif
+          path: gosec.sarif
+          if-no-files-found: error
+
+  deploy:
+    needs: [build-policy, lint, test, container, govulncheck, source-security]
+    if: >-
+      github.server_url == 'https://git.waozi.xyz' &&
+      github.repository == 'ziranlang/mesh' && github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      vars.MESH_DEPLOY_READY == 'true' && vars.MESH_DEPLOY_RUNNER != ''
+    runs-on: ${{ vars.MESH_DEPLOY_RUNNER || 'build-ubuntu24.04' }}
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Verify canonical deployment context
+        run: |
+          test "$GITHUB_SERVER_URL" = https://git.waozi.xyz
+          test "$GITHUB_REPOSITORY" = ziranlang/mesh
+          test "$GITHUB_REF" = refs/heads/master
+          case "$GITHUB_EVENT_NAME" in push|workflow_dispatch) ;; *) exit 1 ;; esac
+      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: Generate the Go from the Zi sources
+        uses: ./.gitea/actions/generate
+
+      - name: Verify the pinned native source
+        id: liboqs
+        run: python3 -B scripts/verify_deployment_inputs.py pinned-source
+
+      - name: Package the exact canonical revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(git ls-remote --exit-code origin refs/heads/master | cut -f1)" = "$GITHUB_SHA"
+          git ls-files -z --recurse-submodules > "$RUNNER_TEMP/mesh-source-files"
+          find . -maxdepth 1 -type f \( -name '*.zi.go' -o -name '*.zi_test.go' \) \
+            -print0 >> "$RUNNER_TEMP/mesh-source-files"
+          tar --null --no-recursion --files-from="$RUNNER_TEMP/mesh-source-files" \
+            --create --gzip --file="$RUNNER_TEMP/mesh-source.tar.gz"
+
+      - name: Publish the source artifact for this attempt
+        id: origin-artifact
+        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mesh-origin-source-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/mesh-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+      - name: Configure SSH
+        env:
+          MESH_SSH_KEY: ${{ secrets.MESH_SSH_KEY }}
+          MESH_SSH_HOST: ${{ secrets.MESH_HOST }}
+          MESH_SSH_HOST_KEY: ${{ secrets.MESH_SSH_HOST_KEY }}
+          MESH_SSH_USER: ${{ secrets.MESH_USER }}
+        run: |
+          : "${MESH_SSH_KEY:?Missing Mesh origin identity}"
+          : "${MESH_SSH_HOST:?Missing Mesh origin host}"
+          : "${MESH_SSH_HOST_KEY:?Missing Mesh origin host key}"
+          : "${MESH_SSH_USER:?Missing Mesh origin account}"
+          umask 077
+          ssh_dir=$(mktemp -d /dev/shm/mesh-deploy-ssh.XXXXXXXX)
+          printf 'MESH_SSH_DIR=%s\n' "$ssh_dir" >> "$GITHUB_ENV"
+          printf '%s\n' "$MESH_SSH_KEY" > "$ssh_dir/id_ed25519"
+          python3 -B scripts/verify_deployment_inputs.py configure-ssh \
+            --host "$MESH_SSH_HOST" --user "$MESH_SSH_USER" \
+            --trusted-key "$MESH_SSH_HOST_KEY" --ssh-dir "$ssh_dir"
+
+      - name: Deploy the verified Gitea artifact
+        env:
+          GITEA_JOB_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          EXPECTED_LIBOQS_COMMIT: ${{ steps.liboqs.outputs.liboqs_commit }}
+          EXPECTED_LIBOQS_DIGEST: ${{ steps.liboqs.outputs.liboqs_digest }}
+          EXPECTED_LIBOQS_ENTRIES: ${{ steps.liboqs.outputs.liboqs_entries }}
+          ARTIFACT_ID: ${{ steps.origin-artifact.outputs.artifact-id }}
+        run: |
+          : "${GITEA_JOB_TOKEN:?Missing short-lived Gitea job identity}"
+          : "${ARTIFACT_ID:?Missing Gitea artifact ID}"
+          printf '%s' "$GITEA_JOB_TOKEN" | ssh -F "$MESH_SSH_DIR/config" mesh-origin \
+            deploy "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA" \
+            "$EXPECTED_LIBOQS_COMMIT" "$EXPECTED_LIBOQS_DIGEST" "$EXPECTED_LIBOQS_ENTRIES" "$ARTIFACT_ID"
+
+      - name: Remove the job's SSH credentials
+        if: always()
+        run: |
+          if [ -n "${MESH_SSH_DIR:-}" ]; then
+            rm -rf -- "$MESH_SSH_DIR"
+          fi

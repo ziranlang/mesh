@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Check the Gitea deployment graph, pinned inputs, and runner shell scripts."""
+
+from pathlib import Path
+import re
+import subprocess
+import unittest
+
+import yaml
+
+from verify_build_inputs import EXPECTED_GOLANGCI_LINT_SHA256, EXPECTED_GOLANGCI_LINT_VERSION
+
+
+ROOT = Path(__file__).resolve().parents[1]
+WORKFLOW = ROOT / ".gitea/workflows/ci.yml"
+ACTION_REF = re.compile(r"^https://(?:github\.com|git\.waozi\.xyz)/[\w./-]+@[a-f0-9]{40}$")
+REQUIRED_JOBS = {
+    "build-policy", "lint", "test", "container", "govulncheck", "source-security",
+}
+
+
+def read_yaml(path):
+    return yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+
+
+class GiteaWorkflowTest(unittest.TestCase):
+    def setUp(self):
+        self.workflow = read_yaml(WORKFLOW)
+        self.jobs = self.workflow["jobs"]
+
+    def test_canonical_deploy_requires_every_gate(self):
+        self.assertEqual(self.workflow["on"]["push"]["branches"], ["master"])
+        self.assertEqual(set(self.workflow["on"]), {"push", "workflow_dispatch", "schedule"})
+        self.assertEqual(self.workflow["permissions"], {"contents": "read"})
+        deploy = self.jobs["deploy"]
+        self.assertEqual(set(deploy["needs"]), REQUIRED_JOBS)
+        self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy"})
+        for guard in (
+            "github.server_url == 'https://git.waozi.xyz'",
+            "github.repository == 'ziranlang/mesh'",
+            "github.ref == 'refs/heads/master'",
+            "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')",
+            "vars.MESH_DEPLOY_READY == 'true'",
+            "vars.MESH_DEPLOY_RUNNER != ''",
+        ):
+            self.assertIn(guard, deploy["if"])
+        self.assertNotIn("environment", deploy)
+        self.assertEqual(deploy["permissions"], {"contents": "read", "actions": "read"})
+        self.assertEqual(self.workflow["concurrency"]["cancel-in-progress"], "false")
+        self.assertEqual(set(read_yaml(ROOT / ".github/workflows/deploy.yml")["on"]), {"workflow_dispatch"})
+        for filename in ("ci.yml", "security.yml"):
+            self.assertEqual(set(read_yaml(ROOT / ".github/workflows" / filename)["on"]), {"workflow_call"})
+
+    def test_pinned_actions_and_job_shell_syntax(self):
+        step_groups = [job["steps"] for job in self.jobs.values()]
+        for action_file in (ROOT / ".gitea/actions").glob("*/action.yml"):
+            step_groups.append(read_yaml(action_file)["runs"]["steps"])
+        for steps in step_groups:
+            for step in steps:
+                action = step.get("uses")
+                if action and not action.startswith("./"):
+                    self.assertRegex(action, ACTION_REF)
+                if "actions/checkout@" in (action or ""):
+                    self.assertEqual(step["with"]["persist-credentials"], "false")
+                    self.assertEqual(step["with"]["submodules"], "recursive")
+                if "run" in step:
+                    with self.subTest(step=step.get("name")):
+                        bash = re.sub(r"\$\{\{.*?\}\}", "0" * 40, step["run"])
+                        subprocess.run(["bash", "-n"], text=True, input=bash, check=True)
+        container = self.jobs["container"]["steps"]
+        build = next(step for step in container if step.get("name") == "Build container image")
+        scan = next(step for step in container if step.get("name") == "Scan image")
+        self.assertIn('mesh:ci-$GITHUB_RUN_ID', build["run"])
+        self.assertEqual(scan["with"]["image-ref"], "mesh:ci-${{ github.run_id }}")
+        self.assertEqual(scan["with"]["exit-code"], "1")
+        self.assertEqual(scan["with"]["severity"], "CRITICAL,HIGH")
+        source = WORKFLOW.read_text()
+        for job_id in REQUIRED_JOBS:
+            self.assertNotRegex(str(self.jobs[job_id]), r"\$\{\{\s*secrets\.")
+        self.assertNotIn("ssh-keyscan", source)
+        self.assertNotIn("~/.ssh", source)
+        deploy = self.jobs["deploy"]
+        origin = next(step for step in deploy["steps"] if step.get("name") == "Deploy the verified Gitea artifact")
+        self.assertIn("printf '%s' \"$GITEA_JOB_TOKEN\" | ssh", origin["run"])
+        self.assertIn('deploy "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$GITHUB_SHA"', origin["run"])
+        self.assertNotIn("/opt/mesh-src", source)
+
+    def test_linter_pins_and_checksum_are_retained(self):
+        step = next(item for item in self.jobs["lint"]["steps"] if item.get("name") == "Install golangci-lint")
+        self.assertEqual(step["env"], {
+            "GOLANGCI_LINT_VERSION": EXPECTED_GOLANGCI_LINT_VERSION,
+            "GOLANGCI_LINT_SHA256": EXPECTED_GOLANGCI_LINT_SHA256,
+        })
+        self.assertIn("sha256sum --check --strict", step["run"])
+        self.assertLess(step["run"].index("sha256sum"), step["run"].index("tar --extract"))
+
+
+if __name__ == "__main__":
+    unittest.main()

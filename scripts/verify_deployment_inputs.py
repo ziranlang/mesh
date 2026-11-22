@@ -340,6 +340,9 @@ def configure_ssh(host, user, trusted_lines, ssh_directory):
     validate_user_name(user)
     known_host_entries(host, trusted_lines)
 
+    ssh_directory = ssh_directory.absolute()
+    if any(character in str(ssh_directory) for character in '"\\%$\r\n'):
+        raise VerificationError("invalid deployment SSH directory")
     ssh_directory.mkdir(parents=True, mode=0o700, exist_ok=True)
     ssh_directory.chmod(0o700)
     known_hosts = ssh_directory / "known_hosts"
@@ -349,10 +352,10 @@ def configure_ssh(host, user, trusted_lines, ssh_directory):
             "Host mesh-origin",
             f"  HostName {host}",
             f"  User {user}",
-            "  IdentityFile ~/.ssh/id_ed25519",
+            f'  IdentityFile "{ssh_directory / "id_ed25519"}"',
             "  IdentitiesOnly yes",
             "  StrictHostKeyChecking yes",
-            "  UserKnownHostsFile ~/.ssh/known_hosts",
+            f'  UserKnownHostsFile "{known_hosts}"',
             "  GlobalKnownHostsFile /dev/null",
             "  BatchMode yes",
             "",
