@@ -216,8 +216,38 @@ def record_native_build(source_directory, build_directory, artifact, cmake, cmak
     return identity
 
 
+def source_tree_digest(directory):
+    """Digest of every C source and header's relative path and bytes, in a stable order."""
+    digest = sha256()
+    files = sorted(path for path in directory.rglob("*") if path.is_file() and path.suffix in (".c", ".h"))
+    for path in files:
+        digest.update(str(path.relative_to(directory)).encode() + b"\0")
+        digest.update(sha256(path.read_bytes()).digest())
+    return digest.hexdigest(), len(files)
+
+
+def toolchain_provenance(output, toolchain, sources):
+    if toolchain == "c":
+        if sources is None or not sources.is_dir():
+            raise VerificationError("native release sources are required")
+        compiler = run_command(["cc", "--version"], "cannot identify the C compiler")
+        digest, count = source_tree_digest(sources)
+        return "c", {"compiler": compiler.splitlines()[0], "sources_sha256": digest, "sources": count}
+    go_version = run_command(["go", "version"], "cannot identify the Go compiler")
+    go_version_m = run_command(
+        ["go", "version", "-m", str(output)], "cannot inspect the Go build"
+    )
+    return "go", {
+        "version": go_version,
+        "version_m": go_version_m,
+        "cgo_cflags": os.environ.get("CGO_CFLAGS", ""),
+        "cgo_ldflags": os.environ.get("CGO_LDFLAGS", ""),
+        "goflags": os.environ.get("GOFLAGS", ""),
+    }
+
+
 def record_artifact_manifest(
-    output, manifest, source_commit, liboqs_commit, native_metadata
+    output, manifest, source_commit, liboqs_commit, native_metadata, toolchain="go", sources=None
 ):
     if not output.is_file():
         raise VerificationError(f"artifact does not exist: {output}")
@@ -232,10 +262,7 @@ def record_artifact_manifest(
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise VerificationError(f"invalid native build metadata: {error}") from error
 
-    go_version = run_command(["go", "version"], "cannot identify the Go compiler")
-    go_version_m = run_command(
-        ["go", "version", "-m", str(output)], "cannot inspect the Go build"
-    )
+    toolchain_name, toolchain_record = toolchain_provenance(output, toolchain, sources)
     artifact_bytes = output.read_bytes()
     repository = Path(__file__).resolve().parents[1]
     source_inputs = {}
@@ -250,13 +277,7 @@ def record_artifact_manifest(
         "liboqs_source": native["identity"]["source"],
         "source_inputs": source_inputs,
         "native_build": native,
-        "go": {
-            "version": go_version,
-            "version_m": go_version_m,
-            "cgo_cflags": os.environ.get("CGO_CFLAGS", ""),
-            "cgo_ldflags": os.environ.get("CGO_LDFLAGS", ""),
-            "goflags": os.environ.get("GOFLAGS", ""),
-        },
+        toolchain_name: toolchain_record,
         "artifact": {
             "path": output.name,
             "sha256": sha256(artifact_bytes).hexdigest(),
@@ -406,6 +427,8 @@ def main():
     artifact.add_argument("--source-commit", required=True)
     artifact.add_argument("--liboqs-commit", required=True)
     artifact.add_argument("--native-metadata", required=True, type=Path)
+    artifact.add_argument("--toolchain", choices=("go", "c"), default="go")
+    artifact.add_argument("--sources", type=Path)
 
     verify_artifact = commands.add_parser("verify-artifact-manifest")
     verify_artifact.add_argument("--output", required=True, type=Path)
@@ -468,6 +491,8 @@ def main():
                 arguments.source_commit,
                 arguments.liboqs_commit,
                 arguments.native_metadata,
+                arguments.toolchain,
+                arguments.sources,
             )
             print(json.dumps(provenance["artifact"], sort_keys=True))
         elif arguments.command == "verify-artifact-manifest":

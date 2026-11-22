@@ -22,16 +22,27 @@ suite under `tests/_go` is Go.
      Monero monitor parity noted in `referral_monero.zi:108-110`.
    - `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
 2. The generated C in the native build folder includes only libc and compiler
-   headers. `ziran_exe_main.c` is the executable entry. CI builds and tests the
-   native server, then adds that generated C to the deploy artifact. The origin
-   compiles it with `cc` and links its system libraries. The Ziran toolchain
-   stays off the origin.
-3. The origin (Debian 13) lacks libmicrohttpd and links SQLite from the system.
-   Add the libmicrohttpd runtime package and confirm the system SQLite against
-   the native SQLite suite.
-4. The origin installs the native binary beside the Go binary. One command
-   switches `mesh.service` back to the Go binary. Keep the Go build until native
-   has run in production without problems.
+   headers. `ziran_exe_main.c` is the executable entry. CI already runs the
+   native suite against `make sqlite-native` (SQLite 3.53.4 from the locked
+   source) and `make microhttpd-native` (Debian 1.0.1-4, pinned by sha256).
+   Add `native-release`: copy the generated `*.c`/`*.h` and the SQLite
+   amalgamation into `build/native-release`, which the deploy job adds to the
+   artifact. Add `build-native` for the origin: per-file `cc -O3 -Wno-psabi
+   -pthread` objects plus static SQLite and liboqs, linked with
+   `-l:libmicrohttpd.so.12 -l:libcrypto.so.3 -l:libcurl.so.4 -l:libzstd.so.1
+   -l:libz.so.1 -l:libpcre2-8.so.0`. The Ziran toolchain stays off the origin.
+3. The origin (Debian 13) needs the `libmicrohttpd12t64` 1.0.1-4 runtime
+   package installed. That is the only new host package.
+4. `install.sh` keeps the Go binary at `/opt/mesh/mesh` (its `dew-ratio` and
+   `rescale-dew` commands and `apply-dew-ratio.sh` use it) and installs
+   `/opt/mesh/mesh-native` with its manifest. The drop-in
+   `mesh.service.d/30-runtime.conf` (`ExecStart=` then
+   `ExecStart=/opt/mesh/mesh-native`) selects native. `rollback.sh` restores
+   the previous drop-in state. Manual rollback to Go: remove that drop-in,
+   `systemctl daemon-reload`, `systemctl restart mesh.service`. The origin
+   gateway (`deploy/gitea-origin.py`, installed at
+   `/usr/local/libexec/mesh-gitea-deploy`) also runs `make build-native` and
+   verifies its manifest.
 5. Verify the public `build_version`, `/readyz` and authenticated account and
    sync routes on the native binary.
 

@@ -194,6 +194,41 @@ test-ziran-native-google-play: liboqs
 		python3 -B tests/native/check_google_play.py $(BUILD_DIR)/native-tests/google-play/google_play \
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
 
+# The generated C of the native server and the SQLite amalgamation, which the
+# deploy artifact carries so the origin builds without the Ziran toolchain.
+NATIVE_RELEASE_DIR := $(BUILD_DIR)/native-release
+native-release: sqlite-native microhttpd-native
+	$(MAKE) -f Makefile build-ziran-native-server SQLITE_NATIVE_DIR="$(abspath $(SQLITE_LOCKED_DIR))" \
+		MICROHTTPD_NATIVE_DIR="$(abspath $(MICROHTTPD_ROOT))/root/usr/lib/x86_64-linux-gnu"
+	rm -rf "$(NATIVE_RELEASE_DIR)"
+	mkdir -p "$(NATIVE_RELEASE_DIR)/server"
+	cp "$(NATIVE_SERVER_BUILD_DIR)"/*.c "$(NATIVE_SERVER_BUILD_DIR)"/*.h "$(NATIVE_RELEASE_DIR)/server/"
+	cp "$(SQLITE_BUILD_DIR)/sqlite3.c" "$(NATIVE_RELEASE_DIR)/sqlite3.c"
+
+# Builds the native server from build/native-release with cc and the origin's
+# runtime libraries. SQLite and liboqs link statically.
+NATIVE_RELEASE_SOURCES := $(wildcard $(NATIVE_RELEASE_DIR)/server/*.c)
+NATIVE_RELEASE_OBJECTS := $(NATIVE_RELEASE_SOURCES:.c=.o)
+NATIVE_RELEASE_LIBS := -l:libmicrohttpd.so.12 -loqs -l:libcrypto.so.3 -l:libcurl.so.4 -l:libzstd.so.1 \
+	-l:libz.so.1 -l:libpcre2-8.so.0 -lm -ldl -pthread
+NATIVE_DEPLOYMENT_MANIFEST := $(BUILD_DIR)/mesh-native.manifest.json
+
+$(NATIVE_RELEASE_DIR)/server/%.o: $(NATIVE_RELEASE_DIR)/server/%.c
+	$(CC) -O3 -Wno-psabi -pthread -I$(NATIVE_RELEASE_DIR)/server -c $< -o $@
+
+$(NATIVE_RELEASE_DIR)/sqlite3.o: $(NATIVE_RELEASE_DIR)/sqlite3.c
+	$(CC) -O2 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 -c $< -o $@
+
+build-native: liboqs $(NATIVE_RELEASE_OBJECTS) $(NATIVE_RELEASE_DIR)/sqlite3.o
+	test -n "$(NATIVE_RELEASE_OBJECTS)"
+	$(CC) $(LDFLAGS) $(NATIVE_RELEASE_OBJECTS) $(NATIVE_RELEASE_DIR)/sqlite3.o \
+		-L$(abspath $(LIBOQS_PREFIX))/lib $(NATIVE_RELEASE_LIBS) -o mesh-native
+	python3 -B scripts/verify_deployment_inputs.py record-artifact-manifest \
+		--output mesh-native --manifest "$(NATIVE_DEPLOYMENT_MANIFEST)" \
+		--source-commit "$(SOURCE_COMMIT)" --liboqs-commit "$(LIBOQS_COMMIT)" \
+		--native-metadata "$(LIBOQS_BUILD_DIR)/.mesh-native-build.json" \
+		--toolchain c --sources "$(NATIVE_RELEASE_DIR)"
+
 # Load generated protocol types before SQL macros with matching field names.
 build-ziran-native-embedded: liboqs
 	mkdir -p "$(NATIVE_EMBEDDED_BUILD_DIR)"

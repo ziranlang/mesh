@@ -182,6 +182,31 @@ class DeploymentInputTest(unittest.TestCase):
                     output, manifest, "a" * 40, "b" * 40
                 )
 
+    def test_native_server_manifest_records_the_compiled_sources(self):
+        with tempfile.TemporaryDirectory(prefix="native-manifest-", dir="build") as temporary:
+            build = Path(temporary)
+            sources = build / "native-release"
+            (sources / "server").mkdir(parents=True)
+            (sources / "server" / "entry.c").write_bytes(b"int main(void) { return 0; }\n")
+            native_metadata = build / "native.json"
+            native_metadata.write_text(json.dumps(deployment_inputs.native_build_identity(
+                Path("vendor/liboqs"), "cmake", "-DOQS_MINIMAL_BUILD=SIG_ml_dsa_44")))
+            output = build / "mesh-native"
+            output.write_bytes(b"native server")
+            manifest = build / "manifest.json"
+            with mock.patch.object(deployment_inputs, "run_command", return_value="cc (Debian 14.2.0-19) 14.2.0\nCopyright"):
+                provenance = deployment_inputs.record_artifact_manifest(
+                    output, manifest, "a" * 40, "b" * 40, native_metadata, "c", sources)
+            self.assertNotIn("go", provenance)
+            self.assertEqual(provenance["c"]["compiler"], "cc (Debian 14.2.0-19) 14.2.0")
+            self.assertEqual(provenance["c"]["sources"], 1)
+            first = provenance["c"]["sources_sha256"]
+            (sources / "server" / "entry.c").write_bytes(b"int main(void) { return 1; }\n")
+            self.assertNotEqual(deployment_inputs.source_tree_digest(sources)[0], first)
+            deployment_inputs.verify_artifact_manifest(output, manifest, "a" * 40, "b" * 40)
+            with self.assertRaisesRegex(deployment_inputs.VerificationError, "release sources are required"):
+                deployment_inputs.record_artifact_manifest(output, manifest, "a" * 40, "b" * 40, native_metadata, "c")
+
     def test_native_cleanup_rejects_unsafe_paths(self):
         with self.assertRaisesRegex(
             deployment_inputs.VerificationError,
