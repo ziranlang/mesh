@@ -75,6 +75,14 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(len(scans), 2)
         script_tests = re.findall(r"python3 -B (scripts/test_\w+\.py)", "\n".join(runs))
         self.assertEqual(len(script_tests), len(set(script_tests)))
+        setup_go = next(step for step in steps if "actions/setup-go@" in (step.get("uses") or ""))
+        self.assertEqual(setup_go["with"]["cache"], "false")
+
+    def test_generated_go_reuses_the_runner_package_cache(self):
+        steps = read_yaml(ROOT / ".gitea/actions/generate/action.yml")["runs"]["steps"]
+        generate = next(step for step in steps if step.get("name") == "Generate the Go")
+        self.assertNotIn("XDG_CACHE_HOME", generate.get("env", {}))
+        self.assertNotIn("runner.temp", str(generate))
 
     def test_pinned_actions_and_job_shell_syntax(self):
         step_groups = [job["steps"] for job in self.jobs.values()]

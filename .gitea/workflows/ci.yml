@@ -53,10 +53,12 @@ jobs:
           python3 -B scripts/test_deployment_inputs.py
           python3 -B scripts/test_deploy_install.py
 
+      # The host runner keeps the Go build and module caches. Its job cache
+      # server is unreachable, and a restore waits out a timeout of minutes.
       - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Generate the Go from the Zi sources
         uses: ./.gitea/actions/generate

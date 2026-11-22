@@ -9,11 +9,10 @@ runs:
       uses: https://git.waozi.xyz/ziranlang/ziran/.github/actions/setup@4135e07fae33bcd0c00dd66b5716fdfe19c1fca5
       with:
         path: .ziran
-    # Packages the build fetches stay outside the checkout, where go ./...
-    # would compile their files.
+    # Fetched packages stay in the host runner's own cache between jobs. It
+    # is outside the checkout, where go ./... would compile their files.
     - name: Generate the Go
       shell: bash
       env:
-        XDG_CACHE_HOME: ${{ runner.temp }}/ziran-cache
         ZIRAN: ${{ steps.ziran.outputs.ziran }}
       run: make generate ZIRAN="$ZIRAN"
