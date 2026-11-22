@@ -145,7 +145,7 @@ jobs:
           CGO_CFLAGS: '-I${{ github.workspace }}/build/liboqs/install/include'
           CGO_LDFLAGS: '-L${{ github.workspace }}/build/liboqs/install/lib -loqs'
         run: |
-          gosec -quiet -severity high -confidence high -fmt=sarif -out gosec.sarif . ./native
+          gosec -severity high -confidence high -fmt=sarif -out gosec.sarif . ./native
           GOROOT="$(go env GOROOT)" go-licenses check --ignore mesh . ./native
       - name: Preserve the source scan report
         if: always()

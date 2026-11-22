@@ -75,6 +75,10 @@ class GiteaWorkflowTest(unittest.TestCase):
             self.assertIn(name, [step.get("name") for step in steps])
         scans = [run for run in runs if "govulncheck -scan=package . ./native" in run]
         self.assertEqual(len(scans), 2)
+        # gosec with -quiet writes no report when it finds nothing, and the upload requires one.
+        scan = next(step for step in steps if step.get("name") == "Scan generated Go and check dependency licenses")
+        self.assertIn("-fmt=sarif -out gosec.sarif", scan["run"])
+        self.assertNotIn("-quiet", scan["run"])
         script_tests = re.findall(r"python3 -B (scripts/test_\w+\.py)", "\n".join(runs))
         self.assertEqual(len(script_tests), len(set(script_tests)))
         setup_go = next(step for step in steps if "actions/setup-go@" in (step.get("uses") or ""))
