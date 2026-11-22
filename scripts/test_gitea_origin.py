@@ -22,7 +22,8 @@ class OriginPolicyTest(unittest.TestCase):
         self.run = {'id': 42, 'run_attempt': 3, 'head_sha': self.revision, 'head_branch': 'master',
                     'path': 'ci.yml@refs/heads/master', 'event': 'push', 'status': 'in_progress'}
         self.jobs = {'jobs': [{'name': job, 'status': 'completed', 'conclusion': 'success'}
-                              for job in origin.REQUIRED_JOBS] + [{'name': 'deploy', 'status': 'in_progress'}]}
+                              for job in ('build-policy', 'lint', 'test', 'container',
+                                          'govulncheck (0)', 'govulncheck (1)', 'source-security')] + [{'name': 'deploy', 'status': 'in_progress'}]}
         self.artifacts = {'artifacts': [{'id': 88, 'name': 'mesh-origin-source-3', 'expired': False,
                                         'size_in_bytes': 1593}]}
 
@@ -51,6 +52,15 @@ class OriginPolicyTest(unittest.TestCase):
                         self.verify()
                 finally:
                     target[field] = old
+
+    def test_both_gitea_matrix_jobs_must_pass(self):
+        for name in ('govulncheck (0)', 'govulncheck (1)'):
+            with self.subTest(job=name):
+                job = next(item for item in self.jobs['jobs'] if item['name'] == name)
+                job['conclusion'] = 'failure'
+                with self.assertRaises(origin.DeployError):
+                    self.verify()
+                job['conclusion'] = 'success'
 
     def test_forced_command_grammar(self):
         command = f'deploy 42 3 {self.revision} {"4" * 40} {"5" * 64} 6667 88'
