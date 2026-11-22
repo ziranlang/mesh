@@ -124,6 +124,11 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(scan["with"]["image-ref"], "mesh:ci-${{ github.run_id }}")
         self.assertEqual(scan["with"]["exit-code"], "1")
         self.assertEqual(scan["with"]["severity"], "CRITICAL,HIGH")
+        self.assertEqual(scan["with"]["skip-setup-trivy"], "true")
+        install = next(step for step in container if step.get("name") == "Install the pinned image scanner")
+        self.assertLess(container.index(install), container.index(scan))
+        self.assertRegex(install["env"]["TRIVY_SHA256"], r"^[0-9a-f]{64}$")
+        self.assertLess(install["run"].index("sha256sum --check --strict"), install["run"].index("tar --extract"))
         source = WORKFLOW.read_text()
         for job_id in REQUIRED_JOBS:
             self.assertNotRegex(str(self.jobs[job_id]), r"\$\{\{\s*secrets\.")
