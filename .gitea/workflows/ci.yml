@@ -101,14 +101,15 @@ jobs:
           CGO_CFLAGS: "-I${{ github.workspace }}/build/liboqs/install/include"
           CGO_LDFLAGS: "-L${{ github.workspace }}/build/liboqs/install/lib -loqs"
 
-      # One run reports coverage and is the plain test gate.
+      # One run reports coverage and is the plain test gate. The package takes
+      # close to go test's default 10 minute limit on a slow slot, under -race too.
       - name: Test and report coverage
         run: |
-          make test TEST_FLAGS="-coverprofile=coverage.out"
+          make test TEST_FLAGS="-coverprofile=coverage.out -timeout=30m"
           GOFLAGS=-mod=mod go tool cover -func=coverage.out | tail -1
 
       - name: Race test
-        run: make test GOFLAGS="-mod=mod -race"
+        run: make test GOFLAGS="-mod=mod -race" TEST_FLAGS="-timeout=30m"
 
       - name: Install pinned vulnerability, source and license scanners
         env:

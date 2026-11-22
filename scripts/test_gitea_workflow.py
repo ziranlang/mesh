@@ -69,6 +69,9 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(len(plain_tests), 1)
         self.assertIn("-coverprofile=coverage.out", plain_tests[0])
         self.assertEqual(sum("-race" in run for run in runs), 1)
+        for run in runs:
+            if re.search(r"make test(\s|$)", run):
+                self.assertIn("-timeout=30m", run)
         coverage = next(step for step in steps if step.get("name") == "Test and report coverage")
         self.assertIn("GOFLAGS=-mod=mod go tool cover", coverage["run"])
         for name in ("Lint", "Race test", "Scan generated Go and check dependency licenses"):
