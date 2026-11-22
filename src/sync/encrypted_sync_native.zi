@@ -222,10 +222,11 @@
                 return failure
             }
         }
-        if !AttachPayloads(database, request, document, root) || !AttachMetadata(settings, document, root, request, auditTime, version.value) ||
-            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+        if !AttachPayloads(database, request, document, root) || !AttachMetadata(settings, document, root, request, auditTime, version.value) {
             return failure
         }
+        // Keep client tracking and audit logging inside the same SQLite WAL
+        // transaction instead of issuing 3 separate commits per sync.
         tracked: [7]sql.Argument = .[user[0], sql.TextArg(request.client), sql.TextArg(auditTime), sql.IntArg(request.since),
             sql.IntArg(version.value), sql.IntArg(protocol.LatestProtocol), sql.IntArg(version.value)]
         unused sql.Execute(database, clients.RecordSync, tracked[:])
@@ -233,6 +234,9 @@
             sql.IntArg(request.since), sql.IntArg(request.since), sql.IntArg(version.value), sql.TextArg(EmptyApplied), sql.IntArg(0),
             sql.IntArg(0), sql.TextArg(""), sql.IntArg(1), sql.IntArg(request.bytes.count)]
         unused sql.Execute(database, audit.InsertSyncAuditSQL, event[:])
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK {
+            return failure
+        }
         return .{serverVersion = version.value}
     }
 
@@ -287,31 +291,44 @@
         if size == 0 || !mutex.Lock(*service.databaseLock) {
             return replies.ErrorReply(connection, "POST", 500, "encrypted sync failed", zstd)
         }
-        defer mutex.Unlock(*service.databaseLock)
+        locked := true
+        defer { if locked { unused mutex.Unlock(*service.databaseLock) } }
         auditTime := TextView(buffer[:size])
         checked := auth.Authenticate(settings.database, connection, settings.secret, now.seconds, auditTime, false)
         if checked.status != 0 {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", checked.status, checked.message, zstd)
         }
         account := TextView(user[:])
         bucket: Vec(u8)
         if !BuilderAppend(bucket, "sync:user:") || !BuilderAppend(bucket, account) {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", 500, "encrypted sync failed", zstd)
         }
         if !rates.Allow(*service.limiter, TextView(VecSlice(bucket, 0, bucket.count)), 300, 60000, timer.MonotonicMilliseconds()) {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", 429, "rate limit exceeded", zstd)
         }
         request: Query = .{user = account, client = Alias(connection, "X-Mesh-Client", "X-Ksync-Client"), bytes = bytes, now = now}
         if request.client != "" && !identity.ValidClientID(request.client) {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Client", zstd)
         }
         request.since = DecimalHeader(Alias(connection, "X-Mesh-Since-Version", "X-Ksync-Since-Version"), 0)
         if request.since < 0 {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Since-Version", zstd)
         }
         limit := Alias(connection, "X-Mesh-Limit", "X-Ksync-Limit")
         request.limit = DecimalHeader(limit, settings.encryptedPayloadMaxReturn)
         if request.limit < 0 || (limit != "" && request.limit == 0) {
+            locked = false
+            unused mutex.Unlock(*service.databaseLock)
             return replies.ErrorReply(connection, "POST", 400, "invalid X-Mesh-Limit", zstd)
         }
         if settings.encryptedPayloadMaxReturn > 0 && request.limit > settings.encryptedPayloadMaxReturn {
@@ -320,6 +337,10 @@
         document: json.JsonDocument
         root := json.JsonNewObject(*document)
         result := Store(settings, request, auditTime, *document, root)
+        // Release databaseLock before WebSocket publish, JSON serialization,
+        // and Zstandard/gzip compression of the response body.
+        locked = false
+        unused mutex.Unlock(*service.databaseLock)
         if result.storageLimit > 0 {
             error: json.JsonDocument
             response := json.JsonNewObject(*error)
