@@ -33,6 +33,11 @@ Consume :: (database: *sql.Database, context: ctx.Context, nodeID: string, nonce
     if deleted.error != null {
         return deleted.error
     }
+    // The DELETE acquires SQLite's write lock. Recheck the deadline after any
+    // wait so a request cannot claim an expired nonce after its row is pruned.
+    if expiresAt < clock.Unix(clock.Now()) {
+        return errors.New("expired node authentication")
+    }
     inserted := Insert(transaction, context, schema.InsertNonceSQL, nodeID, nonce, expiresAt)
     if inserted.error != null {
         return errors.New("node request replayed")

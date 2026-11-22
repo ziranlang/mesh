@@ -611,6 +611,8 @@ CREATE TABLE IF NOT EXISTS server_authorization_nonces (
     expires_at INTEGER NOT NULL,
     PRIMARY KEY(grant_id,nonce)
 );
+CREATE INDEX IF NOT EXISTS server_authorization_nonces_expiry
+    ON server_authorization_nonces(expires_at);
 CREATE TABLE IF NOT EXISTS server_telegram_init_claims (
     digest TEXT PRIMARY KEY,
     request_id TEXT NOT NULL REFERENCES server_authorization_requests(request_id) ON DELETE CASCADE,

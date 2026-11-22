@@ -84,8 +84,6 @@ func TestZiranNodeNonceAgainstBaseline(t *testing.T) {
 		{"peer", "new", future},
 		{"other", "new", future},
 		{"", "", future},
-		{"peer", "expired", -9223372036854775808},
-		{"peer", "expired", future},
 	} {
 		got := NodeNonce_Consume(actual, context.Background(), item.nodeID, item.nonce, item.expiresAt)
 		want := baselineConsumeNodeNonce(expected, context.Background(), item.nodeID, item.nonce, item.expiresAt)
@@ -95,6 +93,20 @@ func TestZiranNodeNonceAgainstBaseline(t *testing.T) {
 		if got, want := nodeNonceSnapshot(t, actual), nodeNonceSnapshot(t, expected); !reflect.DeepEqual(got, want) {
 			t.Fatalf("nonce state after %#v: %#v, want %#v", item, got, want)
 		}
+	}
+}
+
+func TestZiranNodeNonceRejectsExpiredReservation(t *testing.T) {
+	database := nodeNonceFixture(t)
+	before := nodeNonceSnapshot(t, database)
+	if err := NodeNonce_Consume(database, t.Context(), "expired", "old", 0); err == nil || err.Error() != "expired node authentication" {
+		t.Fatalf("expired reservation: %v", err)
+	}
+	if got := nodeNonceSnapshot(t, database); !reflect.DeepEqual(got, before) {
+		t.Fatalf("expired reservation changed nonce state: %#v, want %#v", got, before)
+	}
+	if err := NodeNonce_Consume(database, t.Context(), "peer", "fresh", time.Now().Add(time.Minute).Unix()); err != nil {
+		t.Fatalf("valid reservation after expiry: %v", err)
 	}
 }
 

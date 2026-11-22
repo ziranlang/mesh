@@ -1,5 +1,6 @@
 #if TARGET == .C && OS == .LINUX {
     binary :: #import "binary_codec";
+    calendar :: #import "std/date_time_linux";
     keys :: #import "device_signature_native";
     identity :: #import "identity";
     json :: #import "std/json_document";
@@ -142,7 +143,16 @@
                 VecSlice(signature.value, 0, signature.value.count))
         }
         if problem != "" { return .{status = 401, error = problem} }
-        expire: [1]sql.Argument = .[sql.IntArg(now)]
+        // Verify the deadline again after obtaining the SQLite write lock.
+        milliseconds := calendar.UnixMilliseconds()
+        if milliseconds < 0 {
+            return .{status = 500, error = StoreFailure}
+        }
+        reservationTime := milliseconds / 1000
+        if timestamp + WindowSeconds < reservationTime {
+            return .{status = 401, error = "expired node authentication"}
+        }
+        expire: [1]sql.Argument = .[sql.IntArg(reservationTime)]
         insert: [3]sql.Argument = .[sql.TextArg(node), sql.TextArg(nonce), sql.IntArg(timestamp + WindowSeconds)]
         if sql.Execute(database, schema.ExpireNoncesSQL, expire[:]) != sqlite.SQLITE_OK { return .{status = 500, error = StoreFailure} }
         written := sql.Execute(database, schema.InsertNonceSQL, insert[:])

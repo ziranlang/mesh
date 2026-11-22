@@ -171,6 +171,99 @@ INSERT INTO server_mesh_changes(user_id_hash,collection,record_id,created_at) VA
 	}
 }
 
+const delegatedNonceTestSchema = `
+CREATE TABLE server_authorization_grants(grant_id TEXT PRIMARY KEY);
+CREATE TABLE server_authorization_nonces (
+    grant_id TEXT NOT NULL REFERENCES server_authorization_grants(grant_id) ON DELETE CASCADE,
+    nonce TEXT NOT NULL, expires_at INTEGER NOT NULL, PRIMARY KEY(grant_id,nonce)
+);
+INSERT INTO server_authorization_grants VALUES('fixture');`
+
+const delegatedNoncePrune = "DELETE FROM server_authorization_nonces WHERE expires_at<?1"
+
+func TestZiranStoreSchemaIndexesDelegatedNonceExpiryOnUpgrade(t *testing.T) {
+	store := schemaFixture(t, delegatedNonceTestSchema+
+		"INSERT INTO server_authorization_nonces VALUES('fixture','live',100),('fixture','expired',99);")
+	for range 2 {
+		if err := StoreSchema_Ensure(store.Database, t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var id, parent, unused int
+	var plan string
+	if err := store.Database.QueryRow("EXPLAIN QUERY PLAN "+delegatedNoncePrune, 100).Scan(&id, &parent, &unused, &plan); err != nil ||
+		!strings.Contains(plan, "server_authorization_nonces_expiry") {
+		t.Fatalf("nonce expiry index missing from query plan: %q, %v", plan, err)
+	}
+	var count int
+	if err := store.Database.QueryRow("SELECT count(*) FROM server_authorization_nonces").Scan(&count); err != nil || count != 2 {
+		t.Fatalf("upgrade changed replay rows: count=%d, %v", count, err)
+	}
+	if _, err := store.Database.Exec(delegatedNoncePrune, 100); err != nil {
+		t.Fatal(err)
+	}
+	var nonce string
+	if err := store.Database.QueryRow("SELECT nonce FROM server_authorization_nonces").Scan(&nonce); err != nil || nonce != "live" {
+		t.Fatalf("cleanup changed the expiry boundary: nonce=%q, %v", nonce, err)
+	}
+	if _, err := store.Database.Exec("INSERT INTO server_authorization_nonces VALUES('fixture','live',100)"); err == nil {
+		t.Fatal("upgraded store accepted a duplicate nonce")
+	}
+}
+
+func BenchmarkDelegatedNoncePrune(b *testing.B) {
+	for _, count := range []int{128, 32768} {
+		for _, indexed := range []bool{false, true} {
+			b.Run(fmt.Sprintf("active=%d/indexed=%t", count, indexed), func(b *testing.B) {
+				db, err := sql.Open("sqlite3", filepath.Join(b.TempDir(), "replay.db"))
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.Cleanup(func() { _ = db.Close() })
+				db.SetMaxOpenConns(1)
+				if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;" + delegatedNonceTestSchema); err != nil {
+					b.Fatal(err)
+				}
+				if err := StoreSchema_Ensure(db, b.Context()); err != nil {
+					b.Fatal(err)
+				}
+				if !indexed {
+					if _, err := db.Exec("DROP INDEX server_authorization_nonces_expiry"); err != nil {
+						b.Fatal(err)
+					}
+				}
+				if _, err := db.Exec(`
+WITH RECURSIVE ids(n) AS (VALUES(0) UNION ALL SELECT n+1 FROM ids WHERE n+1<?1)
+INSERT INTO server_authorization_nonces SELECT 'fixture', printf('%032x',n),100+(n%59) FROM ids`, count); err != nil {
+					b.Fatal(err)
+				}
+				const expiredRow = "INSERT INTO server_authorization_nonces VALUES('fixture','expiring',99)"
+				if _, err := db.Exec(expiredRow); err != nil {
+					b.Fatal(err)
+				}
+				for b.Loop() {
+					tx, err := db.BeginTx(b.Context(), nil)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if _, err := tx.Exec(delegatedNoncePrune, 100); err != nil {
+						_ = tx.Rollback()
+						b.Fatal(err)
+					}
+					// Keep one expiring row per iteration for a steady workload.
+					if _, err := tx.Exec(expiredRow); err != nil {
+						_ = tx.Rollback()
+						b.Fatal(err)
+					}
+					if err := tx.Commit(); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestZiranStoreSchemaMeditationFailureRollback(t *testing.T) {
 	setup := schemaLegacyUsers + `
 CREATE TABLE server_meditation_logs(id TEXT PRIMARY KEY,user_id_hash TEXT NOT NULL,session_id TEXT NOT NULL,duration_seconds INTEGER NOT NULL DEFAULT 0,completed_at TEXT NOT NULL,server_version INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);

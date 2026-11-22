@@ -190,6 +190,7 @@ CoreSchemaChecks :: () -> s32 {
     } else if !Exists(database, "SELECT COUNT(*)=1 FROM server_social_snapshots WHERE user_id_hash='legacy' AND kind='public' AND server_version=17") ||
         !Exists(database, "SELECT COUNT(*)=0 FROM sqlite_schema WHERE name='server_social_cache'") ||
         !Exists(database, "SELECT COUNT(*)=1 FROM server_storage_plans WHERE user_id='legacy' AND size='1gb'") ||
+        !Exists(database, "SELECT COUNT(*)=1 FROM pragma_index_info('server_authorization_nonces_expiry') WHERE name='expires_at'") ||
         !Exists(database, "SELECT COUNT(*)=1 FROM sqlite_schema WHERE name='server_state_hashes_forget_server_meditation_logs_insert'") {
         status = 12
     } else if sqlite.SqliteExecText(database, "DELETE FROM server_users WHERE user_id_hash='legacy'") != sqlite.SQLITE_OK ||

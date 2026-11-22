@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Recheck signed peer request expiry when reserving its nonce and speed up expired delegated nonce cleanup.
+
 - Refuse startup when an explicitly configured Ed25519 node identity is invalid or unreadable, preserving the persisted fallback identity.
 
 - Pin a Ziran toolchain that can generate Go from the multiline OpenAPI strings.
