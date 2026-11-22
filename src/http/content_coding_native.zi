@@ -54,6 +54,50 @@
         return -1
     }
 
+    #scope_file
+    libc :: #system_library "libc";
+    PoolLockRaw :: (storage: *void) -> s32 #foreign libc "pthread_mutex_lock";
+    PoolUnlockRaw :: (storage: *void) -> s32 #foreign libc "pthread_mutex_unlock";
+
+    ZstdPoolCapacity :: 8;
+    zstdPoolMutex: [8]u64;
+    zstdPool: [ZstdPoolCapacity]zstd.ZstdEncoder;
+    zstdPoolCount: s64 = 0;
+
+    AcquireZstdEncoder :: () -> zstd.ZstdEncoderOpen {
+        if PoolLockRaw(cast(*void)*zstdPoolMutex[0]) == 0 {
+            if zstdPoolCount > 0 {
+                zstdPoolCount -= 1
+                encoder := zstdPool[zstdPoolCount]
+                zstdPool[zstdPoolCount] = .{}
+                unused PoolUnlockRaw(cast(*void)*zstdPoolMutex[0])
+                if zstd.ZstdResetEncoder(*encoder) == .None {
+                    return .{encoder = encoder, problem = .None}
+                }
+                zstd.ZstdFreeEncoder(*encoder)
+            } else {
+                unused PoolUnlockRaw(cast(*void)*zstdPoolMutex[0])
+            }
+        }
+        return zstd.ZstdOpenEncoder(1, preferences.ResponseZstdWindowLog)
+    }
+
+    ReleaseZstdEncoder :: (encoder: *zstd.ZstdEncoder, ok: bool) {
+        if encoder == null || encoder.context == null { return }
+        if ok && PoolLockRaw(cast(*void)*zstdPoolMutex[0]) == 0 {
+            if zstdPoolCount < ZstdPoolCapacity {
+                zstdPool[zstdPoolCount] = encoder.*
+                zstdPoolCount += 1
+                encoder.* = .{}
+                unused PoolUnlockRaw(cast(*void)*zstdPoolMutex[0])
+                return
+            }
+            unused PoolUnlockRaw(cast(*void)*zstdPoolMutex[0])
+        }
+        zstd.ZstdFreeEncoder(encoder)
+    }
+
+    #scope_export
     Encode :: (encoding: string, input: []u8, output: []u8) -> s64 {
         if encoding == "gzip" {
             return gzip.GzipCompress(input, output, 1)
@@ -61,11 +105,12 @@
         if encoding != "zstd" {
             return -1
         }
-        state := zstd.ZstdOpenEncoder(1, preferences.ResponseZstdWindowLog)
+        state := AcquireZstdEncoder()
         if state.problem != .None {
             return -1
         }
-        defer zstd.ZstdFreeEncoder(*state.encoder)
+        ok := false
+        defer ReleaseZstdEncoder(*state.encoder, ok)
         wrote := zstd.ZstdWriteEncoder(*state.encoder, input, output)
         if wrote.problem != .None || !wrote.done {
             return -1
@@ -74,6 +119,7 @@
         if ended.problem != .None || !ended.done {
             return -1
         }
+        ok = true
         return wrote.written + ended.written
     }
 
