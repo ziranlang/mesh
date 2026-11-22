@@ -71,20 +71,28 @@ RawQuery :: (value: *url.URL) -> string #go_field #foreign native_url "(*URL).Ra
 Split :: (value: string, separator: string) -> []string #foreign strings;
 
 #scope_export
-ChallengeMessage :: (value: SessionChallenge) -> string {
-    fields: [7]string = .["daochi-session-v1", value.grantID, value.challenge,
+ChallengeMessageWithDomain :: (domain: string, value: SessionChallenge) -> string {
+    fields: [7]string = .[domain, value.grantID, value.challenge,
         value.nodeID, value.audience, FormatInteger(value.expiresAt, 10), ""]
     return Join(fields[:], "\n")
 }
 
-ProofMessage :: (proof: RequestProof) -> string {
-    fields: [18]string = .["daochi-delegate-request-v1", "1", proof.grantID,
+ChallengeMessage :: (value: SessionChallenge) -> string {
+    return ChallengeMessageWithDomain("mesh-session-v1", value)
+}
+
+ProofMessageWithDomain :: (domain: string, proof: RequestProof) -> string {
+    fields: [18]string = .[domain, "1", proof.grantID,
         proof.sessionID, proof.accountID, proof.appID, proof.clientID,
         proof.nodeID, proof.audience, proof.challenge, proof.method, proof.path,
         proof.query, proof.bodySHA256, FormatInteger(proof.expiresAt, 10),
         proof.nonce, "", ""]
     // A single trailing newline is part of the protocol fixture.
     return Join(fields[0:17], "\n")
+}
+
+ProofMessage :: (proof: RequestProof) -> string {
+    return ProofMessageWithDomain("mesh-delegate-request-v1", proof)
 }
 
 VerifyKeyProof :: (publicKey: string, message: string, signatureText: string) -> bool {
@@ -201,7 +209,9 @@ AuthenticateTx :: (transaction: *sql.Transaction, context: ctx.Context,
     grant := active.value
     if proof.accountID != grant.accountID || proof.appID != grant.appID ||
         proof.clientID != grant.clientID ||
-        !VerifyKeyProof(grant.signingKey, ProofMessage(proof), proof.signature) {
+        (!VerifyKeyProof(grant.signingKey, ProofMessage(proof), proof.signature) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                VerifyKeyProof(grant.signingKey, ProofMessageWithDomain("daochi-delegate-request-v1", proof), proof.signature))) {
         result.authentication = auth.Failure(401, "delegate signature rejected")
         return result
     }

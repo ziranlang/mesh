@@ -79,8 +79,10 @@ SafeCollection :: (appID: string, collection: string) -> bool {
         !(appID == "inbe" && HasPrefix(collection, "private.inbe.v1."))
 }
 
-GrantMessage :: (grant: Grant) -> string {
-    fields: [19]string = .["daochi-authorization-v1", "1", grant.accountID,
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
+
+GrantMessageWithDomain :: (domain: string, grant: Grant) -> string {
+    fields: [19]string = .[domain, "1", grant.accountID,
         grant.grantID, grant.requestID, grant.appID, grant.clientID, grant.nodeID,
         grant.audience, grant.signingKey, grant.encryptionKey,
         FormatInteger(grant.issuedAt, 10), FormatInteger(grant.notBefore, 10),
@@ -100,6 +102,10 @@ GrantMessage :: (grant: Grant) -> string {
         message = Join(fields[:], "")
     }
     return message
+}
+
+GrantMessage :: (grant: Grant) -> string {
+    return GrantMessageWithDomain("mesh-authorization-v1", grant)
 }
 
 ValidGrant :: (grant: Grant, nodeID: string, audience: string, now: s64) -> bool {
@@ -159,9 +165,12 @@ VerifyGrant :: (database: *sql.Database, context: ctx.Context, grant: Grant,
         return auth.NativeFailure(owner.error)
     }
     signature := codec.DecodeBinaryField(grant.signature)
+    sigBytes := text.ToBytes(signature.value)
     if !owner.found || !HexID(grant.signature, 4840) || signature.error != "" ||
         signature.value.count != codec.mlDSA44SignatureSize ||
-        !verify(owner.value, text.ToBytes(GrantMessage(grant)), text.ToBytes(signature.value)) {
+        (!verify(owner.value, text.ToBytes(GrantMessage(grant)), sigBytes) &&
+            !(clock.Unix(clock.Now()) <= LegacyDaochiSignedDomainValidThrough &&
+                verify(owner.value, text.ToBytes(GrantMessageWithDomain("daochi-authorization-v1", grant)), sigBytes))) {
         return auth.Failure(401, "owner authorization rejected")
     }
     // Reuse registration validation. ActiveGrant checks current ownership and

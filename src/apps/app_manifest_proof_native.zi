@@ -45,8 +45,15 @@
         message: Vec(u8)
         if !BuilderAppend(message, rules.AppManifestContext) || !BuilderAppend(message, "\n") ||
             !BuilderAppend(message, canonical) { return failure }
-        if !SignedByActiveKey(document, root, VecSlice(message, 0, message.count),
-            VecSlice(signature.value, 0, signature.value.count), now) {
+        sigBytes := VecSlice(signature.value, 0, signature.value.count)
+        manifestOk := SignedByActiveKey(document, root, VecSlice(message, 0, message.count), sigBytes, now)
+        if !manifestOk && now <= rules.LegacyDaochiSignedDomainValidThrough {
+            VecClear(message)
+            if !BuilderAppend(message, rules.LegacyAppManifestContext) || !BuilderAppend(message, "\n") ||
+                !BuilderAppend(message, canonical) { return failure }
+            manifestOk = SignedByActiveKey(document, root, VecSlice(message, 0, message.count), sigBytes, now)
+        }
+        if !manifestOk {
             return .{status = 401, problem = "manifest signature rejected"}
         }
 
@@ -56,7 +63,16 @@
         if !BuilderAppend(message, rules.AppApprovalContext) || !BuilderAppend(message, "\n") ||
             !BuilderAppend(message, id) || !BuilderAppend(message, "\n") || !BuilderAppend(message, TextView(hash[:64])) ||
             !BuilderAppend(message, "\n") { return failure }
-        if !signatures.Verify(approvalKey, VecSlice(message, 0, message.count), VecSlice(approval.value, 0, approval.value.count)) {
+        approvalBytes := VecSlice(approval.value, 0, approval.value.count)
+        approvalOk := signatures.Verify(approvalKey, VecSlice(message, 0, message.count), approvalBytes)
+        if !approvalOk && now <= rules.LegacyDaochiSignedDomainValidThrough {
+            VecClear(message)
+            if !BuilderAppend(message, rules.LegacyAppApprovalContext) || !BuilderAppend(message, "\n") ||
+                !BuilderAppend(message, id) || !BuilderAppend(message, "\n") || !BuilderAppend(message, TextView(hash[:64])) ||
+                !BuilderAppend(message, "\n") { return failure }
+            approvalOk = signatures.Verify(approvalKey, VecSlice(message, 0, message.count), approvalBytes)
+        }
+        if !approvalOk {
             return .{status = 401, problem = "node approval rejected"}
         }
         if !BuilderAppend(<<encoded, canonical) { return failure }

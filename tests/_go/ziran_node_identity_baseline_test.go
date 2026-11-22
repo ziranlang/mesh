@@ -20,8 +20,8 @@ import (
 )
 
 const (
-	baselinePairingInviteContext = "daochi-pairing-invite-v1"
-	baselineNameClaimContext     = "daochi-name-claim-v1"
+	baselinePairingInviteContext = "mesh-pairing-invite-v1"
+	baselineNameClaimContext     = "mesh-name-claim-v1"
 )
 
 var baselineNamePattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$`)

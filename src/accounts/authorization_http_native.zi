@@ -291,10 +291,20 @@ QUERY_END, args[:]) == sqlite.SQLITE_OK && sqlite.SqliteChanges(database) == 1
             return Error(context, 400, "unexpected Telegram claim")
         }
         digits: [24]u8
-        parts: [11]string = .["daochi-rendezvous-claim-v1", id, TextView(pending.app), TextView(pending.node), TextView(pending.audience),
+        parts: [11]string = .["mesh-rendezvous-claim-v1", id, TextView(pending.app), TextView(pending.node), TextView(pending.audience),
             TextView(pending.challenge), numbers.FormatInteger(pending.expiresAt, digits[:]), client, key, encryption, TextView(digest[:digestLength])]
         message: Vec(u8)
-        if !authorization.AppendLines(*message, parts[:]) || !session.VerifyKeyProof(key, VecSlice(message, 0, message.count), TextView(values[6])) {
+        if !authorization.AppendLines(*message, parts[:]) {
+            return Error(context, 401, "delegate claim proof rejected")
+        }
+        verified := session.VerifyKeyProof(key, VecSlice(message, 0, message.count), TextView(values[6]))
+        if !verified && now <= 1826928000 {
+            VecClear(message)
+            parts[0] = "daochi-rendezvous-claim-v1"
+            verified = authorization.AppendLines(*message, parts[:]) &&
+                session.VerifyKeyProof(key, VecSlice(message, 0, message.count), TextView(values[6]))
+        }
+        if !verified {
             return Error(context, 401, "delegate claim proof rejected")
         }
         if TextView(digest[:digestLength]) != "" && entry == "" {

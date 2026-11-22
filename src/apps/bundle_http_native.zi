@@ -54,15 +54,20 @@
         return release
     }
 
-    Proof :: (access: *accounts.AccountAccess, release: *Release, now: s64) -> bool {
+    ProofWithDomain :: (access: *accounts.AccountAccess, domain: string, release: *Release, now: s64) -> bool {
         message: Vec(u8)
-        if !delivery.AppendLine(*message, "daochi-zib-release-v1") ||
+        if !delivery.AppendLine(*message, domain) ||
             !delivery.AppendLine(*message, TextView(release.app)) || !delivery.AppendNumber(*message, release.sequence) ||
             !delivery.AppendLine(*message, TextView(release.version)) || !delivery.AppendLine(*message, TextView(release.runtime)) ||
             !delivery.AppendLine(*message, TextView(release.hash)) || !delivery.AppendNumber(*message, release.size) ||
             !delivery.AppendLine(*message, TextView(release.key)) { return false }
         return delivery.Trusted(access, TextView(release.app), TextView(release.key), TextView(release.proof),
             VecSlice(message, 0, message.count), now)
+    }
+
+    Proof :: (access: *accounts.AccountAccess, release: *Release, now: s64) -> bool {
+        if ProofWithDomain(access, "mesh-zib-release-v1", release, now) { return true }
+        return now <= 1826928000 && ProofWithDomain(access, "daochi-zib-release-v1", release, now)
     }
 
     Latest :: (connection: *void, release: *Release) -> s32 {

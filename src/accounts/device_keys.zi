@@ -117,20 +117,28 @@ RecordNonce :: (transaction: *sql.Transaction, context: ctx.Context, accountID: 
 }
 
 #scope_export
-RegistrationMessage :: (accountID: string, request: DeviceRegistrationRequest) -> []u8 {
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
+
+RegistrationMessageWithContext :: (domain: string, accountID: string, request: DeviceRegistrationRequest) -> []u8 {
     parts: [9]string = .[
-        "daochi-device-registration-v1", accountID, request.AppID, request.KeyID,
+        domain, accountID, request.AppID, request.KeyID,
         request.ClientID, request.PublicKey, request.Nonce,
         FormatInteger(request.ExpiresAt, cast(isize)10), ""
     ]
     return text.ToBytes(Join(parts[:], "\n"))
 }
-RevocationMessage :: (accountID: string, request: DeviceRevocationRequest) -> []u8 {
+RevocationMessageWithContext :: (domain: string, accountID: string, request: DeviceRevocationRequest) -> []u8 {
     parts: [7]string = .[
-        "daochi-device-revocation-v1", accountID, request.AppID, request.KeyID,
+        domain, accountID, request.AppID, request.KeyID,
         request.Nonce, FormatInteger(request.ExpiresAt, cast(isize)10), ""
     ]
     return text.ToBytes(Join(parts[:], "\n"))
+}
+RegistrationMessage :: (accountID: string, request: DeviceRegistrationRequest) -> []u8 {
+    return RegistrationMessageWithContext("mesh-device-registration-v1", accountID, request)
+}
+RevocationMessage :: (accountID: string, request: DeviceRevocationRequest) -> []u8 {
+    return RevocationMessageWithContext("mesh-device-revocation-v1", accountID, request)
 }
 NormalizeRegistration :: (request: *DeviceRegistrationRequest) {
     request.AppID = wire_text.TrimSpace(request.AppID)
@@ -177,7 +185,10 @@ VerifyRegistration :: (database: *sql.Database, context: ctx.Context, accountID:
     if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
         return auth.Failure(cast(isize)400, "invalid device registration signature")
     }
-    if !verifySignature(account.value, RegistrationMessage(accountID, request), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if !verifySignature(account.value, RegistrationMessage(accountID, request), sigBytes) &&
+        !(clock.Unix(clock.Now()) <= LegacyDaochiSignedDomainValidThrough &&
+            verifySignature(account.value, RegistrationMessageWithContext("daochi-device-registration-v1", accountID, request), sigBytes)) {
         return auth.Failure(cast(isize)401, "device registration rejected")
     }
     return auth.NativeFailure(null)
@@ -198,7 +209,10 @@ VerifyRevocation :: (database: *sql.Database, context: ctx.Context, accountID: s
     if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
         return auth.Failure(cast(isize)400, "invalid device revocation signature")
     }
-    if !verifySignature(account.value, RevocationMessage(accountID, request), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if !verifySignature(account.value, RevocationMessage(accountID, request), sigBytes) &&
+        !(clock.Unix(clock.Now()) <= LegacyDaochiSignedDomainValidThrough &&
+            verifySignature(account.value, RevocationMessageWithContext("daochi-device-revocation-v1", accountID, request), sigBytes)) {
         return auth.Failure(cast(isize)401, "device revocation rejected")
     }
     return auth.NativeFailure(null)

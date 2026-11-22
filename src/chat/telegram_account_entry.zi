@@ -253,25 +253,37 @@ Create :: (service: AccountEntries, context: ctx.Context, telegramID: s64) -> En
     return result
 }
 
-VerifyMessage :: (info: EntryChallenge, input: EntryVerify, initDigest: string) -> string {
-    fields: [14]string = .["daochi-telegram-entry-verify-v1", info.entryID, info.mode,
+VerifyMessageWithDomain :: (domain: string, info: EntryChallenge, input: EntryVerify, initDigest: string) -> string {
+    fields: [14]string = .[domain, info.entryID, info.mode,
         info.appID, info.nodeID, info.audience, FormatInteger(info.botID, 10),
         info.challenge, FormatInteger(info.expiresAt, 10), input.clientID,
         input.signingKey, input.encryptionKey, initDigest, ""]
     return Join(fields[:], "\n")
 }
 
-ActionMessage :: (info: EntryChallenge, input: EntryAction, action: string) -> string {
-    fields: [16]string = .["daochi-telegram-entry-action-v1", action, info.entryID,
+VerifyMessage :: (info: EntryChallenge, input: EntryVerify, initDigest: string) -> string {
+    return VerifyMessageWithDomain("mesh-telegram-entry-verify-v1", info, input, initDigest)
+}
+
+ActionMessageWithDomain :: (domain: string, info: EntryChallenge, input: EntryAction, action: string) -> string {
+    fields: [16]string = .[domain, action, info.entryID,
         info.mode, info.appID, info.nodeID, info.audience, FormatInteger(info.botID, 10),
         info.challenge, FormatInteger(info.expiresAt, 10), input.clientID,
         input.signingKey, input.encryptionKey, FormatInteger(input.expiresAt, 10), input.nonce, ""]
     return Join(fields[:], "\n")
 }
 
-BindMessage :: (entry: EntryIdentity, input: EntryAction, accountID: string) -> string {
-    fields: [4]string = .[ActionMessage(entry.info, input, "bind"), accountID, entry.initDigest, ""]
+ActionMessage :: (info: EntryChallenge, input: EntryAction, action: string) -> string {
+    return ActionMessageWithDomain("mesh-telegram-entry-action-v1", info, input, action)
+}
+
+BindMessageWithDomain :: (domain: string, entry: EntryIdentity, input: EntryAction, accountID: string) -> string {
+    fields: [4]string = .[ActionMessageWithDomain(domain, entry.info, input, "bind"), accountID, entry.initDigest, ""]
     return Join(fields[:], "\n")
+}
+
+BindMessage :: (entry: EntryIdentity, input: EntryAction, accountID: string) -> string {
+    return BindMessageWithDomain("mesh-telegram-entry-action-v1", entry, input, accountID)
 }
 
 EntryInfo :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.Request) {
@@ -336,7 +348,9 @@ Verify :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.
     }
     verified := telegram.Validate(input.initData, service.configuration.LumiBotToken, now)
     if !verified.valid || verified.botID != entry.info.botID || verified.userID != entry.telegramID ||
-        !session.VerifyKeyProof(input.signingKey, VerifyMessage(entry.info, input, verified.digest), input.proof) {
+        (!session.VerifyKeyProof(input.signingKey, VerifyMessage(entry.info, input, verified.digest), input.proof) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(input.signingKey, VerifyMessageWithDomain("daochi-telegram-entry-verify-v1", entry.info, input, verified.digest), input.proof))) {
         response.Error(writer, 401, "Telegram sender and delegate proof required")
         return
     }
@@ -496,7 +510,9 @@ Status :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.
     entry := ReadEntry(opened.value, context, input.entryID)
     now := clock.Unix(clock.Now())
     if !Current(service, entry, now) || !Matches(entry, input) || !FreshAction(entry, input, now) ||
-        !session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "status"), input.proof) {
+        (!session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "status"), input.proof) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(entry.signingKey, ActionMessageWithDomain("daochi-telegram-entry-action-v1", entry.info, input, "status"), input.proof))) {
         response.Error(writer, 401, "verified delegate proof required")
         return
     }
@@ -535,7 +551,9 @@ Cancel :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.
     }
     entry := ReadEntry(transaction, context, input.entryID)
     if !Current(service, entry, now) || !Matches(entry, input) || !FreshAction(entry, input, now) ||
-        !session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "cancel"), input.proof) {
+        (!session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "cancel"), input.proof) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(entry.signingKey, ActionMessageWithDomain("daochi-telegram-entry-action-v1", entry.info, input, "cancel"), input.proof))) {
         response.Error(writer, 401, "verified delegate proof required")
         return
     }
@@ -594,7 +612,9 @@ Bind :: (service: AccountEntries, writer: http.ResponseWriter, request: *http.Re
         return
     }
     if !Matches(entry, input) || !FreshAction(entry, input, now) ||
-        !session.VerifyKeyProof(entry.signingKey, BindMessage(entry, input, account), input.proof) {
+        (!session.VerifyKeyProof(entry.signingKey, BindMessage(entry, input, account), input.proof) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(entry.signingKey, BindMessageWithDomain("daochi-telegram-entry-action-v1", entry, input, account), input.proof))) {
         response.Error(writer, 401, "verified delegate binding proof required")
         return
     }
@@ -698,7 +718,9 @@ Rendezvous :: (service: AccountEntries, writer: http.ResponseWriter, request: *h
     now := clock.Unix(clock.Now())
     if !Current(service, entry, now) || !Matches(entry, input) || !FreshAction(entry, input, now) ||
         (entry.status != "verified" && entry.status != "bound") ||
-        !session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "request"), input.proof) {
+        (!session.VerifyKeyProof(entry.signingKey, ActionMessage(entry.info, input, "request"), input.proof) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(entry.signingKey, ActionMessageWithDomain("daochi-telegram-entry-action-v1", entry.info, input, "request"), input.proof))) {
         response.Error(writer, 401, "verified delegate proof required")
         return
     }

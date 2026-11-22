@@ -180,8 +180,8 @@
         context: string
     }
     SignedHeader :: (connection: *void) -> RequestSignature {
-        names: [3]string = .["X-Mesh-Signature", "X-Ksync-Signature", "X-Inbe-Signature"]
-        contexts: [3]string = .["daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
+        names: [4]string = .["X-Mesh-Signature", "X-Daochi-Signature", "X-Ksync-Signature", "X-Inbe-Signature"]
+        contexts: [4]string = .["mesh-sync-v1", "daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
         for name, index: names {
             value := wire.TrimSpace(transport.Header(connection, name))
             if value != "" {

@@ -48,7 +48,7 @@ func baselineVerifyNodeRequest(database *sql.DB, ctx context.Context, req *http.
 	if err != nil || len(signature) != ed25519.SignatureSize {
 		return errors.New("invalid node signature")
 	}
-	message := []byte(baselineNodeMessage("daochi-node-request-v1", nodeID, timestampText, nonce,
+	message := []byte(baselineNodeMessage("mesh-node-request-v1", nodeID, timestampText, nonce,
 		req.Method, req.URL.EscapedPath(), body))
 	if !ed25519.Verify(publicKey, message, signature) {
 		return errors.New("invalid node signature")
@@ -112,7 +112,7 @@ func signedNodeFixture(nodeID string, key ed25519.PrivateKey, method, path, time
 	if err != nil {
 		panic(err)
 	}
-	message := baselineNodeMessage("daochi-node-request-v1", nodeID, timestamp, nonce,
+	message := baselineNodeMessage("mesh-node-request-v1", nodeID, timestamp, nonce,
 		request.Method, request.URL.EscapedPath(), body)
 	request.Header.Set("X-Mesh-Node-ID", nodeID)
 	request.Header.Set("X-Mesh-Node-Time", timestamp)
@@ -154,7 +154,7 @@ func TestZiranNodeSigningPreservesExactMessages(t *testing.T) {
 		if err != nil || len(decoded) != 16 || nonce != strings.ToLower(nonce) {
 			t.Fatalf("signing nonce = %q", nonce)
 		}
-		message := baselineNodeMessage("daochi-node-request-v1", nodeID, timestamp, nonce,
+		message := baselineNodeMessage("mesh-node-request-v1", nodeID, timestamp, nonce,
 			request.Method, request.URL.EscapedPath(), item.body)
 		want := base64.RawURLEncoding.EncodeToString(ed25519.Sign(key, []byte(message)))
 		if got := request.Header.Get("X-Mesh-Node-Signature"); got != want {

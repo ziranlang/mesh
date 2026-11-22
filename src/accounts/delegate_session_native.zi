@@ -126,8 +126,17 @@
         actual[13] = numbers.FormatInteger(expiresAt, digits[:])
         message: Vec(u8)
         if actual[3] != TextView(grant.account) || actual[4] != TextView(grant.app) || actual[5] != TextView(grant.client) ||
-            !BuilderAppend(message, "daochi-delegate-request-v1\n") || !authorization.AppendLines(*message, actual[:15]) ||
-            !VerifyKeyProof(TextView(grant.signingKey), VecSlice(message, 0, message.count), actual[15]) {
+            !BuilderAppend(message, "mesh-delegate-request-v1\n") || !authorization.AppendLines(*message, actual[:15]) {
+            return .{failure = .{status = 401, message = "delegate signature rejected"}}
+        }
+        verified := VerifyKeyProof(TextView(grant.signingKey), VecSlice(message, 0, message.count), actual[15])
+        if !verified && now <= 1826928000 {
+            VecClear(message)
+            verified = BuilderAppend(message, "daochi-delegate-request-v1\n") &&
+                authorization.AppendLines(*message, actual[:15]) &&
+                VerifyKeyProof(TextView(grant.signingKey), VecSlice(message, 0, message.count), actual[15])
+        }
+        if !verified {
             return .{failure = .{status = 401, message = "delegate signature rejected"}}
         }
         if request.user != "" && request.user != TextView(grant.account) {
@@ -179,11 +188,20 @@
         if active.failure.status != 0 { return .{failure = active.failure} }
         expires := sql.ReadInteger(database, "SELECT expires_at FROM server_authorization_challenges WHERE challenge=?1 AND grant_id=?2", arguments[:2])
         digits: [24]u8
-        fields: [6]string = .["daochi-session-v1", grantID, challenge, environment.node, environment.audience,
+        fields: [6]string = .["mesh-session-v1", grantID, challenge, environment.node, environment.audience,
             numbers.FormatInteger(expires.value, digits[:])]
         message: Vec(u8)
-        if expires.status != sqlite.SQLITE_OK || !expires.found || !authorization.AppendLines(*message, fields[:]) ||
-            !VerifyKeyProof(TextView(active.grant.signingKey), VecSlice(message, 0, message.count), signature) {
+        if expires.status != sqlite.SQLITE_OK || !expires.found || !authorization.AppendLines(*message, fields[:]) {
+            return .{failure = .{status = 401, message = "session key proof rejected"}}
+        }
+        verified := VerifyKeyProof(TextView(active.grant.signingKey), VecSlice(message, 0, message.count), signature)
+        if !verified && environment.now <= 1826928000 {
+            VecClear(message)
+            fields[0] = "daochi-session-v1"
+            verified = authorization.AppendLines(*message, fields[:]) &&
+                VerifyKeyProof(TextView(active.grant.signingKey), VecSlice(message, 0, message.count), signature)
+        }
+        if !verified {
             return .{failure = .{status = 401, message = "session key proof rejected"}}
         }
         owner: [1]sql.Argument = .[sql.TextArg(TextView(active.grant.account))]

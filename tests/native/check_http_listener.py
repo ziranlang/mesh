@@ -1403,7 +1403,7 @@ def check_node_pairing(binary, directory, oracle):
 
     def signature(value, private, invite_signature=None):
         addresses = ",".join(sorted(value["addresses"]))
-        lines = ["daochi-pairing-invite-v1", "1", value["invite_id"], value["node_id"], value["public_key"],
+        lines = ["mesh-pairing-invite-v1", "1", value["invite_id"], value["node_id"], value["public_key"],
                  value["display_name"], addresses]
         if invite_signature is None:
             policy_names = ("direction", "apps", "accounts", "collections", "spaces", "data")
@@ -1541,7 +1541,7 @@ def check_namespace(host, port, database, oracle, admin_token):
 
     def sign(key, value, services):
         digest = hashlib.sha256(services).hexdigest()
-        parts = ["daochi-name-claim-v1", "1", value["space_id"], value["name"], value["node_id"],
+        parts = ["mesh-name-claim-v1", "1", value["space_id"], value["name"], value["node_id"],
                  str(value["sequence"]), str(value["expires_at"]), digest, ""]
         signed = sign_with_oracle(oracle, "device-sign", PrivateKey=base64.b64encode(key).decode(),
                                   Message=base64.b64encode("\n".join(parts).encode()).decode())

@@ -320,7 +320,7 @@ func TestZiranMeshPostJSONAgainstBaseline(t *testing.T) {
 						}
 						if signed {
 							signature, err := base64.RawURLEncoding.DecodeString(request.Header.Get("X-Mesh-Node-Signature"))
-							message := baselineNodeMessage("daochi-node-request-v1", server.Node.ID, request.Header.Get("X-Mesh-Node-Time"), request.Header.Get("X-Mesh-Node-Nonce"), request.Method, request.URL.EscapedPath(), data)
+							message := baselineNodeMessage("mesh-node-request-v1", server.Node.ID, request.Header.Get("X-Mesh-Node-Time"), request.Header.Get("X-Mesh-Node-Nonce"), request.Method, request.URL.EscapedPath(), data)
 							if err != nil || !ed25519.Verify(server.Node.PublicKey, []byte(message), signature) || request.Header.Get("X-Mesh-Node-ID") != server.Node.ID || request.Header.Get("Authorization") != "" {
 								t.Fatal("mesh request lost node authentication")
 							}

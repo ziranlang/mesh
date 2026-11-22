@@ -10,7 +10,9 @@ go_hex :: #system_library "go:encoding/hex";
 go_strconv :: #system_library "go:strconv";
 go_strings :: #system_library "go:strings";
 
-RecordProvenanceDomain :: "daochi-record-provenance-v1";
+RecordProvenanceDomain :: "mesh-record-provenance-v1";
+LegacyRecordProvenanceDomain :: "daochi-record-provenance-v1";
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 RecordProvenanceMaxFutureSeconds :: 300;
 RecordMutation :: "record";
 TombstoneMutation :: "tombstone";
@@ -138,13 +140,13 @@ StateFor :: (mutation: RecordProvenanceMutation, signed: bool) -> RecordProvenan
 }
 
 #scope_export
-CanonicalRecordProvenanceMessage :: (mutation: RecordProvenanceMutation) -> string {
+CanonicalRecordProvenanceMessageWithDomain :: (domain: string, mutation: RecordProvenanceMutation) -> string {
     kind := RecordMutation
     if mutation.Tombstone {
         kind = TombstoneMutation
     }
     parts: [10]string = .[
-    RecordProvenanceDomain,
+    domain,
     kind,
     mutation.AccountID,
     mutation.AppID,
@@ -156,6 +158,10 @@ CanonicalRecordProvenanceMessage :: (mutation: RecordProvenanceMutation) -> stri
     "",
     ]
     return Join(parts[:], "\n")
+}
+
+CanonicalRecordProvenanceMessage :: (mutation: RecordProvenanceMutation) -> string {
+    return CanonicalRecordProvenanceMessageWithDomain(RecordProvenanceDomain, mutation)
 }
 
 VerifyRecordProvenance :: (mutation: RecordProvenanceMutation,
@@ -230,7 +236,9 @@ VerifyRecordProvenance :: (mutation: RecordProvenanceMutation,
             return result
         }
         message := text.ToBytes(CanonicalRecordProvenanceMessage(mutation))
-        if !signature.Verify(decodedKey.value, message, signatureBytes) {
+        if !signature.Verify(decodedKey.value, message, signatureBytes) &&
+            !(authorization.Now <= LegacyDaochiSignedDomainValidThrough &&
+                signature.Verify(decodedKey.value, text.ToBytes(CanonicalRecordProvenanceMessageWithDomain(LegacyRecordProvenanceDomain, mutation)), signatureBytes)) {
             result.Error = errors.New("record provenance signature rejected")
             return result
         }

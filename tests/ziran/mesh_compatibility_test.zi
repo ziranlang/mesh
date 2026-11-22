@@ -54,7 +54,7 @@ MeshAndDaochiHeadersShareSignatureBytes :: (test: *testing.Test) {
         http.SetHeader(header, signature_headers[index], "proof")
         account := auth.UserHeader(request.value)
         signature := sync_request.SignatureHeader(request.value)
-        if account.value != user || signature.value != "proof" || signature.context != "daochi-sync-v1" {
+        if account.value != user || signature.value != "proof" || signature.context != "mesh-sync-v1" {
             arguments: [3]Any = .[user_headers[index], account, signature]
             testing.Fatalf(test, "%s changed signed headers: %+v, %+v", arguments[:])
         }

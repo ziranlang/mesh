@@ -25,7 +25,9 @@
         if !Canonical(parts.before, content) || !Canonical(parts.after, proof) { return false }
         prefix := wire.Cut(TextView(content), #char "\n")
         named := wire.Cut(prefix.after, #char "\n")
-        if !prefix.found || !named.found || prefix.before != "daochi-pack-grant-v1" || named.before != product { return false }
+        validPrefix := prefix.found && (prefix.before == "mesh-pack-grant-v1" ||
+            (now <= 1826928000 && prefix.before == "daochi-pack-grant-v1"))
+        if !validPrefix || !named.found || named.before != product { return false }
         expiry, count := numbers.IntegerPrefix(named.after)
         digits: [24]u8
         return count == named.after.count && expiry > now && numbers.FormatInteger(expiry, digits[:]) == named.after &&

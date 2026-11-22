@@ -216,9 +216,9 @@
         return true
     }
 
-    GrantMessage :: (grant: *Grant, output: *Vec(u8)) -> bool {
+    GrantMessageWithDomain :: (domain: string, grant: *Grant, output: *Vec(u8)) -> bool {
         digits: [6][24]u8
-        fields: [18]string = .["daochi-authorization-v1", "1", TextView(grant.account), TextView(grant.id), TextView(grant.request),
+        fields: [18]string = .[domain, "1", TextView(grant.account), TextView(grant.id), TextView(grant.request),
             TextView(grant.app), TextView(grant.client), TextView(grant.node), TextView(grant.audience), TextView(grant.signingKey), TextView(grant.encryptionKey),
             numbers.FormatInteger(grant.issuedAt, digits[0][:]), numbers.FormatInteger(grant.notBefore, digits[1][:]),
             numbers.FormatInteger(grant.expiresAt, digits[2][:]), TextView(grant.nonce), numbers.FormatInteger(grant.botID, digits[3][:]),
@@ -232,6 +232,10 @@
             if !AppendLines(output, values[:]) { return false }
         }
         return !grant.telegramStars || BuilderAppend(<<output, "telegram-stars-purchases\n")
+    }
+
+    GrantMessage :: (grant: *Grant, output: *Vec(u8)) -> bool {
+        return GrantMessageWithDomain("mesh-authorization-v1", grant, output)
     }
 
     VerifyGrant :: (database: *void, verify: signatures.VerifySignature, grant: *Grant, account: string,
@@ -256,8 +260,17 @@
         }
         proof := binary.DecodeBinaryField(signature)
         message: Vec(u8)
-        if proof.error != "" || !GrantMessage(grant, *message) ||
-            !verify(owner.bytes[:], VecSlice(message, 0, message.count), VecSlice(proof.value, 0, proof.value.count)) {
+        if proof.error != "" || !GrantMessage(grant, *message) {
+            return .{status = 401, message = "owner authorization rejected"}
+        }
+        sigBytes := VecSlice(proof.value, 0, proof.value.count)
+        verified := verify(owner.bytes[:], VecSlice(message, 0, message.count), sigBytes)
+        if !verified && now <= 1826928000 {
+            VecClear(message)
+            verified = GrantMessageWithDomain("daochi-authorization-v1", grant, *message) &&
+                verify(owner.bytes[:], VecSlice(message, 0, message.count), sigBytes)
+        }
+        if !verified {
             return .{status = 401, message = "owner authorization rejected"}
         }
         args: [1]sql.Argument = .[sql.TextArg(app)]

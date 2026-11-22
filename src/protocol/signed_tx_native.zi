@@ -21,7 +21,9 @@
     }
 
     #scope_file
-    SignatureContext :: "daochi-tx-v1";
+    SignatureContext :: "mesh-tx-v1";
+    LegacySignatureContext :: "daochi-tx-v1";
+    LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
     #scope_export
     Envelope :: struct {
         version: s64
@@ -107,18 +109,17 @@
         return wire.MatchesToken(actual, TextView(lower[:expected.count]))
     }
 
-    Canonical :: (transaction: *Envelope, account: string, app: string, method: string, path: string,
-        digest: string) -> Vec(u8) {
+    Canonical :: (domain: string, transaction: *Envelope, account: string, app: string, method: string, path: string,
+        digest: string, output: *Vec(u8)) -> bool {
         protocolDigits: [24]u8
         expiryDigits: [24]u8
-        parts: [11]string = .[SignatureContext, numbers.FormatInteger(transaction.version, protocolDigits[:]),
+        parts: [11]string = .[domain, numbers.FormatInteger(transaction.version, protocolDigits[:]),
             wire.TrimSpace(TextView(transaction.id)), account, app, wire.TrimSpace(TextView(transaction.device)), method, path, digest,
             wire.TrimSpace(TextView(transaction.nonce)), numbers.FormatInteger(transaction.expiresAt, expiryDigits[:])]
-        output: Vec(u8)
         for part: parts {
-            if !BuilderAppend(output, part) || !BuilderAppend(output, "\n") { return .{} }
+            if !BuilderAppend(<<output, part) || !BuilderAppend(<<output, "\n") { return false }
         }
-        return output
+        return true
     }
 
     VerifyDevice :: (database: *void, arguments: []sql.Argument, proof: string, message: []u8) -> Authorization {
@@ -150,7 +151,11 @@
         if !transaction.valid { return .{status = 400, message = "invalid signed transaction"} }
         if transaction.version < 6 { return .{status = 400, message = "signed transaction protocol too old"} }
         context := wire.TrimSpace(TextView(transaction.context))
-        if context != "" && context != SignatureContext { return .{status = 400, message = "invalid signed transaction context"} }
+        legacyAllowed := now <= LegacyDaochiSignedDomainValidThrough
+        if context != "" && context != SignatureContext &&
+            !(legacyAllowed && context == LegacySignatureContext) {
+            return .{status = 400, message = "invalid signed transaction context"}
+        }
         id := wire.TrimSpace(TextView(transaction.id))
         nonce := wire.TrimSpace(TextView(transaction.nonce))
         if !identity.ValidClientID(id) || !identity.ValidClientID(nonce) { return .{status = 400, message = "invalid signed transaction id"} }
@@ -181,16 +186,28 @@
         if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
             return .{status = 400, message = "invalid signed transaction signature"}
         }
-        message := Canonical(*transaction, account, app, method, path, digestText)
-        if message.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
-        bytes := VecSlice(message, 0, message.count)
-        if key.count != codec.mlDSA44PublicKeySize || !verify(key.bytes[:], bytes, VecSlice(signature.value, 0, signature.value.count)) {
-            return .{status = 401, message = "signed transaction rejected"}
+        domain := ifx context != "" then context else SignatureContext
+        message: Vec(u8)
+        if !Canonical(domain, *transaction, account, app, method, path, digestText, *message) {
+            return .{databaseError = sqlite.SQLITE_NOMEM}
+        }
+        if key.count != codec.mlDSA44PublicKeySize || !verify(key.bytes[:], VecSlice(message, 0, message.count), VecSlice(signature.value, 0, signature.value.count)) {
+            if context == "" && legacyAllowed {
+                VecClear(message)
+                if !Canonical(LegacySignatureContext, *transaction, account, app, method, path, digestText, *message) {
+                    return .{databaseError = sqlite.SQLITE_NOMEM}
+                }
+                if key.count != codec.mlDSA44PublicKeySize || !verify(key.bytes[:], VecSlice(message, 0, message.count), VecSlice(signature.value, 0, signature.value.count)) {
+                    return .{status = 401, message = "signed transaction rejected"}
+                }
+            } else {
+                return .{status = 401, message = "signed transaction rejected"}
+            }
         }
         device := wire.TrimSpace(TextView(transaction.device))
         if !identity.ValidClientID(device) { return .{status = 400, message = "invalid device key id"} }
         deviceArgs: [4]sql.Argument = .[sql.TextArg(account), sql.TextArg(app), sql.TextArg(device), sql.TextArg(auditTime)]
-        authorized := VerifyDevice(database, deviceArgs[:3], wire.TrimSpace(TextView(transaction.deviceSignature)), bytes)
+        authorized := VerifyDevice(database, deviceArgs[:3], wire.TrimSpace(TextView(transaction.deviceSignature)), VecSlice(message, 0, message.count))
         if authorized.status != 0 || authorized.databaseError != sqlite.SQLITE_OK { return authorized }
         expired: [1]sql.Argument = .[sql.IntArg(now)]
         status := sql.Execute(database, queries.DeleteExpiredSignedTransactionsSQL, expired[:])

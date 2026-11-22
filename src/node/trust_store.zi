@@ -158,8 +158,11 @@ ImportNameClaim :: (context: ctx.Context, transaction: *sql.Transaction, claim: 
         return result
     }
     signature := codec.DecodeBase64(claim.Signature, true, false)
-    if signature.error != "" || !keys.Verify(cast(keys.PublicKey)publicKey,
-        node.NameClaimMessage(claim), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if signature.error != "" || (!keys.Verify(cast(keys.PublicKey)publicKey,
+        node.NameClaimMessage(claim), sigBytes) &&
+        !(clock.Unix(clock.Now()) <= 1826928000 && keys.Verify(cast(keys.PublicKey)publicKey,
+            node.NameClaimMessageWithDomain("daochi-name-claim-v1", claim), sigBytes))) {
         result.error = errors.New("invalid mesh name claim signature")
         return result
     }
@@ -426,8 +429,11 @@ ResolveNameClaim :: (database: *sql.Database, context: ctx.Context, spaceID: str
         return result
     }
     signature := codec.DecodeBase64(result.value.Signature, true, false)
-    if signature.error != "" || !keys.Verify(cast(keys.PublicKey)publicKey,
-        node.NameClaimMessage(result.value), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if signature.error != "" || (!keys.Verify(cast(keys.PublicKey)publicKey,
+        node.NameClaimMessage(result.value), sigBytes) &&
+        !(clock.Unix(clock.Now()) <= 1826928000 && keys.Verify(cast(keys.PublicKey)publicKey,
+            node.NameClaimMessageWithDomain("daochi-name-claim-v1", result.value), sigBytes))) {
         result.error = errors.New("invalid stored name claim signature")
         return result
     }

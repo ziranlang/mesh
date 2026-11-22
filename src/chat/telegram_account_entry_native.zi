@@ -195,14 +195,21 @@
         return EntryReply(request, entry, false)
     }
 
-    VerifyProof :: (entry: *entries.Entry, input: *Input, digest: string) -> bool {
+    VerifyProof :: (entry: *entries.Entry, input: *Input, digest: string, now: s64) -> bool {
         bot: [24]u8
         expiry: [24]u8
-        values: [13]string = .["daochi-telegram-entry-verify-v1", TextView(entry.id), TextView(entry.mode), TextView(entry.app),
+        values: [13]string = .["mesh-telegram-entry-verify-v1", TextView(entry.id), TextView(entry.mode), TextView(entry.app),
             TextView(entry.node), TextView(entry.audience), numbers.FormatInteger(entry.bot, bot[:]), TextView(entry.challenge),
             numbers.FormatInteger(entry.expiry, expiry[:]), TextView(input.client), TextView(input.signingKey),
             TextView(input.encryptionKey), digest]
         message: Vec(u8)
+        if authorization.AppendLines(*message, values[:]) &&
+            session.VerifyKeyProof(TextView(input.signingKey), VecSlice(message, 0, message.count), TextView(input.proof)) {
+            return true
+        }
+        if now > 1826928000 { return false }
+        VecClear(message)
+        values[0] = "daochi-telegram-entry-verify-v1"
         return authorization.AppendLines(*message, values[:]) &&
             session.VerifyKeyProof(TextView(input.signingKey), VecSlice(message, 0, message.count), TextView(input.proof))
     }
@@ -213,7 +220,7 @@
         }
         verified := telegram.Validate(TextView(input.initData), request.token, request.now)
         digest := TextView(verified.digest[:64])
-        if !verified.valid || verified.botID != entry.bot || verified.userID != entry.sender || !VerifyProof(entry, input, digest) {
+        if !verified.valid || verified.botID != entry.bot || verified.userID != entry.sender || !VerifyProof(entry, input, digest, request.now) {
             return Error(request, 401, "Telegram sender and delegate proof required")
         }
         database := request.settings.database
@@ -264,11 +271,26 @@ QUERY, arguments[:]) != sqlite.SQLITE_OK {
         bot: [24]u8
         entryExpiry: [24]u8
         expiry: [24]u8
-        values: [15]string = .["daochi-telegram-entry-action-v1", action, TextView(entry.id), TextView(entry.mode), TextView(entry.app),
+        values: [15]string = .["mesh-telegram-entry-action-v1", action, TextView(entry.id), TextView(entry.mode), TextView(entry.app),
             TextView(entry.node), TextView(entry.audience), numbers.FormatInteger(entry.bot, bot[:]), TextView(entry.challenge),
             numbers.FormatInteger(entry.expiry, entryExpiry[:]), TextView(input.client), TextView(input.signingKey), TextView(input.encryptionKey),
             numbers.FormatInteger(input.expiry, expiry[:]), TextView(input.nonce)]
         message: Vec(u8)
+        if !authorization.AppendLines(*message, values[:]) {
+            return false
+        }
+        if action == "bind" {
+            binding: [3]string = .["", account, TextView(entry.digest)]
+            if !authorization.AppendLines(*message, binding[:]) {
+                return false
+            }
+        }
+        if session.VerifyKeyProof(TextView(entry.signingKey), VecSlice(message, 0, message.count), TextView(input.proof)) {
+            return true
+        }
+        if now > 1826928000 { return false }
+        VecClear(message)
+        values[0] = "daochi-telegram-entry-action-v1"
         if !authorization.AppendLines(*message, values[:]) {
             return false
         }

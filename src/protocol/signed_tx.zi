@@ -21,7 +21,9 @@ errors :: #import "std/errors_go";
 go_sql :: #system_library "go:database/sql";
 go_strings :: #system_library "go:strings";
 
-TransactionContext :: "daochi-tx-v1";
+TransactionContext :: "mesh-tx-v1";
+LegacyTransactionContext :: "daochi-tx-v1";
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 MaxFutureSkew :: 900000000000;
 SignedHeaderResult :: struct {
     value: SignedTxEnvelope
@@ -77,7 +79,11 @@ Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request
     if tx.protocolVersion < 6 {
         return auth.Failure(cast(isize)400, "signed transaction protocol too old")
     }
-    if tx.signatureContext != "" && tx.signatureContext != TransactionContext {
+    now := clock.Now()
+    nowUnix := clock.Unix(now)
+    legacyAllowed := nowUnix <= LegacyDaochiSignedDomainValidThrough
+    if tx.signatureContext != "" && tx.signatureContext != TransactionContext &&
+        !(legacyAllowed && tx.signatureContext == LegacyTransactionContext) {
         return auth.Failure(cast(isize)400, "invalid signed transaction context")
     }
     if !identity.ValidClientID(tx.txID) || !identity.ValidClientID(tx.nonce) {
@@ -95,8 +101,7 @@ Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request
     if tx.bodySHA256 != signing.SHA256Hex(body) {
         return auth.Failure(cast(isize)401, "signed transaction body mismatch")
     }
-    now := clock.Now()
-    if tx.expiresAt <= clock.Unix(now) ||
+    if tx.expiresAt <= nowUnix ||
         clock.After(clock.FromUnix(tx.expiresAt, 0), clock.Add(now, cast(clock.Duration)MaxFutureSkew)) {
         return auth.Failure(cast(isize)401, "signed transaction expired")
     }
@@ -111,9 +116,19 @@ Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request
     if signature.error != "" || signature.value.count != codec.mlDSA44SignatureSize {
         return auth.Failure(cast(isize)400, "invalid signed transaction signature")
     }
-    message := text.ToBytes(transaction.CanonicalMessage(TransactionContext, tx))
+    sigContext := ifx tx.signatureContext != "" then tx.signatureContext else TransactionContext
+    message := text.ToBytes(transaction.CanonicalMessage(sigContext, tx))
     if !verifySignature(account.value, message, text.ToBytes(signature.value)) {
-        return auth.Failure(cast(isize)401, "signed transaction rejected")
+        if tx.signatureContext == "" && legacyAllowed {
+            legacy := text.ToBytes(transaction.CanonicalMessage(LegacyTransactionContext, tx))
+            if verifySignature(account.value, legacy, text.ToBytes(signature.value)) {
+                message = legacy
+            } else {
+                return auth.Failure(cast(isize)401, "signed transaction rejected")
+            }
+        } else {
+            return auth.Failure(cast(isize)401, "signed transaction rejected")
+        }
     }
     device := VerifyDevice(database, context, tx, message)
     if device.status != 0 || device.error != null {

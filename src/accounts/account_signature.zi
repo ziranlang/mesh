@@ -10,8 +10,11 @@ text :: #import "std/text_go";
 constant_time :: #import "std/constant_time";
 ctx :: #import "std/context_go";
 sql :: #import "std/sql_go";
+clock :: #import "std/time_go";
 wire_text :: #import "wire_text";
 strings :: #system_library "go:strings";
+
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 
 AccountSignatureResult :: struct {
     value: []u8
@@ -77,12 +80,22 @@ Authenticate :: (database: *sql.Database, challenges: *challenge.ChallengeStore,
     if signature.count != codec.mlDSA44SignatureSize {
         return Failure(cast(isize)400, "wrong signature size")
     }
+    nowUnix := clock.Unix(clock.Now())
+    if signatureContext == "daochi-sync-v1" && nowUnix > LegacyDaochiSignedDomainValidThrough {
+        return Failure(cast(isize)401, "signature rejected")
+    }
     // Overlapping sign-ins of one account each hold a challenge. Accept the
     // one this signature covers and use it up, so it cannot sign in again.
     for candidate: pending {
         message := signing.CanonicalMessageWithContext(signatureContext, candidate.Nonce,
             method, path, signedPayload)
-        if !verify(publicKey, text.ToBytes(message), signature) {
+        matched := verify(publicKey, text.ToBytes(message), signature)
+        if !matched && signatureContext == "mesh-sync-v1" && nowUnix <= LegacyDaochiSignedDomainValidThrough {
+            legacy := signing.CanonicalMessageWithContext("daochi-sync-v1", candidate.Nonce,
+                method, path, signedPayload)
+            matched = verify(publicKey, text.ToBytes(legacy), signature)
+        }
+        if !matched {
             continue
         }
         if !challenge.Take(challenges, candidate.Key) {

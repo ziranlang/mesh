@@ -137,7 +137,7 @@ a{color:#0b625d}
 <section class="endpoint"><span class="method">DELETE</span><code>/api/v1/account</code><p>Legacy signed deletion endpoint kept for older clients.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Deletes all remote data for the sync account after verifying exported account key text, with the same 30-day hold.</p></section>
 <h2>Signed Message</h2>
-<pre>daochi-sync-v1
+<pre>mesh-sync-v1
 &lt;HTTP_METHOD&gt;
 &lt;HTTP_PATH&gt;
 &lt;sha256 hex of exact raw request body bytes&gt;

@@ -8,9 +8,12 @@
     message :: #import "account_signing_message";
     sha :: #import "crypto/sha256";
     clock :: #import "std/timer";
+    calendar :: #import "std/date_time_linux";
     mutex :: #import "std/mutex_linux";
     #import "std/constant_time"
     #import "std/vec"
+
+    LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 
     VerifySignature :: #type (publicKey: []u8, message: []u8, signature: []u8) -> bool;
 
@@ -87,11 +90,21 @@
         if upper.count != method.count { return .{databaseError = sqlite.SQLITE_NOMEM} }
         verb := TextView(VecSlice(upper, 0, upper.count))
         digest := sha.Sha256Of(TextView(payload))
+        nowUnix := calendar.UnixMilliseconds() / 1000
+        if signatureContext == "daochi-sync-v1" && nowUnix > LegacyDaochiSignedDomainValidThrough {
+            return .{status = 401, message = "signature rejected"}
+        }
         for index: 0..pending.count - 1 {
             candidate := pending.challenges[index]
             signed := message.Canonical(signatureContext, candidate.nonce[:], verb, path, digest)
             if signed.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
-            if !verify(key.bytes[:], VecSlice(signed, 0, signed.count), signature) { continue }
+            matched := verify(key.bytes[:], VecSlice(signed, 0, signed.count), signature)
+            if !matched && signatureContext == "mesh-sync-v1" && nowUnix <= LegacyDaochiSignedDomainValidThrough {
+                legacy := message.Canonical("daochi-sync-v1", candidate.nonce[:], verb, path, digest)
+                if legacy.count == 0 { return .{databaseError = sqlite.SQLITE_NOMEM} }
+                matched = verify(key.bytes[:], VecSlice(legacy, 0, legacy.count), signature)
+            }
+            if !matched { continue }
             if !challenge.Take(challenges, userID, candidate.nonce[:], clock.MonotonicMilliseconds()) {
                 return .{status = 400, message = "missing or expired challenge"}
             }

@@ -212,23 +212,29 @@ LoadOrCreateKey :: (rawPath: string) -> PrivateKeyResult {
     return result
 }
 
-InviteMessage :: (invite: PairingInvite) -> []u8 {
+InviteMessageWithDomain :: (domain: string, invite: PairingInvite) -> []u8 {
     policy := json.Marshal(invite.Policy)
-    parts: [12]string = .["daochi-pairing-invite-v1", FormatInteger(cast(s64)invite.Version, cast(isize)10),
+    parts: [12]string = .[domain, FormatInteger(cast(s64)invite.Version, cast(isize)10),
         invite.InviteID, invite.NodeID, invite.PublicKey, invite.DisplayName, SortedAddresses(invite.Addresses),
         invite.SpaceID, FormatInteger(invite.ExpiresAt, cast(isize)10), invite.Nonce,
         signing.SHA256Hex(policy.value), ""]
     return text.ToBytes(Join(parts[:], "\n"))
 }
+InviteMessage :: (invite: PairingInvite) -> []u8 {
+    return InviteMessageWithDomain("mesh-pairing-invite-v1", invite)
+}
 SignInvite :: (node: NodeIdentity, invite: *PairingInvite) {
     invite.Signature = SignedMessage(node.PrivateKey, InviteMessage(<<invite))
 }
-AcceptanceMessage :: (invite: PairingInvite, acceptance: PairingAcceptance) -> []u8 {
-    parts: [11]string = .["daochi-pairing-invite-v1-acceptance", FormatInteger(cast(s64)acceptance.Version, cast(isize)10),
+AcceptanceMessageWithDomain :: (domain: string, invite: PairingInvite, acceptance: PairingAcceptance) -> []u8 {
+    parts: [11]string = .[domain, FormatInteger(cast(s64)acceptance.Version, cast(isize)10),
         acceptance.InviteID, acceptance.NodeID, acceptance.PublicKey, acceptance.DisplayName,
         SortedAddresses(acceptance.Addresses), FormatInteger(acceptance.AcceptedAt, cast(isize)10),
         acceptance.Nonce, signing.SHA256Hex(text.ToBytes(invite.Signature)), ""]
     return text.ToBytes(Join(parts[:], "\n"))
+}
+AcceptanceMessage :: (invite: PairingInvite, acceptance: PairingAcceptance) -> []u8 {
+    return AcceptanceMessageWithDomain("mesh-pairing-invite-v1-acceptance", invite, acceptance)
 }
 SignAcceptance :: (node: NodeIdentity, invite: PairingInvite, acceptance: *PairingAcceptance) {
     acceptance.Signature = SignedMessage(node.PrivateKey, AcceptanceMessage(invite, <<acceptance))
@@ -274,7 +280,10 @@ ValidateAcceptance :: (invite: PairingInvite, acceptance: PairingAcceptance, now
     }
     signature := codec.DecodeBase64(acceptance.Signature, true, false)
     key := cast(keys.PublicKey)publicBytes.value
-    if signature.error != "" || !keys.Verify(key, AcceptanceMessage(invite, acceptance), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if signature.error != "" || (!keys.Verify(key, AcceptanceMessage(invite, acceptance), sigBytes) &&
+        !(clock.Unix(now) <= auth.LegacyDaochiSignedDomainValidThrough &&
+            keys.Verify(key, AcceptanceMessageWithDomain("daochi-pairing-invite-v1-acceptance", invite, acceptance), sigBytes))) {
         result.error = errors.New("invalid pairing acceptance signature")
         return result
     }
@@ -303,7 +312,10 @@ ValidateInvite :: (invite: PairingInvite, now: clock.Time) -> PublicKeyResult {
     }
     signature := codec.DecodeBase64(invite.Signature, true, false)
     key := cast(keys.PublicKey)publicBytes.value
-    if signature.error != "" || !keys.Verify(key, InviteMessage(invite), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if signature.error != "" || (!keys.Verify(key, InviteMessage(invite), sigBytes) &&
+        !(clock.Unix(now) <= auth.LegacyDaochiSignedDomainValidThrough &&
+            keys.Verify(key, InviteMessageWithDomain("daochi-pairing-invite-v1", invite), sigBytes))) {
         result.error = errors.New("invalid pairing signature")
         return result
     }
@@ -320,10 +332,13 @@ NormalizeName :: (name: string) -> string {
 ValidName :: (name: string) -> bool {
     return name_rules.Valid(name)
 }
-NameClaimMessage :: (claim: NameClaim) -> []u8 {
+NameClaimMessageWithDomain :: (domain: string, claim: NameClaim) -> []u8 {
     services := json.Marshal(claim.Services)
-    parts: [9]string = .["daochi-name-claim-v1", FormatInteger(cast(s64)claim.Version, cast(isize)10),
+    parts: [9]string = .[domain, FormatInteger(cast(s64)claim.Version, cast(isize)10),
         claim.SpaceID, claim.Name, claim.NodeID, FormatInteger(claim.Sequence, cast(isize)10),
         FormatInteger(claim.ExpiresAt, cast(isize)10), signing.SHA256Hex(services.value), ""]
     return text.ToBytes(Join(parts[:], "\n"))
+}
+NameClaimMessage :: (claim: NameClaim) -> []u8 {
+    return NameClaimMessageWithDomain("mesh-name-claim-v1", claim)
 }

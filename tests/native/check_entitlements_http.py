@@ -211,7 +211,7 @@ def check_unlocks(connection, database, owner, token, trial_end, root, oracle):
     encoded, signature = grant["grant"].split(".")
     assert "=" not in grant["grant"] and abs(grant["expires_at"] - int(time.time()) - 3600) < 5
     payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    assert payload == f"daochi-pack-grant-v1\n{TAI_CHI}\n{grant['expires_at']}".encode()
+    assert payload == f"mesh-pack-grant-v1\n{TAI_CHI}\n{grant['expires_at']}".encode()
     verify_signature(root, payload, base64.urlsafe_b64decode(signature + "==").hex())
 
 

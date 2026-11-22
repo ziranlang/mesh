@@ -43,10 +43,14 @@ Write :: (writer: http.ResponseWriter, data: []u8) -> WriteResult #go_results #f
 WriteResult :: struct { count: isize; error: Error; }
 CloseRootAtReturn :: (root: *rooted.Root) #go_defer #foreign go_os "(*Root).Close";
 
-SigningMessage :: (release: Release) -> string {
-    return Message("daochi-zib-release-v1\n%s\n%d\n%s\n%s\n%s\n%d\n%s\n",
+SigningMessageWithDomain :: (domain: string, release: Release) -> string {
+    return Concat(domain, Message("\n%s\n%d\n%s\n%s\n%s\n%d\n%s\n",
         release.AppID, release.Sequence, release.Version, release.Runtime,
-        release.SHA256, release.Size, release.KeyID)
+        release.SHA256, release.Size, release.KeyID))
+}
+
+SigningMessage :: (release: Release) -> string {
+    return SigningMessageWithDomain("mesh-zib-release-v1", release)
 }
 
 Valid :: (release: Release, appID: string) -> bool {
@@ -117,11 +121,14 @@ Route :: (registry: app_registry.Registry, writer: http.ResponseWriter, request:
     key := store.ActiveKey(registry.database, http.Context(request), appID, release.KeyID)
     public := Decode(key.value.PublicKey)
     signature := Decode(release.Signature)
+    nowUnix := clock.Unix(clock.Now())
     if key.error != null || !key.found || key.value.Algorithm != "ed25519" ||
-        (key.value.ExpiresAt > 0 && key.value.ExpiresAt <= clock.Unix(clock.Now())) ||
+        (key.value.ExpiresAt > 0 && key.value.ExpiresAt <= nowUnix) ||
         public.error != null || public.value.count != 32 ||
         signature.error != null || signature.value.count != 64 ||
-        !keys.Verify(cast(keys.PublicKey)public.value, text.ToBytes(SigningMessage(release)), signature.value) {
+        (!keys.Verify(cast(keys.PublicKey)public.value, text.ToBytes(SigningMessage(release)), signature.value) &&
+            !(nowUnix <= 1826928000 && keys.Verify(cast(keys.PublicKey)public.value,
+                text.ToBytes(SigningMessageWithDomain("daochi-zib-release-v1", release)), signature.value))) {
         response.Error(writer, 503, "untrusted portable release")
         return
     }

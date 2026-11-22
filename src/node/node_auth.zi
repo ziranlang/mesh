@@ -19,7 +19,9 @@ go_numbers :: #system_library "go:strconv";
 go_hex :: #system_library "go:encoding/hex";
 builtin :: #system_library "go:builtin";
 
-NodeRequestContext :: "daochi-node-request-v1";
+NodeRequestContext :: "mesh-node-request-v1";
+LegacyNodeRequestContext :: "daochi-node-request-v1";
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 NodeAuthenticationWindowSeconds :: 300;
 
 #scope_file
@@ -92,7 +94,11 @@ Verify :: (database: *sql.Database, context: ctx.Context, request: *http.Request
     }
     message := signing.NodeRequestMessage(NodeRequestContext, nodeID, timestampText, nonce,
         http.Method(request), url.EscapedPath(http.RequestURL(request)), body)
-    if !keys.Verify(peer.value, text.ToBytes(message), text.ToBytes(signature.value)) {
+    sigBytes := text.ToBytes(signature.value)
+    if !keys.Verify(peer.value, text.ToBytes(message), sigBytes) &&
+        !(now <= LegacyDaochiSignedDomainValidThrough &&
+            keys.Verify(peer.value, text.ToBytes(signing.NodeRequestMessage(LegacyNodeRequestContext, nodeID, timestampText, nonce,
+                http.Method(request), url.EscapedPath(http.RequestURL(request)), body)), sigBytes)) {
         return errors.New("invalid node signature")
     }
     return nonces.Consume(database, context, nodeID, nonce, timestamp.value + NodeAuthenticationWindowSeconds)

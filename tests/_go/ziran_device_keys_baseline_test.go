@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	deviceRegistrationContext = "daochi-device-registration-v1"
-	deviceRevocationContext   = "daochi-device-revocation-v1"
+	deviceRegistrationContext = "mesh-device-registration-v1"
+	deviceRevocationContext   = "mesh-device-revocation-v1"
 )
 
 type baselineDeviceKey struct {

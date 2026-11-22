@@ -53,9 +53,8 @@
         return BuilderAppend(<<output, "\n")
     }
 
-    Message :: (document: *json.JsonDocument, root: s32, acceptance: bool,
+    MessageWithDomain :: (context: string, document: *json.JsonDocument, root: s32, acceptance: bool,
         inviteSignature: string, output: *Vec(u8)) -> bool {
-        context := ifx acceptance then "daochi-pairing-invite-v1-acceptance" else "daochi-pairing-invite-v1"
         if !BuilderAppend(<<output, context) || !BuilderAppend(<<output, "\n1\n") { return false }
         names: [4]string = .["invite_id", "node_id", "public_key", "display_name"]
         for name: names {
@@ -83,6 +82,12 @@
         encoded: [65]u8
         return sha.BytesToHex(*digest[0], digest.count, *encoded[0], encoded.count) == 1 &&
             BuilderAppend(<<output, TextView(encoded[:64])) && BuilderAppend(<<output, "\n")
+    }
+
+    Message :: (document: *json.JsonDocument, root: s32, acceptance: bool,
+        inviteSignature: string, output: *Vec(u8)) -> bool {
+        context := ifx acceptance then "mesh-pairing-invite-v1-acceptance" else "mesh-pairing-invite-v1"
+        return MessageWithDomain(context, document, root, acceptance, inviteSignature, output)
     }
 
     #scope_export
@@ -170,8 +175,18 @@
         signed: Text = fields.StringField(document, root, "signature")
         signature := binary.DecodeBase64(TextView(signed), true, false)
         message: Vec(u8)
-        if signature.error != "" || signature.value.count != 64 || !Message(document, root, acceptance, inviteSignature, *message) ||
-            !keys.Verify(bytes, VecSlice(message, 0, message.count), VecSlice(signature.value, 0, signature.value.count)) {
+        if signature.error != "" || signature.value.count != 64 || !Message(document, root, acceptance, inviteSignature, *message) {
+            return .{error = ifx acceptance then "invalid pairing acceptance signature" else "invalid pairing signature"}
+        }
+        sigBytes := VecSlice(signature.value, 0, signature.value.count)
+        verified := keys.Verify(bytes, VecSlice(message, 0, message.count), sigBytes)
+        if !verified && now <= 1826928000 {
+            VecClear(message)
+            legacy := ifx acceptance then "daochi-pairing-invite-v1-acceptance" else "daochi-pairing-invite-v1"
+            verified = MessageWithDomain(legacy, document, root, acceptance, inviteSignature, *message) &&
+                keys.Verify(bytes, VecSlice(message, 0, message.count), sigBytes)
+        }
+        if !verified {
             return .{error = ifx acceptance then "invalid pairing acceptance signature" else "invalid pairing signature"}
         }
         result: Proof

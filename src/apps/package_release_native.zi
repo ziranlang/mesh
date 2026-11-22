@@ -134,7 +134,7 @@
         if TextView(id) != app || result.sequence <= 0 || result.host <= 0 || result.module <= 0 || result.schema < 0 ||
             !VersionValid(TextView(version)) || TextView(runtime) != "kryon-app-v1" || !identity.ValidNamespace(TextView(key)) ||
             (TextView(channel) != "" && TextView(channel) != "beta") { return .{} }
-        if !delivery.AppendLine(*result.message, "daochi-zib-release-v2") || !delivery.AppendLine(*result.message, app) ||
+        if !delivery.AppendLine(*result.message, "mesh-zib-release-v2") || !delivery.AppendLine(*result.message, app) ||
             !delivery.AppendNumber(*result.message, result.sequence) || !delivery.AppendLine(*result.message, TextView(version)) ||
             !delivery.AppendLine(*result.message, TextView(runtime)) || !delivery.AppendNumber(*result.message, result.host) ||
             !delivery.AppendNumber(*result.message, result.module) || !delivery.AppendNumber(*result.message, result.schema) ||
@@ -147,7 +147,17 @@
     Trusted :: (access: *accounts.AccountAccess, document: *json.JsonDocument, release: *Release, app: string, now: s64) -> bool {
         key: Text = json.JsonString(document, release.nodes[7])
         proof: Text = json.JsonString(document, release.nodes[10])
-        return delivery.Trusted(access, app, TextView(key), TextView(proof), VecSlice(release.message, 0, release.message.count), now)
+        if delivery.Trusted(access, app, TextView(key), TextView(proof), VecSlice(release.message, 0, release.message.count), now) {
+            return true
+        }
+        if now > 1826928000 || release.message.count < 19 { return false }
+        // Legacy fallback replaces leading "mesh-zib-release-v2" (19 bytes) with "daochi-zib-release-v2".
+        legacy: Vec(u8)
+        if !BuilderAppend(legacy, "daochi-zib-release-v2") ||
+            !BuilderAppend(legacy, TextView(VecSlice(release.message, 19, release.message.count))) {
+            return false
+        }
+        return delivery.Trusted(access, app, TextView(key), TextView(proof), VecSlice(legacy, 0, legacy.count), now)
     }
 
     ModuleHash :: (document: *json.JsonDocument, release: *Release) -> Text {

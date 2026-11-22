@@ -100,8 +100,8 @@ SignatureHeader :: (request: *http.Request) -> RequestSignature {
     result: RequestSignature
     result.context = "ksync-sync-v1"
     headers := http.Headers(request)
-    names: [3]string = .["X-Mesh-Signature", "X-Ksync-Signature", "X-Inbe-Signature"]
-    contexts: [3]string = .["daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
+    names: [4]string = .["X-Mesh-Signature", "X-Daochi-Signature", "X-Ksync-Signature", "X-Inbe-Signature"]
+    contexts: [4]string = .["mesh-sync-v1", "daochi-sync-v1", "ksync-sync-v1", "inbe-sync-v1"]
     index: s64 = 0
     while index < names.count {
         value := TrimSpace(wire.Value(headers, names[index]))

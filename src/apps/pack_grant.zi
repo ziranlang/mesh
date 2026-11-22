@@ -15,7 +15,9 @@ builtin :: #system_library "go:builtin";
 
 // The payload prefix keeps a grant signature from ever matching a token
 // receipt or checkpoint signed by the same key.
-GrantPrefix :: "daochi-pack-grant-v1";
+GrantPrefix :: "mesh-pack-grant-v1";
+LegacyGrantPrefix :: "daochi-pack-grant-v1";
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z
 GrantSeconds :: 3600
 
 PackGrant :: struct {
@@ -103,7 +105,9 @@ Valid :: (publicKey: ed.PublicKey, grant: string, product: string, now: s64) -> 
         return false
     }
     fields := Split(text.FromBytes(payload.value), "\n")
-    if fields.count != 3 || fields[0] != GrantPrefix || fields[1] != product {
+    validPrefix := fields.count == 3 && (fields[0] == GrantPrefix ||
+        (now <= LegacyDaochiSignedDomainValidThrough && fields[0] == LegacyGrantPrefix))
+    if !validPrefix || fields[1] != product {
         return false
     }
     expiry := ParseInteger(fields[2], cast(isize)10, cast(isize)64)

@@ -15,9 +15,9 @@ import (
 )
 
 const (
-	baselineTxContext          = "daochi-tx-v1"
-	baselineAppManifestContext = "daochi-app-manifest-v1"
-	baselineAppApprovalContext = "daochi-app-approval-v1"
+	baselineTxContext          = "mesh-tx-v1"
+	baselineAppManifestContext = "mesh-app-manifest-v1"
+	baselineAppApprovalContext = "mesh-app-approval-v1"
 	baselineTxMaxFutureSkew    = 15 * time.Minute
 )
 

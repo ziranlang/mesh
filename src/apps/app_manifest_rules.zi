@@ -36,5 +36,8 @@ ValidDate :: (value: string) -> bool {
     }
     return day <= days
 }
-AppManifestContext :: "daochi-app-manifest-v1";
-AppApprovalContext :: "daochi-app-approval-v1";
+AppManifestContext :: "mesh-app-manifest-v1";
+LegacyAppManifestContext :: "daochi-app-manifest-v1";
+AppApprovalContext :: "mesh-app-approval-v1";
+LegacyAppApprovalContext :: "daochi-app-approval-v1";
+LegacyDaochiSignedDomainValidThrough :: 1826928000; // 2027-11-22T23:59:59Z

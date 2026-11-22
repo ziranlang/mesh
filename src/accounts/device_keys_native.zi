@@ -172,12 +172,23 @@
         }
         message: Vec(u8)
         expiry: [24]u8
-        context := ifx revoke then "daochi-device-revocation-v1" else "daochi-device-registration-v1"
+        expiryText := numbers.FormatInteger(expires, expiry[:])
+        context := ifx revoke then "mesh-device-revocation-v1" else "mesh-device-registration-v1"
         if !AppendLine(*message, context) || !AppendLine(*message, account) || !AppendLine(*message, app) || !AppendLine(*message, id) ||
             (!revoke && (!AppendLine(*message, client) || !AppendLine(*message, publicKey))) ||
-            !AppendLine(*message, nonce) || !AppendLine(*message, numbers.FormatInteger(expires, expiry[:])) { return Failed(revoke) }
-        if accountKey.count != codec.mlDSA44PublicKeySize || !verify(accountKey.bytes[:], VecSlice(message, 0, message.count),
-            VecSlice(signature.value, 0, signature.value.count)) {
+            !AppendLine(*message, nonce) || !AppendLine(*message, expiryText) { return Failed(revoke) }
+        sigBytes := VecSlice(signature.value, 0, signature.value.count)
+        verified := accountKey.count == codec.mlDSA44PublicKeySize &&
+            verify(accountKey.bytes[:], VecSlice(message, 0, message.count), sigBytes)
+        if !verified && accountKey.count == codec.mlDSA44PublicKeySize && now.seconds <= 1826928000 {
+            VecClear(message)
+            legacy := ifx revoke then "daochi-device-revocation-v1" else "daochi-device-registration-v1"
+            if !AppendLine(*message, legacy) || !AppendLine(*message, account) || !AppendLine(*message, app) || !AppendLine(*message, id) ||
+                (!revoke && (!AppendLine(*message, client) || !AppendLine(*message, publicKey))) ||
+                !AppendLine(*message, nonce) || !AppendLine(*message, expiryText) { return Failed(revoke) }
+            verified = verify(accountKey.bytes[:], VecSlice(message, 0, message.count), sigBytes)
+        }
+        if !verified {
             return .{status = 401, message = ifx revoke then "device revocation rejected" else "device registration rejected"}
         }
         created: [31]u8

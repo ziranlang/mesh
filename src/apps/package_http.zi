@@ -300,12 +300,15 @@ Trusted :: (context: registry.Registry, request: *http.Request,
     key := store.ActiveKey(context.database, http.Context(request), value.AppID, value.KeyID)
     public := Decode(key.value.PublicKey)
     signature := Decode(value.Signature)
+    nowUnix := clock.Unix(clock.Now())
     return key.error == null && key.found && key.value.Algorithm == "ed25519" &&
-    (key.value.ExpiresAt <= 0 || key.value.ExpiresAt > clock.Unix(clock.Now())) &&
+    (key.value.ExpiresAt <= 0 || key.value.ExpiresAt > nowUnix) &&
     public.error == null && public.value.count == 32 &&
     signature.error == null && signature.value.count == 64 &&
-    keys.Verify(cast(keys.PublicKey)public.value,
-        text.ToBytes(release.SigningMessage(value)), signature.value)
+    (keys.Verify(cast(keys.PublicKey)public.value,
+        text.ToBytes(release.SigningMessage(value)), signature.value) ||
+        (nowUnix <= 1826928000 && keys.Verify(cast(keys.PublicKey)public.value,
+            text.ToBytes(release.SigningMessageWithDomain("daochi-zib-release-v2", value)), signature.value)))
 }
 
 // Retained choices may have large sequence gaps. Read the bounded history

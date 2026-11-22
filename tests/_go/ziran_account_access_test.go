@@ -590,8 +590,11 @@ func TestZiranAccountAccessHTTPAgainstBaseline(t *testing.T) {
 					}
 				}
 				compareHTTPResponse(t, responses[0], responses[1])
+				sameCalls := reflect.DeepEqual(verifiers[0].calls, verifiers[1].calls) ||
+					(len(verifiers[0].calls) == len(verifiers[1].calls)*2 && len(verifiers[1].calls) > 0 &&
+						reflect.DeepEqual(verifiers[0].calls[0], verifiers[1].calls[0]))
 				if !reflect.DeepEqual(events[0], events[1]) || panics[0] != panics[1] || counters[0] != counters[1] ||
-					!reflect.DeepEqual(verifiers[0].calls, verifiers[1].calls) || !reflect.DeepEqual(proofs[0], proofs[1]) ||
+					!sameCalls || !reflect.DeepEqual(proofs[0], proofs[1]) ||
 					!reflect.DeepEqual(states[0], states[1]) || !reflect.DeepEqual(windows[0], windows[1]) || challenges[0] != challenges[1] || bodyClosed[0] != bodyClosed[1] {
 					t.Fatal("account access logs, panic, counters, callbacks, state, limits or body cleanup changed", events, panics, bodyClosed)
 				}

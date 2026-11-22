@@ -178,14 +178,18 @@ ReadRendezvous :: (transaction: *sql.Transaction, context: ctx.Context, requestI
 }
 
 #scope_export
-ClaimMessage :: (pending: Rendezvous, claim: RendezvousClaim, initDigest: string) -> string {
+ClaimMessageWithDomain :: (domain: string, pending: Rendezvous, claim: RendezvousClaim, initDigest: string) -> string {
     // The unguessable request and fresh challenge bind the owner-created
     // pending row without disclosing its account or numeric Telegram user.
-    fields: [12]string = .["daochi-rendezvous-claim-v1", pending.requestID,
+    fields: [12]string = .[domain, pending.requestID,
         pending.appID, pending.nodeID, pending.audience,
         pending.challenge, FormatInteger(pending.expiresAt, 10),
         claim.clientID, claim.signingKey, claim.encryptionKey, initDigest, ""]
     return Join(fields[:], "\n")
+}
+
+ClaimMessage :: (pending: Rendezvous, claim: RendezvousClaim, initDigest: string) -> string {
+    return ClaimMessageWithDomain("mesh-rendezvous-claim-v1", pending, claim, initDigest)
 }
 
 CreateRequest :: (service: Authorizations, writer: http.ResponseWriter, request: *http.Request) {
@@ -398,7 +402,9 @@ Claim :: (service: Authorizations, writer: http.ResponseWriter, request: *http.R
         Failure(service, writer, 400, "unexpected Telegram claim")
         return
     }
-    if !session.VerifyKeyProof(input.signingKey, ClaimMessage(pending, input, digest), input.proof) {
+    if !session.VerifyKeyProof(input.signingKey, ClaimMessage(pending, input, digest), input.proof) &&
+        !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+            session.VerifyKeyProof(input.signingKey, ClaimMessageWithDomain("daochi-rendezvous-claim-v1", pending, input, digest), input.proof)) {
         Failure(service, writer, 401, "delegate claim proof rejected")
         return
     }
@@ -668,7 +674,9 @@ IssueSession :: (service: Authorizations, writer: http.ResponseWriter, request: 
     row := sql.QueryRowTx(transaction, context,
         "SELECT expires_at FROM server_authorization_challenges WHERE challenge=?1 AND grant_id=?2", arguments[0:2])
     if sql.ScanRow(row, destinations[:]) != null ||
-        !session.VerifyKeyProof(grant.value.signingKey, session.ChallengeMessage(challenge), input.signature) {
+        (!session.VerifyKeyProof(grant.value.signingKey, session.ChallengeMessage(challenge), input.signature) &&
+            !(now <= authorization.LegacyDaochiSignedDomainValidThrough &&
+                session.VerifyKeyProof(grant.value.signingKey, session.ChallengeMessageWithDomain("daochi-session-v1", challenge), input.signature))) {
         Failure(service, writer, 401, "session key proof rejected")
         return
     }

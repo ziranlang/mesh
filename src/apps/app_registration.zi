@@ -237,11 +237,16 @@ Verify :: (request: SignedAppRegistrationRequest, nodeKey: keys.PublicKey) -> Ma
         result.authentication = auth.Failure(cast(isize)400, "invalid manifest signature")
         return result
     }
+    nowUnix := clock.Unix(clock.Now())
     parts: [2]string = .[manifest_rules.AppManifestContext, text.FromBytes(encoded.value)]
     message := text.ToBytes(Join(parts[:], "\n"))
-    if !manifest.SignedByActiveKey(request.Manifest, message, signature, clock.Unix(clock.Now())) {
-        result.authentication = auth.Failure(cast(isize)401, "manifest signature rejected")
-        return result
+    if !manifest.SignedByActiveKey(request.Manifest, message, signature, nowUnix) {
+        legacyParts: [2]string = .[manifest_rules.LegacyAppManifestContext, text.FromBytes(encoded.value)]
+        if nowUnix > manifest_rules.LegacyDaochiSignedDomainValidThrough ||
+            !manifest.SignedByActiveKey(request.Manifest, text.ToBytes(Join(legacyParts[:], "\n")), signature, nowUnix) {
+            result.authentication = auth.Failure(cast(isize)401, "manifest signature rejected")
+            return result
+        }
     }
     decoded = codec.DecodeBinaryField(request.ApprovalSignature)
     signature = text.ToBytes(decoded.value)
@@ -250,7 +255,9 @@ Verify :: (request: SignedAppRegistrationRequest, nodeKey: keys.PublicKey) -> Ma
         return result
     }
     approval := text.ToBytes(signing.AppApprovalMessage(manifest_rules.AppApprovalContext, request.Manifest.AppID, hash))
-    if !keys.Verify(nodeKey, approval, signature) {
+    if !keys.Verify(nodeKey, approval, signature) &&
+        !(nowUnix <= manifest_rules.LegacyDaochiSignedDomainValidThrough &&
+            keys.Verify(nodeKey, text.ToBytes(signing.AppApprovalMessage(manifest_rules.LegacyAppApprovalContext, request.Manifest.AppID, hash)), signature)) {
         result.authentication = auth.Failure(cast(isize)401, "node approval rejected")
         return result
     }

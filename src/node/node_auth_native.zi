@@ -41,15 +41,19 @@
         return .{}
     }
 
-    RequestMessage :: (node: string, timestamp: string, nonce: string, path: string, body: []u8, message: *Vec(u8)) -> bool {
+    RequestMessageWithDomain :: (domain: string, node: string, timestamp: string, nonce: string, path: string, body: []u8, message: *Vec(u8)) -> bool {
         digest := sha.Sha256Of(TextView(body))
         hash: [65]u8
         if sha.BytesToHex(*digest[0], digest.count, *hash[0], hash.count) != 1 { return false }
-        parts: [7]string = .["daochi-node-request-v1", node, timestamp, nonce, "POST", path, TextView(hash[:64])]
+        parts: [7]string = .[domain, node, timestamp, nonce, "POST", path, TextView(hash[:64])]
         for part: parts {
             if !BuilderAppend(<<message, part) || !BuilderAppend(<<message, "\n") { return false }
         }
         return true
+    }
+
+    RequestMessage :: (node: string, timestamp: string, nonce: string, path: string, body: []u8, message: *Vec(u8)) -> bool {
+        return RequestMessageWithDomain("mesh-node-request-v1", node, timestamp, nonce, path, body, message)
     }
 
     #scope_file
@@ -129,6 +133,14 @@
         }
         problem := Verify(database, node, VecSlice(message, 0, message.count),
             VecSlice(signature.value, 0, signature.value.count))
+        if problem == "invalid node signature" && now <= 1826928000 {
+            VecClear(message)
+            if !RequestMessageWithDomain("daochi-node-request-v1", node, timestampText, nonce, path, body, *message) {
+                return .{status = 500, error = StoreFailure}
+            }
+            problem = Verify(database, node, VecSlice(message, 0, message.count),
+                VecSlice(signature.value, 0, signature.value.count))
+        }
         if problem != "" { return .{status = 401, error = problem} }
         expire: [1]sql.Argument = .[sql.IntArg(now)]
         insert: [3]sql.Argument = .[sql.TextArg(node), sql.TextArg(nonce), sql.IntArg(timestamp + WindowSeconds)]

@@ -403,7 +403,7 @@ func TestPackGrantFormat(t *testing.T) {
 		t.Fatalf("grant: %s", issued.Grant)
 	}
 	payload := mustDecodeGrantPart(t, parts[0])
-	if string(payload) != "daochi-pack-grant-v1\ninbe.practice.taichi\n2000" ||
+	if string(payload) != "mesh-pack-grant-v1\ninbe.practice.taichi\n2000" ||
 		!ed25519.Verify(public, payload, mustDecodeGrantPart(t, parts[1])) {
 		t.Fatalf("payload: %q", payload)
 	}

@@ -45,7 +45,7 @@ Decode :: (value: string) -> Decoded #go_results #foreign hex "DecodeString";
 Encode :: (value: []u8) -> string #foreign hex "EncodeToString";
 Split :: (value: string, separator: string) -> []string #foreign strings;
 Less :: (a: string, b: string) -> s32 #foreign strings "Compare";
-HeaderMessage :: (template: string, app: string, sequence: s64,
+HeaderMessage :: (template: string, domain: string, app: string, sequence: s64,
     version: string, runtime: string, host: s64, module: s64, schema: s64,
     key: string, count: s64) -> string #foreign fmt "Sprintf";
 ArtifactMessage :: (template: string, prefix: string, variant: string,
@@ -118,9 +118,9 @@ Valid :: (release: ReleaseV2, appID: string) -> bool {
     return true
 }
 
-SigningMessage :: (release: ReleaseV2) -> string {
-    result := HeaderMessage("daochi-zib-release-v2\n%s\n%d\n%s\n%s\n%d\n%d\n%d\n%s\n%d\n",
-        release.AppID, release.Sequence, release.Version, release.Runtime,
+SigningMessageWithDomain :: (domain: string, release: ReleaseV2) -> string {
+    result := HeaderMessage("%s\n%s\n%d\n%s\n%s\n%d\n%d\n%d\n%s\n%d\n",
+        domain, release.AppID, release.Sequence, release.Version, release.Runtime,
         release.HostAPI, release.ModuleAPI, release.DataSchema,
         release.KeyID, release.Artifacts.count)
     for artifact: release.Artifacts {
@@ -133,6 +133,10 @@ SigningMessage :: (release: ReleaseV2) -> string {
             dependency.Version, dependency.SHA256, dependency.Size)
     }
     return result
+}
+
+SigningMessage :: (release: ReleaseV2) -> string {
+    return SigningMessageWithDomain("mesh-zib-release-v2", release)
 }
 
 ContainsArtifact :: (release: ReleaseV2, hash: string) -> bool {
