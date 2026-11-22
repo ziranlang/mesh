@@ -58,6 +58,45 @@ test-ziran-native:
 	$(BUILD_DIR)/native-tests/primitives
 
 SQLITE_NATIVE_DIR ?= $(abspath ../packages/sqlite/build/native)
+SQLITE_BUILD_DIR := $(BUILD_DIR)/sqlite3
+SQLITE_LOCKED_DIR := $(BUILD_DIR)/sqlite-native
+MICROHTTPD_VERSION := 1.0.1-4
+MICROHTTPD_RUNTIME_SHA256 := e4161f63d26b4835a79b936f50b4cc90fb10b718f3b6623ac609856adde4c76b
+MICROHTTPD_DEV_SHA256 := 4bfcff352f603d881683339b0faf55de1b1c4fc492d17741f400264851852b35
+MICROHTTPD_ROOT := $(BUILD_DIR)/microhttpd
+
+# SQLite from the locked sqlite3 source, built outside its package checkout.
+# Production links this amalgamation, so the native suites use it too.
+sqlite-native: $(SQLITE_LOCKED_DIR)/libsqlite3.so
+
+$(SQLITE_LOCKED_DIR)/libsqlite3.so: ziran.lock
+	mkdir -p $(SQLITE_BUILD_DIR) $(SQLITE_LOCKED_DIR)
+	set -e; \
+	source=$$($(ZIRAN) pkg path sqlite3 $(if $(wildcard ziran.local.toml),,--locked)); \
+	test -x "$$source/configure"; \
+	cd $(SQLITE_BUILD_DIR) && "$$source/configure" --disable-shared --disable-readline --disable-tcl
+	$(MAKE) -C $(SQLITE_BUILD_DIR) sqlite3.c
+	$(CC) -O2 -fPIC -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
+		-c $(SQLITE_BUILD_DIR)/sqlite3.c -o $(SQLITE_LOCKED_DIR)/sqlite3.o
+	$(CC) -shared $(SQLITE_LOCKED_DIR)/sqlite3.o -lm -ldl -pthread -o $@
+
+# Debian's libmicrohttpd, the package the production origin installs.
+microhttpd-native:
+	mkdir -p $(MICROHTTPD_ROOT)/root
+	set -e; \
+	for entry in libmicrohttpd12t64:$(MICROHTTPD_RUNTIME_SHA256) libmicrohttpd-dev:$(MICROHTTPD_DEV_SHA256); do \
+		package=$${entry%%:*}; \
+		digest=$${entry#*:}; \
+		file="$(MICROHTTPD_ROOT)/$${package}_$(MICROHTTPD_VERSION)_amd64.deb"; \
+		if [ ! -f "$$file" ]; then \
+			curl --fail --location --silent --show-error --output "$$file.part" \
+				"https://deb.debian.org/debian/pool/main/libm/libmicrohttpd/$${package}_$(MICROHTTPD_VERSION)_amd64.deb"; \
+			mv "$$file.part" "$$file"; \
+		fi; \
+		printf '%s  %s\n' "$$digest" "$$file" | sha256sum --check --strict --quiet; \
+		dpkg-deb -x "$$file" $(MICROHTTPD_ROOT)/root; \
+	done
+
 test-ziran-native-sqlite:
 	mkdir -p $(BUILD_DIR)/native-tests/sqlite-health
 	XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \

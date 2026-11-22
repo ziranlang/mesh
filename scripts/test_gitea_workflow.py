@@ -65,10 +65,13 @@ class GiteaWorkflowTest(unittest.TestCase):
         for action in SHARED_SLOT_SETUP:
             self.assertEqual(uses.count(action), 1)
         runs = [step.get("run", "") for step in steps]
-        plain_tests = [run for run in runs if "make test" in run and "-race" not in run]
+        plain_tests = [run for run in runs if re.search(r"make test(\s|$)", run) and "-race" not in run]
         self.assertEqual(len(plain_tests), 1)
         self.assertIn("-coverprofile=coverage.out", plain_tests[0])
         self.assertEqual(sum("-race" in run for run in runs), 1)
+        native = next(step for step in steps if step.get("name") == "Native server suite")
+        self.assertIn("make sqlite-native microhttpd-native", native["run"])
+        self.assertIn("make test-ziran-native-server", native["run"])
         for name in ("Lint", "Race test", "Scan generated Go and check dependency licenses"):
             self.assertIn(name, [step.get("name") for step in steps])
         scans = [run for run in runs if "govulncheck -scan=package . ./native" in run]

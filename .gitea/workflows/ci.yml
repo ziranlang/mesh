@@ -110,6 +110,13 @@ jobs:
       - name: Race test
         run: make test GOFLAGS="-mod=mod -race"
 
+      # The native server links the SQLite and libmicrohttpd production uses.
+      - name: Native server suite
+        run: |
+          make sqlite-native microhttpd-native
+          make test-ziran-native-server SQLITE_NATIVE_DIR="$PWD/build/sqlite-native" \
+            MICROHTTPD_NATIVE_DIR="$PWD/build/microhttpd/root/usr/lib/x86_64-linux-gnu"
+
       - name: Install pinned vulnerability, source and license scanners
         env:
           CGO_ENABLED: '0'
