@@ -110,13 +110,6 @@ jobs:
       - name: Race test
         run: make test GOFLAGS="-mod=mod -race"
 
-      # The native server links the SQLite and libmicrohttpd production uses.
-      - name: Native server suite
-        run: |
-          make sqlite-native microhttpd-native
-          make test-ziran-native-server SQLITE_NATIVE_DIR="$PWD/build/sqlite-native" \
-            MICROHTTPD_NATIVE_DIR="$PWD/build/microhttpd/root/usr/lib/x86_64-linux-gnu"
-
       - name: Install pinned vulnerability, source and license scanners
         env:
           CGO_ENABLED: '0'
@@ -286,10 +279,6 @@ jobs:
       - name: Generate the Go from the Zi sources
         uses: ./.gitea/actions/generate
 
-      # The origin compiles this generated C with cc; Ziran stays off the origin.
-      - name: Generate the native server sources
-        run: make native-release
-
       - name: Verify the pinned native source
         id: liboqs
         run: python3 -B scripts/verify_deployment_inputs.py pinned-source
@@ -300,8 +289,6 @@ jobs:
           test "$(git ls-remote --exit-code origin refs/heads/master | cut -f1)" = "$GITHUB_SHA"
           git ls-files -z --recurse-submodules > "$RUNNER_TEMP/mesh-source-files"
           find . -maxdepth 1 -type f \( -name '*.zi.go' -o -name '*.zi_test.go' \) \
-            -print0 >> "$RUNNER_TEMP/mesh-source-files"
-          find build/native-release -type f \( -name '*.c' -o -name '*.h' \) \
             -print0 >> "$RUNNER_TEMP/mesh-source-files"
           tar --null --no-recursion --files-from="$RUNNER_TEMP/mesh-source-files" \
             --create --gzip --file="$RUNNER_TEMP/mesh-source.tar.gz"

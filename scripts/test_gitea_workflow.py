@@ -71,9 +71,6 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(sum("-race" in run for run in runs), 1)
         coverage = next(step for step in steps if step.get("name") == "Test and report coverage")
         self.assertIn("GOFLAGS=-mod=mod go tool cover", coverage["run"])
-        native = next(step for step in steps if step.get("name") == "Native server suite")
-        self.assertIn("make sqlite-native microhttpd-native", native["run"])
-        self.assertIn("make test-ziran-native-server", native["run"])
         for name in ("Lint", "Race test", "Scan generated Go and check dependency licenses"):
             self.assertIn(name, [step.get("name") for step in steps])
         scans = [run for run in runs if "govulncheck -scan=package . ./native" in run]
@@ -95,16 +92,6 @@ class GiteaWorkflowTest(unittest.TestCase):
         wanted = {word for group in targets for word in group.split() if "=" not in word}
         wanted |= {"build", "build-native"}
         self.assertLessEqual(wanted, forwarded | {"all"})
-
-    def test_deploy_ships_the_native_sources_it_generated(self):
-        steps = self.jobs["deploy"]["steps"]
-        names = [step.get("name") for step in steps]
-        release = names.index("Generate the native server sources")
-        package = names.index("Package the exact canonical revision")
-        self.assertEqual(steps[release]["run"], "make native-release")
-        self.assertLess(names.index("Generate the Go from the Zi sources"), release)
-        self.assertLess(release, package)
-        self.assertIn("find build/native-release -type f", steps[package]["run"])
 
     def test_container_probe_stays_inside_its_network_namespace(self):
         steps = self.jobs["container"]["steps"]

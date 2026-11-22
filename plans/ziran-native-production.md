@@ -10,6 +10,27 @@ suite under `tests/_go` is Go.
 `make test-ziran-native-server` passes locally against the native C build of
 `src/server/server_native.zi`.
 
+Blocked on unpushed dependencies. The native server added in Mesh `82940cd`
+compiles only with uncommitted work in other checkouts, so it does not build
+from the locked toolchain and packages:
+
+- ziranlang/ziran `std/file_tree_linux.zi`: `OpenDirectoryHandle`,
+  `OpenChildRegularFile`, `OpenChildDirectory`, `OpenOrCreateChildDirectory`,
+  `OpenNewChildFile`, `RemoveChildFile`, `RenameChild` (edited by an active
+  Ziran lane on 2026-11-22).
+- ziranlang/ziran `std/gzip_linux.zi`: `GzipDecompressMembers` (uncommitted
+  since 2026-11-20).
+- ziranlang/compression `src/zstd_native.zi`: the `ZstdEncoder` pool
+  (uncommitted since 2026-11-20).
+- ziranlang/sqlite `src/SQLite.zi` (uncommitted since 2026-11-20).
+
+When their owners push them, bump the `ziran.toml` pins, run `ziran lock`
+without `ziran.local.toml`, run the Go and native suites, and restore the CI
+steps: the native server suite in `checks` (`make sqlite-native
+microhttpd-native`, then `make test-ziran-native-server` with those
+directories) and `make native-release` plus packaging `build/native-release`
+`*.c`/`*.h` in `deploy`.
+
 1. Close the gaps between the Go and native servers, each with its regression
    test. Done: `/readyz` direct purchases, chat-usage retention, the Telegram
    Stars and Google Play suites, the shared capability list, `DAOCHI_*`
