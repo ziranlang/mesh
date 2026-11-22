@@ -47,6 +47,16 @@ INSERT INTO server_chat_usage(account_id,day,used) VALUES(?1,?2,1)
 ON CONFLICT(account_id,day) DO UPDATE SET used=used+1 WHERE used<?3
 SQL_END;
 
+    // Chat allowances count requests per UTC day; those counts are kept this long.
+    UsageDays :: 30;
+    ExpiredUsage :: "DELETE FROM server_chat_usage WHERE day<?1";
+    // A request answered while its account was being deleted can leave a count
+    // behind. The node's own total and the group allowance are not accounts.
+    OrphanedUsage :: #string SQL_END
+DELETE FROM server_chat_usage WHERE account_id NOT IN ('node','lumi-group')
+AND NOT EXISTS(SELECT 1 FROM server_users WHERE user_id_hash=server_chat_usage.account_id)
+SQL_END;
+
     Quota :: struct {
         remaining: s64
         status: u32
@@ -78,6 +88,27 @@ SQL_END;
         return format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, target)
     }
 
+    #scope_export
+    // Deletes daily chat counts older than UsageDays and those of deleted
+    // accounts. The caller holds the database lock.
+    PruneUsage :: (database: *void, now: s64) -> bool {
+        oldest := now - UsageDays * 86400000
+        stamp: [32]u8
+        if oldest < 0 || UTC(oldest, stamp[:]) < 10 {
+            return false
+        }
+        if sqlite.SqliteExecText(database, "BEGIN IMMEDIATE") != sqlite.SQLITE_OK {
+            return false
+        }
+        defer Rollback(database)
+        day: [1]sql.Argument = .[sql.TextArg(TextView(stamp[:10]))]
+        none: [0]sql.Argument
+        return sql.Execute(database, ExpiredUsage, day[:]) == sqlite.SQLITE_OK &&
+            sql.Execute(database, OrphanedUsage, none[:]) == sqlite.SQLITE_OK &&
+            sqlite.SqliteExecText(database, "COMMIT") == sqlite.SQLITE_OK
+    }
+
+    #scope_file
     Authenticate :: (access: *accounts.AccountAccess, connection: *void) -> auth.BearerAuthentication {
         now := calendar.UnixMilliseconds()
         audit: [32]u8

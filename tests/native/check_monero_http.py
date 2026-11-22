@@ -153,8 +153,15 @@ def get(connection, path, status=200, **kwargs):
     return request(connection, "GET", path, status, **kwargs)[1]
 
 
+def direct_purchase_readiness(connection):
+    connection.request("GET", "/readyz")
+    reply = connection.getresponse()
+    return json.loads(reply.read())["checks"].get("token_direct_purchases")
+
+
 def check_disabled(binary, oracle, root):
     with server(binary, root / "disabled.sqlite", **configuration("", MESH_TOKEN_DIRECT_PURCHASES_ENABLED="false")) as (connection, _):
+        assert direct_purchase_readiness(connection) is None
         assert get(connection, ADDRESS, 503) == {"error": "monero purchases disabled"}
         assert get(connection, DEPOSITS, 401) == {"error": "bearer token required"}
         _, bearer, _ = login(connection, oracle)
@@ -257,6 +264,7 @@ def main(binary, oracle):
         root = Path(temporary)
         check_disabled(binary, oracle, root)
         with mock_wallet() as (wallet, url), server(binary, root / "ready.sqlite", **configuration(url)) as (connection, database):
+            assert direct_purchase_readiness(connection) == "ok"
             owner, bearer, keys = login(connection, oracle)
             check_address(connection, oracle, wallet, owner, bearer)
             check_invoices(connection, database, wallet, oracle, root, owner, bearer, keys)

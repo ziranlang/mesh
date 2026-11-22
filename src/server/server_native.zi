@@ -140,6 +140,8 @@
         meshToken: string
         meshBatch: s64
         persistentSecret: bool
+        directPurchases: bool
+        moneroWalletURL: string
         issuerPublic: []u8
     }
 
@@ -581,12 +583,23 @@
                 node.displayName, node.baseURL, *state.knownPeers, notifications.Stats(*state.notificationHub),
                 state.premiumAliasesEnabled, state.playVerifier, configuration.zstdRequests, configuration.zstdResponses)
         }
-        return operational.Ready(connection, state.accounts.configuration.database, .{
-            persistentTokenSecret = state.persistentSecret, verifierAvailable = true,
-            issuerStatus = token_issuer.Status(*state.tokens.signer)})
+        return Ready(state, connection)
     }
 
     #scope_file
+    // Reports direct-purchase readiness from the same inputs as the Go server.
+    Ready :: (state: *State, connection: *void) -> s32 {
+        issuer := token_issuer.Status(*state.tokens.signer)
+        rules := state.entitlements
+        canPurchase := state.directPurchases && issuer == "ok"
+        rateOrProduct := canPurchase &&
+            (state.tokens.moneroProduct || (rules.moneroAtomicAmount > 0 && rules.moneroTokenUnits > 0))
+        return operational.Ready(connection, state.accounts.configuration.database, .{
+            persistentTokenSecret = state.persistentSecret, verifierAvailable = true, issuerStatus = issuer,
+            directPurchasesEnabled = state.directPurchases, moneroRateOrProduct = rateOrProduct,
+            moneroWalletConfigured = rateOrProduct && wire.TrimSpace(state.moneroWalletURL) != ""})
+    }
+
     Fail :: (message: string) -> s32 {
         unused stdio.PrintError(message)
         return 1
@@ -623,6 +636,9 @@
         }
         if !blob_store.Purge(settings.database, settings.path, now, trashDays) {
             unused stdio.PrintError("could not purge expired trashed blobs\n")
+        }
+        if !chat.PruneUsage(settings.database, calendar.UnixMilliseconds()) {
+            unused stdio.PrintError("could not prune expired chat usage\n")
         }
     }
 
@@ -775,6 +791,8 @@
             trialUntil = trialUntil.value, islandLaunchAt = islandLaunch.value}
         walletURL := Setting("MONERO_WALLET_RPC_URL", "")
         walletNetwork := Setting("MONERO_NETWORK", "mainnet")
+        state.directPurchases = directPurchases
+        state.moneroWalletURL = walletURL
         entitlementError := entitlements.ConfigurationError(state.entitlements, persistent, directPurchases, walletURL, walletNetwork)
         if entitlementError != "" { return FailLine(entitlementError) }
         settlement := reward_campaign.SettleCampaign(database, *state.tokens.signer)

@@ -26,6 +26,8 @@
     State :: struct {
         signer: issuer.Issuer
         products: Vec(u8)
+        // A product with a Monero price lets direct purchases quote without a rate.
+        moneroProduct: bool
     }
 
     #scope_file
@@ -57,7 +59,7 @@
         return left.count < right.count
     }
 
-    ProductConfiguration :: (configuration: string, directPurchases: bool, output: *Vec(u8)) -> bool {
+    ProductConfiguration :: (configuration: string, directPurchases: bool, output: *Vec(u8), moneroProduct: *bool) -> bool {
         products: Vec(Product)
         remaining := configuration
         while remaining != "" {
@@ -103,7 +105,11 @@
         document: json.JsonDocument
         root := json.JsonNewObject(*document)
         array := json.JsonNewArray(*document)
+        <<moneroProduct = false
         for product: VecSlice(products, 0, products.count) {
+            if product.atomic > 0 {
+                <<moneroProduct = true
+            }
             item := json.JsonNewObject(*document)
             if !ledger.PutText(*document, item, "product_id", product.id) ||
                 !ledger.PutInt(*document, item, "token_units", product.units) ||
@@ -549,7 +555,8 @@
     #scope_export
     Open :: (state: *State, rawProducts: string, directPurchases: bool, publicKey: []u8, privateKey: []u8) -> bool {
         products: Vec(u8)
-        if !ProductConfiguration(rawProducts, directPurchases, *products) || !issuer.Open(*state.signer, publicKey, privateKey) {
+        if !ProductConfiguration(rawProducts, directPurchases, *products, *state.moneroProduct) ||
+            !issuer.Open(*state.signer, publicKey, privateKey) {
             return false
         }
         VecSwap(state.products, products)

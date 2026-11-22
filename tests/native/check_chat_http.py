@@ -142,6 +142,28 @@ def values(database, account):
         return dict(connection.execute("SELECT account_id,used FROM server_chat_usage WHERE account_id IN (?, 'node')", (account,)))
 
 
+def usage_rows(database):
+    with closing(sqlite3.connect(database)) as connection:
+        return set(connection.execute("SELECT account_id,day FROM server_chat_usage"))
+
+
+def stage_retention(database, owner):
+    """Adds counts the boot purge must remove next to ones it must keep."""
+    current = usage_rows(database)
+    assert (owner, "2000-01-01") not in current and current, current
+    today = next(day for account, day in current if account == owner)
+    with closing(sqlite3.connect(database)) as connection, connection:
+        connection.executemany("INSERT INTO server_chat_usage(account_id,day,used) VALUES(?,?,?)", (
+            (owner, "2000-01-01", 5), ("node", "2000-01-01", 9),
+            ("deleted-account", today, 3), ("lumi-group", today, 2),
+        ))
+    return current | {("lumi-group", today)}
+
+
+def check_retention(database, kept):
+    assert usage_rows(database) == kept, usage_rows(database)
+
+
 def check_chat(port, database, provider, owner, auth, other):
     invalid = {"error": "invalid chat request"}
     assert request(port, "POST", CHAT, body=completion("Hi"), expected=401) == {"error": "bearer token required"}
@@ -259,7 +281,9 @@ def main():
             other, other_auth = login(port, oracle, "chat-other")
             check_chat(port, database, provider, owner, auth, other)
             check_shared_cap(port, database, provider, owner, auth, other, other_auth)
+        kept = stage_retention(database, owner)
         with node(binary, directory, **settings) as (port, _):
+            check_retention(database, kept)
             assert request(port, "POST", CHAT, headers=other_auth, body=completion("still exhausted"), expected=429) == {
                 "error": "daily chat allowance reached",
             }
@@ -271,7 +295,7 @@ def main():
                 "error": "online chat unavailable",
             }
             provider.idle()
-    print("Native chat HTTP: three routes, signed account isolation, provider wire bounds, feedback proposals, quota rollback, and cancellation verified.")
+    print("Native chat HTTP: three routes, signed account isolation, provider wire bounds, feedback proposals, quota rollback, cancellation and usage retention verified.")
 
 
 if __name__ == "__main__":
