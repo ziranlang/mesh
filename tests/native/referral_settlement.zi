@@ -15,6 +15,8 @@ writes :: #import "token_writes_native";
 Referrer :: "1111111111111111111111111111111111111111111111111111111111111111";
 Friend :: "2222222222222222222222222222222222222222222222222222222222222222";
 Late :: "3333333333333333333333333333333333333333333333333333333333333333";
+Debtor :: "4444444444444444444444444444444444444444444444444444444444444444";
+Buyer :: "5555555555555555555555555555555555555555555555555555555555555555";
 FixtureTime :: "2026-11-22T12:00:00Z";
 
 Exec :: (database: *void, statement: string) -> bool {
@@ -27,9 +29,9 @@ Integer :: (database: *void, statement: string, text: string) -> s64 {
     return ifx result.found then result.value else -1
 }
 
-// Binds `account` to the referrer with its welcome credit at ledger sequence `welcome`.
-Claim :: (database: *void, account: string, welcome: s64) -> bool {
-    arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(Referrer), sql.IntArg(welcome)]
+// Binds `account` to `referrer` with its welcome credit at ledger sequence `welcome`.
+Claim :: (database: *void, account: string, welcome: s64, referrer: string = Referrer) -> bool {
+    arguments: [3]sql.Argument = .[sql.TextArg(account), sql.TextArg(referrer), sql.IntArg(welcome)]
     return sql.Execute(database, "INSERT INTO referral_claims(account_id,referrer_id,code,request_id,source_app_id,accepted_at,welcome_receipt_id,welcome_seq) VALUES(?1,?2,'cccccccccccccccccccccccccccccccc','claim-0001','',?3||'',substr(?1,1,32),?3)", arguments[:]) == sqlite.SQLITE_OK
 }
 
@@ -99,6 +101,33 @@ Ineligible :: (database: *void, signer: *issuer.Issuer, lock: *mutex.Mutex) -> b
         Integer(database, "SELECT COUNT(*) FROM referral_outbox WHERE done=0 AND receipt_id<>?1", "") == 0
 }
 
+State :: (database: *void, purchase: string) -> s64 {
+    return Integer(database, "SELECT target_units*1000000+issued_units*1000+reversed_units FROM referral_commissions WHERE purchase_receipt_id=?1", purchase)
+}
+
+// A spent commission whose purchase is refunded leaves debt that the next
+// commission repays through an authorized offset before it becomes spendable.
+Offset :: (database: *void, signer: *issuer.Issuer, lock: *mutex.Mutex) -> bool {
+    canonical: settlement.Settlement = .{database = database, lock = lock, signer = signer, baseURL = referrals.Authority}
+    first: [32]u8
+    second: [32]u8
+    spent: signing.Event = .{account = Debtor, app = "inbe", kind = "debit", amount = -50, source = "spend", reference = "spent-1"}
+    refund: signing.Event = .{account = Buyer, app = "inbe", kind = "debit", amount = -1000, source = "monero_account", reference = "deposit-3"}
+    if !Claim(database, Buyer, 0, Debtor) || !Purchase(database, signer, Buyer, "deposit-3", 1000, first[:]) ||
+        !settlement.Reconcile(*canonical) || !Unverified(database, signer, spent) ||
+        !Unverified(database, signer, refund) || !settlement.Reconcile(*canonical) {
+        return false
+    }
+    older := TextView(first[:])
+    if State(database, older) != 50000 || ledger.Balance(database, Debtor).value != 0 { return false }
+    if !Purchase(database, signer, Buyer, "deposit-4", 1000, second[:]) || !settlement.Reconcile(*canonical) { return false }
+    newer := TextView(second[:])
+    return State(database, older) == 50050 && State(database, newer) == 50050000 &&
+        Integer(database, "SELECT units*1000+remaining FROM token_referral_offsets WHERE source_receipt_id=?1", older) == 50000 &&
+        Integer(database, "SELECT remaining FROM token_allocations WHERE source_type='referral_commission' AND source_receipt_id=?1", newer) == 0 &&
+        ledger.Balance(database, Debtor).value == 0
+}
+
 Failure :: (name: string) -> s32 {
     unused stdio.PrintError(name)
     unused stdio.PrintError("\n")
@@ -123,6 +152,7 @@ Main :: () -> s32 {
     if !Commission(opened.database, *signer, *lock, purchase[:]) { return Failure("referral commission on a verified deposit") }
     if !Reversal(opened.database, *signer, *lock, TextView(purchase[:])) { return Failure("referral reversal after a partial refund") }
     if !Ineligible(opened.database, *signer, *lock) { return Failure("referral eligibility") }
+    if !Offset(opened.database, *signer, *lock) { return Failure("referral debt offset") }
     unused stdio.WriteOutput("Native referral settlement tests passed\n")
     return 0
 }
