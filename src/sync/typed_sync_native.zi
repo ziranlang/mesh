@@ -173,9 +173,10 @@
             !output.TextField(response, root, "base_state_hash", baseHash) ||
             !output.BooleanField(response, root, "changes_complete", !full) || !output.BooleanField(response, root, "full_snapshot_required", full) ||
             !output.Storage(response, root, used.value, allowance.value) ||
-            history.Record(database, user, current.value, TextView(final.hex[:64])) != sqlite.SQLITE_OK ||
-            sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return failure }
+            history.Record(database, user, current.value, TextView(final.hex[:64])) != sqlite.SQLITE_OK { return failure }
+        // Fold audit insert inside the main SQLite WAL transaction (2 commits -> 1).
         Audit(database, user, app, client, request, current.value, snapshotReason, remoteCount, response, applied)
+        if sqlite.SqliteExecText(database, "COMMIT") != sqlite.SQLITE_OK { return failure }
         publish := summary.Habits > 0 || summary.HabitDays > 0 || summary.Sessions > 0 || summary.MeditationLogs > 0 || summary.EncryptedRecords > 0
         return .{version = current.value, publish = publish}
     }
