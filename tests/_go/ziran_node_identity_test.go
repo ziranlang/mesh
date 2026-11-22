@@ -139,9 +139,7 @@ func TestZiranNodeIdentityKeyFilesAgainstBaseline(t *testing.T) {
 	if err != nil || !bytes.Equal(got.Value, want) {
 		t.Fatal("persisted identity did not survive baseline reload")
 	}
-	if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temporary key file remains: %v", err)
-	}
+	assertOnlyIdentityEntry(t, path)
 }
 
 type identityEntropyReader struct {
@@ -162,6 +160,73 @@ func (reader identityEntropyReader) Read(data []byte) (int, error) {
 	return len(data), nil
 }
 
+func assertOnlyIdentityEntry(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		t.Fatal("temporary identity file remains")
+	}
+}
+
+func TestZiranNodeIdentityConcurrentCreation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "new", "node.key")
+	const callers = 24
+	type result struct {
+		key ed25519.PrivateKey
+		err error
+	}
+	start := make(chan struct{})
+	results := make(chan result, callers)
+	for range callers {
+		go func() {
+			<-start
+			got := NodeIdentity_LoadOrCreateKey(path)
+			results <- result{got.Value, got.Error}
+		}()
+	}
+	close(start)
+	first := <-results
+	if first.err != nil {
+		t.Error(first.err)
+	}
+	for range callers - 1 {
+		got := <-results
+		if got.err != nil || !bytes.Equal(got.key, first.key) {
+			t.Errorf("concurrent caller returned a different identity: %v", got.err)
+		}
+	}
+	saved := NodeIdentity_LoadOrCreateKey(path)
+	if saved.Error != nil || len(saved.Value) != ed25519.PrivateKeySize || !bytes.Equal(saved.Value, first.key) {
+		t.Fatalf("restart did not load the shared identity: %v", saved.Error)
+	}
+	assertOnlyIdentityEntry(t, path)
+}
+
+func TestZiranNodeIdentityKeepsFirstPersistedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node.key")
+	existing := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{0x17}, ed25519.SeedSize))
+	data := []byte(hex.EncodeToString(existing) + "\n")
+	original := rand.Reader
+	rand.Reader = identityEntropyReader{before: func() {
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	defer func() { rand.Reader = original }()
+	got := NodeIdentity_LoadOrCreateKey(path)
+	if got.Error != nil || !bytes.Equal(got.Value, existing) {
+		t.Fatalf("the first persisted key must win: %v", got.Error)
+	}
+	saved, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(saved, data) {
+		t.Fatalf("the persisted key was changed: %v", err)
+	}
+	assertOnlyIdentityEntry(t, path)
+}
+
 func TestZiranNodeIdentityFailureCleanup(t *testing.T) {
 	t.Run("entropy", func(t *testing.T) {
 		sentinel := errors.New("entropy unavailable")
@@ -179,7 +244,7 @@ func TestZiranNodeIdentityFailureCleanup(t *testing.T) {
 			t.Fatal("entropy failure persisted an identity")
 		}
 	})
-	t.Run("rename", func(t *testing.T) {
+	t.Run("destination became a directory", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "node.key")
 		original := rand.Reader
 		rand.Reader = identityEntropyReader{before: func() {
@@ -189,13 +254,10 @@ func TestZiranNodeIdentityFailureCleanup(t *testing.T) {
 		}}
 		defer func() { rand.Reader = original }()
 		got := NodeIdentity_LoadOrCreateKey(path)
-		var pathError *os.LinkError
-		if !errors.As(got.Error, &pathError) || pathError.Op != "rename" || got.Value != nil {
-			t.Fatalf("key-file rename failure = %#v", got)
+		if got.Error == nil || got.Value != nil {
+			t.Fatal("key creation must fail when the destination became a directory")
 		}
-		if _, err := os.Stat(path + ".tmp"); !errors.Is(err, os.ErrNotExist) {
-			t.Fatalf("failed rename left temporary secret: %v", err)
-		}
+		assertOnlyIdentityEntry(t, path)
 	})
 	t.Run("read directory", func(t *testing.T) {
 		path := t.TempDir()

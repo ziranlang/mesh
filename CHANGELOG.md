@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Keep a single persistent node identity when Go startups share a new identity path.
+
 - Recheck signed peer request expiry when reserving its nonce and speed up expired delegated nonce cleanup.
 
 - Refuse startup when an explicitly configured Ed25519 node identity is invalid or unreadable, preserving the persisted fallback identity.

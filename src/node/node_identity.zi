@@ -17,6 +17,8 @@ go_strings :: #system_library "go:strings";
 go_hex :: #system_library "go:encoding/hex";
 go_numbers :: #system_library "go:strconv";
 go_format :: #system_library "go:fmt";
+go_os :: #system_library "go:os";
+go_subtle :: #system_library "go:crypto/subtle";
 builtin :: #system_library "go:builtin";
 
 NodeIdentity :: struct {
@@ -87,6 +89,15 @@ HexResult :: struct {
     value: []u8
     error: Error
 }
+File :: #type #foreign go_os "File";
+FileResult :: struct {
+    value: *File
+    error: Error
+}
+WriteResult :: struct {
+    count: isize
+    error: Error
+}
 DecodeHex :: (value: string) -> HexResult #go_results #foreign go_hex "DecodeString";
 EncodeHex :: (value: []u8) -> string #foreign go_hex "EncodeToString";
 TrimSpace :: (value: string) -> string #foreign go_strings;
@@ -97,6 +108,15 @@ DecodeError :: (format: string, path: string, error: Error) -> Error #foreign go
 AllocateBytes :: (count: isize) -> []u8 #foreign builtin "make";
 AllocateStrings :: (count: isize) -> []string #foreign builtin "make";
 SortStrings :: (values: []string) #foreign go_sort "Strings";
+CreateTemporary :: (directory: string, pattern: string) -> FileResult #go_results #foreign go_os "CreateTemp";
+FileName :: (file: *File) -> string #foreign go_os "(*File).Name";
+Write :: (file: *File, data: []u8) -> WriteResult #go_results #foreign go_os "(*File).Write";
+Sync :: (file: *File) -> Error #foreign go_os "(*File).Sync";
+Close :: (file: *File) -> Error #foreign go_os "(*File).Close";
+RemoveAtReturn :: (path: string) #go_defer #foreign go_os "Remove";
+Link :: (oldPath: string, newPath: string) -> Error #foreign go_os "Link";
+ExistsError :: () -> Error #go_field #foreign go_os "ErrExist";
+EqualKeyBytes :: (left: []u8, right: []u8) -> isize #foreign go_subtle "ConstantTimeCompare";
 
 Concat :: (left: string, right: string) -> string {
     parts: [2]string = .[left, right]
@@ -128,6 +148,30 @@ SignedMessage :: (key: keys.PrivateKey, message: []u8) -> string {
     return encoded.value
 }
 
+ReadKey :: (path: string) -> PrivateKeyResult {
+    read := files.ReadFile(path)
+    if read.error != null {
+        return .{error = read.error}
+    }
+    decoded := DecodeHex(TrimSpace(text.FromBytes(read.value)))
+    if decoded.error != null {
+        return .{error = DecodeError("decode %s: %w", path, decoded.error)}
+    }
+    if decoded.value.count == 32 {
+        return .{value = keys.NewKeyFromSeed(decoded.value)}
+    }
+    if decoded.value.count != 64 {
+        return .{error = errors.New(Concat(path, " has invalid key length"))}
+    }
+    // The node ID comes from the public half, so it must be the seed's.
+    derived := keys.NewKeyFromSeed(decoded.value[0:32])
+    derivedBytes := cast([]u8)derived
+    if EqualKeyBytes(derivedBytes[32:64], decoded.value[32:64]) != 1 {
+        return .{error = errors.New(Concat(path, " public key does not match its seed"))}
+    }
+    return .{value = derived}
+}
+
 #scope_export
 New :: (privateKey: keys.PrivateKey) -> NodeIdentityResult {
     result: NodeIdentityResult
@@ -153,63 +197,54 @@ New :: (privateKey: keys.PrivateKey) -> NodeIdentityResult {
 }
 
 LoadOrCreateKey :: (rawPath: string) -> PrivateKeyResult {
-    result: PrivateKeyResult
     path := TrimSpace(rawPath)
     if path == "" {
-        result.error = errors.New("empty node identity key path")
-        return result
+        return .{error = errors.New("empty node identity key path")}
     }
-    read := files.ReadFile(path)
-    if read.error == null {
-        decoded := DecodeHex(TrimSpace(text.FromBytes(read.value)))
-        if decoded.error != null {
-            result.error = DecodeError("decode %s: %w", path, decoded.error)
-            return result
-        }
-        if decoded.value.count == 32 {
-            result.value = keys.NewKeyFromSeed(decoded.value)
-            return result
-        }
-        if decoded.value.count != 64 {
-            result.error = errors.New(Concat(path, " has invalid key length"))
-            return result
-        }
-        // The node ID comes from the public half, so it must be the seed's.
-        derived := keys.NewKeyFromSeed(decoded.value[0:32])
-        if EncodeHex(cast([]u8)derived) != EncodeHex(decoded.value) {
-            result.error = errors.New(Concat(path, " public key does not match its seed"))
-            return result
-        }
-        result.value = derived
-        return result
-    }
+    read := ReadKey(path)
     if !errors.Is(read.error, files.NotExist()) {
-        result.error = read.error
-        return result
+        return read
     }
-    // 0700 directories and a 0600 key file retain the private-storage contract.
-    result.error = files.MkdirAll(files.Dir(path), cast(files.FileMode)448)
-    if result.error != null {
-        return result
+    directory := files.Dir(path)
+    created := files.MkdirAll(directory, cast(files.FileMode)448)
+    if created != null {
+        return .{error = created}
     }
     generated := keys.GenerateKey()
     if generated.error != null {
-        result.error = generated.error
-        return result
+        return .{error = generated.error}
     }
-    temporary := Concat(path, ".tmp")
+    // CreateTemp reserves a unique file with mode 0600 in the target directory.
+    opened := CreateTemporary(directory, ".mesh-node-key-*")
+    if opened.error != null {
+        return .{error = opened.error}
+    }
+    temporary := FileName(opened.value)
+    RemoveAtReturn(temporary)
     encoded := Concat(EncodeHex(cast([]u8)generated.privateKey), "\n")
-    result.error = files.WriteFile(temporary, text.ToBytes(encoded), cast(files.FileMode)384)
-    if result.error != null {
-        return result
+    written := Write(opened.value, text.ToBytes(encoded))
+    if written.error != null {
+        unused Close(opened.value)
+        return .{error = written.error}
     }
-    result.error = files.Rename(temporary, path)
-    if result.error != null {
-        files.Remove(temporary)
-        return result
+    synced := Sync(opened.value)
+    closed := Close(opened.value)
+    if synced != null {
+        return .{error = synced}
     }
-    result.value = generated.privateKey
-    return result
+    if closed != null {
+        return .{error = closed}
+    }
+    // A complete key becomes visible atomically. Concurrent callers load the
+    // persisted winner, including when the native backend created that key.
+    linked := Link(temporary, path)
+    if errors.Is(linked, ExistsError()) {
+        return ReadKey(path)
+    }
+    if linked != null {
+        return .{error = linked}
+    }
+    return .{value = generated.privateKey}
 }
 
 InviteMessageWithDomain :: (domain: string, invite: PairingInvite) -> []u8 {

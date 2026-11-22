@@ -10,6 +10,10 @@ Keep legacy data readable through the planning horizon of 2027-11-22. Reassess c
 
 The nonce deadline and additive index are implemented. The full Go application and the native SQLite and server suites passed. The saved-IR application suite passed with a local overlay adjustment for duplicate generated filenames from the Shovey override. The SQLite benchmark includes deleting one expired row and inserting its replacement in a WAL transaction. With 32,768 active nonce rows, median time across three trials fell from 1.402 ms to 0.033 ms. Native delegated sync returned eight synthetic opaque 4 KiB records per request to four loopback workers. Median p95 across three local trials fell from 6.192 ms to 3.044 ms. Production traffic and nonce-table size remain unmeasured. The rest of the database and wire format are compatible with existing clients and servers.
 
+## Persistent identity creation
+
+Both backends stage a private file in the identity directory before publishing it with a hard link that cannot replace the destination. A concurrent starter reads and validates the file already published. The existing seed and expanded key encodings remain supported. First startup requires hard-link support in the identity directory's filesystem. An explicitly configured identity bypasses this file-creation step.
+
 ## Follow-on work
 
 1. Use independent random content roots for a versioned client format. Define key IDs, authenticated recipient key wraps, restore behavior and old-client handling before writing the new format. Keep existing ciphertext readable under its original derivation. Coordinate client changes with the package owner first.
