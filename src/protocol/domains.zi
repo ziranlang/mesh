@@ -1,0 +1,36 @@
+// Canonical Mesh wire protocol constants (signing domains, headers, and
+// 1-year legacy daochi-* compatibility cutoff). Mirrors mesh_client/protocol.
+
+#scope_export
+HeaderUser :: "X-Mesh-User";
+HeaderSignature :: "X-Mesh-Signature";
+HeaderClient :: "X-Mesh-Client";
+HeaderTx :: "X-Mesh-Tx";
+Header2FA :: "X-Mesh-2FA";
+HeaderDelegate :: "X-Mesh-Delegate";
+HeaderAdmin :: "X-Mesh-Admin";
+
+DomainSync :: "mesh-sync-v1";
+DomainTx :: "mesh-tx-v1";
+DomainDeviceKey :: "mesh-device-key-v1";
+DomainDeviceRevoke :: "mesh-device-revoke-v1";
+DomainAuthorization :: "mesh-authorization-v1";
+DomainRendezvousClaim :: "mesh-rendezvous-claim-v1";
+DomainSession :: "mesh-session-v1";
+DomainDelegateRequest :: "mesh-delegate-request-v1";
+DomainReleaseV2 :: "mesh-zib-release-v2";
+DomainReleaseV1 :: "mesh-zib-release-v1";
+DomainPackGrant :: "mesh-pack-grant-v1";
+DomainAppManifest :: "mesh-app-manifest-v1";
+DomainAppApproval :: "mesh-app-approval-v1";
+DomainNodeRequest :: "mesh-node-request-v1";
+DomainPairingInvite :: "mesh-pairing-invite-v1";
+DomainPairingAcceptance :: "mesh-pairing-invite-v1-acceptance";
+DomainNameClaim :: "mesh-name-claim-v1";
+DomainRecordProvenance :: "mesh-record-provenance-v1";
+
+// 2027-11-22T00:00:00Z
+LegacyDaochiSignedValidThrough :: 1826928000;
+LegacyDomainSync :: "daochi-sync-v1";
+LegacyDomainTx :: "daochi-tx-v1";
+LegacyDomainReleaseV2 :: "daochi-zib-release-v2";

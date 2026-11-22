@@ -23,5 +23,5 @@ git = "https://git.waozi.xyz/ziranlang/compression.git"
 ref = "4f75a402c58c86648011c30bcb52380993887565"
 
 [dependencies.oqs]
-git = "https://github.com/ziranlang/oqs.git"
+git = "https://git.waozi.xyz/ziranlang/oqs.git"
 ref = "22d2ddbdc236796953c905a05a2cebf5ab1b4ff3"
