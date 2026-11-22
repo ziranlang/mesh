@@ -42,21 +42,24 @@
         return kept
     }
 
-    ShiftLeft :: (entries: []Challenge, index: s64) {
-        at := index + 1
-        while at < entries.count {
-            entries[at - 1] = entries[at]
-            at += 1
+    SwapRemove :: (entries: []Challenge, index: s64) {
+        last := entries.count - 1
+        if index < last {
+            entries[index] = entries[last]
         }
     }
 
     EvictionIndex :: (entries: []Challenge, user: string) -> s64 {
         oldest: s64 = -1
+        oldestExpiry: s64 = 0
         count: s64 = 0
         for entry, index: entries {
             if TextView(entry.user[:]) != user { continue }
             count += 1
-            if oldest < 0 { oldest = index }
+            if oldest < 0 || entry.expiresAt < oldestExpiry {
+                oldest = index
+                oldestExpiry = entry.expiresAt
+            }
         }
         return ifx count >= limits.MaxOutstanding then oldest else -1
     }
@@ -90,7 +93,7 @@
         if count >= limits.MaxOutstandingChallenges { return .{status = .Busy} }
         evict := EvictionIndex(VecSlice(store.entries, 0, count), user)
         if evict >= 0 {
-            ShiftLeft(VecSlice(store.entries, 0, count), evict)
+            SwapRemove(VecSlice(store.entries, 0, count), evict)
             unused VecResize(store.entries, count - 1)
         }
         if !VecPush(store.entries, item) { return .{status = .Unavailable} }
@@ -128,7 +131,7 @@
             }
         }
         if found < 0 { return false }
-        ShiftLeft(VecSlice(store.entries, 0, count), found)
+        SwapRemove(VecSlice(store.entries, 0, count), found)
         unused VecResize(store.entries, count - 1)
         return !expired
     }

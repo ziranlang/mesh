@@ -440,14 +440,15 @@
         if now < 0 || count == 0 || !mutex.Lock(*access.databaseLock) {
             return ErrorReply(access, connection, method, 500, "export failed")
         }
-        defer mutex.Unlock(*access.databaseLock)
         auth := bearer.Authenticate(settings.database, connection, settings.secret, now / 1000, TextView(audit[:count]), false)
         if auth.status != 0 {
+            unused mutex.Unlock(*access.databaseLock)
             return ErrorReply(access, connection, method, auth.status, auth.message)
         }
         document: json.JsonDocument
         root := json.JsonNewObject(*document)
         status := exporter.Export(settings.database, TextView(auth.userID[:]), *document, root)
+        unused mutex.Unlock(*access.databaseLock)
         if status == 404 {
             return ErrorReply(access, connection, method, 404, "sync account not found")
         }

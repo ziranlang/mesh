@@ -213,6 +213,27 @@
         account := parsed.value.userID
         if parsed.error != "" || (userID != "" && account != userID) || now > parsed.value.expiresAt { return .{} }
         if database == null { return .{databaseError = sqlite.SQLITE_MISUSE} }
+        hash := Hash(bearer)
+        key := TextView(hash[:64])
+        // Fast path for v2 sessions: one primary-key lookup on server_auth_sessions
+        // (FK ON DELETE CASCADE guarantees the account exists when an active session row exists).
+        if parsed.value.version == "v2" {
+            active := ActiveQuery(database, account, key, now)
+            if active.databaseError != sqlite.SQLITE_OK { return active }
+            if active.active {
+                for index: 0..63 { active.userID[index] = account[index] }
+                return active
+            }
+            found := Exists(database, queries.AccountExists, account)
+            if found.databaseError != sqlite.SQLITE_OK { return found }
+            if !found.active {
+                if !allowBootstrap { return .{accountMissing = true} }
+                deleted := Exists(database, queries.AccountTombstoned, account)
+                if deleted.databaseError != sqlite.SQLITE_OK { return deleted }
+                if deleted.active { return .{accountMissing = true} }
+            }
+            return .{}
+        }
         found := Exists(database, queries.AccountExists, account)
         if found.databaseError != sqlite.SQLITE_OK { return found }
         if !found.active {
@@ -220,16 +241,8 @@
             deleted := Exists(database, queries.AccountTombstoned, account)
             if deleted.databaseError != sqlite.SQLITE_OK { return deleted }
             if deleted.active { return .{accountMissing = true} }
-            if parsed.value.version == "v2" { return .{} }
         }
-        hash := Hash(bearer)
-        key := TextView(hash[:64])
-        result: SessionStatus
-        if parsed.value.version == "v2" {
-            result = ActiveQuery(database, account, key, now)
-        } else {
-            result = AuthorizeLegacy(database, parsed.value, key, now, createdAt, allowBootstrap)
-        }
+        result := AuthorizeLegacy(database, parsed.value, key, now, createdAt, allowBootstrap)
         if result.active {
             for index: 0..63 { result.userID[index] = account[index] }
         }
