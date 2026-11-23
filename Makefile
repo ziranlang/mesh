@@ -172,7 +172,7 @@ build-ziran-native-server: liboqs | $(NATIVE_SERVER_BUILD_DIR)
 
 # Native server checks written in Ziran. Each tests/native/NAME.zi builds to
 # $(NATIVE_CHECKS_DIR)/NAME, which check_http_listener.py runs.
-NATIVE_CHECKS := check_docs_http
+NATIVE_CHECKS := check_docs_http check_legacy_headers
 NATIVE_CHECKS_DIR := $(abspath $(BUILD_DIR)/native-tests/checks)
 
 build-native-checks: liboqs

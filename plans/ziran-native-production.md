@@ -17,13 +17,20 @@ The origin has `libmicrohttpd12t64`, the native-capable gateway and a built
 `/opt/mesh/mesh-native` beside Go.
 
 Native ran in production on 2026-11-23 from 05:00:31 to 05:02:25 UTC and was
-rolled back to Go. `/readyz`, the node document, its 28 capabilities and the
-admin routes matched Go, but a real Android client's `POST /api/v1/sync` got
-HTTP 400 (52-byte body) four times out of four, where Go answered 200. Find
-that request shape, add its regression test to the native suite, then set
-`deploy/runtime` back to `native`. Also seen: unauthenticated
-`GET /api/v1/account` is 405 on native and 404 on Go, and native `/metrics`
-has 22 metric names where Go has 41.
+rolled back to Go: installed apps send `X-Daochi-User`, which Go accepts for
+`X-Mesh-User` and native did not. `transport.Header` now accepts the
+`X-Daochi-` alias for every `X-Mesh-` header, with a native check.
+
+Before setting `deploy/runtime` back to `native`:
+
+- Audit every other legacy name Go accepts (Ksync, Inbe and Daochi headers,
+  signature contexts, fields, routes) against native, and add a native check
+  for each gap.
+- Get evidence from real traffic first, for example by mirroring live
+  requests to a native instance on a database copy and comparing statuses.
+
+Smaller differences seen live: unauthenticated `GET /api/v1/account` is 405 on
+native and 404 on Go, and native `/metrics` has 22 metric names where Go has 41.
 
 Open gaps between the Go and native servers, each needing its regression test:
 

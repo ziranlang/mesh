@@ -1,0 +1,88 @@
+// Checks that the X-Daochi- headers installed clients and nodes still send
+// answer for their X-Mesh- names, as on the Go server.
+// Usage: check_legacy_headers SERVER_BINARY
+#import "std/byte_text_linux"
+#import "std/file_tree_linux"
+check :: #import "native_check";
+using Vectors :: #import "std/vec"
+
+#scope_file
+Account :: "abababababababababababababababababababababababababababababababab";
+AdminToken :: "check-admin-token-0123456789abcdef";
+SyncBody :: "{\"app_id\":\"inbe\",\"client_id\":\"client-1\",\"protocol_version\":1}";
+MissingUser :: "{\"error\":\"missing X-Mesh-User\"}\n";
+InvalidUser :: "{\"error\":\"invalid user_id_hash\"}\n";
+
+// A typed sync request that names its account only through `headers`.
+Sync :: (port: u16, headers: []check.Header) -> check.Response {
+    return check.Request(port, "POST", "/api/v1/sync", headers, SyncBody)
+}
+
+Metrics :: (port: u16, name: string, value: string) -> s32 {
+    headers: [1]check.Header = .[.{name = name, value = value}]
+    response := check.Request(port, "GET", "/metrics", headers[:])
+    defer check.FreeResponse(*response)
+    return response.status
+}
+
+CheckUserHeader :: (port: u16) {
+    json: check.Header = .{name = "Content-Type", value = "application/json"}
+
+    current_headers: [2]check.Header = .[json, .{name = "X-Mesh-User", value = Account}]
+    current := Sync(port, current_headers[:])
+    defer check.FreeResponse(*current)
+    // The account is named, so the request reaches bearer authentication.
+    check.Check(current.status == 401, "X-Mesh-User reaches bearer authentication")
+
+    legacy_headers: [2]check.Header = .[json, .{name = "X-Daochi-User", value = Account}]
+    legacy := Sync(port, legacy_headers[:])
+    defer check.FreeResponse(*legacy)
+    check.Check(legacy.status == current.status, "X-Daochi-User answers for X-Mesh-User")
+    check.Check(TextFromBytes(legacy.body[:]) == TextFromBytes(current.body[:]), "X-Daochi-User gets the X-Mesh-User reply")
+
+    absent_headers: [1]check.Header = .[json]
+    absent := Sync(port, absent_headers[:])
+    defer check.FreeResponse(*absent)
+    check.Check(absent.status == 400 && TextFromBytes(absent.body[:]) == MissingUser, "a request without a user header is refused")
+
+    invalid_headers: [2]check.Header = .[json, .{name = "X-Daochi-User", value = "not-an-account"}]
+    invalid := Sync(port, invalid_headers[:])
+    defer check.FreeResponse(*invalid)
+    check.Check(invalid.status == 400 && TextFromBytes(invalid.body[:]) == InvalidUser, "the X-Daochi-User value is the one validated")
+
+    both_headers: [3]check.Header = .[json, .{name = "X-Daochi-User", value = "not-an-account"}, .{name = "X-Mesh-User", value = Account}]
+    both := Sync(port, both_headers[:])
+    defer check.FreeResponse(*both)
+    check.Check(both.status == current.status, "X-Mesh-User takes precedence over X-Daochi-User")
+}
+
+CheckAdminHeader :: (port: u16) {
+    check.Check(Metrics(port, "Accept", "text/plain") == 401, "metrics need the admin token")
+    check.Check(Metrics(port, "X-Mesh-Admin", AdminToken) == 200, "X-Mesh-Admin opens metrics")
+    check.Check(Metrics(port, "X-Daochi-Admin", AdminToken) == 200, "X-Daochi-Admin answers for X-Mesh-Admin")
+    check.Check(Metrics(port, "X-Daochi-Admin", "wrong-admin-token-0123456789abcdef") == 401, "a wrong X-Daochi-Admin is refused")
+}
+
+#scope_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 2 {
+        print("usage: check_legacy_headers SERVER_BINARY\n")
+        return 2
+    }
+    settings: [6]string = .[
+        "MESH_ADDR=127.0.0.1:0",
+        "MESH_DB=mesh.db",
+        "MESH_NODE_IDENTITY_KEY_FILE=mesh.node-key",
+        "MESH_TOKEN_SECRET_HEX=0000000000000000000000000000000000000000000000000000000000000000",
+        "MESH_NODE_SYNC_INTERVAL_SECONDS=0",
+        "MESH_ADMIN_TOKEN=check-admin-token-0123456789abcdef"
+    ]
+    binary: Text = ResolvePath(TextFromCString(argv[1]))
+    server: check.Server
+    if check.StartServer(*server, binary, settings[:]) {
+        CheckUserHeader(server.port)
+        CheckAdminHeader(server.port)
+    }
+    check.StopServer(*server)
+    return check.ExitStatus("Native legacy X-Daochi header aliases passed")
+}

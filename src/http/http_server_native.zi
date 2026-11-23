@@ -283,6 +283,9 @@
     }
 
     #scope_file
+    MeshHeaderPrefix :: "X-Mesh-";
+    LegacyHeaderPrefix :: "X-Daochi-";
+
     RequestValue :: (connection: *void, kind: s32, name: string) -> string {
         key: [128]u8
         if name.count >= key.count || !c_string.CopyCString(name, key[:]) {
@@ -307,9 +310,30 @@
         return <<result
     }
 
-    // These values borrow MicroHTTPD's request storage.
+    // These values borrow MicroHTTPD's request storage. New public header
+    // names share the original authenticated wire format: when an X-Mesh-
+    // header is absent or empty, the X-Daochi- header installed clients and
+    // nodes still send answers for it.
     Header :: (connection: *void, name: string) -> string {
-        return RequestValue(connection, RequestHeaders, name)
+        value := RequestValue(connection, RequestHeaders, name)
+        suffix := wire.TrimPrefix(name, MeshHeaderPrefix)
+        if value != "" || suffix.count == name.count {
+            return value
+        }
+        legacy: [128]u8
+        count: s64 = 0
+        for byte: LegacyHeaderPrefix {
+            legacy[count] = byte
+            count += 1
+        }
+        if count + suffix.count >= legacy.count {
+            return value
+        }
+        for byte: suffix {
+            legacy[count] = byte
+            count += 1
+        }
+        return RequestValue(connection, RequestHeaders, bytes.TextFromBytes(legacy[:count]))
     }
 
     QueryArgument :: (connection: *void, name: string) -> string {
