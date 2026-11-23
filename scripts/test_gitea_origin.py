@@ -22,7 +22,7 @@ class OriginPolicyTest(unittest.TestCase):
         self.run = {'id': 42, 'run_attempt': 3, 'head_sha': self.revision, 'head_branch': 'master',
                     'path': 'ci.yml@refs/heads/master', 'event': 'push', 'status': 'in_progress'}
         self.jobs = {'jobs': [{'name': job, 'status': 'completed', 'conclusion': 'success'}
-                              for job in ('checks', 'container')] + [{'name': 'deploy', 'status': 'in_progress'}]}
+                              for job in ('checks', 'native', 'scans')] + [{'name': 'deploy', 'status': 'in_progress'}]}
         self.artifacts = {'artifacts': [{'id': 88, 'name': 'mesh-origin-source-3', 'expired': False,
                                         'size_in_bytes': 1593}]}
 
@@ -53,7 +53,7 @@ class OriginPolicyTest(unittest.TestCase):
                     target[field] = old
 
     def test_every_required_job_must_pass(self):
-        for name in ('checks', 'container'):
+        for name in ('checks', 'native', 'scans'):
             with self.subTest(job=name):
                 job = next(item for item in self.jobs['jobs'] if item['name'] == name)
                 job['conclusion'] = 'failure'
@@ -66,16 +66,21 @@ class OriginPolicyTest(unittest.TestCase):
         with self.assertRaises(origin.DeployError):
             self.verify()
 
-    def test_native_server_builds_only_from_shipped_sources(self):
+    def test_origin_installs_only_the_binaries_ci_shipped(self):
         with tempfile.TemporaryDirectory() as directory:
             stage = Path(directory)
-            self.assertEqual(origin.native_build_commands(stage, self.revision, '4' * 40), [])
-            (stage / 'build/native-release/server').mkdir(parents=True)
-            build, verify = origin.native_build_commands(stage, self.revision, '4' * 40)
-            self.assertEqual(build[:3], ('/usr/bin/make', '-j2', 'build-native'))
-            self.assertIn(f'SOURCE_COMMIT={self.revision}', build)
-            self.assertIn('mesh-native', verify)
-            self.assertIn(self.revision, verify)
+            (stage / 'build').mkdir()
+            for output, manifest in origin.RELEASES:
+                with self.assertRaises(origin.DeployError):
+                    origin.release_checks(stage, self.revision, '4' * 40)
+                (stage / output).write_bytes(b'binary')
+                (stage / manifest).write_text('{}')
+            checks = origin.release_checks(stage, self.revision, '4' * 40)
+            self.assertEqual([command[command.index('--output') + 1] for command in checks], ['mesh', 'mesh-native'])
+            for command in checks:
+                self.assertIn('verify-artifact-manifest', command)
+                self.assertIn(self.revision, command)
+                self.assertNotIn('/usr/bin/make', command)
 
     def test_forced_command_grammar(self):
         command = f'deploy 42 3 {self.revision} {"4" * 40} {"5" * 64} 6667 88'

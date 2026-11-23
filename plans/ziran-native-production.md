@@ -40,6 +40,11 @@ statuses with the three hours of Go traffic before the switch and rolls back
 to Go when a route Go served answers an error status Go never gave it.
 
 
+Once native has run in production without problems, drop Go generation, the
+Go tests and lint from the per-push gate and keep them weekly. The deploy then
+ships only the native binary, so `deploy/gitea-origin.py` stops requiring the
+Go release and the installed Go binary stays as the rollback.
+
 Rollback to Go: remove `/etc/systemd/system/mesh.service.d/30-runtime.conf`,
 run `systemctl daemon-reload` and `systemctl restart mesh.service`.
 

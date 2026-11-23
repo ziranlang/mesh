@@ -1,0 +1,54 @@
+name: Set up the pinned Ziran
+description: >
+  Uses the Ziran build this runner kept for the commit ziran.lock pins, or sets
+  it up with Ziran's own action and keeps the build for later jobs. The
+  runner's job cache server is unreachable, so the kept build lives in the
+  runner's own cache directory, and a build takes about nine minutes.
+outputs:
+  ziran:
+    description: Absolute path of the ziran command.
+    value: ${{ steps.kept.outputs.ziran || steps.setup.outputs.ziran }}
+runs:
+  using: composite
+  steps:
+    - name: Find the kept Ziran build
+      id: kept
+      shell: bash
+      run: |
+        set -euo pipefail
+        commit=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["toolchain"]["commit"])' ziran.lock)
+        if ! printf '%s' "$commit" | grep -Eq '^[0-9a-f]{40}$'; then
+          echo "::error::The Ziran commit is not a full commit hash: $commit"
+          exit 1
+        fi
+        root="${XDG_CACHE_HOME:-$HOME/.cache}/mesh-ci/ziran-$commit"
+        echo "root=$root" >> "$GITHUB_OUTPUT"
+        if [ -x "$root/build/bin/ziran" ] && [ "$(git -C "$root" rev-parse HEAD)" = "$commit" ]; then
+          echo "ziran=$root/build/bin/ziran" >> "$GITHUB_OUTPUT"
+          # As Ziran's own action does, so make finds ziran on PATH.
+          echo "$root/build/bin" >> "$GITHUB_PATH"
+        fi
+    # Go ignores the dot folder, and the deploy and image leave it out.
+    - name: Set up Ziran
+      id: setup
+      if: steps.kept.outputs.ziran == ''
+      uses: https://git.waozi.xyz/ziranlang/ziran/.github/actions/setup@4135e07fae33bcd0c00dd66b5716fdfe19c1fca5
+      with:
+        path: .ziran
+    # Ziran finds its standard library from its own executable, so the kept
+    # tree works where it lies. Builds of other Ziran commits are dropped.
+    - name: Keep the Ziran build for later jobs
+      if: steps.kept.outputs.ziran == ''
+      shell: bash
+      env:
+        KEPT: ${{ steps.kept.outputs.root }}
+        BUILT: ${{ steps.setup.outputs.root }}
+      run: |
+        set -euo pipefail
+        parent=$(dirname "$KEPT")
+        mkdir -p "$parent"
+        staging=$(mktemp -d "$parent/.ziran-XXXXXX")
+        cp -a "$BUILT/." "$staging/"
+        # A job on another slot of this runner may have kept the same build first.
+        mv -T "$staging" "$KEPT" 2>/dev/null || rm -rf "$staging"
+        find "$parent" -mindepth 1 -maxdepth 1 -name 'ziran-*' ! -path "$KEPT" -mmin +1440 -exec rm -rf {} +

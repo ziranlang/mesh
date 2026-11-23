@@ -51,8 +51,9 @@ commands. Do not hand-edit lockfiles or downstream dependency source copies.
 
 ## Tests
 
-Gitea runs the Linux build, race tests, container smoke and scan, source
-analysis and deployment gates. The deployment workflow and origin admission
+Gitea runs the Linux build, tests, source analysis and deployment gates on
+each push; the weekly run adds coverage, race tests and the container smoke
+and scan. The deployment workflow and origin admission
 fixtures run with `python3 -B scripts/test_gitea_workflow.py` and
 `python3 -B scripts/test_gitea_origin.py`.
 
@@ -215,27 +216,35 @@ record envelopes and compression before encryption.
 
 The [canonical Mesh repository](https://git.waozi.xyz/ziranlang/mesh) contains
 `.gitea/workflows/ci.yml` for master pushes, weekly security checks and manual
-runs on Build. The `checks` job runs every gate that uses the shared Build
-slot: build policy, lint, Go test with coverage, race, both vulnerability
-scans, static analysis and dependency licenses. It sets up Ziran, generates
-the Go and builds liboqs once. The `container` job runs in parallel on the
-Mesh runner. Production deployment requires both jobs, and
-`deploy/gitea-origin.py` requires the same job names. The deploy job accepts only the canonical repository's `master` and
+runs on Build. Three jobs run side by side on Build's slots. `checks` runs
+build policy, lint and one Go test run, then builds the Go release; the weekly
+run adds coverage and the race detector. `native` runs the native server
+suite and builds the native release. `scans` runs both vulnerability scans,
+static analysis and dependency licenses, and skips them on a push whose
+scanned inputs already passed on that runner. Each runner keeps its Ziran
+build and the SQLite and libmicrohttpd builds, keyed by their pins, because
+its job cache server is unreachable. The `container` job builds and scans the
+image weekly; nothing deploys it. Production deployment requires `checks`,
+`native` and `scans`, and `deploy/gitea-origin.py` requires the same job
+names. The deploy job accepts only the canonical repository's `master` and
 checks the current remote revision before transferring source to the origin.
 GitHub mirrors source and holds no origin credential.
 
-The deploy job also ships the native server's generated C and SQLite source
-(`make native-release`). The origin builds both servers: `make build` for the
-Go binary at `/opt/mesh/mesh` and `make build-native` for
-`/opt/mesh/mesh-native`, which needs Debian's `libmicrohttpd12t64`.
+Build's slots and the origin run Debian 13 with glibc 2.41, so the deploy ships
+the two binaries CI built with their manifests: the Go binary for
+`/opt/mesh/mesh` and the native server for `/opt/mesh/mesh-native`, which
+needs Debian's `libmicrohttpd12t64`. The origin compiles nothing; it checks
+each binary against its manifest and installs it. A release build fails when
+a binary needs a newer glibc than the origin's.
 `deploy/runtime` (`go` or `native`) selects the server. `native` writes the
 `mesh.service.d/30-runtime.conf` drop-in, and a failed install restores the
 previous selection. The Go binary stays installed for its CLI commands. To go
 back to Go by hand, remove that drop-in, then run `systemctl daemon-reload`
 and `systemctl restart mesh.service`.
 
-The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker and
-an isolated `MESH_DEPLOY_RUNNER` with access to the production origin. Set the
+The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker for
+the weekly image check and an isolated `MESH_DEPLOY_RUNNER` with access to the
+production origin. Set the
 repository variable `MESH_DEPLOY_READY` to `true` after verifying the runner and
 provisioning the scoped `MESH_SSH_KEY`, `MESH_SSH_HOST`, `MESH_SSH_HOST_KEY` and
 `MESH_SSH_USER` secrets. The workflow uses strict host-key verification and a

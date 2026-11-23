@@ -1,0 +1,35 @@
+name: Build the native server's libraries
+description: >
+  Builds the SQLite amalgamation ziran.lock pins and unpacks the pinned
+  libmicrohttpd. The runner keeps both, keyed by those pins, so later jobs
+  skip the configure, compile and download. Run it after the Ziran setup.
+runs:
+  using: composite
+  steps:
+    - name: Build or reuse SQLite and libmicrohttpd
+      shell: bash
+      run: |
+        set -euo pipefail
+        key=$({ cat ziran.lock; grep -E '^(MICROHTTPD|SQLITE)_' Makefile; } | sha256sum | cut -c1-32)
+        parent="${XDG_CACHE_HOME:-$HOME/.cache}/mesh-ci"
+        kept="$parent/native-libraries-$key"
+        built="build/sqlite-native build/sqlite3 build/microhttpd"
+        if [ -f "$kept/.complete" ]; then
+          mkdir -p build
+          for directory in $built; do
+            cp -a "$kept/$(basename "$directory")" build/
+          done
+          # Newer than the checked-out ziran.lock, so make keeps them.
+          # shellcheck disable=SC2086
+          find $built -exec touch {} +
+        fi
+        make sqlite-native microhttpd-native
+        if [ ! -f "$kept/.complete" ]; then
+          mkdir -p "$parent"
+          staging=$(mktemp -d "$parent/.native-libraries-XXXXXX")
+          # shellcheck disable=SC2086
+          cp -a $built "$staging/"
+          touch "$staging/.complete"
+          mv -T "$staging" "$kept" 2>/dev/null || rm -rf "$staging"
+          find "$parent" -mindepth 1 -maxdepth 1 -name 'native-libraries-*' ! -path "$kept" -mmin +1440 -exec rm -rf {} +
+        fi

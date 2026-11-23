@@ -14,8 +14,10 @@ from verify_build_inputs import EXPECTED_GOLANGCI_LINT_SHA256, EXPECTED_GOLANGCI
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".gitea/workflows/ci.yml"
 ACTION_REF = re.compile(r"^https://(?:github\.com|git\.waozi\.xyz)/[\w./-]+@[a-f0-9]{40}$")
-REQUIRED_JOBS = {"checks", "container"}
+REQUIRED_JOBS = {"checks", "native", "scans"}
 SHARED_SLOT_SETUP = ("./.gitea/actions/generate", "./.gitea/actions/liboqs")
+PUSH = "github.event_name != 'schedule'"
+WEEKLY = "github.event_name == 'schedule'"
 
 
 def read_yaml(path):
@@ -34,7 +36,9 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         deploy = self.jobs["deploy"]
         self.assertEqual(set(deploy["needs"]), REQUIRED_JOBS)
-        self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy"})
+        self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy", "container"})
+        # Nothing deploys the container image, so only the weekly run builds it.
+        self.assertEqual(self.jobs["container"]["if"], WEEKLY)
         for guard in (
             # Gitea evaluates job conditions with its ROOT_URL, which ends in a slash.
             "(github.server_url == 'https://git.waozi.xyz' || github.server_url == 'https://git.waozi.xyz/')",
@@ -63,40 +67,57 @@ class GiteaWorkflowTest(unittest.TestCase):
         for job_id in REQUIRED_JOBS:
             self.assertNotIn("strategy", self.jobs[job_id])
 
-    def test_shared_slot_sets_up_and_tests_once(self):
+    def test_each_push_runs_the_go_tests_once(self):
         steps = self.jobs["checks"]["steps"]
         uses = [step.get("uses") for step in steps]
         for action in SHARED_SLOT_SETUP:
             self.assertEqual(uses.count(action), 1)
-        runs = [step.get("run", "") for step in steps]
-        plain_tests = [run for run in runs if re.search(r"make test(\s|$)", run) and "-race" not in run]
-        self.assertEqual(len(plain_tests), 1)
-        self.assertIn("-coverprofile=coverage.out", plain_tests[0])
-        self.assertEqual(sum("-race" in run for run in runs), 1)
-        for run in runs:
-            if re.search(r"make test(\s|$)", run):
-                self.assertIn("-timeout=30m", run)
-        coverage = next(step for step in steps if step.get("name") == "Test and report coverage")
-        self.assertIn("GOFLAGS=-mod=mod go tool cover", coverage["run"])
+        tests = [step for step in steps if re.search(r"make test(\s|$)", step.get("run", ""))]
+        for step in tests:
+            self.assertIn("-timeout=30m", step["run"])
+        per_push = [step for step in tests if step.get("if") == PUSH]
+        self.assertEqual(len(per_push), 1)
+        self.assertNotIn("-race", per_push[0]["run"])
+        self.assertNotIn("-coverprofile", per_push[0]["run"])
+        weekly = {step["name"]: step["run"] for step in tests if step.get("if") == WEEKLY}
+        self.assertEqual(set(weekly), {"Test and report coverage", "Race test"})
+        self.assertIn("GOFLAGS=-mod=mod go tool cover", weekly["Test and report coverage"])
+        self.assertIn("-race", weekly["Race test"])
+        self.assertEqual(len(tests), 3)
+        self.assertIn("Lint", [step.get("name") for step in steps])
+        runs = [step.get("run", "") for job in REQUIRED_JOBS for step in self.jobs[job]["steps"]]
+        script_tests = re.findall(r"python3 -B (scripts/test_\w+\.py)", "\n".join(runs))
+        self.assertEqual(len(script_tests), len(set(script_tests)))
+        for job in REQUIRED_JOBS:
+            job_steps = self.jobs[job]["steps"]
+            setup_go = next(step for step in job_steps if "actions/setup-go@" in (step.get("uses") or ""))
+            self.assertEqual(setup_go["with"]["cache"], "false")
+            names = [step.get("name") for step in job_steps]
+            root = names.index("Use the installed Go root")
+            self.assertEqual(root, job_steps.index(setup_go) + 1)
+            self.assertIn('echo "GOROOT=$root" >> "$GITHUB_ENV"', job_steps[root]["run"])
+
+    def test_native_suite_reuses_the_kept_libraries(self):
+        steps = self.jobs["native"]["steps"]
+        uses = [step.get("uses") for step in steps]
+        self.assertLess(uses.index("./.gitea/actions/ziran"), uses.index("./.gitea/actions/native-libraries"))
         native = next(step for step in steps if step.get("name") == "Native server suite")
-        self.assertIn("make sqlite-native microhttpd-native", native["run"])
         self.assertIn("make test-ziran-native-server", native["run"])
-        for name in ("Lint", "Race test", "Scan generated Go and check dependency licenses"):
-            self.assertIn(name, [step.get("name") for step in steps])
-        scans = [run for run in runs if "govulncheck -scan=package . ./native" in run]
-        self.assertEqual(len(scans), 2)
+        self.assertLess(uses.index("./.gitea/actions/native-libraries"), steps.index(native))
+
+    def test_scans_run_once_per_set_of_inputs(self):
+        steps = self.jobs["scans"]["steps"]
+        inputs = next(step for step in steps if step.get("name") == "Find the scanned inputs")
+        self.assertIn('[ "$EVENT" != schedule ]', inputs["run"])
+        for step in steps[steps.index(inputs) + 1:]:
+            self.assertIn("steps.inputs.outputs.unchanged != 'true'", step["if"])
+        runs = [step.get("run", "") for step in steps]
+        self.assertEqual(sum("govulncheck -scan=package . ./native" in run for run in runs), 2)
         # gosec with -quiet writes no report when it finds nothing, and the upload requires one.
         scan = next(step for step in steps if step.get("name") == "Scan generated Go and check dependency licenses")
         self.assertIn("-fmt=sarif -out gosec.sarif", scan["run"])
         self.assertNotIn("-quiet", scan["run"])
-        script_tests = re.findall(r"python3 -B (scripts/test_\w+\.py)", "\n".join(runs))
-        self.assertEqual(len(script_tests), len(set(script_tests)))
-        setup_go = next(step for step in steps if "actions/setup-go@" in (step.get("uses") or ""))
-        self.assertEqual(setup_go["with"]["cache"], "false")
-        names = [step.get("name") for step in steps]
-        root = names.index("Use the installed Go root")
-        self.assertEqual(root, steps.index(setup_go) + 1)
-        self.assertIn('echo "GOROOT=$root" >> "$GITHUB_ENV"', steps[root]["run"])
+        self.assertEqual(steps[-1]["name"], "Record the scanned inputs")
 
     def test_make_shim_forwards_every_target_ci_and_the_origin_run(self):
         shim = (ROOT / "makefile").read_text()
@@ -107,15 +128,24 @@ class GiteaWorkflowTest(unittest.TestCase):
         wanted |= {"build", "build-native"}
         self.assertLessEqual(wanted, forwarded | {"all"})
 
-    def test_deploy_ships_the_native_sources_it_generated(self):
+    def test_deploy_ships_the_binaries_ci_built(self):
+        uploads = {}
+        for job in ("checks", "native"):
+            for step in self.jobs[job]["steps"]:
+                if "actions/upload-artifact@" in (step.get("uses") or ""):
+                    self.assertEqual(step["if"], PUSH)
+                    uploads[step["with"]["name"]] = step["with"]["path"].split()
+        self.assertEqual(uploads, {"mesh-go-release": ["mesh", "build/mesh.manifest.json"],
+                                   "mesh-native-release": ["mesh-native", "build/mesh-native.manifest.json"]})
         steps = self.jobs["deploy"]["steps"]
-        names = [step.get("name") for step in steps]
-        release = names.index("Generate the native server sources")
-        package = names.index("Package the exact canonical revision")
-        self.assertEqual(steps[release]["run"], "make native-release")
-        self.assertLess(names.index("Generate the Go from the Zi sources"), release)
-        self.assertLess(release, package)
-        self.assertIn("find build/native-release -type f", steps[package]["run"])
+        downloads = [step["with"]["name"] for step in steps if "actions/download-artifact@" in (step.get("uses") or "")]
+        self.assertEqual(set(downloads), set(uploads))
+        # Nothing builds in the deploy: it packages what checks and native built.
+        self.assertFalse(any("actions/setup-go@" in (step.get("uses") or "") for step in steps))
+        self.assertFalse(any("make " in step.get("run", "") for step in steps))
+        package = next(step for step in steps if step.get("name") == "Package the exact canonical revision")
+        for path in (path for paths in uploads.values() for path in paths):
+            self.assertIn(path, package["run"])
 
     def test_container_probe_stays_inside_its_network_namespace(self):
         steps = self.jobs["container"]["steps"]

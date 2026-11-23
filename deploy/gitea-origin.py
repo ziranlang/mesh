@@ -22,7 +22,7 @@ ORIGIN = 'https://git.waozi.xyz'
 API = ORIGIN + '/api/v1/repos/ziranlang/mesh'
 PUBLIC = 'https://api.waozi.xyz'
 SOURCE = Path('/opt/mesh-src')
-REQUIRED_JOBS = {'checks', 'container'}
+REQUIRED_JOBS = {'checks', 'native', 'scans'}
 MAX_ARCHIVE = 64 * 1024**2
 MAX_SOURCE = 512 * 1024**2
 COMMAND = re.compile(
@@ -122,17 +122,20 @@ def run(*args, cwd=None, data=None, timeout=60):
                    env={'PATH': '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': '/root', 'LANG': 'C.UTF-8'})
 
 
-def native_build_commands(stage, revision, native_revision):
-    """The native server builds with cc from the artifact's generated C, when present."""
-    if not (stage / 'build/native-release/server').is_dir():
-        return []
-    return [
-        ('/usr/bin/make', '-j2', 'build-native', f'VERSION={revision}', f'SOURCE_COMMIT={revision}',
-         f'LIBOQS_COMMIT={native_revision}'),
-        ('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-artifact-manifest',
-         '--output', 'mesh-native', '--manifest', 'build/mesh-native.manifest.json',
-         '--expected-source-commit', revision, '--expected-liboqs-commit', native_revision),
-    ]
+# CI builds both servers on the origin's Debian release and ships them in the
+# artifact, so the origin only checks each one against its manifest.
+RELEASES = (('mesh', 'build/mesh.manifest.json'), ('mesh-native', 'build/mesh-native.manifest.json'))
+
+
+def release_checks(stage, revision, native_revision):
+    commands = []
+    for output, manifest in RELEASES:
+        if not ((stage / output).is_file() and (stage / manifest).is_file()):
+            raise DeployError('The Mesh artifact lacks the release binaries CI built')
+        commands.append(('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-artifact-manifest',
+                         '--output', output, '--manifest', manifest,
+                         '--expected-source-commit', revision, '--expected-liboqs-commit', native_revision))
+    return commands
 
 
 def check_revision(revision, attempts=15):
@@ -169,13 +172,8 @@ def deploy(run_id, attempt, revision, native_revision, native_digest, native_ent
         run('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-source',
             '--source-dir', 'vendor/liboqs', '--expected-commit', native_revision,
             '--expected-digest', native_digest, '--expected-entries', native_entries, cwd=stage)
-        run('/usr/bin/make', 'build', f'VERSION={revision}', f'SOURCE_COMMIT={revision}',
-            f'LIBOQS_COMMIT={native_revision}', cwd=stage, timeout=900)
-        run('/usr/bin/python3', '-B', 'scripts/verify_deployment_inputs.py', 'verify-artifact-manifest',
-            '--output', 'mesh', '--manifest', 'build/mesh.manifest.json', '--expected-source-commit', revision,
-            '--expected-liboqs-commit', native_revision, cwd=stage)
-        for command in native_build_commands(stage, revision, native_revision):
-            run(*command, cwd=stage, timeout=900)
+        for command in release_checks(stage, revision, native_revision):
+            run(*command, cwd=stage)
         require_master(revision, get)
         old = Path(temporary) / 'previous-source'
         if not SOURCE.is_dir() or SOURCE.is_symlink():
