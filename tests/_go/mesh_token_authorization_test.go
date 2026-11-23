@@ -134,8 +134,8 @@ func TestMeshLegacySharedTokenConfigurationIsDisabled(t *testing.T) {
 	if Mesh_Authorize(server.mesh(), writer, request, []byte("body")) {
 		t.Fatal("raw shared token retained implicit authority")
 	}
-	if writer.Code != http.StatusServiceUnavailable {
-		t.Fatalf("status = %d, want %d", writer.Code, http.StatusServiceUnavailable)
+	if writer.Code != http.StatusUnauthorized || !strings.Contains(writer.Body.String(), "signed peer identity required") {
+		t.Fatalf("status = %d body %q, want %d signed peer identity required", writer.Code, writer.Body.String(), http.StatusUnauthorized)
 	}
 }
 

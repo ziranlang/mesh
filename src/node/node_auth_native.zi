@@ -11,6 +11,7 @@
     secure :: #import "std/constant_time";
     sha :: #import "crypto/sha256";
     sql :: #import "sqlite_statement_native";
+    tokens :: #import "node_token";
     sqlite :: #import "sqlite/SQLite";
     transport :: #import "http_server_native";
     wire :: #import "wire_text";
@@ -61,42 +62,21 @@
     WindowSeconds :: 300;
     StoreFailure :: "node authentication unavailable";
 
-    Token :: struct {
-        node: string
-        secret: string
-    }
-
-    TokenParts :: (value: string) -> Token {
-        cut := wire.Cut(wire.TrimSpace(value), 58)
-        if !cut.found { return .{} }
-        id := wire.TrimSpace(cut.before)
-        secret := wire.TrimSpace(cut.after)
-        if secret == "" || !identity.ValidUserID(id) { return .{} }
-        return .{node = id, secret = secret}
-    }
-
     Header :: (connection: *void, name: string, legacy: string) -> string {
         value := transport.Header(connection, name)
         return ifx value == "" then transport.Header(connection, legacy) else value
     }
 
     TokenAuthorization :: (connection: *void, configured: string, lanOnly: bool) -> Authorization {
-        if lanOnly { return .{status = 401, error = "LAN mesh requires signed peer identity"} }
-        if wire.TrimSpace(configured) == "" { return .{status = 503, error = "node sync disabled"} }
-        expected := TokenParts(configured)
-        if expected.node == "" { return .{status = 503, error = "identity-bound node token required"} }
         raw := wire.TrimSpace(Header(connection, "X-Mesh-Node-Token", "X-Ksync-Node-Token"))
         if raw == "" {
             authorization := wire.TrimSpace(transport.Header(connection, "Authorization"))
             cut := wire.Cut(authorization, 32)
             if cut.found && wire.MatchesToken(cut.before, "bearer") { raw = cut.after }
         }
-        candidate := TokenParts(raw)
-        if candidate.node == "" || !secure.ConstantTimeTextEqual(expected.node, candidate.node) ||
-            !secure.ConstantTimeTextEqual(expected.secret, candidate.secret) {
-            return .{status = 401, error = "invalid node token"}
-        }
-        return .{nodeID = candidate.node}
+        decision := tokens.Decide(configured, raw, lanOnly)
+        if decision.status != 0 { return .{status = cast(u32)decision.status, error = decision.error} }
+        return .{nodeID = decision.node}
     }
 
     Verify :: (database: *void, node: string, message: []u8, signature: []u8) -> string {

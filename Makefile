@@ -25,7 +25,7 @@ CGO_ENV := CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(abspath $(LIBOQS_PREFIX))/include" \
 	CGO_LDFLAGS="-L$(abspath $(LIBOQS_PREFIX))/lib -loqs"
 
-.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server build-native-checks test-ziran-native-google-play test-ziran-native-ledger sqlite-native microhttpd-native test-ziran-native-embedded compression-bench
+.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server build-native-checks test-ziran-native-google-play test-ziran-native-ledger sqlite-native microhttpd-native test-ziran-native-embedded test-ziran-native-node-token compression-bench
 
 all: build
 
@@ -200,7 +200,8 @@ test-ziran-native-server: test-ziran-native-http
 	$(MAKE) -f Makefile test-ziran-native-ledger
 	# CI runs only this target, so it also runs the smaller native programs.
 	$(MAKE) -f Makefile test-ziran-native test-ziran-native-sqlite test-ziran-native-ml-dsa44 \
-		test-ziran-native-account-auth test-ziran-native-http-coding test-ziran-native-embedded
+		test-ziran-native-account-auth test-ziran-native-http-coding test-ziran-native-embedded \
+		test-ziran-native-node-token
 
 # Signed ledger allocation and referral settlement against in-memory SQLite.
 NATIVE_LEDGER_TESTS := token_payment_ledger referral_settlement
@@ -290,6 +291,13 @@ test-ziran-native-embedded: build-ziran-native-embedded build-native-checks
 		-o "$(NATIVE_EMBEDDED_BUILD_DIR)/embedded_host"
 	LD_LIBRARY_PATH="$(abspath $(NATIVE_EMBEDDED_BUILD_DIR)):$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		"$(NATIVE_CHECKS_DIR)/check_embedded_host" "$(NATIVE_EMBEDDED_BUILD_DIR)/embedded_host"
+
+test-ziran-native-node-token:
+	mkdir -p $(BUILD_DIR)/native-tests/node-token
+	XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
+	$(ZIRAN) build $(ZIRAN_PROJECT) --target=c --exe --entry node_token_decisions:Main --root tests/native \
+		-o $(BUILD_DIR)/native-tests/node-token tests/native/node_token_decisions.zi
+	$(BUILD_DIR)/native-tests/node-token/node_token_decisions
 
 test-ziran-native-ml-dsa44: liboqs
 	mkdir -p $(BUILD_DIR)/native-tests/ml-dsa44

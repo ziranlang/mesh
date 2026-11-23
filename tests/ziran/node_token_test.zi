@@ -1,0 +1,39 @@
+#import "std/go_types"
+testing :: #import "testing_test";
+tokens :: #import "node_token";
+
+#scope_file
+NodeA :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+Bound :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:secret";
+
+Case :: struct {
+    name: string
+    configured: string
+    presented: string
+    lan_only: bool
+    status: s32
+    error: string
+    node: string
+}
+
+#scope_export
+#program_export "TestZiranNodeTokenDecisions"
+ZiranNodeTokenDecisions :: (test: *testing.Test) {
+    cases: [8]Case = .[
+        .{name = "LAN only", configured = Bound, presented = Bound, lan_only = true, status = 401, error = tokens.LanIdentityRequired},
+        .{name = "no token configured", configured = "", presented = Bound, status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "bare token configured", configured = "mesh-secret", presented = "mesh-secret", status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "configured node ID invalid", configured = "not-a-node:secret", presented = "not-a-node:secret", status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "nothing presented", configured = Bound, presented = "", status = 401, error = tokens.InvalidToken},
+        .{name = "wrong secret", configured = Bound, presented = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:other", status = 401, error = tokens.InvalidToken},
+        .{name = "other node", configured = Bound, presented = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:secret", status = 401, error = tokens.InvalidToken},
+        .{name = "matching token", configured = Bound, presented = "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa : secret ", node = NodeA}
+    ]
+    for cases {
+        decision := tokens.Decide(it.configured, it.presented, it.lan_only)
+        if decision.status != it.status || decision.error != it.error || decision.node != it.node {
+            arguments: [7]Any = .[it.name, decision.status, decision.error, decision.node, it.status, it.error, it.node]
+            testing.Fatalf(test, "%s: got %d %q %q, want %d %q %q", arguments[:])
+        }
+    }
+}

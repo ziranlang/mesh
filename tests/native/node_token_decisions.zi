@@ -1,0 +1,44 @@
+// Checks the node sync token decisions on the native build.
+tokens :: #import "node_token";
+
+#scope_file
+Bound :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:secret";
+NodeA :: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+Case :: struct {
+    name: string
+    configured: string
+    presented: string
+    lan_only: bool
+    status: s32
+    error: string
+    node: string
+}
+
+#scope_export
+#program_export
+Main :: () -> s32 {
+    cases: [8]Case = .[
+        .{name = "LAN only", configured = Bound, presented = Bound, lan_only = true, status = 401, error = tokens.LanIdentityRequired},
+        .{name = "no token configured", configured = "", presented = Bound, status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "bare token configured", configured = "mesh-secret", presented = "mesh-secret", status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "configured node ID invalid", configured = "not-a-node:secret", presented = "not-a-node:secret", status = 401, error = tokens.SignedIdentityRequired},
+        .{name = "nothing presented", configured = Bound, presented = "", status = 401, error = tokens.InvalidToken},
+        .{name = "wrong secret", configured = Bound, presented = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:other", status = 401, error = tokens.InvalidToken},
+        .{name = "other node", configured = Bound, presented = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb:secret", status = 401, error = tokens.InvalidToken},
+        .{name = "matching token", configured = Bound, presented = "  aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa : secret ", node = NodeA}
+    ]
+    failures: s32 = 0
+    for cases {
+        decision := tokens.Decide(it.configured, it.presented, it.lan_only)
+        if decision.status != it.status || decision.error != it.error || decision.node != it.node {
+            print("FAIL: % got % % %\n", it.name, decision.status, decision.error, decision.node)
+            failures += 1
+        }
+    }
+    if failures != 0 {
+        return 1
+    }
+    print("Native node token decisions passed\n")
+    return 0
+}

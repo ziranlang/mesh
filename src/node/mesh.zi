@@ -10,6 +10,7 @@ http_auth :: #import "http_auth";
 http_body :: #import "http_body";
 response :: #import "response";
 identity :: #import "identity";
+tokens :: #import "node_token";
 apps :: #import "mesh_apps";
 records :: #import "mesh_store";
 storage :: #import "account_storage";
@@ -77,19 +78,25 @@ RemoteFailure :: (format: string, status: string, body: string) -> Error #foreig
 
 ParseTokenCredential :: (credential: string) -> TokenCredential {
     result: TokenCredential
-    cut := Cut(TrimSpace(credential), ":")
-    if !cut.found {
+    parsed := tokens.ParseToken(credential)
+    if parsed.node == "" {
         return result
     }
-    result.nodeID = TrimSpace(cut.before)
-    result.secret = TrimSpace(cut.after)
-    if result.nodeID == "" || result.secret == "" || !identity.ValidUserID(result.nodeID) {
-        return result
-    }
+    result.nodeID = parsed.node
+    result.secret = parsed.secret
     value: [2]string = .[result.nodeID, result.secret]
     result.value = Join(value[:], ":")
     result.valid = true
     return result
+}
+
+// The token a peer presents in X-Mesh-Node-Token (or its Ksync name) or as a bearer token.
+PresentedToken :: (request: *http.Request) -> string {
+    provided := TrimSpace(http_auth.HeaderAlias(request, headerNames[:]))
+    if provided == "" {
+        provided = BearerToken(wire.Value(http.Headers(request), "Authorization"))
+    }
+    return provided
 }
 
 RequestTokenCredential :: (mesh: Mesh, request: *http.Request) -> TokenCredential {
@@ -98,12 +105,7 @@ RequestTokenCredential :: (mesh: Mesh, request: *http.Request) -> TokenCredentia
     if !configured.valid {
         return result
     }
-    headers := http.Headers(request)
-    provided := TrimSpace(http_auth.HeaderAlias(request, headerNames[:]))
-    if provided == "" {
-        provided = BearerToken(wire.Value(headers, "Authorization"))
-    }
-    candidate := ParseTokenCredential(provided)
+    candidate := ParseTokenCredential(PresentedToken(request))
     if !candidate.valid || !constant_time.ConstantTimeTextEqual(candidate.value, configured.value) {
         return result
     }
@@ -261,21 +263,9 @@ Authorize :: (mesh: Mesh, writer: http.ResponseWriter, request: *http.Request, b
         }
         return true
     }
-    credential := ParseTokenCredential(mesh.configuration.NodeSyncToken)
-    if scope.LANOnly {
-        response.Error(writer, cast(isize)401, "LAN mesh requires signed peer identity")
-        return false
-    }
-    if TrimSpace(mesh.configuration.NodeSyncToken) == "" {
-        response.Error(writer, cast(isize)503, "node sync disabled")
-        return false
-    }
-    if !credential.valid {
-        response.Error(writer, cast(isize)503, "identity-bound node token required")
-        return false
-    }
-    if !RequestTokenCredential(mesh, request).valid {
-        response.Error(writer, cast(isize)401, "invalid node token")
+    decision := tokens.Decide(mesh.configuration.NodeSyncToken, PresentedToken(request), scope.LANOnly)
+    if decision.status != 0 {
+        response.Error(writer, cast(isize)decision.status, decision.error)
         return false
     }
     return true

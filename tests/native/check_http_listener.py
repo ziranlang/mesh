@@ -1682,7 +1682,7 @@ def check_peer_exchange(host, port, database, oracle):
             return json.loads(data)
 
     body = json.dumps({"limit": 1, "policy": policy}).encode()
-    post(body, 401 if host == "127.0.0.1" else 503)
+    post(body, 401)
     post(body + b" ", 401, sign(body, "modified"))
     post(body, 401, sign(body, "expired", now - 600))
     missing = b"{}"

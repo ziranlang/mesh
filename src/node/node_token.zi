@@ -1,0 +1,56 @@
+// Node sync token decisions shared by the Go and native servers. A token
+// authorizes a peer only when it binds a node ID, as "<node_id>:<secret>";
+// without one, peers must sign requests with their node identity.
+identity :: #import "identity";
+secure :: #import "std/constant_time";
+wire :: #import "wire_text";
+
+LanIdentityRequired :: "LAN mesh requires signed peer identity";
+SignedIdentityRequired :: "signed peer identity required";
+InvalidToken :: "invalid node token";
+
+Token :: struct {
+    node: string
+    secret: string
+}
+
+Decision :: struct {
+    // Zero authorizes `node`; otherwise the HTTP status to answer with `error`.
+    status: s32
+    error: string
+    node: string
+}
+
+// The node ID and secret of an identity-bound token, or empty fields.
+ParseToken :: (value: string) -> Token {
+    cut := wire.Cut(wire.TrimSpace(value), 58)
+    if !cut.found {
+        return .{}
+    }
+    node := wire.TrimSpace(cut.before)
+    secret := wire.TrimSpace(cut.after)
+    if secret == "" || !identity.ValidUserID(node) {
+        return .{}
+    }
+    return .{node = node, secret = secret}
+}
+
+// Decides a peer request that presents a token rather than a signed node
+// identity. `configured` is this node's sync token and `presented` the
+// peer's. A node without an identity-bound token refuses every token request
+// with 401: the peer has to sign, and retrying the same request cannot help.
+Decide :: (configured: string, presented: string, lan_only: bool) -> Decision {
+    if lan_only {
+        return .{status = 401, error = LanIdentityRequired}
+    }
+    expected := ParseToken(configured)
+    if expected.node == "" {
+        return .{status = 401, error = SignedIdentityRequired}
+    }
+    candidate := ParseToken(presented)
+    if candidate.node == "" || !secure.ConstantTimeTextEqual(expected.node, candidate.node) ||
+        !secure.ConstantTimeTextEqual(expected.secret, candidate.secret) {
+        return .{status = 401, error = InvalidToken}
+    }
+    return .{node = candidate.node}
+}

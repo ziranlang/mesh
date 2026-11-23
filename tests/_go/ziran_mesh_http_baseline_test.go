@@ -138,7 +138,7 @@ func (s *Server) baselineMeshAuthorizeNodeSync(w http.ResponseWriter, r *http.Re
 	}
 	token := strings.TrimSpace(s.Cfg.NodeSyncToken)
 	if token == "" {
-		Response_Error(w, http.StatusServiceUnavailable, "node sync disabled")
+		Response_Error(w, http.StatusUnauthorized, "signed peer identity required")
 		return false
 	}
 	got := strings.TrimSpace(HttpAuth_HeaderAlias(r, []string{"X-Mesh-Node-Token", "X-Ksync-Node-Token"}))
