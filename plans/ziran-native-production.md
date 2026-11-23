@@ -39,6 +39,17 @@ Native goes live through `deploy/runtime=native`. A watchdog compares live
 statuses with the three hours of Go traffic before the switch and rolls back
 to Go when a route Go served answers an error status Go never gave it.
 
+Run 445 (commit `6f5d618`) deployed the native release built by CI, and
+production has served it since 2026-11-23 12:09 UTC. `/readyz` reports 200
+with every check ok, `GET /openapi.json` answers 200 with its OpenAPI content
+type, and the routes only native serves (`GET /api/v1/account/2fa`,
+`POST /api/v1/account/2fa/totp/setup`) answer 401 instead of not being routed
+at all. `POST /api/v1/sync` and `POST /api/v1/node/mesh/export` answer their
+usual 400 and 401. Run 431 had stopped one step short of this: its `native`
+job linked the release without the libmicrohttpd directory, failed on
+`-l:libmicrohttpd.so.12`, and skipped the deploy; `build-native` was the only
+native target that ignored `MICROHTTPD_NATIVE_DIR`.
+
 
 Once native has run in production without problems, drop Go generation, the
 Go tests and lint from the per-push gate and keep them weekly. The deploy then
