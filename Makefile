@@ -143,10 +143,25 @@ test-ziran-native-http-coding:
 	LD_LIBRARY_PATH="$(MICROHTTPD_NATIVE_DIR)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 -B tests/native/check_http_coding.py $(BUILD_DIR)/native-tests/http-coding/http_coding
 
-build-ziran-native-server: export MESH_NATIVE_BUILD_VERSION = $(NATIVE_SERVER_VERSION)
-build-ziran-native-server: liboqs
-	mkdir -p "$(NATIVE_SERVER_BUILD_DIR)"
-	python3 -B scripts/write_native_entry.py "$(NATIVE_SERVER_BUILD_DIR)/mesh_native_entry.zi"
+# The native entry sets the build version as a Ziran string literal.
+native_version_literal = "$(subst ",\",$(subst \,\\,$(NATIVE_SERVER_VERSION)))"
+define NATIVE_ENTRY
+server :: #import "server_native";
+version :: #import "version";
+
+#program_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    version.BuildVersion = $(native_version_literal)
+    return server.Main(argc, argv)
+}
+endef
+
+$(NATIVE_SERVER_BUILD_DIR):
+	mkdir -p "$@"
+
+build-ziran-native-server: liboqs | $(NATIVE_SERVER_BUILD_DIR)
+	$(if $(strip $(NATIVE_SERVER_VERSION)),,$(error Mesh native build version must be nonempty))
+	$(file >$(NATIVE_SERVER_BUILD_DIR)/mesh_native_entry.zi,$(NATIVE_ENTRY))
 	XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
 	LDFLAGS="$(LDFLAGS) -L$(abspath $(LIBOQS_PREFIX))/lib -L$(SQLITE_NATIVE_DIR) $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR))" \
 	LDLIBS="$(NATIVE_SERVER_LIBS)" \
