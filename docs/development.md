@@ -222,8 +222,7 @@ the Go and builds liboqs once. The `container` job runs in parallel on the
 Mesh runner. Production deployment requires both jobs, and
 `deploy/gitea-origin.py` requires the same job names. The deploy job accepts only the canonical repository's `master` and
 checks the current remote revision before transferring source to the origin.
-GitHub mirrors source. Its legacy API workflow requires manual dispatch for
-recovery during the transition.
+GitHub mirrors source and holds no origin credential.
 
 The deploy job also ships the native server's generated C and SQLite source
 (`make native-release`). The origin builds both servers: `make build` for the

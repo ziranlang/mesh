@@ -48,7 +48,9 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertNotIn("environment", deploy)
         self.assertEqual(deploy["permissions"], {"contents": "read", "actions": "read"})
         self.assertEqual(self.workflow["concurrency"]["cancel-in-progress"], "false")
-        self.assertEqual(set(read_yaml(ROOT / ".github/workflows/deploy.yml")["on"]), {"workflow_dispatch"})
+        # Gitea is the only deploy path; the GitHub mirror holds no origin key.
+        for retired in ("deploy.yml", "bootstrap-ssh.yml"):
+            self.assertFalse((ROOT / ".github/workflows" / retired).exists())
         for filename in ("ci.yml", "security.yml"):
             self.assertEqual(set(read_yaml(ROOT / ".github/workflows" / filename)["on"]), {"workflow_call"})
 

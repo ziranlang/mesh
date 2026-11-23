@@ -81,7 +81,7 @@ public readiness after install. The deploy job supplies a short-lived Gitea
 job token with Actions and contents read access. It uses the pinned origin host
 key and leaves the existing node credentials in place.
 
-GitHub retains a manual API recovery workflow with the legacy secret names. Pages uses project
+GitHub no longer deploys the API. Pages uses project
 `mesh` and provisions `mesh.ziran-lang.org` with `CLOUDFLARE_DNS_API_TOKEN`
 (falling back to `CLOUDFLARE_API_TOKEN`). This provisioning token needs Pages
 Edit, Zone Read and DNS Edit for ziran-lang.org. Site uploads continue using

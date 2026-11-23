@@ -297,7 +297,7 @@ class DeploymentInputTest(unittest.TestCase):
             self.assertFalse((ssh_directory / "known_hosts").exists())
 
     def test_workflow_uses_exact_native_source_and_strict_ssh(self):
-        workflow_path = Path(".github/workflows/deploy.yml")
+        workflow_path = Path(".gitea/workflows/ci.yml")
         workflow = yaml.safe_load(workflow_path.read_text())
         workflow_text = workflow_path.read_text()
         for job in workflow["jobs"].values():
@@ -316,13 +316,11 @@ class DeploymentInputTest(unittest.TestCase):
         deploy_checkout = next(
             step for step in checkouts if "actions/checkout" in str(step.get("uses"))
         )
-        self.assertEqual(deploy_checkout.get("with"), {"submodules": "recursive"})
+        self.assertEqual(deploy_checkout.get("with"), {"persist-credentials": False, "submodules": "recursive"})
         self.assertNotIn("ssh-keyscan", workflow_text)
         self.assertNotIn("--exclude='vendor/liboqs'", workflow_text)
-        for path in (workflow_path, Path(".gitea/workflows/ci.yml")):
-            package = path.read_text()
-            self.assertIn("git ls-files -z --recurse-submodules", package)
-            self.assertIn("tar --null --no-recursion --files-from=", package)
+        self.assertIn("git ls-files -z --recurse-submodules", workflow_text)
+        self.assertIn("tar --null --no-recursion --files-from=", workflow_text)
         self.assertIn("*.node-key", Path(".dockerignore").read_text().splitlines())
         self.assertNotIn('cp -a "/opt/mesh-src/$keep"', workflow_text)
         step_names = [step.get("name") for step in checkouts]
@@ -333,12 +331,12 @@ class DeploymentInputTest(unittest.TestCase):
         ssh_commands = [
             line.strip()
             for line in workflow_text.splitlines()
-            if line.strip().startswith("ssh ")
+            if re.search(r"(^|\| )ssh ", line.strip())
         ]
         self.assertTrue(ssh_commands)
-        self.assertTrue(all("mesh-origin" in line for line in ssh_commands))
+        self.assertTrue(all('ssh -F "$MESH_SSH_DIR/config" mesh-origin' in line for line in ssh_commands))
         deployment = Path(__file__).resolve().parents[1] / "deploy"
-        self.assertEqual(workflow_text.count("sh /opt/mesh-src/deploy/rollback.sh"), 2)
+        self.assertIn("deploy/rollback.sh", (deployment / "gitea-origin.py").read_text())
         self.assertIn("trap finish 0", (deployment / "install.sh").read_text())
         self.assertIn("rm -f /opt/mesh/mesh.manifest.json", (deployment / "rollback.sh").read_text())
 
