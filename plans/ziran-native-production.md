@@ -39,10 +39,6 @@ Native goes live through `deploy/runtime=native`. A watchdog compares live
 statuses with the three hours of Go traffic before the switch and rolls back
 to Go when a route Go served answers an error status Go never gave it.
 
-Smaller differences: unauthenticated `GET /api/v1/account` is 405 on native
-and 404 on Go, and native `/metrics` lacks 25 of Go's metric names (13
-`mesh_*`, 12 `ksync_*`).
-
 Open gaps between the Go and native servers, each needing its regression test:
 
 - Referral settlement: the historical Google origin backfill
