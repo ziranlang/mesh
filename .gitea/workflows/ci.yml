@@ -3,6 +3,8 @@ name: Mesh CI and deploy
 on:
   push:
     branches: [master]
+    # Plans and prose never reach the server, so they neither test nor redeploy.
+    paths-ignore: ['plans/**', '**/*.md']
   workflow_dispatch:
   schedule:
     - cron: '27 4 * * 1'

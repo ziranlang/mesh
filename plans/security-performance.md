@@ -19,9 +19,3 @@ Both backends stage a private file in the identity directory before publishing i
 1. Use independent random content roots for a versioned client format. Define key IDs, authenticated recipient key wraps, restore behavior and old-client handling before writing the new format. Keep existing ciphertext readable under its original derivation. Coordinate client changes with the package owner first.
 2. Specify owner or authorized delegate provenance for opt-in replica collections. Bind the record, operation, predecessor and ciphertext digest, then persist validation and replay state with the record. Keep explicitly trusted legacy collections compatible. Verify tombstones, expiry, unauthorized and malformed imports, duplicates, conflicting writes, offline catch-up and rollback before promotion.
 3. Profile the native encrypted sync paths against deterministic high-entropy fixtures and release-sized databases. Attribute SQLite lock time, database checkpoint stalls, encoding and compression before optimizing them. Keep durability and authorization unchanged across measurements. Coordinate any SQLite engine or package change separately.
-
-## Canonical Gitea delivery
-
-1. Verify a Build container executor for the Docker smoke and Trivy gates, and a production runner isolated from pull requests and other jobs. Use the existing Mesh origin and provision the runner's authorized SSH identity and pinned host key through the operations owner.
-2. Configure the repository-scoped Build runner and the origin's pinned SSH forced command. The origin accepts deployment artifacts from the active Gitea master run after the required gates pass. GitHub keeps the manual API recovery workflow.
-3. Verify the first Gitea run at the exact master revision. Confirm the required gates, origin manifest, public `build_version` and `/readyz` HTTP 200. Keep the previous deployment available until that validation completes.

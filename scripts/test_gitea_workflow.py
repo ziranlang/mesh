@@ -29,6 +29,7 @@ class GiteaWorkflowTest(unittest.TestCase):
 
     def test_canonical_deploy_requires_every_gate(self):
         self.assertEqual(self.workflow["on"]["push"]["branches"], ["master"])
+        self.assertEqual(self.workflow["on"]["push"]["paths-ignore"], ["plans/**", "**/*.md"])
         self.assertEqual(set(self.workflow["on"]), {"push", "workflow_dispatch", "schedule"})
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         deploy = self.jobs["deploy"]
