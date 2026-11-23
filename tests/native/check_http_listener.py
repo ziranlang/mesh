@@ -1005,7 +1005,9 @@ def check_signed_login(host, port, database, oracle, server_mode=False):
         if server_mode:
             legacy_delete = "/api/v1/account"
             body = json.dumps({"user_id_hash": user}).encode()
-            assert request("POST", legacy_delete) == (405, None)
+            assert request("GET", legacy_delete) == (404, {"error": "not found"})
+            status, response, contents = request("POST", legacy_delete, raw=True)
+            assert (status, contents, response.getheader("Allow")) == (405, b"Method Not Allowed\n", "DELETE, GET, HEAD")
             assert request("DELETE", legacy_delete, body, proof(body, "/api/v1/account/delete", "DELETE")) == (401, {"error": "signature rejected"})
             assert request("DELETE", legacy_delete, body, proof(body, legacy_delete, "DELETE")) == (200, {"status": "deleted"})
             assert held_file.is_file()
@@ -2145,7 +2147,7 @@ def check_node_status(binary, database):
             response.read()
             connection.request("GET", "/private-fixture-path")
             response = connection.getresponse()
-            assert response.status == 404 and response.read() == b""
+            assert response.status == 404 and json.loads(response.read()) == {"error": "not found"}
             challenge = f"/api/v1/sync/challenge?user_id={current}"
             for expected in [200] * 20 + [429] * 2:
                 connection.request("GET", challenge)

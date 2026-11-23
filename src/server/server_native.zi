@@ -565,7 +565,7 @@
             return registry.Handle(state.accounts.configuration.database, connection, verb, route)
         }
         if route != "/readyz" && route != "/healthz" && route != "/api/v1/node" && route != "/metrics" {
-            return http.Write(connection, 404, "", empty[:])
+            return http_json.NoRoute(connection, verb, "GET, HEAD")
         }
         if verb != "GET" && verb != "HEAD" {
             headers: [1]http.HeaderValue = .[.{name = "Allow", value = "GET, HEAD"}]

@@ -138,8 +138,10 @@
         varyHeader: [1]transport.HeaderValue = .[.{name = "Vary", value = "Accept-Encoding"}]
         vary := varyHeader[:]
         if method == "HEAD" || status == 204 || status == 304 {
+            // As with Go, a HEAD reply keeps the JSON content type of its GET.
+            kind := ifx method == "HEAD" && status != 204 && status != 304 then "application/json" else ""
             empty: []u8
-            return transport.WriteWithHeaders(connection, status, "", empty, vary)
+            return transport.WriteWithHeaders(connection, status, kind, empty, vary)
         }
         accepted: [preferences.MaximumHeaderBytes]u8
         count := transport.JoinHeader(connection, "Accept-Encoding", accepted[:])

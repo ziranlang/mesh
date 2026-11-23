@@ -696,6 +696,10 @@
         deleteOnly := path == LegacyDeleteRoute
         allowed := ifx deviceRoute then "DELETE, GET, HEAD, POST" else ifx readOnly then "GET, HEAD" else ifx deleteOnly then "DELETE" else "POST"
         supported := ifx deviceRoute then reads || method == "POST" || method == "DELETE" else ifx readOnly then reads else ifx deleteOnly then method == "DELETE" else method == "POST"
+        if !supported && deleteOnly {
+            // Go serves only DELETE here; its GET catch-all answers the rest.
+            return replies.NoRoute(connection, method, "DELETE, GET, HEAD")
+        }
         if !supported {
             headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allowed}]
             body: []u8

@@ -28,6 +28,45 @@ CheckMetricsRefusal :: (port: u16) {
     check.Check(varies, "the refusal varies by origin")
 }
 
+Answer :: struct {
+    method: string
+    path: string
+    status: s32
+    content_type: string
+    allow: string
+    body: string
+}
+
+// What the Go server answers for paths and methods no route serves,
+// measured on the live origin on 2026-11-23.
+CheckNoRoute :: (port: u16) {
+    answers: [8]Answer = .[
+        .{method = "GET", path = "/api/v1/account", status = 404, content_type = "application/json", body = "{\"error\":\"not found\"}\n"},
+        .{method = "HEAD", path = "/api/v1/account", status = 404, content_type = "application/json"},
+        .{method = "POST", path = "/api/v1/account", status = 405, content_type = "text/plain; charset=utf-8", allow = "DELETE, GET, HEAD", body = "Method Not Allowed\n"},
+        .{method = "PUT", path = "/api/v1/account", status = 405, content_type = "text/plain; charset=utf-8", allow = "DELETE, GET, HEAD", body = "Method Not Allowed\n"},
+        .{method = "GET", path = "/api/v1/no-such-route", status = 404, content_type = "application/json", body = "{\"error\":\"not found\"}\n"},
+        .{method = "HEAD", path = "/api/v1/no-such-route", status = 404, content_type = "application/json"},
+        .{method = "POST", path = "/api/v1/no-such-route", status = 405, content_type = "text/plain; charset=utf-8", allow = "GET, HEAD", body = "Method Not Allowed\n"},
+        .{method = "DELETE", path = "/readyz/extra", status = 405, content_type = "text/plain; charset=utf-8", allow = "GET, HEAD", body = "Method Not Allowed\n"}
+    ]
+    for answers {
+        headers: [1]check.Header = .[.{name = "Accept-Encoding", value = "identity"}]
+        response := check.Request(port, it.method, it.path, headers[:])
+        defer check.FreeResponse(*response)
+        allow, has_allow := check.HeaderValue(response.head[:], "Allow")
+        matches := response.status == it.status && check.HeaderIs(*response, "Content-Type", it.content_type) &&
+            ifx it.allow == "" then !has_allow else allow == it.allow
+        if it.method != "HEAD" {
+            matches = matches && TextFromBytes(response.body[:]) == it.body
+        }
+        if !matches {
+            print("% % answered % allow % body %\n", it.method, it.path, response.status, allow, TextFromBytes(response.body[:]))
+        }
+        check.Check(matches, it.path)
+    }
+}
+
 #scope_export
 Main :: (argc: s32, argv: **u8) -> s32 {
     if argc != 2 {
@@ -47,6 +86,7 @@ Main :: (argc: s32, argv: **u8) -> s32 {
     if check.StartServer(*server, binary, settings[:]) {
         policy.CheckPreflight(server.port)
         CheckMetricsRefusal(server.port)
+        CheckNoRoute(server.port)
     }
     check.StopServer(*server)
     return check.ExitStatus("Native server origin policy passed")

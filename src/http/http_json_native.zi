@@ -71,4 +71,18 @@
         }
         return Reply(connection, method, status, *document, root, zstd)
     }
+
+    // A path, or a method on it, that no route serves, answered as Go's router
+    // does: its GET catch-all gives 404 {"error":"not found"}, and any other
+    // method gets 405 listing `allow`, which always includes GET and HEAD.
+    NoRoute :: (connection: *void, method: string, allow: string) -> s32 {
+        if method == "GET" || method == "HEAD" {
+            return ErrorReply(connection, method, 404, "not found", false)
+        }
+        text: Vec(u8)
+        defer VecFree(text)
+        BuilderAppend(text, "Method Not Allowed\n")
+        headers: [1]transport.HeaderValue = .[.{name = "Allow", value = allow}]
+        return transport.WriteWithHeaders(connection, 405, "text/plain; charset=utf-8", VecSlice(text, 0, text.count), headers[:])
+    }
 }
