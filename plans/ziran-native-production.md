@@ -35,9 +35,14 @@ login, using a token the copy had not yet seen. No other route differed.
 X-Daochi-User and X-Daochi-Signature login over `daochi-sync-v1`, then a sync
 with its token.
 
-Native goes live through `deploy/runtime=native`. A watchdog compares live
-statuses with the three hours of Go traffic before the switch and rolls back
-to Go when a route Go served answers an error status Go never gave it.
+Native goes live through `deploy/runtime=native`. There is no automatic
+traffic watchdog: an earlier draft described one, but none was built. The
+protection against a bad switch is the offline traffic comparison above plus
+`check_revision` in `deploy/gitea-origin.py`, which waits for `/readyz` and the
+expected `build_version` and rolls the release back when either fails. A
+route that answers wrong statuses while staying ready is not detected
+automatically; the Go binary stays installed so the rollback below is one
+command.
 
 Run 445 (commit `6f5d618`) deployed the native release built by CI, and
 production has served it since 2026-11-23 12:09 UTC. `/readyz` reports 200
@@ -49,6 +54,13 @@ usual 400 and 401. Run 431 had stopped one step short of this: its `native`
 job linked the release without the libmicrohttpd directory, failed on
 `-l:libmicrohttpd.so.12`, and skipped the deploy; `build-native` was the only
 native target that ignored `MICROHTTPD_NATIVE_DIR`.
+
+The same switch dropped LAN discovery: Go advertised the node through its own
+mDNS, native loads `libavahi-core.so.7` at runtime, and the origin did not have
+Avahi Core. It logged one startup line and kept serving. `libavahi-core7` is
+now installed on the origin and the requirement is documented beside
+`libmicrohttpd12t64`. The deploy still installs no host packages, because its
+tests run the installer on a rootless runner.
 
 
 Once native has run in production without problems, drop Go generation, the
