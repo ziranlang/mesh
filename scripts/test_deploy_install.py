@@ -26,9 +26,11 @@ class InstallTests(unittest.TestCase):
         for name in ("opt/mesh", "opt/mesh-src/deploy", "opt/mesh-src/scripts", "opt/mesh-src/build",
                      "var/lib/mesh", "etc/mesh", "etc/systemd/system/mesh.service.d", "bin"):
             (self.root / name).mkdir(parents=True, exist_ok=True)
-        for script in ("install.sh", "rollback.sh"):
+        for script in ("install.sh", "rollback.sh", "harden-service.sh"):
             text = (REPOSITORY / "deploy" / script).read_text()
-            for prefix in ("/opt/mesh", "/var/lib/mesh", "/etc/mesh", "/etc/systemd"):
+            # /var/lib/mesh is a prefix of /var/lib/mesh/backups only, while
+            # /etc/mesh must not rewrite /etc/mesh.* siblings.
+            for prefix in ("/opt/mesh", "/var/lib/mesh", "/var/lib/daochi", "/etc/mesh", "/etc/systemd"):
                 text = text.replace(prefix, str(self.root) + prefix)
             (self.root / "opt/mesh-src/deploy" / script).write_text(text)
         for name, value in {
@@ -56,6 +58,43 @@ assert "stop mesh.service" in (pathlib.Path(os.environ["TEST_ROOT"]) / "services
 shutil.copyfile(sys.argv[1], shlex.split(sys.argv[2])[1])
 ''')
         self.executable("bin/sleep", "")
+        for name in ("chown", "chgrp"):
+            self.executable(f"bin/{name}", '''
+import os, pathlib, sys
+with (pathlib.Path(os.environ["TEST_ROOT"]) / "accounts.log").open("a") as output:
+    output.write(" ".join(sys.argv[1:]) + "\\n")
+''')
+        self.executable("bin/groupadd", '''
+import os, pathlib, sys
+with (pathlib.Path(os.environ["TEST_ROOT"]) / "accounts.log").open("a") as output:
+    output.write(" ".join(sys.argv[1:]) + "\\n")
+''')
+        self.executable("bin/useradd", '''
+import os, pathlib, sys
+with (pathlib.Path(os.environ["TEST_ROOT"]) / "accounts.log").open("a") as output:
+    output.write(" ".join(sys.argv[1:]) + "\\n")
+''')
+        # A disposable tree has no mesh account, so drop the owner flags and
+        # keep the real install(1) for directory creation and modes.
+        self.executable("bin/install", '''
+import os, subprocess, sys
+arguments = []
+skip = False
+for argument in sys.argv[1:]:
+    if skip:
+        skip = False
+        continue
+    if argument in ("-o", "-g"):
+        skip = True
+        continue
+    arguments.append(argument)
+sys.exit(subprocess.run(["/usr/bin/install", *arguments]).returncode)
+''')
+        self.executable("bin/getent", '''
+import os, sys
+# Neither the Mesh group nor the Mesh account exists yet in a disposable tree.
+sys.exit(2 if sys.argv[1] in ("group", "passwd") else 1)
+''')
         self.executable("opt/mesh-src/scripts/verify_deployment_inputs.py", '''
 import os, sys
 sys.exit(1 if os.environ.get("FAIL_VERIFY") else 0)
@@ -93,6 +132,37 @@ pathlib.Path(sys.argv[1]).write_text("new environment")
         for name, value in (("mesh", "old mesh setting"), ("daochi", "old daochi setting")):
             self.assertFalse((self.root / f"etc/systemd/system/mesh.service.d/20-{name}-mesh.conf").exists())
             self.assertEqual((self.root / f"var/lib/mesh/backups/mesh.{name}.{STAMP}").read_text(), value)
+
+    def sandbox(self):
+        return self.root / "etc/systemd/system/mesh.service.d/10-sandbox.conf"
+
+    def test_install_runs_as_a_dedicated_user_in_a_sandbox(self):
+        result = self.run_install()
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        unit = self.sandbox().read_text()
+        for setting in ("User=mesh", "Group=mesh", "NoNewPrivileges=true", "PrivateTmp=true",
+                        "ProtectSystem=strict"):
+            self.assertIn(setting, unit)
+        self.assertIn(f"ReadWritePaths={self.root}/var/lib/daochi {self.root}/var/lib/mesh/backups", unit)
+        self.assertEqual(self.sandbox().stat().st_mode & 0o777, 0o644)
+        accounts = (self.root / "accounts.log").read_text()
+        self.assertIn("--system --gid 987 mesh", accounts)
+        self.assertIn("--system --uid 987 --gid mesh", accounts)
+        # Only the data directory is owned by the service; configuration stays root's.
+        self.assertIn(f"-R mesh:mesh {self.root}/var/lib/daochi", accounts)
+        self.assertIn(f"-R mesh {self.root}/etc/mesh", accounts)
+        self.assertNotIn(f"mesh:mesh {self.root}/etc/mesh", accounts)
+
+    def test_failed_install_restores_the_previous_ownership_and_unit(self):
+        self.sandbox().write_text("old sandbox")
+        self.environment["FAIL_MIGRATION"] = "1"
+        self.assertNotEqual(self.run_install().returncode, 0)
+        self.assertEqual(self.sandbox().read_text(), "old sandbox")
+        restoration = (self.root / "accounts.log").read_text()
+        # The saved owner is restored after the service's ownership change.
+        restored = [line for line in restoration.splitlines() if line.startswith(f"{os.getuid()}:{os.getgid()} ")]
+        self.assertTrue(restored, restoration)
+        self.assertIn(f"{os.getuid()}:{os.getgid()} {self.sandbox().parent}", restored)
 
     def test_deploy_token_is_refused_before_any_change(self):
         token = 'node:quote\"$()\\percent%'
@@ -232,7 +302,11 @@ print("MONERO_RATE_TOKEN_UNITS=100")
         shutil.copy2(REPOSITORY / "deploy/migrate-install.py", self.root / "opt/mesh-src/deploy/migrate-install.py")
         for name in ("install.sh", "rollback.sh"):
             script = self.root / "opt/mesh-src/deploy" / name
-            text = script.read_text().replace('prepare "$STAMP"', 'prepare "$STAMP" --root "$TEST_ROOT"').replace('restore "$STAMP"', 'restore "$STAMP" --root "$TEST_ROOT"')
+            text = script.read_text().replace(
+                "migrate-install.py prepare \"$STAMP\"",
+                "migrate-install.py prepare \"$STAMP\" --root \"$TEST_ROOT\"").replace(
+                "migrate-install.py restore \"$STAMP\"",
+                "migrate-install.py restore \"$STAMP\" --root \"$TEST_ROOT\"")
             script.write_text(text)
         shutil.copy2(REPOSITORY / "scripts/migrate-legacy-env.py", self.root / "opt/mesh-src/scripts/migrate-legacy-env.py")
         self.executable("opt/mesh-src/deploy/database-path.py", 'import os; print(os.environ["TEST_ROOT"] + "/var/lib/daochi/daochi.db")')

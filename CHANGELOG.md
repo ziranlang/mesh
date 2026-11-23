@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+- Prove the native pull client's legacy peer headers with a fixture that accepts only `X-Daochi-Node-*` and verifies the request signature.
+
+- Keep the native `/metrics` families and route labels equal to the Go server, with a parity test that fails on any name, type or label mismatch.
+
+- Run `mesh.service` as a dedicated non-root `mesh` account with `NoNewPrivileges`, `ProtectSystem=strict`, `ReadWritePaths` and `PrivateTmp`, restoring ownership on a failed deploy.
+
 - Keep a single persistent node identity when Go startups share a new identity path.
 
 - Recheck signed peer request expiry when reserving its nonce and speed up expired delegated nonce cleanup.

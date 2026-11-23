@@ -75,6 +75,12 @@ func main() {
 			} else {
 				output.Signature = ed25519.Sign(input.PrivateKey, input.Message)
 			}
+		case "device-verify":
+			if len(input.PublicKey) != ed25519.PublicKeySize {
+				err = errors.New("invalid fixture device public key")
+			} else {
+				output.Verified = ed25519.Verify(input.PublicKey, input.Message, input.Signature)
+			}
 		case "app-manifest-sign":
 			output.Message, err = json.Marshal(json.RawMessage(input.Message))
 			if err == nil && len(input.PrivateKey) == ed25519.PrivateKeySize {

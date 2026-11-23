@@ -59,7 +59,7 @@
     active: *Counters;
 
     Methods: [10]string = .["OTHER", "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT"];
-    Routes: [125]string = .["unmatched", "/healthz", "/readyz", "/metrics", "/api/v1/rates", "/api/v1/node", "/api/v1/node/peers",
+    Routes: [129]string = .["unmatched", "/healthz", "/readyz", "/metrics", "/api/v1/rates", "/api/v1/node", "/api/v1/node/peers",
         "/api/v1/node/pairing/invites", "/api/v1/node/pairing/accept", "/api/v1/node/pairing/complete",
         "/api/v1/node/mesh/export", "/api/v1/node/mesh/import", "/api/v1/namespaces", "/api/v1/namespaces/claims",
         "/api/v1/namespaces/resolve", "/api/v1/sync", "/api/v1/sync/challenge", "/api/v1/sync/login", "/api/v1/sync/logout",
@@ -69,15 +69,16 @@
         "/api/v1/account-backup/salt", "/api/v1/account-backup/passkey/open", "/api/v1/account/app-grants",
         "/api/v1/account/app-records", "/api/v1/link/put", "/api/v1/link/get", "/api/v1/link/close", "/api/v1/apps",
         "/api/v1/apps/{app_id}", "/api/v1/apps/{app_id}/collections", "/api/v1/account/app-grants/{id}",
-        "/api/v1/blobs/{path}", "/api/v1/packages/{path}", "/api/v2/packages/{path}",
+        "/api/v1/blobs/", "/api/v1/packages/", "/api/v2/packages/", "/api/v1/referrals/me",
+        "/api/v1/referrals/claim", "/api/v1/referrals/accepted", "/api/v1/referrals/code/rotate",
         "/", "/openapi.json", "/api/v1/feedback", "/api/v1/admin/feedback", "/api/v1/admin/feedback/reply",
-        "/api/v1/publications", "/api/v1/publications/{id}", "/api/v1/friends", "/api/v1/friends/requests",
+        "/api/v1/publications", "/api/v1/publications/", "/api/v1/friends", "/api/v1/friends/requests",
         "/api/v1/friends/stats", "/api/v1/friends/{user_id_hash}", "/api/v1/friends/requests/{id}", "/api/v1/profile/stats",
         "/api/v1/chat/completions", "/api/v1/chat/spelling", "/api/v1/chat/habit-icons", "/api/v1/lists",
         "/api/v1/account-backup/methods", "/api/v1/account-backup/google", "/api/v1/account/google", "/api/v1/account/google/remove",
         "/api/v1/lumi/developer", "/api/v1/admin/lumi/developer", "/api/v1/tokens/assets", "/api/v1/tokens/products",
         "/api/v1/tokens/issuer", "/api/v1/tokens/balance", "/api/v1/tokens/ledger", "/api/v1/tokens/activity",
-        "/api/v1/tokens/checkpoints/latest", "/api/v1/tokens/receipts/{id}", "/api/v1/tokens/spend",
+        "/api/v1/tokens/checkpoints/latest", "/api/v1/tokens/receipts/{receipt_id}", "/api/v1/tokens/spend",
         "/api/v1/admin/tokens/manual-credit", "/api/v1/admin/tokens/checkpoint", "/api/v1/authorization/requests",
         "/api/v1/authorization/rendezvous", "/api/v1/authorization/cancel", "/api/v1/authorization/claim",
         "/api/v1/authorization/approve", "/api/v1/authorization/revoke", "/api/v1/authorization/challenge",
@@ -90,10 +91,10 @@
         "/api/v1/telegram/account/bind", "/api/v1/account/alias", "/api/v1/account/alias/purchase",
         "/api/v1/rewards/migration", "/api/v1/admin/game-maps", "/api/v1/game-completions", "/api/v1/telegram/launch",
         "/api/v1/tokens/purchases/telegram/catalog", "/api/v1/tokens/purchases/telegram/balance",
-        "/api/v1/tokens/purchases/telegram/invoices", "/api/v1/tokens/purchases/telegram/invoices/{id}",
-        "/api/v1/tokens/purchases/telegram/invoices/{id}/cancel", "/api/v1/admin/tokens/purchases/telegram/reconcile",
+        "/api/v1/tokens/purchases/telegram/invoices", "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}",
+        "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}/cancel", "/api/v1/admin/tokens/purchases/telegram/reconcile",
         "/api/v1/tokens/purchases/monero/invoices", "/api/v1/tokens/purchases/monero/invoices/{id}",
-        "/api/v1/tokens/purchases/monero/address", "/api/v1/tokens/purchases/monero/address/{reference}",
+        "/api/v1/tokens/purchases/monero/address", "/api/v1/tokens/purchases/monero/address/{recipient}",
         "/api/v1/tokens/purchases/monero/deposits", "/api/v1/tokens/purchases/google/verify"];
 
     Route :: (path: string) -> s64 {
@@ -103,18 +104,18 @@
         } else if text.TextHasPrefix(path, "/api/v1/account/app-grants/") {
             normalized = "/api/v1/account/app-grants/{id}"
         } else if text.TextHasPrefix(path, "/api/v1/blobs/") {
-            normalized = "/api/v1/blobs/{path}"
+            normalized = "/api/v1/blobs/"
         } else if text.TextHasPrefix(path, "/api/v1/packages/") {
-            normalized = "/api/v1/packages/{path}"
+            normalized = "/api/v1/packages/"
         } else if text.TextHasPrefix(path, "/api/v2/packages/") {
-            normalized = "/api/v2/packages/{path}"
+            normalized = "/api/v2/packages/"
         } else if text.TextHasPrefix(path, "/api/v1/publications/") {
-            normalized = "/api/v1/publications/{id}"
+            normalized = "/api/v1/publications/"
         } else if text.TextHasPrefix(path, "/api/v1/tokens/receipts/") {
-            normalized = "/api/v1/tokens/receipts/{id}"
+            normalized = "/api/v1/tokens/receipts/{receipt_id}"
         } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/telegram/invoices/") {
-            normalized = "/api/v1/tokens/purchases/telegram/invoices/{id}"
-            if text.TextHasSuffix(path, "/cancel") { normalized = "/api/v1/tokens/purchases/telegram/invoices/{id}/cancel" }
+            normalized = "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}"
+            if text.TextHasSuffix(path, "/cancel") { normalized = "/api/v1/tokens/purchases/telegram/invoices/{invoice_id}/cancel" }
         } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/monero/invoices/") {
             normalized = "/api/v1/tokens/purchases/monero/invoices/{id}"
         } else if text.TextHasPrefix(path, "/api/v1/tokens/purchases/monero/address/") {

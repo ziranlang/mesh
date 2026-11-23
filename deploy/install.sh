@@ -86,6 +86,13 @@ if [ -f /etc/systemd/system/mesh.service.d/30-runtime.conf ]; then
 else
   touch "/var/lib/mesh/backups/mesh.runtime-absent.$STAMP"
 fi
+if [ -f /etc/systemd/system/mesh.service.d/10-sandbox.conf ]; then
+  cp /etc/systemd/system/mesh.service.d/10-sandbox.conf "/var/lib/mesh/backups/mesh.sandbox.$STAMP"
+else
+  touch "/var/lib/mesh/backups/mesh.sandbox-absent.$STAMP"
+fi
+# Ownership and mode of the data and configuration trees are part of rollback.
+sh /opt/mesh-src/deploy/harden-service.sh record "$STAMP"
 rollback_ready=1
 # Replace the existing backup maintenance unit only when it was already enabled.
 if systemctl is-enabled --quiet daochi-backup-prune.timer || systemctl is-enabled --quiet mesh-backup-prune.timer; then
@@ -123,6 +130,7 @@ else
   rm -f /etc/systemd/system/mesh.service.d/30-runtime.conf
 fi
 rm -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf /etc/systemd/system/mesh.service.d/20-daochi-mesh.conf
+sh /opt/mesh-src/deploy/harden-service.sh apply
 systemctl daemon-reload
 python3 /opt/mesh-src/scripts/migrate-legacy-env.py /etc/mesh/mesh.env --apply --canonical-only
 sh /opt/mesh-src/deploy/set-environment.sh /opt/mesh-src/deploy/node.env /etc/mesh/mesh.env

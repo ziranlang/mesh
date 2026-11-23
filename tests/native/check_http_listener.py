@@ -13,6 +13,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from http.client import HTTPConnection
 from pathlib import Path
@@ -39,6 +40,54 @@ def masked_frame(payload, opcode=1):
     length = bytearray(frame_length(len(payload)))
     length[0] |= 0x80
     return bytes([0x80 | opcode]) + length + mask + bytes(value ^ mask[i % 4] for i, value in enumerate(payload))
+
+
+# The family names the Go /metrics handler always writes. The by-reason
+# families only appear after their first event, so they are checked by
+# test_metrics_parity.py, not by this request fixture.
+GO_METRIC_FAMILIES = (
+    "mesh_build_info",
+    "mesh_sync_requests_total",
+    "mesh_sync_failures_total",
+    "mesh_sync_full_snapshots_total",
+    "mesh_sync_encrypted_records_applied_total",
+    "mesh_sync_encrypted_payloads_applied_total",
+    "mesh_rate_limited_requests_total",
+    "mesh_auth_failures_total",
+    "mesh_legacy_client_hints_total",
+    "mesh_websocket_accepted_total",
+    "mesh_websocket_rejected_total",
+    "mesh_monero_stuck_invoices_total",
+    "mesh_websocket_active",
+    "mesh_connected_users",
+    "mesh_registered_users",
+    "mesh_active_users_30d",
+    "mesh_registered_clients",
+    "mesh_active_clients_30d",
+    "mesh_websocket_connection_limit_per_user",
+    "mesh_storage_database_total_bytes",
+    "mesh_storage_sqlite_page_bytes",
+    "mesh_storage_logical_bytes",
+    "mesh_storage_encrypted_record_bytes",
+    "mesh_storage_encrypted_payload_bytes",
+    "mesh_storage_app_logical_bytes",
+    "mesh_storage_collection_logical_bytes",
+    "ksync_sync_requests_total",
+    "ksync_sync_failures_total",
+    "ksync_sync_full_snapshots_total",
+    "ksync_sync_encrypted_records_applied_total",
+    "ksync_sync_encrypted_payloads_applied_total",
+    "ksync_rate_limited_requests_total",
+    "ksync_auth_failures_total",
+    "ksync_legacy_client_hints_total",
+    "ksync_websocket_accepted_total",
+    "ksync_websocket_rejected_total",
+    "ksync_websocket_active",
+    "mesh_http_requests_total",
+    "mesh_http_request_duration_milliseconds_total",
+    "ksync_http_requests_total",
+    "ksync_http_request_duration_milliseconds_total",
+)
 
 
 NODE_CAPABILITIES = [
@@ -2171,6 +2220,18 @@ def check_node_status(binary, database):
         assert "# TYPE mesh_rate_limited_requests_total counter" in samples
         assert "mesh_rate_limited_requests_total 2" in samples
         assert "ksync_rate_limited_requests_total 2" in samples
+        # Every Go family name reaches native, with the same type and labels.
+        families = {
+            parts[2]: parts[3]
+            for line in samples if line.startswith("# TYPE ")
+            for parts in [line.split(" ")]
+        }
+        for name in GO_METRIC_FAMILIES:
+            assert name in families, (name, sorted(families))
+        assert families["mesh_websocket_active"] == "gauge", families["mesh_websocket_active"]
+        assert families["ksync_websocket_active"] == "gauge"
+        assert families["mesh_rate_limited_requests_total"] == "counter"
+        assert families["mesh_storage_app_logical_bytes"] == "gauge"
         assert "/private-fixture-path" not in body
 
 
@@ -2314,6 +2375,89 @@ def check_peer_pulls(binary, directory, oracle):
                 connections.enter_context(request)
                 assert request.readline() == b"POST /api/v1/node/mesh/export HTTP/1.1\r\n"
                 # Shutdown must interrupt the transfer even though the peer is still connected.
+
+
+def check_pull_headers(binary, directory, oracle):
+    """A pre-rename peer accepts only the X-Daochi-Node-* signing headers.
+
+    Peers installed before the Mesh rename read the legacy names, so the pull
+    client must send both spellings. The fixture answers one export request and
+    checks ID/Time/Nonce/Signature exactly as node_auth_native does, using the
+    pulling node's paired key.
+    """
+    database = directory / "pull-headers.db"
+    policy = {"direction": "pull", "collections": ["private.pull-fixture.v1.*"], "data": ["encrypted_records"]}
+
+    with pairing_node(binary, database):
+        pass
+    public_key = bytes.fromhex(Path(f"{database}.node-key").read_text())[-32:]
+    node = hashlib.sha256(public_key).hexdigest()
+
+    received = []
+
+    def serve(listener):
+        listener.settimeout(20)
+        try:
+            connection, _ = listener.accept()
+        except socket.timeout:
+            raise AssertionError("pull client did not contact the legacy-only peer") from None
+        with closing(connection), closing(connection.makefile("rb")) as stream:
+            connection.settimeout(20)
+            request_line = stream.readline()
+            headers = {}
+            while True:
+                line = stream.readline()
+                if line in (b"\r\n", b""):
+                    break
+                name, _, value = line.decode("latin-1").partition(":")
+                headers[name.strip().lower()] = value.strip()
+            length = int(headers.get("content-length", "0"))
+            body = stream.read(length)
+            received.append({"line": request_line, "headers": headers, "body": body})
+            reply = json.dumps({"status": "ok", "records": [], "deletions": []}).encode()
+            connection.sendall(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(reply)}\r\nConnection: close\r\n\r\n".encode()
+                + reply)
+
+    with socket.socket(socket.AF_INET) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        address = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        with closing(sqlite3.connect(database)) as store, store:
+            store.execute(
+                "INSERT INTO trusted_node_peers(node_id,public_key,addresses_json,policy_json,trusted_at) "
+                "VALUES (?,?,?,?,?)",
+                ("ab" * 32, bytes(32), json.dumps([address]), json.dumps(policy), str(int(time.time()))))
+        worker = threading.Thread(target=serve, args=(listener,))
+        worker.start()
+        try:
+            with pairing_node(binary, database, MESH_NODE_SYNC_INTERVAL_SECONDS="1"):
+                deadline = time.monotonic() + 20
+                while not received and time.monotonic() < deadline:
+                    time.sleep(0.05)
+        finally:
+            worker.join(timeout=20)
+    assert received, "pull client sent no request to the legacy-only peer"
+    exchange = received[0]
+    assert exchange["line"] == b"POST /api/v1/node/mesh/export HTTP/1.1\r\n", exchange["line"]
+    headers = exchange["headers"]
+    for field in ("ID", "Time", "Nonce", "Signature"):
+        assert f"x-daochi-node-{field.lower()}" in headers, (field, sorted(headers))
+    assert headers["x-daochi-node-id"] == node
+    timestamp, nonce = headers["x-daochi-node-time"], headers["x-daochi-node-nonce"]
+    assert timestamp.isdigit() and abs(int(timestamp) - time.time()) <= 300
+    assert 1 <= len(nonce) <= 128
+    signature = base64.urlsafe_b64decode(headers["x-daochi-node-signature"] + "=" * 4)
+    # The header names are legacy; the signed domain is the current one, as in
+    # node_auth_native.Signed before its daochi fallback.
+    message = "\n".join(("mesh-node-request-v1", node, timestamp, nonce, "POST",
+                         "/api/v1/node/mesh/export", hashlib.sha256(exchange["body"]).hexdigest(), "")).encode()
+    verified = sign_with_oracle(oracle, "device-verify", PublicKey=base64.b64encode(public_key).decode(),
+                                Message=base64.b64encode(message).decode(),
+                                Signature=base64.b64encode(signature).decode())
+    assert verified["Verified"], "Daochi-named node request signature did not verify"
+    assert json.loads(exchange["body"])["policy"] == policy
 
 
 def run_listener(binary, host, database, oracle, server_mode=False):
@@ -2531,6 +2675,7 @@ def main():
             check_legacy_environment(binary, Path(directory))
             check_node_pairing(binary, Path(directory), oracle)
             check_peer_pulls(binary, Path(directory), oracle)
+            check_pull_headers(binary, Path(directory), oracle)
             check_node_status(binary, Path(directory) / "node-status.db")
             check_payment_wiring(binary, Path(directory))
             check_feedback_token_settings(binary, Path(directory))

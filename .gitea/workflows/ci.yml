@@ -45,7 +45,7 @@ jobs:
         run: |
           python3 -B scripts/test_gitea_workflow.py
           python3 -B scripts/test_gitea_origin.py
-          shellcheck deploy/install.sh deploy/rollback.sh
+          shellcheck deploy/install.sh deploy/rollback.sh deploy/harden-service.sh
       - name: Verify immutable build and deployment policy
         run: |
           python3 -B scripts/verify_build_inputs.py
@@ -53,6 +53,7 @@ jobs:
           python3 -B scripts/test_check_sarif.py
           python3 -B scripts/test_deployment_inputs.py
           python3 -B scripts/test_deploy_install.py
+          python3 -B scripts/test_metrics_parity.py
 
       # The host runner keeps the Go build and module caches. Its job cache
       # server is unreachable, and a restore waits out a timeout of minutes.

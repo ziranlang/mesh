@@ -34,6 +34,12 @@ if [ -f "/var/lib/mesh/backups/mesh.runtime.$STAMP" ]; then
 elif [ -f "/var/lib/mesh/backups/mesh.runtime-absent.$STAMP" ]; then
   rm -f /etc/systemd/system/mesh.service.d/30-runtime.conf
 fi
+sh /opt/mesh-src/deploy/harden-service.sh restore "$STAMP"
+if [ -f "/var/lib/mesh/backups/mesh.sandbox.$STAMP" ]; then
+  install -m 644 "/var/lib/mesh/backups/mesh.sandbox.$STAMP" /etc/systemd/system/mesh.service.d/10-sandbox.conf
+elif [ -f "/var/lib/mesh/backups/mesh.sandbox-absent.$STAMP" ]; then
+  rm -f /etc/systemd/system/mesh.service.d/10-sandbox.conf
+fi
 systemctl daemon-reload
 if [ -f "/var/lib/mesh/backups/mesh.legacy-prune-enabled.$STAMP" ]; then
   systemctl disable --now mesh-backup-prune.timer || true
