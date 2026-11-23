@@ -115,11 +115,6 @@ if [ -f /opt/mesh-src/mesh-native ]; then
   mv /opt/mesh/mesh-native.manifest.new /opt/mesh/mesh-native.manifest.json
 fi
 install -d -m 755 /etc/systemd/system/mesh.service.d
-# The native server loads Avahi Core at runtime for LAN discovery. Without it,
-# native drops advertisement that the Go binary provided.
-if [ "$runtime" = native ] && ! ldconfig -p | grep -q 'libavahi-core\.so\.7'; then
-  apt-get install -y libavahi-core7 >/dev/null
-fi
 if [ "$runtime" = native ]; then
   printf '[Service]\nExecStart=\nExecStart=/opt/mesh/mesh-native\n' > /etc/systemd/system/mesh.service.d/30-runtime.new
   chmod 644 /etc/systemd/system/mesh.service.d/30-runtime.new
