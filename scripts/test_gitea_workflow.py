@@ -104,6 +104,11 @@ class GiteaWorkflowTest(unittest.TestCase):
         native = next(step for step in steps if step.get("name") == "Native server suite")
         self.assertIn("make test-ziran-native-server", native["run"])
         self.assertLess(uses.index("./.gitea/actions/native-libraries"), steps.index(native))
+        # The release links the same library the suite built; without the path
+        # the linker cannot find libmicrohttpd.so.12 and deploy never runs.
+        release = next(step for step in steps if step.get("name") == "Build the native release")
+        self.assertIn("MICROHTTPD_NATIVE_DIR=", release["run"])
+        self.assertIn("build-native", release["run"])
 
     def test_scans_run_once_per_set_of_inputs(self):
         steps = self.jobs["scans"]["steps"]

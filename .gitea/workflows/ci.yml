@@ -191,7 +191,9 @@ jobs:
           ORIGIN_GLIBC: '2.41'
         run: |
           make native-release VERSION="$GITHUB_SHA"
-          make -j"$(nproc)" build-native VERSION="$GITHUB_SHA" SOURCE_COMMIT="$GITHUB_SHA" LIBOQS_COMMIT="$LIBOQS_COMMIT"
+          make -j"$(nproc)" build-native VERSION="$GITHUB_SHA" SOURCE_COMMIT="$GITHUB_SHA" \
+            LIBOQS_COMMIT="$LIBOQS_COMMIT" \
+            MICROHTTPD_NATIVE_DIR="$PWD/build/microhttpd/root/usr/lib/x86_64-linux-gnu"
           newest=$(objdump -T mesh-native | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -1)
           test "$(printf '%s\n%s\n' "$newest" "$ORIGIN_GLIBC" | sort -V | tail -1)" = "$ORIGIN_GLIBC"
 

@@ -258,7 +258,8 @@ $(NATIVE_RELEASE_DIR)/sqlite3.o: $(NATIVE_RELEASE_DIR)/sqlite3.c
 build-native: liboqs $(NATIVE_RELEASE_OBJECTS) $(NATIVE_RELEASE_DIR)/sqlite3.o
 	test -n "$(NATIVE_RELEASE_OBJECTS)"
 	$(CC) $(LDFLAGS) $(NATIVE_RELEASE_OBJECTS) $(NATIVE_RELEASE_DIR)/sqlite3.o \
-		-L$(abspath $(LIBOQS_PREFIX))/lib $(NATIVE_RELEASE_LIBS) -o mesh-native
+		-L$(abspath $(LIBOQS_PREFIX))/lib $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR)) \
+		$(NATIVE_RELEASE_LIBS) -o mesh-native
 	python3 -B scripts/verify_deployment_inputs.py record-artifact-manifest \
 		--output mesh-native --manifest "$(NATIVE_DEPLOYMENT_MANIFEST)" \
 		--source-commit "$(SOURCE_COMMIT)" --liboqs-commit "$(LIBOQS_COMMIT)" \
