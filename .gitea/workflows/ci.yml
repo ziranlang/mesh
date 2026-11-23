@@ -24,7 +24,7 @@ jobs:
   # Every gate that runs on the shared Build slot lives in one job, so each
   # push sets up Ziran, generates the Go and builds liboqs once.
   checks:
-    runs-on: build-ubuntu24.04
+    runs-on: build-native
     steps:
       - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -165,7 +165,7 @@ jobs:
           if-no-files-found: error
 
   container:
-    runs-on: ${{ vars.MESH_CONTAINER_RUNNER || 'build-ubuntu24.04' }}
+    runs-on: ${{ vars.MESH_CONTAINER_RUNNER || 'build-mesh' }}
     steps:
       - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -266,7 +266,7 @@ jobs:
       github.repository == 'ziranlang/mesh' && github.ref == 'refs/heads/master' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       vars.MESH_DEPLOY_READY == 'true' && vars.MESH_DEPLOY_RUNNER != ''
-    runs-on: ${{ vars.MESH_DEPLOY_RUNNER || 'build-ubuntu24.04' }}
+    runs-on: ${{ vars.MESH_DEPLOY_RUNNER || 'build-mesh' }}
     permissions:
       contents: read
       actions: read

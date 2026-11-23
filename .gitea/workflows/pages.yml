@@ -22,7 +22,7 @@ jobs:
   build:
     name: Check Site
     if: github.ref == 'refs/heads/master'
-    runs-on: alpha-ubuntu24.04
+    runs-on: build-native
 
     steps:
       - name: Checkout Repository
@@ -53,7 +53,7 @@ jobs:
     name: Deploy Site
     needs: build
     if: github.ref == 'refs/heads/master' && vars.MESH_PAGES_READY == 'true'
-    runs-on: alpha-ubuntu24.04
+    runs-on: build-native
     timeout-minutes: 20
     steps:
       - name: Checkout the revision for the canonical-domain verifier
