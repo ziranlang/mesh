@@ -242,6 +242,14 @@ previous selection. The Go binary stays installed for its CLI commands. To go
 back to Go by hand, remove that drop-in, then run `systemctl daemon-reload`
 and `systemctl restart mesh.service`.
 
+Selecting `native` also requires Avahi Core (`libavahi-core7`) on the host:
+the Go server advertised the node through its own mDNS implementation, while
+native loads `libavahi-core.so.7` at runtime and only logs one startup line
+when it is absent. Without it the switch silently drops LAN discovery, so
+install the package before changing `deploy/runtime`. The deploy checks
+binaries, not host packages, and must stay free of package installation: its
+tests run the installer on a rootless runner.
+
 The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker for
 the weekly image check and an isolated `MESH_DEPLOY_RUNNER` with access to the
 production origin. Set the
