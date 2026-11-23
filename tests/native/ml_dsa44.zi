@@ -1,12 +1,16 @@
+// Checks native ML-DSA-44 signing round trips and the Wycheproof known answers.
+// Usage: ml_dsa44 WYCHEPROOF_JSON
 mesh :: #import "ml_dsa44_native";
 oqs :: #import "oqs/Oqs";
 sha :: #import "crypto/sha256";
-env :: #import "std/environment_linux";
+#import "std/byte_text_linux"
+#import "std/file"
+#import "std/json_document"
+using Vectors :: #import "std/vec"
 
 #scope_file
-KnownAnswer :: (keyHex: string) -> s32 {
-    signatureHex := env.EnvironmentText("MESH_TEST_MLDSA_SIGNATURE")
-    messageHex := env.EnvironmentText("MESH_TEST_MLDSA_MESSAGE")
+// 0 when the signature verifies, 1 when it does not, 2 for malformed hex or sizes.
+KnownAnswer :: (keyHex: string, signatureHex: string, messageHex: string) -> s32 {
     publicKey: [oqs.MlDsa44PublicKeyBytes + 1]u8
     signature: [oqs.MlDsa44SignatureBytes]u8
     message: [4096]u8
@@ -24,13 +28,8 @@ KnownAnswer :: (keyHex: string) -> s32 {
     return ifx mesh.Verify(publicKey[:keySize], message[:size], signature[:]) then 0 else 1
 }
 
-#scope_export
-#program_export
-Main :: () -> s32 {
-    keyHex := env.EnvironmentText("MESH_TEST_MLDSA_PUBLIC_KEY")
-    if keyHex != "" {
-        return KnownAnswer(keyHex)
-    }
+// 0 when a fresh key signs and verifies, and changed inputs are refused.
+RoundTrip :: () -> s32 {
     publicKey: [oqs.MlDsa44PublicKeyBytes]u8
     privateKey: [oqs.MlDsa44SecretKeyBytes]u8
     signature: [oqs.MlDsa44SignatureBytes]u8
@@ -48,5 +47,72 @@ Main :: () -> s32 {
     if mesh.Verify(publicKey[:], message[:], signature[:]) {
         return 5
     }
+    return 0
+}
+
+// Every case must verify exactly as recorded, and the fixture must hold the
+// reviewed case IDs.
+Wycheproof :: (path: string) -> bool {
+    text, ok := ReadEntireFile(path)
+    if !ok {
+        print("cannot read %\n", path)
+        return false
+    }
+    document: JsonDocument
+    defer JsonReset(*document)
+    if !JsonRead(*document, text) {
+        print("% is not JSON\n", path)
+        return false
+    }
+    seen: Vec(s64)
+    defer VecFree(seen)
+    group := JsonFirst(*document, JsonMember(*document, document.root, "testGroups"))
+    while group >= 0 {
+        key: Text = JsonString(*document, JsonMember(*document, group, "publicKey"))
+        entry := JsonFirst(*document, JsonMember(*document, group, "tests"))
+        while entry >= 0 {
+            id, id_ok := JsonInteger(*document, JsonMember(*document, entry, "tcId"))
+            signature: Text = JsonString(*document, JsonMember(*document, entry, "sig"))
+            message: Text = JsonString(*document, JsonMember(*document, entry, "msg"))
+            expected: s32 = ifx JsonIs(*document, JsonMember(*document, entry, "result"), "valid") then 0 else 1
+            result := KnownAnswer(key, signature, message)
+            if !id_ok || result != expected {
+                print("ML-DSA-44 case % returned %, expected %\n", id, result, expected)
+                return false
+            }
+            VecPush(seen, id)
+            entry = JsonNext(*document, entry)
+        }
+        group = JsonNext(*document, group)
+    }
+    reviewed: [5]s64 = .[1, 8, 15, 64, 65]
+    same := seen.count == reviewed.count
+    for id, index: reviewed {
+        if same && seen[index] != id {
+            same = false
+        }
+    }
+    if !same {
+        print("unexpected ML-DSA-44 case IDs\n")
+    }
+    return same
+}
+
+#scope_export
+#program_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    status := RoundTrip()
+    if status != 0 {
+        print("ML-DSA-44 round trip failed with %\n", status)
+        return status
+    }
+    if argc != 2 {
+        print("usage: ml_dsa44 WYCHEPROOF_JSON\n")
+        return 2
+    }
+    if !Wycheproof(TextFromCString(argv[1])) {
+        return 1
+    }
+    print("Native ML-DSA-44 checks passed\n")
     return 0
 }

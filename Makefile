@@ -25,7 +25,7 @@ CGO_ENV := CGO_ENABLED=1 \
 	CGO_CFLAGS="-I$(abspath $(LIBOQS_PREFIX))/include" \
 	CGO_LDFLAGS="-L$(abspath $(LIBOQS_PREFIX))/lib -loqs"
 
-.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server test-ziran-native-google-play test-ziran-native-ledger sqlite-native microhttpd-native test-ziran-native-embedded compression-bench
+.PHONY: all build test run clean liboqs generate build-ziran-native-server build-ziran-native-embedded test-ziran test-ziran-ir test-ziran-native test-ziran-native-sqlite test-ziran-native-http test-ziran-native-http-coding test-ziran-native-ml-dsa44 test-ziran-native-account-auth test-ziran-native-server build-native-checks test-ziran-native-google-play test-ziran-native-ledger sqlite-native microhttpd-native test-ziran-native-embedded compression-bench
 
 all: build
 
@@ -170,9 +170,26 @@ build-ziran-native-server: liboqs | $(NATIVE_SERVER_BUILD_DIR)
 		-o "$(NATIVE_SERVER_BUILD_DIR)" "$(NATIVE_SERVER_BUILD_DIR)/mesh_native_entry.zi"
 	mv "$(NATIVE_SERVER_BUILD_DIR)/mesh_native_entry" "$(NATIVE_SERVER_BUILD_DIR)/server_native"
 
+# Native server checks written in Ziran. Each tests/native/NAME.zi builds to
+# $(NATIVE_CHECKS_DIR)/NAME, which check_http_listener.py runs.
+NATIVE_CHECKS := check_docs_http
+NATIVE_CHECKS_DIR := $(abspath $(BUILD_DIR)/native-tests/checks)
+
+build-native-checks: liboqs
+	set -e; \
+	for check in $(NATIVE_CHECKS); do \
+		XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
+		LDFLAGS="$(LDFLAGS) -L$(abspath $(LIBOQS_PREFIX))/lib -L$(SQLITE_NATIVE_DIR) $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR))" \
+		LDLIBS="$(NATIVE_SERVER_LIBS)" \
+		$(ZIRAN) build $(ZIRAN_PROJECT) --module-path tests/native/lib --target=c --exe \
+			--entry "$$check:Main" --root tests/native -o "$(NATIVE_CHECKS_DIR)/build-$$check" "tests/native/$$check.zi"; \
+		mv "$(NATIVE_CHECKS_DIR)/build-$$check/$$check" "$(NATIVE_CHECKS_DIR)/$$check"; \
+	done
+
 test-ziran-native-server: export MESH_TEST_BUILD_VERSION = $(NATIVE_SERVER_VERSION)
+test-ziran-native-server: export MESH_NATIVE_CHECKS_DIR = $(NATIVE_CHECKS_DIR)
 test-ziran-native-server: test-ziran-native-http
-	$(MAKE) -f Makefile build-ziran-native-server
+	$(MAKE) -f Makefile build-ziran-native-server build-native-checks
 	LD_LIBRARY_PATH="$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
 		python3 -B tests/native/check_http_listener.py "$(NATIVE_SERVER_BUILD_DIR)/server_native" \
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle --server
@@ -280,7 +297,7 @@ test-ziran-native-ml-dsa44: liboqs
 	$(ZIRAN) build $(ZIRAN_PROJECT) \
 		--target=c --exe --entry ml_dsa44:Main --root tests/native \
 		-o $(BUILD_DIR)/native-tests/ml-dsa44 tests/native/ml_dsa44.zi
-	python3 -B tests/native/check_ml_dsa44.py $(BUILD_DIR)/native-tests/ml-dsa44/ml_dsa44
+	$(BUILD_DIR)/native-tests/ml-dsa44/ml_dsa44 testdata/ml_dsa44_wycheproof.json
 
 test-ziran-native-account-auth: liboqs
 	mkdir -p $(BUILD_DIR)/native-tests/account-auth

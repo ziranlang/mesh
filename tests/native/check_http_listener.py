@@ -2550,7 +2550,8 @@ def main():
             check_server_cli(binary, Path(directory) / "cli.db")
     if server_mode:
         fixture_dir = Path(__file__).resolve().parent
-        subprocess.run([sys.executable, "-B", fixture_dir / "check_docs_http.py", binary], check=True)
+        checks = Path(os.environ["MESH_NATIVE_CHECKS_DIR"])
+        subprocess.run([checks / "check_docs_http", binary], check=True)
         subprocess.run([sys.executable, "-B", fixture_dir / "check_exchange_rate_http.py", binary], check=True)
         for fixture in ("check_feedback_http.py", "check_publications_http.py", "check_social_http.py",
                         "check_chat_http.py", "check_google_account_http.py", "check_lists_http.py",

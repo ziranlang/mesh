@@ -1,0 +1,168 @@
+// Checks the released docs representations on a disposable native listener.
+// Usage: check_docs_http SERVER_BINARY
+#import "std/byte_text_linux"
+#import "std/file_tree_linux"
+#import "std/json_document"
+#import "std/text_tools"
+check :: #import "native_check";
+openapi :: #import "docs_openapi";
+sqlite :: #import "sqlite/SQLite";
+using Vectors :: #import "std/vec"
+
+#scope_file
+FooterPrefix :: "<footer class=\"status\" aria-label=\"Users: 0; Storage: 1/";
+AddUserStatement :: "INSERT INTO server_users(user_id_hash, public_key) VALUES ('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', X'74657374')";
+
+Route :: struct {
+    path: string
+    content_type: string
+}
+
+EncodedGet :: (port: u16, method: string, path: string) -> check.Response {
+    headers: [1]check.Header = .[.{name = "Accept-Encoding", value = "zstd, gzip"}]
+    return check.Request(port, method, path, headers[:])
+}
+
+// The status footer shows zero users and a positive storage limit in gigabytes.
+StatusFooter :: (page: string) -> bool {
+    start := TextFind(page, FooterPrefix)
+    if start < 0 {
+        return false
+    }
+    offset := start + FooterPrefix.count
+    if offset >= page.count || page[offset] < #char "1" || page[offset] > #char "9" {
+        return false
+    }
+    while offset < page.count && page[offset] >= #char "0" && page[offset] <= #char "9" {
+        offset += 1
+    }
+    return TextHasPrefix(page[offset:], " GB\">")
+}
+
+CheckSpecification :: (body: string) {
+    document: JsonDocument
+    defer JsonReset(*document)
+    if !JsonRead(*document, body) {
+        check.Check(false, "the OpenAPI document parses as JSON")
+        return
+    }
+    root := document.root
+    check.Check(JsonIs(*document, JsonMember(*document, root, "openapi"), "3.1.0"), "OpenAPI version 3.1.0")
+    info := JsonMember(*document, root, "info")
+    check.Check(JsonIs(*document, JsonMember(*document, info, "title"), "Mesh API"), "OpenAPI title")
+    paths := JsonMember(*document, root, "paths")
+    login := JsonMember(*document, paths, "/api/v1/sync/login")
+    check.Check(JsonMember(*document, login, "post") >= 0, "the sync login route documents POST")
+    claim := JsonMember(*document, paths, "/api/v1/referrals/claim")
+    check.Check(JsonMember(*document, claim, "post") >= 0, "the referral claim route documents POST")
+    components := JsonMember(*document, root, "components")
+    schemas := JsonMember(*document, components, "schemas")
+    check.Check(JsonMember(*document, schemas, "SyncRequest") >= 0, "the SyncRequest schema is documented")
+}
+
+CheckRoute :: (port: u16, route: Route, expected_spec: string) {
+    path_with_query: Vec(u8)
+    defer VecFree(path_with_query)
+    BuilderPrint(*path_with_query, "%?source=test", route.path)
+    response := EncodedGet(port, "GET", TextFromBytes(path_with_query[:]))
+    defer check.FreeResponse(*response)
+    check.Check(response.status == 200, route.path)
+    check.Check(check.HeaderIs(*response, "Content-Type", route.content_type), "GET content type")
+    check.Check(!check.HasHeader(*response, "Content-Encoding"), "GET is not encoded")
+    check.Check(check.HeaderIs(*response, "Cache-Control", "no-store"), "GET is not cached")
+    check.Check(check.HeaderIs(*response, "X-Content-Type-Options", "nosniff"), "GET is not sniffed")
+    page := TextFromBytes(response.body[:])
+
+    headed := EncodedGet(port, "HEAD", route.path)
+    defer check.FreeResponse(*headed)
+    check.Check(headed.status == 200 && headed.body.count == 0, "HEAD has no body")
+    check.Check(check.HeaderIs(*headed, "Content-Type", route.content_type), "HEAD content type")
+    check.Check(!check.HasHeader(*headed, "Content-Encoding"), "HEAD is not encoded")
+    length, found := check.HeaderValue(headed.head[:], "Content-Length")
+    count, valid := TextInteger(length)
+    check.Check(found && valid && count == page.count, "HEAD reports the GET length")
+
+    refused := EncodedGet(port, "POST", route.path)
+    defer check.FreeResponse(*refused)
+    check.Check(refused.status == 405 && TextFromBytes(refused.body[:]) == "Method Not Allowed\n", "POST is refused")
+    check.Check(check.HeaderIs(*refused, "Allow", "GET, HEAD"), "POST names the allowed methods")
+    check.Check(check.HeaderIs(*refused, "Content-Type", "text/plain; charset=utf-8"), "POST refusal is plain text")
+
+    options := EncodedGet(port, "OPTIONS", route.path)
+    defer check.FreeResponse(*options)
+    check.Check(options.status == 204 && options.body.count == 0, "OPTIONS has no content")
+
+    if route.path == "/" {
+        check.Check(TextHasPrefix(page, "<!doctype html>\n<html lang=\"en\">\n"), "the page starts as HTML")
+        check.Check(TextContains(page, "<title>Mesh</title>"), "the page title")
+        check.Check(TextContains(page, "href=\"/openapi.json\""), "the page links the OpenAPI document")
+        check.Check(TextContains(page, "linear-gradient(180deg,#f7ede2 0%,#f2e2d0 60%,#f7ede2 100%)"), "the page background")
+        check.Check(StatusFooter(page), "the page status footer")
+        check.Check(TextHasSuffix(page, "</main>\n</body>\n</html>"), "the page ends as HTML")
+        return
+    }
+    check.Check(page == expected_spec, "OpenAPI response matches the released representation")
+    CheckSpecification(page)
+    again := EncodedGet(port, "GET", route.path)
+    defer check.FreeResponse(*again)
+    check.Check(TextFromBytes(again.body[:]) == page, "OpenAPI responses repeat exactly")
+}
+
+AddUser :: (database_path: string) -> bool {
+    database: *void
+    if sqlite.SqliteOpenText(database_path, *database, sqlite.SQLITE_OPEN_READWRITE) != sqlite.SQLITE_OK {
+        return false
+    }
+    defer { unused sqlite.SqliteClose(database) }
+    return sqlite.SqliteExecText(database, AddUserStatement) == sqlite.SQLITE_OK
+}
+
+CheckDocs :: (server: *check.Server, expected_spec: string) {
+    routes: [2]Route = .[
+        .{path = "/", content_type = "text/html; charset=utf-8"},
+        .{path = "/openapi.json", content_type = "application/vnd.oai.openapi+json"}
+    ]
+    for routes {
+        CheckRoute(server.port, it, expected_spec)
+    }
+    extra := check.Send(server.port, "GET", "/openapi.json/extra")
+    defer check.FreeResponse(*extra)
+    check.Check(extra.status == 404, "a path below the OpenAPI document is not found")
+
+    database: Text = check.ServerPath(server, "mesh.db")
+    check.Check(AddUser(database), "add a user to the server database")
+    updated := check.Send(server.port, "GET", "/")
+    defer check.FreeResponse(*updated)
+    check.Check(updated.status == 200, "the page reloads")
+    check.Check(TextContains(TextFromBytes(updated.body[:]), "<span><strong>Users</strong> 1</span>"), "the page counts the new user")
+}
+
+#scope_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 2 {
+        print("usage: check_docs_http SERVER_BINARY\n")
+        return 2
+    }
+    expected: Vec(u8)
+    defer VecFree(expected)
+    chunks := openapi.Chunks()
+    for chunks {
+        BuilderAppend(expected, it)
+    }
+    check.Check(expected.count == openapi.ByteCount, "the released OpenAPI chunks have their recorded size")
+    settings: [6]string = .[
+        "MESH_ADDR=127.0.0.1:0",
+        "MESH_DB=mesh.db",
+        "MESH_NODE_IDENTITY_KEY_FILE=mesh.node-key",
+        "MESH_TOKEN_SECRET_HEX=0000000000000000000000000000000000000000000000000000000000000000",
+        "MESH_NODE_SYNC_INTERVAL_SECONDS=0",
+        "MESH_HTTP_ZSTD_RESPONSES=1"
+    ]
+    binary: Text = ResolvePath(TextFromCString(argv[1]))
+    server: check.Server
+    if check.StartServer(*server, binary, settings[:]) {
+        CheckDocs(*server, TextFromBytes(expected[:]))
+    }
+    check.StopServer(*server)
+    return check.ExitStatus("Native docs and OpenAPI HTTP compatibility passed")
+}

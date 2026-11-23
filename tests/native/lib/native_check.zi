@@ -1,0 +1,330 @@
+// Shared helpers for the native HTTP checks: a disposable server process,
+// raw HTTP/1.1 requests to its loopback listener and failure counting.
+#import "std/byte_text_linux"
+#import "std/environment_linux"
+#import "std/file"
+#import "std/file_tree_linux"
+#import "std/process_run_linux"
+#import "std/text_tools"
+socket :: #import "std/socket_linux";
+timer :: #import "std/timer_linux";
+using Vectors :: #import "std/vec"
+
+#scope_export
+failures: s32;
+
+// Counts a failed expectation and names it on standard output.
+Check :: (ok: bool, what: string) {
+    if ok {
+        return
+    }
+    failures += 1
+    print("FAIL: %\n", what)
+}
+
+// The process exit status for the checks so far.
+ExitStatus :: (passed: string) -> s32 {
+    if failures != 0 {
+        print("% failed checks\n", failures)
+        return 1
+    }
+    print("%\n", passed)
+    return 0
+}
+
+Server :: struct {
+    run: ProcessRun
+    port: u16
+    started: bool
+    // The server's own directory, removed by StopServer.
+    path: [1024]u8
+    path_count: s64
+}
+
+// Starts `binary` in a new directory beside it with only the given
+// "NAME=value" settings and LD_LIBRARY_PATH, and waits up to five seconds
+// for the loopback port it announces on its first output line. Stop the
+// server with StopServer whether or not this succeeds.
+StartServer :: (server: *Server, binary: string, settings: []string) -> bool {
+    created: Text = CreateTemporaryDirectory(PathParent(binary), "native-check-")
+    if TextView(created).count == 0 || TextView(created).count > 1024 {
+        Check(false, "create the server directory")
+        return false
+    }
+    for byte, index: TextView(created) {
+        server.path[index] = byte
+    }
+    server.path_count = TextView(created).count
+    output: Text = JoinPath(created, "server.out")
+    errors: Text = JoinPath(created, "server.err")
+    arguments: Vec(string)
+    defer VecFree(arguments)
+    VecPush(arguments, "/usr/bin/env")
+    VecPush(arguments, "-i")
+    library: Text = LibraryPathSetting()
+    if TextView(library).count != 0 {
+        VecPush(arguments, TextView(library))
+    }
+    for settings {
+        VecPush(arguments, it)
+    }
+    VecPush(arguments, binary)
+    options: ProcessOptions = .{
+        arguments = arguments[:],
+        directory = TextView(created),
+        output_path = TextView(output),
+        error_path = TextView(errors)
+    }
+    if !StartProcess(options, *server.run) {
+        Check(false, "start the native server")
+        return false
+    }
+    server.started = true
+    for attempt: 0..250 {
+        text, ok := ReadEntireFile(output)
+        if ok {
+            newline := TextFind(text, "\n")
+            if newline > 0 {
+                port, valid := TextInteger(TextTrim(text[:newline]))
+                if valid && port > 0 && port < 65536 {
+                    server.port = cast(u16)port
+                    return true
+                }
+                Check(false, "the native server announces a numeric loopback port")
+                return false
+            }
+        }
+        if PollProcess(*server.run) {
+            error_text, _ := ReadEntireFile(errors)
+            print("native server exited with %: %\n", server.run.code, error_text)
+            Check(false, "the native server stays running")
+            return false
+        }
+        unused timer.SleepMilliseconds(20)
+    }
+    Check(false, "the native server announces a loopback port within five seconds")
+    return false
+}
+
+// Stops the server, waiting five seconds before killing it, and removes its directory.
+StopServer :: (server: *Server) {
+    if server.started && !server.run.finished {
+        unused SignalProcess(*server.run, 15)
+        for attempt: 0..250 {
+            if PollProcess(*server.run) {
+                break
+            }
+            unused timer.SleepMilliseconds(20)
+        }
+        if !server.run.finished {
+            unused SignalProcess(*server.run, 9)
+            unused WaitProcess(*server.run)
+        }
+    }
+    if server.path_count != 0 {
+        unused RemoveTree(TextFromBytes(server.path[:server.path_count]))
+    }
+}
+
+// The path of a file inside the server directory.
+ServerPath :: (server: *Server, name: string) -> Text {
+    return JoinPath(TextFromBytes(server.path[:server.path_count]), name)
+}
+
+Header :: struct {
+    name: string
+    value: string
+}
+
+Response :: struct {
+    // Zero when the request failed before a status line arrived.
+    status: s32
+    head: Vec(u8)
+    body: Vec(u8)
+}
+
+// Sends one request with Connection: close and reads the response to the end.
+// POST, PUT and PATCH carry Content-Length like Python's http.client.
+Request :: (port: u16, method: string, path: string, headers: []Header, body: string = "") -> Response {
+    response: Response
+    request: Vec(u8)
+    defer VecFree(request)
+    BuilderPrint(*request, "% % HTTP/1.1\r\nHost: 127.0.0.1:%\r\nConnection: close\r\n", method, path, port)
+    for headers {
+        BuilderPrint(*request, "%: %\r\n", it.name, it.value)
+    }
+    if body.count != 0 || method == "POST" || method == "PUT" || method == "PATCH" {
+        BuilderPrint(*request, "Content-Length: %\r\n", body.count)
+    }
+    BuilderPrint(*request, "\r\n%", body)
+    loopback: [4]u8 = .[127, 0, 0, 1]
+    connection := socket.OpenTCPv4(loopback, port, 3000)
+    if !connection.valid {
+        return response
+    }
+    defer { unused socket.SocketClose(*connection) }
+    if socket.SocketSendAll(connection, request[:], 3000) != cast(s64)request.count {
+        return response
+    }
+    received: Vec(u8)
+    defer VecFree(received)
+    chunk: [16384]u8
+    while true {
+        count := socket.SocketReceive(connection, chunk[:], 3000)
+        if count < 0 {
+            return response
+        }
+        if count == 0 {
+            break
+        }
+        BuilderAppend(received, TextFromBytes(chunk[:count]))
+    }
+    ParseResponse(TextFromBytes(received[:]), method == "HEAD", *response)
+    return response
+}
+
+// Releases a response's buffers.
+FreeResponse :: (response: *Response) {
+    VecFree(response.head)
+    VecFree(response.body)
+}
+
+// A request without extra headers.
+Send :: (port: u16, method: string, path: string) -> Response {
+    empty: []Header
+    return Request(port, method, path, empty)
+}
+
+// The first value of a header in a response's head, matched without regard
+// to case. Pass `response.head[:]`.
+HeaderValue :: (head_bytes: []u8, name: string) -> (value: string, found: bool) {
+    head := TextFromBytes(head_bytes)
+    start := TextFind(head, "\r\n")
+    while start >= 0 {
+        line_start := start + 2
+        line_end := TextFind(head, "\r\n", line_start)
+        if line_end < 0 {
+            line_end = head.count
+        }
+        line := head[line_start:line_end]
+        colon := TextFind(line, ":")
+        if colon > 0 && SameName(line[:colon], name) {
+            return TextTrim(line[colon + 1:]), true
+        }
+        if line_end >= head.count {
+            break
+        }
+        start = line_end
+    }
+    return "", false
+}
+
+// True when the response carries the header with exactly this value.
+HeaderIs :: (response: *Response, name: string, value: string) -> bool {
+    found_value, found := HeaderValue(response.head[:], name)
+    return found && found_value == value
+}
+
+HasHeader :: (response: *Response, name: string) -> bool {
+    _, found := HeaderValue(response.head[:], name)
+    return found
+}
+
+#scope_file
+LibraryPathSetting :: () -> Text {
+    out: Vec(u8)
+    value := EnvironmentText("LD_LIBRARY_PATH")
+    if value.count != 0 {
+        BuilderPrint(*out, "LD_LIBRARY_PATH=%", value)
+    }
+    return BuilderFinish(out)
+}
+
+SameName :: (left: string, right: string) -> bool {
+    if left.count != right.count {
+        return false
+    }
+    for byte, index: left {
+        if Lower(byte) != Lower(right[index]) {
+            return false
+        }
+    }
+    return true
+}
+
+Lower :: (byte: u8) -> u8 {
+    if byte >= #char "A" && byte <= #char "Z" {
+        return byte + 32
+    }
+    return byte
+}
+
+ParseResponse :: (raw: string, head_only: bool, response: *Response) {
+    header_end := TextFind(raw, "\r\n\r\n")
+    if header_end < 0 || !TextHasPrefix(raw, "HTTP/1.") || raw.count < 12 {
+        return
+    }
+    code, ok := TextInteger(raw[9:12])
+    if !ok {
+        return
+    }
+    BuilderAppend(response.head, raw[:header_end])
+    content := raw[header_end + 4:]
+    if head_only {
+        BuilderAppend(response.body, content)
+        response.status = cast(s32)code
+        return
+    }
+    if HeaderIs(response, "Transfer-Encoding", "chunked") {
+        if !Dechunk(content, response) {
+            return
+        }
+    } else {
+        BuilderAppend(response.body, content)
+    }
+    response.status = cast(s32)code
+}
+
+Dechunk :: (content: string, response: *Response) -> bool {
+    offset: s64 = 0
+    while true {
+        line_end := TextFind(content, "\r\n", offset)
+        if line_end < 0 {
+            return false
+        }
+        size := HexValue(content[offset:line_end])
+        if size < 0 || line_end + 2 + size + 2 > content.count {
+            return false
+        }
+        if size == 0 {
+            return true
+        }
+        BuilderAppend(response.body, content[line_end + 2:line_end + 2 + size])
+        offset = line_end + 2 + size + 2
+    }
+    return false
+}
+
+HexValue :: (text: string) -> s64 {
+    semicolon := TextFind(text, ";")
+    digits := ifx semicolon >= 0 then text[:semicolon] else text
+    if digits.count == 0 || digits.count > 15 {
+        return -1
+    }
+    value: s64 = 0
+    for byte: digits {
+        digit: s64 = -1
+        if byte >= #char "0" && byte <= #char "9" {
+            digit = cast(s64)(byte - #char "0")
+        } else if byte >= #char "a" && byte <= #char "f" {
+            digit = cast(s64)(byte - #char "a") + 10
+        } else if byte >= #char "A" && byte <= #char "F" {
+            digit = cast(s64)(byte - #char "A") + 10
+        }
+        if digit < 0 {
+            return -1
+        }
+        value = value * 16 + digit
+    }
+    return value
+}
