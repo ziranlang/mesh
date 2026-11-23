@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     access :: #import "account_access_native";
     bearer :: #import "http_auth_native";
     transport :: #import "http_server_native";
@@ -133,7 +134,10 @@
         if header.value == "" { return ErrorReply(connection, 400, "missing X-Mesh-User", settings.zstdResponses) }
         if !scopes.NormalizeUserID(header.value, account[:]) { return ErrorReply(connection, 400, "invalid user_id_hash", settings.zstdResponses) }
         token := bearer.Bearer(connection)
-        if token == "" { return ErrorReply(connection, 401, "bearer token required", settings.zstdResponses) }
+        if token == "" {
+            events.AuthFailure(401, "bearer token required")
+            return ErrorReply(connection, 401, "bearer token required", settings.zstdResponses)
+        }
         milliseconds := calendar.UnixMilliseconds()
         if milliseconds < 0 || !mutex.Lock(*state.databaseLock) { return ErrorReply(connection, 500, "record sync failed", settings.zstdResponses) }
         now: time.TimestampValue = .{seconds = milliseconds / 1000, nanoseconds = cast(s32)(milliseconds % 1000) * 1000000, valid = true}
@@ -161,8 +165,9 @@
         result := sync.ReceiveDocument(.{database = settings.database, databasePath = settings.path, tokenSecret = settings.secret, verify = settings.verify,
             storageLimit = settings.accountStorageLimit, storagePlansEnabled = settings.storagePlansEnabled}, user,
             .{bearer = token, signedTransaction = transport.Header(connection, "X-Mesh-Tx"), path = path, body = bytes, now = now}, *document)
-        if hub != null && result.status == 0 && result.databaseError == sqlite.SQLITE_OK && result.applied > 0 {
-            notifications.Publish(hub, user, result.serverVersion)
+        if result.status == 0 && result.databaseError == sqlite.SQLITE_OK && result.applied > 0 {
+            events.EncryptedRecordsApplied(result.applied)
+            if hub != null { notifications.Publish(hub, user, result.serverVersion) }
         }
         return WriteResult(settings, *state.databaseLock, connection, user, TextView(audit[:length]), *result)
     }

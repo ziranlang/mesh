@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     wallet :: #import "monero_wallet_native";
     rpc :: #import "monero_rpc_native";
     invoice :: #import "monero_invoice_native";
@@ -67,6 +68,7 @@ SQL;
         if !VecPush(notified.ids, TextCopy(id)) { return }
         current := VecSlice(notified.ids, notified.ids.count - 1, notified.ids.count)
         HashMapSet(*notified.invoices, TextView(current[0]), true)
+        events.MoneroStuckInvoice()
         unused stdio.PrintError("Monero invoice has uncredited funds\n")
     }
 

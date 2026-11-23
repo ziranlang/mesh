@@ -1,4 +1,5 @@
-// Checks the shared origin policy on the real native server.
+// Checks the shared origin policy, the answers to unrouted requests and the
+// event counters on the real native server.
 // Usage: check_server_policy SERVER_BINARY
 #import "std/byte_text_linux"
 #import "std/file_tree_linux"
@@ -67,6 +68,50 @@ CheckNoRoute :: (port: u16) {
     }
 }
 
+Account :: "abababababababababababababababababababababababababababababababab";
+
+// A refused sync and WebSocket show in the counters Go's server reports.
+CheckEventMetrics :: (port: u16) {
+    sync_headers: [2]check.Header = .[.{name = "Content-Type", value = "application/json"}, .{name = "X-Mesh-User", value = Account}]
+    refused := check.Request(port, "POST", "/api/v1/sync", sync_headers[:], "{\"app_id\":\"inbe\",\"client_id\":\"client-1\",\"protocol_version\":1}")
+    defer check.FreeResponse(*refused)
+    check.Check(refused.status == 401, "a sync without a bearer token is refused")
+    socket := check.Send(port, "GET", "/api/v1/sync/ws")
+    defer check.FreeResponse(*socket)
+    check.Check(socket.status == 401, "a WebSocket without a bearer token is refused")
+
+    admin: [2]check.Header = .[.{name = "Accept-Encoding", value = "identity"}, .{name = "X-Mesh-Admin", value = "pairing-test"}]
+    metrics := check.Request(port, "GET", "/metrics", admin[:])
+    defer check.FreeResponse(*metrics)
+    report := TextFromBytes(metrics.body[:])
+    lines: [14]string = .[
+        "mesh_sync_requests_total 1",
+        "mesh_sync_failures_total 1",
+        "mesh_sync_full_snapshots_total 0",
+        "mesh_auth_failures_total 2",
+        "mesh_websocket_accepted_total 0",
+        "mesh_websocket_rejected_total 1",
+        "mesh_monero_stuck_invoices_total 0",
+        "mesh_auth_failures_by_reason_total{status=\"401\",reason=\"bearer_token_required\"} 2",
+        "mesh_websocket_rejected_by_reason_total{reason=\"auth\"} 1",
+        "# TYPE mesh_sync_full_snapshots_by_reason_total counter",
+        "ksync_sync_requests_total 1",
+        "ksync_auth_failures_by_reason_total{status=\"401\",reason=\"bearer_token_required\"} 2",
+        "ksync_websocket_rejected_total 1",
+        "# TYPE ksync_legacy_client_hints_total counter"
+    ]
+    for lines {
+        found := tools.TextHasPrefix(report, it) && tools.TextHasPrefix(report[it.count:], "\n")
+        line: Vec(u8)
+        BuilderPrint(*line, "\n%\n", it)
+        found = found || tools.TextContains(report, TextFromBytes(line[:]))
+        VecFree(line)
+        if !found { print("metrics lack: %\n", it) }
+        check.Check(found, it)
+    }
+    check.Check(!tools.TextContains(report, "ksync_monero_stuck_invoices_total"), "Go reports stuck invoices only as mesh_")
+}
+
 #scope_export
 Main :: (argc: s32, argv: **u8) -> s32 {
     if argc != 2 {
@@ -87,6 +132,7 @@ Main :: (argc: s32, argv: **u8) -> s32 {
         policy.CheckPreflight(server.port)
         CheckMetricsRefusal(server.port)
         CheckNoRoute(server.port)
+        CheckEventMetrics(server.port)
     }
     check.StopServer(*server)
     return check.ExitStatus("Native server origin policy passed")

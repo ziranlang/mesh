@@ -3,6 +3,8 @@
     numbers :: #import "std/number_text";
     text :: #import "std/text_tools";
     time :: #import "std/timer_linux";
+    wire :: #import "wire_text";
+    #import "std/byte_text_linux"
     #import "std/vec"
 
     Request :: struct {
@@ -21,12 +23,41 @@
         statuses: Vec(Series)
     }
 
+    // One labelled event count, such as an auth failure's "status|reason".
+    Labelled :: struct {
+        key: [96]u8
+        count: s64
+        total: s64
+    }
+
+    // The event counts Go's server keeps beside its HTTP counters.
+    Events :: struct {
+        syncRequests: s64
+        syncFailures: s64
+        fullSnapshots: s64
+        encryptedRecords: s64
+        encryptedPayloads: s64
+        authFailures: s64
+        legacyHints: s64
+        webSocketAccepted: s64
+        webSocketRejected: s64
+        stuckInvoices: s64
+        authFailuresBy: Vec(Labelled)
+        fullSnapshotsBy: Vec(Labelled)
+        webSocketRejects: Vec(Labelled)
+    }
+
     Counters :: struct {
         lock: mutex.Mutex
         buckets: Vec(Bucket)
+        events: Events
     }
 
     #scope_file
+    // The server's counters, for the handlers that record events. Open sets
+    // it before the listener starts and Close clears it after it stops.
+    active: *Counters;
+
     Methods: [10]string = .["OTHER", "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT"];
     Routes: [125]string = .["unmatched", "/healthz", "/readyz", "/metrics", "/api/v1/rates", "/api/v1/node", "/api/v1/node/peers",
         "/api/v1/node/pairing/invites", "/api/v1/node/pairing/accept", "/api/v1/node/pairing/complete",
@@ -131,6 +162,152 @@
         return true
     }
 
+    SyncRoute :: 15;
+    PostMethod :: 3;
+
+    // Byte order, as Go's sort.Strings uses.
+    Before :: (left: string, right: string) -> bool {
+        shared := ifx left.count < right.count then left.count else right.count
+        for index: 0..shared - 1 {
+            if left[index] != right[index] { return left[index] < right[index] }
+        }
+        return left.count < right.count
+    }
+
+    KeyText :: (key: []u8) -> string {
+        return TextFromBytes(key)
+    }
+
+    // Go's metric reason: lower case, every character outside [a-z0-9_.-]
+    // becomes "_", and underscores are trimmed from both ends.
+    Reason :: (value: string, output: []u8) -> string {
+        count: s64 = 0
+        for character: value {
+            if character >= 128 && character < 192 { continue }
+            byte := character
+            if byte >= 65 && byte <= 90 { byte += 32 }
+            keep := (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 45 || byte == 46
+            if count == output.count { break }
+            output[count] = ifx keep then byte else cast(u8)95
+            count += 1
+        }
+        start: s64 = 0
+        while start < count && output[start] == 95 { start += 1 }
+        while count > start && output[count - 1] == 95 { count -= 1 }
+        return TextFromBytes(output[start:count])
+    }
+
+    // Adds one to `key` in `entries`, which stay sorted by key as Go prints them.
+    Increment :: (entries: *Vec(Labelled), key: string) {
+        at: s64 = 0
+        while at < entries.count {
+            current := KeyText((<<entries)[at].key[:(<<entries)[at].total])
+            if current == key {
+                (<<entries)[at].count += 1
+                return
+            }
+            if !Before(current, key) { break }
+            at += 1
+        }
+        entry: Labelled
+        if key.count > entry.key.count { return }
+        for character, index: key { entry.key[index] = character }
+        entry.total = key.count
+        entry.count = 1
+        if !VecPush(<<entries, entry) { return }
+        index := entries.count - 1
+        while index > at {
+            (<<entries)[index] = (<<entries)[index - 1]
+            index -= 1
+        }
+        (<<entries)[at] = entry
+    }
+
+    Record :: (counter: s64, amount: s64) {
+        state := active
+        if state == null || amount <= 0 || !mutex.Lock(*state.lock) { return }
+        defer mutex.Unlock(*state.lock)
+        events := *state.events
+        if counter == 0 { events.encryptedRecords += amount }
+        if counter == 1 { events.encryptedPayloads += amount }
+        if counter == 2 { events.legacyHints += amount }
+        if counter == 3 { events.webSocketAccepted += amount }
+        if counter == 4 { events.stuckInvoices += amount }
+    }
+
+    RecordLabelled :: (counter: s64, key: string) {
+        state := active
+        if state == null || !mutex.Lock(*state.lock) { return }
+        defer mutex.Unlock(*state.lock)
+        events := *state.events
+        if counter == 0 {
+            events.authFailures += 1
+            Increment(*events.authFailuresBy, key)
+        }
+        if counter == 1 {
+            events.fullSnapshots += 1
+            Increment(*events.fullSnapshotsBy, key)
+        }
+        if counter == 2 {
+            events.webSocketRejected += 1
+            Increment(*events.webSocketRejects, key)
+        }
+    }
+
+    Scalar :: (output: *Vec(u8), name: string, value: s64) -> bool {
+        buffer: [24]u8
+        return BuilderAppend(<<output, "# TYPE ") && BuilderAppend(<<output, name) &&
+            BuilderAppend(<<output, " counter\n") && BuilderAppend(<<output, name) && BuilderAppend(<<output, " ") &&
+            BuilderAppend(<<output, numbers.FormatInteger(value, buffer[:])) && BuilderAppend(<<output, "\n")
+    }
+
+    // A family with one label, or with "status" and "reason" when `split`.
+    LabelFamily :: (output: *Vec(u8), name: string, label: string, entries: *Vec(Labelled), split: bool) -> bool {
+        if !BuilderAppend(<<output, "# TYPE ") || !BuilderAppend(<<output, name) ||
+            !BuilderAppend(<<output, " counter\n") { return false }
+        for index: 0..entries.count - 1 {
+            entry := *(<<entries)[index]
+            key := KeyText(entry.key[:entry.total])
+            buffer: [24]u8
+            if !BuilderAppend(<<output, name) || !BuilderAppend(<<output, "{") { return false }
+            if split {
+                cut := wire.Cut(key, 124)
+                if !BuilderAppend(<<output, "status=\"") || !BuilderAppend(<<output, cut.before) ||
+                    !BuilderAppend(<<output, "\",reason=\"") || !BuilderAppend(<<output, cut.after) { return false }
+            } else if !BuilderAppend(<<output, label) || !BuilderAppend(<<output, "=\"") || !BuilderAppend(<<output, key) {
+                return false
+            }
+            if !BuilderAppend(<<output, "\"} ") || !BuilderAppend(<<output, numbers.FormatInteger(entry.count, buffer[:])) ||
+                !BuilderAppend(<<output, "\n") { return false }
+        }
+        return true
+    }
+
+    Prefixed :: (prefix: string, name: string, output: []u8) -> string {
+        count: s64 = 0
+        for character: prefix { output[count] = character; count += 1 }
+        for character: name { output[count] = character; count += 1 }
+        return TextFromBytes(output[:count])
+    }
+
+    // The event families under one prefix; Go has no ksync_ stuck invoice count.
+    EventFamilies :: (events: *Events, output: *Vec(u8), prefix: string) -> bool {
+        name: [64]u8
+        return Scalar(output, Prefixed(prefix, "sync_requests_total", name[:]), events.syncRequests) &&
+            Scalar(output, Prefixed(prefix, "sync_failures_total", name[:]), events.syncFailures) &&
+            Scalar(output, Prefixed(prefix, "sync_full_snapshots_total", name[:]), events.fullSnapshots) &&
+            Scalar(output, Prefixed(prefix, "sync_encrypted_records_applied_total", name[:]), events.encryptedRecords) &&
+            Scalar(output, Prefixed(prefix, "sync_encrypted_payloads_applied_total", name[:]), events.encryptedPayloads) &&
+            Scalar(output, Prefixed(prefix, "auth_failures_total", name[:]), events.authFailures) &&
+            Scalar(output, Prefixed(prefix, "legacy_client_hints_total", name[:]), events.legacyHints) &&
+            Scalar(output, Prefixed(prefix, "websocket_accepted_total", name[:]), events.webSocketAccepted) &&
+            Scalar(output, Prefixed(prefix, "websocket_rejected_total", name[:]), events.webSocketRejected) &&
+            (prefix != "mesh_" || Scalar(output, "mesh_monero_stuck_invoices_total", events.stuckInvoices)) &&
+            LabelFamily(output, Prefixed(prefix, "auth_failures_by_reason_total", name[:]), "", *events.authFailuresBy, true) &&
+            LabelFamily(output, Prefixed(prefix, "sync_full_snapshots_by_reason_total", name[:]), "reason", *events.fullSnapshotsBy, false) &&
+            LabelFamily(output, Prefixed(prefix, "websocket_rejected_by_reason_total", name[:]), "reason", *events.webSocketRejects, false)
+    }
+
     #scope_export
     Open :: (state: *Counters) -> bool {
         if !VecResize(state.buckets, Routes.count * Methods.count) {
@@ -140,12 +317,50 @@
             VecFree(state.buckets)
             return false
         }
+        active = state
         return true
     }
 
     Close :: (state: *Counters) {
+        if active == state { active = null }
         VecFree(state.buckets)
+        VecFree(state.events.authFailuresBy)
+        VecFree(state.events.fullSnapshotsBy)
+        VecFree(state.events.webSocketRejects)
         unused mutex.Close(*state.lock)
+    }
+
+    // Event counts the handlers record, named after Go's counters.
+    EncryptedRecordsApplied :: (count: s64) { Record(0, count) }
+    EncryptedPayloadApplied :: () { Record(1, 1) }
+    LegacyClientHints :: (count: s64) { Record(2, count) }
+    WebSocketAccepted :: () { Record(3, 1) }
+    MoneroStuckInvoice :: () { Record(4, 1) }
+
+    AuthFailure :: (status: u32, message: string) {
+        reason: [96]u8
+        key: [104]u8
+        digits: [24]u8
+        code := numbers.FormatInteger(cast(s64)status, digits[:])
+        normalized := Reason(message, reason[:])
+        count: s64 = 0
+        for character: code { key[count] = character; count += 1 }
+        key[count] = 124
+        count += 1
+        for character: normalized { key[count] = character; count += 1 }
+        RecordLabelled(0, TextFromBytes(key[:count]))
+    }
+
+    FullSnapshot :: (reason: string) {
+        buffer: [96]u8
+        normalized := Reason(reason, buffer[:])
+        RecordLabelled(1, ifx normalized == "" then "unspecified" else normalized)
+    }
+
+    WebSocketRejected :: (reason: string) {
+        buffer: [96]u8
+        normalized := Reason(reason, buffer[:])
+        RecordLabelled(2, ifx normalized == "" then "rejected" else normalized)
     }
 
     Begin :: (method: string, path: string) -> Request {
@@ -160,6 +375,11 @@
         defer mutex.Unlock(*state.lock)
         elapsed := time.MonotonicMilliseconds() - request.started
         if elapsed < 0 { elapsed = 0 }
+        if request.route == SyncRoute && request.method == PostMethod {
+            // As in Go, a sync that does not answer 200 is a failed sync.
+            state.events.syncRequests += 1
+            if status != 200 { state.events.syncFailures += 1 }
+        }
         bucket := FindBucket(state, request.route, request.method)
         for index: 0..bucket.statuses.count - 1 {
             if bucket.statuses[index].status == status {
@@ -178,6 +398,7 @@
         return Family(state, output, "mesh_http_requests_total", false) &&
             Family(state, output, "mesh_http_request_duration_milliseconds_total", true) &&
             Family(state, output, "ksync_http_requests_total", false) &&
-            Family(state, output, "ksync_http_request_duration_milliseconds_total", true)
+            Family(state, output, "ksync_http_request_duration_milliseconds_total", true) &&
+            EventFamilies(*state.events, output, "mesh_") && EventFamilies(*state.events, output, "ksync_")
     }
 }

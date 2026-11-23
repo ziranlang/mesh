@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     sessions :: #import "auth_sessions_native";
     transport :: #import "http_server_native";
     wire :: #import "wire_text";
@@ -74,7 +75,16 @@
 
     #scope_export
     // The caller owns the database connection for the duration of this request.
+    // Every refusal counts as an auth failure, as Go's auth.Respond counts it.
     Authenticate :: (database: *void, connection: *void, secret: []u8,
+        now: s64, createdAt: string, allowBootstrap: bool) -> BearerAuthentication {
+        result := Check(database, connection, secret, now, createdAt, allowBootstrap)
+        if result.status != 0 { events.AuthFailure(result.status, result.message) }
+        return result
+    }
+
+    #scope_file
+    Check :: (database: *void, connection: *void, secret: []u8,
         now: s64, createdAt: string, allowBootstrap: bool) -> BearerAuthentication {
         bearer := Bearer(connection)
         if bearer == "" {

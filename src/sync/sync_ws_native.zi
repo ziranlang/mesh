@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     access :: #import "account_access_native";
     sessions :: #import "auth_sessions_native";
     accounts :: #import "account_state_native";
@@ -205,42 +206,59 @@
             return Error(connection, 405, "method not allowed")
         }
         if http.QueryArgument(connection, "token") != "" {
-            return Error(connection, 401, "websocket query tokens are not accepted")
+            return Refuse(connection, 401, "websocket query tokens are not accepted", "auth", true)
         }
         token := Credential(connection)
         if token == "" {
-            return Error(connection, 401, "bearer token required")
+            return Refuse(connection, 401, "bearer token required", "auth", true)
         }
         if !mutex.Lock(*state.databaseLock) {
-            return Error(connection, 500, "authentication failed")
+            return Refuse(connection, 500, "authentication failed", "auth", true)
         }
         session := Authorize(state, token, "")
         unused mutex.Unlock(*state.databaseLock)
         if session.databaseError != sqlite.SQLITE_OK {
-            return Error(connection, 500, "authentication failed")
+            return Refuse(connection, 500, "authentication failed", "auth", true)
         }
         if session.accountMissing {
-            return Error(connection, 401, "sync account not found")
+            return Refuse(connection, 401, "sync account not found", "auth", true)
         }
         if !session.active {
-            return Error(connection, 401, "invalid bearer token")
+            // Go answers an inactive session without counting an auth failure.
+            return Refuse(connection, 401, "invalid bearer token", "auth", false)
         }
         address := addresses.FromRequest(connection)
         if !Allowed(state, "ws:ip:", TextView(address.bytes[:address.count]), 120) ||
             !Allowed(state, "ws:user:", TextView(session.userID[:]), 40) {
-            return Error(connection, 429, "rate limit exceeded")
+            return Refuse(connection, 429, "rate limit exceeded", "rate_limited", false)
         }
         watched := notifications.Watch(hub, session.userID)
         if watched.status == 429 {
-            return Error(connection, 429, "too many websocket connections")
+            return Refuse(connection, 429, "too many websocket connections", "too_many_connections", false)
         }
         if watched.status != 0 {
-            return Error(connection, 503, "websocket unavailable")
+            return Refuse(connection, 503, "websocket unavailable", "handshake", false)
         }
         upgraded.accounts = state
         upgraded.watcher = watched.watcher
-        return websocket.Accept(connection, cast(*void)upgraded, Upgraded)
+        queued := websocket.Accept(connection, cast(*void)upgraded, Upgraded)
+        if http.ResponseStatus(connection) == 101 {
+            events.WebSocketAccepted()
+        } else {
+            events.WebSocketRejected("handshake")
+        }
+        return queued
     }
+
+    #scope_file
+    // Refuses a WebSocket and counts why, as Go's sync socket does.
+    Refuse :: (connection: *void, status: u32, message: string, reason: string, authFailure: bool) -> s32 {
+        events.WebSocketRejected(reason)
+        if authFailure { events.AuthFailure(status, message) }
+        return Error(connection, status, message)
+    }
+
+    #scope_export
 
     HandlesDelegated :: (route: string) -> bool { return route == delegated.DelegatedSocketPath }
 

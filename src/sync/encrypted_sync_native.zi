@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     access :: #import "account_access_native";
     auth :: #import "http_auth_native";
     http :: #import "http_server_native";
@@ -354,6 +355,7 @@
         if result.status != 0 {
             return replies.ErrorReply(connection, "POST", result.status, result.message, zstd)
         }
+        events.EncryptedPayloadApplied()
         if hub != null {
             notifications.Publish(hub, account, result.serverVersion)
         }

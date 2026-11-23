@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     access :: #import "account_access_native";
     auth :: #import "http_auth_native";
     accounts :: #import "account_state_native";
@@ -122,6 +123,7 @@
         if quota.Exceeds(before.value, used.value, allowance.value) {
             return .{status = 413, message = "account storage limit reached", used = before.value, allowance = allowance.value}
         }
+        if full { events.FullSnapshot(snapshotReason) }
         current := accounts.CurrentVersion(database, user)
         if current.status != sqlite.SQLITE_OK { return failure }
         remote := json.JsonNewArray(response)
@@ -135,6 +137,7 @@
             (request.protocolVersion >= 2 && !clients.Compact(database, user, current.value, now)) { return failure }
         if request.protocolVersion >= 3 {
             if migration.AccountTx(database, user) != sqlite.SQLITE_OK || !clients.AttachLegacy(database, user, response, root) { return failure }
+            events.LegacyClientHints(cast(s64)json.JsonCount(response, json.JsonMember(response, root, "legacy_clients")))
             current = accounts.CurrentVersion(database, user)
             if current.status != sqlite.SQLITE_OK { return failure }
         }
@@ -157,6 +160,7 @@
             !json.JsonSet(response, root, "applied", applied) ||
             (acceptedCount > 0 && !json.JsonSet(response, root, "accepted_ops", accepted)) ||
             (remoteCount > 0 && !json.JsonSet(response, root, "ops", remote)) { return failure }
+        events.EncryptedRecordsApplied(cast(s64)summary.EncryptedRecords)
         transition := ifx request.protocolVersion >= 5 then "encrypted_primary" else ""
         if request.protocolVersion == 4 { transition = "dual_write" }
         sequence := packages.LatestSequence(settings.path, app)

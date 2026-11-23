@@ -1,4 +1,5 @@
 #if TARGET == .C && OS == .LINUX {
+    events :: #import "http_metrics_native";
     sqlite :: #import "sqlite/SQLite";
     keys :: #import "account_keys_native";
     challenge :: #import "challenge_native";
@@ -43,10 +44,9 @@
         return output
     }
 
-    #scope_export
     // Reads the registered key under lock, then runs ML-DSA-44 verification
     // completely unlocked so concurrent requests do not serialize on crypto.
-    AuthenticateWithLock :: (database: *void, lock: *mutex.Mutex, challenges: *challenge.ChallengeStore,
+    Verify :: (database: *void, lock: *mutex.Mutex, challenges: *challenge.ChallengeStore,
         verify: VerifySignature, user: string, publicKeyText: string, signatureText: string,
         signatureContext: string, method: string, path: string, payload: []u8) -> Authentication {
         account: [64]u8
@@ -111,6 +111,17 @@
             return .{authenticated = true, userID = account, publicKey = key.bytes}
         }
         return .{status = 401, message = "signature rejected"}
+    }
+
+    #scope_export
+    // Every refusal counts as an auth failure, as Go's auth.Respond counts it.
+    AuthenticateWithLock :: (database: *void, lock: *mutex.Mutex, challenges: *challenge.ChallengeStore,
+        verify: VerifySignature, user: string, publicKeyText: string, signatureText: string,
+        signatureContext: string, method: string, path: string, payload: []u8) -> Authentication {
+        result := Verify(database, lock, challenges, verify, user, publicKeyText, signatureText,
+            signatureContext, method, path, payload)
+        if result.status != 0 { events.AuthFailure(result.status, result.message) }
+        return result
     }
 
     Authenticate :: (database: *void, challenges: *challenge.ChallengeStore, verify: VerifySignature,
