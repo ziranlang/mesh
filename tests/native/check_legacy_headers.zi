@@ -3,7 +3,12 @@
 // Usage: check_legacy_headers SERVER_BINARY
 #import "std/byte_text_linux"
 #import "std/file_tree_linux"
+#import "std/json_document"
+codec :: #import "binary_codec";
 check :: #import "native_check";
+mldsa :: #import "ml_dsa44_native";
+oqs :: #import "oqs/Oqs";
+sha :: #import "crypto/sha256";
 using Vectors :: #import "std/vec"
 
 #scope_file
@@ -72,6 +77,91 @@ CheckAdminHeader :: (port: u16) {
     check.Check(Metrics(port, "X-Daochi-Admin", "wrong-admin-token-0123456789abcdef") == 401, "a wrong X-Daochi-Admin is refused")
 }
 
+Hex :: (bytes: []u8, output: []u8) -> string {
+    unused sha.BytesToHex(*bytes[0], bytes.count, *output[0], output.count)
+    return TextFromBytes(output[:bytes.count * 2])
+}
+
+// An installed app signs in with X-Daochi-User and X-Daochi-Signature over
+// the durable daochi-sync-v1 label, then syncs with the bearer token it got.
+CheckDaochiLogin :: (port: u16) {
+    public: [oqs.MlDsa44PublicKeyBytes]u8
+    private: [oqs.MlDsa44SecretKeyBytes]u8
+    defer oqs.Cleanse(private[:])
+    if !mldsa.KeyPair(public[:], private[:]) {
+        check.Check(false, "create an ML-DSA-44 key pair")
+        return
+    }
+    digest := sha.Sha256Of(TextFromBytes(public[:]))
+    user_hex: [65]u8
+    user := Hex(digest[:], user_hex[:])
+
+    challenge_path: Vec(u8)
+    defer VecFree(challenge_path)
+    BuilderPrint(*challenge_path, "/api/v1/sync/challenge?user_id=%", user)
+    issued := check.Send(port, "GET", TextFromBytes(challenge_path[:]))
+    defer check.FreeResponse(*issued)
+    document: JsonDocument
+    defer JsonReset(*document)
+    if issued.status != 200 || !JsonRead(*document, TextFromBytes(issued.body[:])) {
+        check.Check(false, "the server issues a login challenge")
+        return
+    }
+    nonce: Text = JsonString(*document, JsonMember(*document, document.root, "nonce"))
+
+    key := codec.EncodeBase64(TextFromBytes(public[:]), false, true)
+    defer VecFree(key.value)
+    payload: Vec(u8)
+    defer VecFree(payload)
+    BuilderPrint(*payload, "{\"user_id_hash\":\"%\",\"client_id\":\"daochi-login\",\"public_key\":\"%\"}", user, TextFromBytes(key.value[:]))
+    payload_digest := sha.Sha256Of(TextFromBytes(payload[:]))
+    payload_hex: [65]u8
+    message: Vec(u8)
+    defer VecFree(message)
+    BuilderPrint(*message, "daochi-sync-v1\nPOST\n/api/v1/sync/login\n%\n%\n", Hex(payload_digest[:], payload_hex[:]), TextView(nonce))
+    signature: [oqs.MlDsa44SignatureBytes]u8
+    if !mldsa.Sign(private[:], message[:], signature[:]) {
+        check.Check(false, "sign the login challenge")
+        return
+    }
+    signed := codec.EncodeBase64(TextFromBytes(signature[:]), false, true)
+    defer VecFree(signed.value)
+
+    login_headers: [3]check.Header = .[
+        .{name = "Content-Type", value = "application/json"},
+        .{name = "X-Daochi-User", value = user},
+        .{name = "X-Daochi-Signature", value = TextFromBytes(signed.value[:])}
+    ]
+    login := check.Request(port, "POST", "/api/v1/sync/login", login_headers[:], TextFromBytes(payload[:]))
+    defer check.FreeResponse(*login)
+    check.Check(login.status == 200, "a Daochi-header login is accepted")
+    session: JsonDocument
+    defer JsonReset(*session)
+    if login.status != 200 || !JsonRead(*session, TextFromBytes(login.body[:])) {
+        return
+    }
+    token: Text = JsonString(*session, JsonMember(*session, session.root, "auth_token"))
+    check.Check(TextView(token).count != 0, "the login returns a bearer token")
+
+    bearer: Vec(u8)
+    defer VecFree(bearer)
+    BuilderPrint(*bearer, "Bearer %", TextView(token))
+    sync_body: Vec(u8)
+    defer VecFree(sync_body)
+    BuilderPrint(*sync_body, "{\"app_id\":\"inbe\",\"client_id\":\"daochi-login\",\"user_id_hash\":\"%\",\"protocol_version\":1}", user)
+    sync_headers: [3]check.Header = .[
+        .{name = "Content-Type", value = "application/json"},
+        .{name = "X-Daochi-User", value = user},
+        .{name = "Authorization", value = TextFromBytes(bearer[:])}
+    ]
+    synced := check.Request(port, "POST", "/api/v1/sync", sync_headers[:], TextFromBytes(sync_body[:]))
+    defer check.FreeResponse(*synced)
+    if synced.status != 200 {
+        print("Daochi-header sync answered %: %\n", synced.status, TextFromBytes(synced.body[:]))
+    }
+    check.Check(synced.status == 200, "a Daochi-header sync with the login token is accepted")
+}
+
 #scope_export
 Main :: (argc: s32, argv: **u8) -> s32 {
     if argc != 2 {
@@ -91,6 +181,7 @@ Main :: (argc: s32, argv: **u8) -> s32 {
     if check.StartServer(*server, binary, settings[:]) {
         CheckUserHeader(server.port)
         CheckAdminHeader(server.port)
+        CheckDaochiLogin(server.port)
     }
     check.StopServer(*server)
     return check.ExitStatus("Native legacy header aliases passed")
