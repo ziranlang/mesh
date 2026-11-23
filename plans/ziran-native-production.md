@@ -13,9 +13,17 @@ The native server builds from the locked toolchain and packages: Ziran
 handlers). CI runs the native server suite and the deploy job ships the
 generated C.
 
-Remaining: install `libmicrohttpd12t64` on the origin, install the gateway
-from `deploy/gitea-origin.py`, set `deploy/runtime` to `native` and verify the
-live binary.
+The origin has `libmicrohttpd12t64`, the native-capable gateway and a built
+`/opt/mesh/mesh-native` beside Go.
+
+Native ran in production on 2026-11-23 from 05:00:31 to 05:02:25 UTC and was
+rolled back to Go. `/readyz`, the node document, its 28 capabilities and the
+admin routes matched Go, but a real Android client's `POST /api/v1/sync` got
+HTTP 400 (52-byte body) four times out of four, where Go answered 200. Find
+that request shape, add its regression test to the native suite, then set
+`deploy/runtime` back to `native`. Also seen: unauthenticated
+`GET /api/v1/account` is 405 on native and 404 on Go, and native `/metrics`
+has 22 metric names where Go has 41.
 
 Open gaps between the Go and native servers, each needing its regression test:
 
