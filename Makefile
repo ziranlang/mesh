@@ -172,7 +172,7 @@ build-ziran-native-server: liboqs | $(NATIVE_SERVER_BUILD_DIR)
 
 # Native server checks written in Ziran. Each tests/native/NAME.zi builds to
 # $(NATIVE_CHECKS_DIR)/NAME, which check_http_listener.py runs.
-NATIVE_CHECKS := check_docs_http check_legacy_headers check_server_policy
+NATIVE_CHECKS := check_docs_http check_legacy_headers check_server_policy check_embedded_host
 NATIVE_CHECKS_DIR := $(abspath $(BUILD_DIR)/native-tests/checks)
 
 build-native-checks: liboqs
@@ -280,13 +280,13 @@ build-ziran-native-embedded: liboqs
 		-o "$$generation/libmesh_embedded.so"; \
 	mv "$$generation/libmesh_embedded.so" "$(NATIVE_EMBEDDED_BUILD_DIR)/libmesh_embedded.so"
 
-test-ziran-native-embedded: build-ziran-native-embedded
+test-ziran-native-embedded: build-ziran-native-embedded build-native-checks
 	$(CC) $(CPPFLAGS) $(CFLAGS) -std=c11 -Wall -Wextra -Werror -Inative tests/native/embedded_host.c \
 		$(LDFLAGS) -L"$(NATIVE_EMBEDDED_BUILD_DIR)" -Xlinker -rpath-link -Xlinker "$(SQLITE_NATIVE_DIR)" \
 		$(if $(MICROHTTPD_NATIVE_DIR),-Xlinker -rpath-link -Xlinker "$(MICROHTTPD_NATIVE_DIR)") -lmesh_embedded \
 		-o "$(NATIVE_EMBEDDED_BUILD_DIR)/embedded_host"
 	LD_LIBRARY_PATH="$(abspath $(NATIVE_EMBEDDED_BUILD_DIR)):$(SQLITE_NATIVE_DIR)$(if $(MICROHTTPD_NATIVE_DIR),:$(MICROHTTPD_NATIVE_DIR))$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
-		python3 -B tests/native/check_embedded_host.py "$(NATIVE_EMBEDDED_BUILD_DIR)/embedded_host"
+		"$(NATIVE_CHECKS_DIR)/check_embedded_host" "$(NATIVE_EMBEDDED_BUILD_DIR)/embedded_host"
 
 test-ziran-native-ml-dsa44: liboqs
 	mkdir -p $(BUILD_DIR)/native-tests/ml-dsa44

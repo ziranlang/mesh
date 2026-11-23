@@ -1,0 +1,166 @@
+// Checks the native embedded host ABI: private profiles, the loopback
+// lifecycle and a durable node identity.
+// Usage: check_embedded_host EMBEDDED_HOST_BINARY
+#import "std/byte_text_linux"
+#import "std/c_string"
+#import "std/file"
+#import "std/file_linux"
+#import "std/file_tree_linux"
+#import "std/process_run_linux"
+#import "std/text_tools"
+check :: #import "native_check";
+sha :: #import "crypto/sha256";
+sqlite :: #import "sqlite/SQLite";
+sql :: #import "sqlite_statement_native";
+using Vectors :: #import "std/vec"
+
+#scope_file
+libc :: #system_library "libc";
+SymbolicLinkRaw :: (target: *u8, path: *u8) -> s32 #foreign libc "symlink";
+
+// A library host has its own settings. Poisoned process server settings and
+// HTTP proxy configuration also check profile isolation.
+Poison :: () -> [6]string {
+    return string.[
+        "MESH_ADDR=invalid",
+        "MESH_DB=/dev/null",
+        "MESH_TOKEN_SECRET_HEX=invalid",
+        "MESH_LAN_DISCOVERY=1",
+        "http_proxy=http://127.0.0.1:1",
+        "no_proxy="
+    ]
+}
+
+// Runs the host with these arguments; its output lands in `run.output`.
+Host :: (binary: string, arguments: []string, run: *ProcessRun) -> bool {
+    command: Vec(string)
+    defer VecFree(command)
+    VecPush(command, binary)
+    for arguments {
+        VecPush(command, it)
+    }
+    environment := Poison()
+    started := RunProcess(.{arguments = command[:], environment = environment[:], capture_output = true}, run)
+    if !started || run.code != 0 {
+        print("embedded host % exited with %\n", arguments[0], run.code)
+        return false
+    }
+    return true
+}
+
+Reject :: (binary: string, profile: string, what: string) {
+    arguments: [2]string = .["reject", profile]
+    run: ProcessRun
+    check.Check(Host(binary, arguments[:], *run), what)
+}
+
+Symlink :: (target: string, path: string) -> bool {
+    from: [4096]u8
+    to: [4096]u8
+    if !CopyCString(target, from[:]) || !CopyCString(path, to[:]) {
+        return false
+    }
+    return SymbolicLinkRaw(*from[0], *to[0]) == 0
+}
+
+Count :: (path: string, query: string) -> s64 {
+    database: *void
+    if sqlite.SqliteOpenText(path, *database, sqlite.SQLITE_OPEN_READWRITE) != sqlite.SQLITE_OK {
+        return -1
+    }
+    defer { unused sqlite.SqliteClose(database) }
+    empty: []sql.Argument
+    result := sql.ReadInteger(database, query, empty)
+    return ifx result.found then result.value else -1
+}
+
+Mode :: (path: string) -> s32 {
+    return PathStatus(path, false).mode & 511
+}
+
+CheckProfiles :: (binary: string, root: string) {
+    first: Text = JoinPath(root, "nested/first")
+    second: Text = JoinPath(root, "second")
+    dotted: Vec(u8)
+    defer VecFree(dotted)
+    BuilderPrint(*dotted, "%/./", TextView(first))
+    arguments: [4]string = .["lifecycle", TextView(first), TextFromBytes(dotted[:]), TextView(second)]
+    run: ProcessRun
+    if !Host(binary, arguments[:], *run) {
+        check.Check(false, "the lifecycle runs")
+        return
+    }
+    node_id := TextTrim(TextFromBytes(run.output[:]))
+
+    key_path: Text = JoinPath(first, "node-key")
+    key_text, read := ReadEntireFile(key_path)
+    key_hex := TextTrim(key_text)
+    key: [64]u8
+    decoded := read && key_hex.count == 128 && sha.HexToBytes(key_hex, *key[0], 64) == 1
+    check.Check(decoded, "the node key is 64 bytes of hex")
+    if decoded {
+        digest := sha.Sha256Of(TextFromBytes(key[32:]))
+        hex: [65]u8
+        unused sha.BytesToHex(*digest[0], 32, *hex[0], 65)
+        check.Check(TextFromBytes(hex[:64]) == node_id, "the node ID is the SHA-256 of the public key")
+    }
+
+    private: [5]string = .["node-key", "node.lock", "token-secret", "admin-secret", "mesh.sqlite"]
+    for private {
+        path: Text = JoinPath(first, it)
+        check.Check(Mode(path) == 384, it)
+    }
+    check.Check(Mode(first) == 448, "the profile directory is private")
+
+    first_database: Text = JoinPath(first, "mesh.sqlite")
+    second_database: Text = JoinPath(second, "mesh.sqlite")
+    check.Check(Count(first_database, "SELECT COUNT(*) FROM issued_pairing_invites") == 1, "the first profile issued one pairing invite")
+    check.Check(Count(first_database, "SELECT COUNT(*) FROM pragma_journal_mode WHERE journal_mode = 'wal'") == 1, "the profile database uses WAL")
+    check.Check(Count(second_database, "SELECT COUNT(*) FROM issued_pairing_invites") == 0, "the second profile issued none")
+
+    lock_path: Text = JoinPath(first, "node.lock")
+    lock := LockPath(lock_path, true, false)
+    check.Check(lock >= 0, "the node lock can be taken while no host runs")
+    if lock >= 0 {
+        Reject(binary, first, "a locked profile is refused")
+        UnlockPath(lock)
+    }
+
+    public: Text = JoinPath(root, "public")
+    check.Check(CreateDirectories(public, 493) && SetPathMode(public, 493), "create a public directory")
+    Reject(binary, public, "a world-readable profile is refused")
+
+    linked: Text = JoinPath(root, "linked")
+    check.Check(Symlink(first, linked), "link a profile")
+    through: Text = JoinPath(linked, "no-write")
+    Reject(binary, through, "a profile reached through a link is refused")
+    written: Text = JoinPath(first, "no-write")
+    check.Check(!PathExists(written), "nothing is written through the link")
+
+    unsafe: Text = JoinPath(root, "unsafe")
+    check.Check(CreateDirectories(unsafe, 448) && SetPathMode(unsafe, 448), "create a private directory")
+    unsafe_key: Text = JoinPath(unsafe, "node-key")
+    check.Check(Symlink(key_path, unsafe_key), "link a node key")
+    Reject(binary, unsafe, "a linked node key is refused")
+    kept, still := ReadEntireFile(key_path)
+    check.Check(still && TextTrim(kept) == key_hex, "the original node key is unchanged")
+    unsafe_database: Text = JoinPath(unsafe, "mesh.sqlite")
+    check.Check(!PathExists(unsafe_database), "no database is created beside a linked key")
+}
+
+#scope_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 2 {
+        print("usage: check_embedded_host EMBEDDED_HOST_BINARY\n")
+        return 2
+    }
+    binary: Text = ResolvePath(TextFromCString(argv[1]))
+    root: Text = CreateTemporaryDirectory(PathParent(binary), "embedded-check-")
+    if TextView(root).count == 0 {
+        print("cannot create the check directory\n")
+        return 1
+    }
+    CheckProfiles(binary, root)
+    unused RemoveTree(root)
+    return check.ExitStatus("Native embedded host ABI, private profiles, loopback lifecycle and durable identity passed")
+}
