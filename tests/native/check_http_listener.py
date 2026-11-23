@@ -2465,20 +2465,6 @@ def check_feedback_token_settings(binary, directory):
                 response.read()
 
 
-def check_server_http_policy(binary, database):
-    from check_http_policy import ALLOWED, check_preflight, vary_tokens
-
-    with pairing_node(binary, database) as port, closing(HTTPConnection("127.0.0.1", port, timeout=5)) as conn:
-        check_preflight(conn)
-        conn.request("GET", "/metrics", headers={"Origin": ALLOWED[0]})
-        response = conn.getresponse()
-        assert response.status == 401
-        assert response.headers.get_all("Access-Control-Allow-Origin") == [ALLOWED[0]]
-        assert response.headers.get_all("X-Content-Type-Options") == ["nosniff"]
-        assert "origin" in vary_tokens(response.headers)
-        response.read()
-
-
 def check_server_cli(binary, database):
     version = os.environ.get("MESH_TEST_BUILD_VERSION", "dev")
     env = os.environ | {"MESH_DB": str(database), "MESH_TOKEN_SECRET_HEX": "",
@@ -2546,12 +2532,11 @@ def main():
             check_node_status(binary, Path(directory) / "node-status.db")
             check_payment_wiring(binary, Path(directory))
             check_feedback_token_settings(binary, Path(directory))
-            check_server_http_policy(binary, Path(directory) / "http-policy.db")
             check_server_cli(binary, Path(directory) / "cli.db")
     if server_mode:
         fixture_dir = Path(__file__).resolve().parent
         checks = Path(os.environ["MESH_NATIVE_CHECKS_DIR"])
-        for name in ("check_docs_http", "check_legacy_headers"):
+        for name in ("check_docs_http", "check_legacy_headers", "check_server_policy"):
             subprocess.run([checks / name, binary], check=True)
         subprocess.run([sys.executable, "-B", fixture_dir / "check_exchange_rate_http.py", binary], check=True)
         for fixture in ("check_feedback_http.py", "check_publications_http.py", "check_social_http.py",

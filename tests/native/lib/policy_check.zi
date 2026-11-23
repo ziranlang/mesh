@@ -1,0 +1,144 @@
+// Origin policy checks shared by the HTTP policy fixture and the real server.
+#import "std/byte_text_linux"
+check :: #import "native_check";
+sort :: #import "std/sort";
+tools :: #import "std/text_tools";
+using Vectors :: #import "std/vec"
+
+#scope_export
+AllowMethods :: "GET, POST, PUT, PATCH, DELETE, OPTIONS";
+AllowHeaders :: "Authorization, Content-Type, Content-Encoding, X-Mesh-User, X-Mesh-Signature, X-Mesh-Tx, X-Mesh-Delegate, X-Mesh-Client, X-Mesh-Since-Version, X-Mesh-Limit, X-Mesh-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin";
+
+Allowed :: () -> [17]string {
+    return string.[
+        "https://mesh-bew.pages.dev",
+        "https://mesh.ziran-lang.org",
+        "https://inbe.waozi.xyz",
+        "https://innerbreeze.org",
+        "https://uku.waozi.xyz",
+        "https://shovey.waozi.xyz",
+        "https://wurm.waozi.xyz",
+        "https://dew.waozi.xyz",
+        "https://arcade.waozi.xyz",
+        "https://entity.waozi.xyz",
+        "https://waozi.xyz",
+        "http://localhost:8080",
+        "http://127.0.0.1",
+        "http://0.0.0.0:9000",
+        "HTTP://[::1]:8080",
+        "http://localhost?#",
+        "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ]
+}
+
+Rejected :: () -> [22]string {
+    return string.[
+        "null", "*", "https://unknown.example", "https://mesh.ziran-lang.org.evil",
+        "https://mesh.ziran-lang.org:443", "https://mesh.ziran-lang.org/",
+        "https://user@mesh.ziran-lang.org", "https://localhost", "http://LOCALHOST",
+        "http://localhost.evil", "http://localhost:bad", "http://localhost/path",
+        "http://localhost?key=value", "http://localhost#fragment", "http://localhost%00",
+        "http://[::ffff:127.0.0.1]", "http://[::1%25lo]", "http://[::1]:bad",
+        "http://localhost, https://mesh.ziran-lang.org",
+        "chrome-extension://qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq", "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "chrome-extension://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:80"
+    ]
+}
+
+// "http://localhost:" followed by 512 ones, which the policy must refuse.
+LongPort :: () -> Text {
+    out: Vec(u8)
+    BuilderAppend(out, "http://localhost:")
+    for index: 0..512 {
+        BuilderAppend(out, "1")
+    }
+    return BuilderFinish(out)
+}
+
+// The comma-separated Vary tokens of every Vary field, lowercased and sorted,
+// joined with single commas.
+VaryTokens :: (response: *check.Response) -> Text {
+    tokens: Vec(Text)
+    defer VecFree(tokens)
+    index: s64 = 0
+    while true {
+        field, found := check.HeaderValueAt(response.head[:], "Vary", index)
+        if !found {
+            break
+        }
+        parts := tools.TextSplit(field, ",")
+        defer VecFree(parts)
+        for parts {
+            token := tools.TextTrim(it)
+            if token.count != 0 {
+                VecPush(tokens, tools.TextLower(token))
+            }
+        }
+        index += 1
+    }
+    views: Vec(string)
+    defer VecFree(views)
+    for * tokens {
+        VecPush(views, TextView(<<it))
+    }
+    sort.SortText(views[:])
+    out: Vec(u8)
+    for views {
+        if out.count != 0 {
+            BuilderAppend(out, ",")
+        }
+        BuilderAppend(out, it)
+    }
+    return BuilderFinish(out)
+}
+
+Preflight :: (port: u16, origin: string, has_origin: bool, allowed: bool) {
+    fields: [4]check.Header = .[
+        .{name = "Accept-Encoding", value = "identity"},
+        .{name = "Access-Control-Request-Method", value = "POST"},
+        .{name = "Access-Control-Request-Headers", value = "Authorization, X-Mesh-Signature"},
+        .{name = "Origin", value = origin}
+    ]
+    count := ifx has_origin then 4 else 3
+    response := check.Request(port, "OPTIONS", "/protected", fields[:count])
+    defer check.FreeResponse(*response)
+    what := ifx has_origin then origin else "(no origin)"
+    check.Check(response.status == 204 && response.body.count == 0, what)
+    if allowed {
+        check.Check(check.OnlyHeader(*response, "Access-Control-Allow-Origin", origin), what)
+    } else {
+        check.Check(check.HeaderCount(*response, "Access-Control-Allow-Origin") == 0, what)
+    }
+    check.Check(check.HeaderIs(*response, "Access-Control-Allow-Methods", AllowMethods), "preflight methods")
+    check.Check(check.HeaderIs(*response, "Access-Control-Allow-Headers", AllowHeaders), "preflight headers")
+    check.Check(check.OnlyHeader(*response, "Cache-Control", "no-store"), "preflight is not cached")
+    check.Check(check.OnlyHeader(*response, "X-Content-Type-Options", "nosniff"), "preflight is not sniffed")
+    check.Check(!check.HasHeader(*response, "Access-Control-Allow-Credentials"), "preflight allows no credentials")
+    check.Check(!check.HasHeader(*response, "X-Fixture-Downstream"), "preflight stops before the handler")
+    vary: Text = VaryTokens(*response)
+    check.Check(TextView(vary) == (ifx allowed then "origin" else ""), "preflight varies by origin only when allowed")
+}
+
+CheckPreflight :: (port: u16) {
+    allowed := Allowed()
+    rejected := Rejected()
+    for allowed {
+        Preflight(port, it, true, true)
+    }
+    for rejected {
+        Preflight(port, it, true, false)
+    }
+    long: Text = LongPort()
+    Preflight(port, TextView(long), true, false)
+    Preflight(port, "", false, false)
+
+    fields: [3]check.Header = .[
+        .{name = "Accept-Encoding", value = "identity"},
+        .{name = "Origin", value = allowed[0]},
+        .{name = "Origin", value = "https://unknown.example"}
+    ]
+    twice := check.Request(port, "OPTIONS", "/unknown", fields[:])
+    defer check.FreeResponse(*twice)
+    check.Check(twice.status == 204 && twice.body.count == 0, "two origins get an empty preflight")
+    check.Check(!check.HasHeader(*twice, "Access-Control-Allow-Origin"), "two origins are never allowed")
+}

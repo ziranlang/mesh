@@ -127,10 +127,10 @@ test-ziran-native-http: liboqs
 	mkdir -p $(BUILD_DIR)/native-tests/http-policy
 	XDG_CACHE_HOME="$${XDG_CACHE_HOME:-$(abspath $(BUILD_DIR)/package-cache)}" \
 	LDFLAGS="$(LDFLAGS) $(if $(MICROHTTPD_NATIVE_DIR),-L$(MICROHTTPD_NATIVE_DIR))" LDLIBS="$(LDLIBS) -lmicrohttpd" \
-	$(ZIRAN) build $(ZIRAN_PROJECT) --target=c --exe --entry http_policy:Main --root tests/native \
+	$(ZIRAN) build $(ZIRAN_PROJECT) --module-path tests/native/lib --target=c --exe --entry http_policy:Main --root tests/native \
 		-o $(BUILD_DIR)/native-tests/http-policy tests/native/http_policy.zi
 	LD_LIBRARY_PATH="$(MICROHTTPD_NATIVE_DIR)$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}" \
-		python3 -B tests/native/check_http_policy.py $(BUILD_DIR)/native-tests/http-policy/http_policy
+		$(BUILD_DIR)/native-tests/http-policy/http_policy
 
 test-ziran-native-http-coding:
 	mkdir -p $(BUILD_DIR)/native-tests/http-coding
@@ -172,7 +172,7 @@ build-ziran-native-server: liboqs | $(NATIVE_SERVER_BUILD_DIR)
 
 # Native server checks written in Ziran. Each tests/native/NAME.zi builds to
 # $(NATIVE_CHECKS_DIR)/NAME, which check_http_listener.py runs.
-NATIVE_CHECKS := check_docs_http check_legacy_headers
+NATIVE_CHECKS := check_docs_http check_legacy_headers check_server_policy
 NATIVE_CHECKS_DIR := $(abspath $(BUILD_DIR)/native-tests/checks)
 
 build-native-checks: liboqs

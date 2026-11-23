@@ -1,0 +1,53 @@
+// Checks the shared origin policy on the real native server.
+// Usage: check_server_policy SERVER_BINARY
+#import "std/byte_text_linux"
+#import "std/file_tree_linux"
+check :: #import "native_check";
+policy :: #import "policy_check";
+tools :: #import "std/text_tools";
+using Vectors :: #import "std/vec"
+
+#scope_file
+CheckMetricsRefusal :: (port: u16) {
+    allowed := policy.Allowed()
+    fields: [2]check.Header = .[.{name = "Accept-Encoding", value = "identity"}, .{name = "Origin", value = allowed[0]}]
+    response := check.Request(port, "GET", "/metrics", fields[:])
+    defer check.FreeResponse(*response)
+    check.Check(response.status == 401, "metrics need the admin token")
+    check.Check(check.OnlyHeader(*response, "Access-Control-Allow-Origin", allowed[0]), "the refusal names the origin")
+    check.Check(check.OnlyHeader(*response, "X-Content-Type-Options", "nosniff"), "the refusal is not sniffed")
+    vary: Text = policy.VaryTokens(*response)
+    tokens := tools.TextSplit(TextView(vary), ",")
+    defer VecFree(tokens)
+    varies := false
+    for tokens {
+        if it == "origin" {
+            varies = true
+        }
+    }
+    check.Check(varies, "the refusal varies by origin")
+}
+
+#scope_export
+Main :: (argc: s32, argv: **u8) -> s32 {
+    if argc != 2 {
+        print("usage: check_server_policy SERVER_BINARY\n")
+        return 2
+    }
+    settings: [6]string = .[
+        "MESH_ADDR=127.0.0.1:0",
+        "MESH_DB=mesh.db",
+        "MESH_NODE_IDENTITY_KEY_FILE=mesh.node-key",
+        "MESH_TOKEN_SECRET_HEX=0000000000000000000000000000000000000000000000000000000000000000",
+        "MESH_NODE_SYNC_INTERVAL_SECONDS=0",
+        "MESH_ADMIN_TOKEN=pairing-test"
+    ]
+    binary: Text = ResolvePath(TextFromCString(argv[1]))
+    server: check.Server
+    if check.StartServer(*server, binary, settings[:]) {
+        policy.CheckPreflight(server.port)
+        CheckMetricsRefusal(server.port)
+    }
+    check.StopServer(*server)
+    return check.ExitStatus("Native server origin policy passed")
+}

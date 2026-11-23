@@ -195,10 +195,11 @@ Send :: (port: u16, method: string, path: string) -> Response {
     return Request(port, method, path, empty)
 }
 
-// The first value of a header in a response's head, matched without regard
-// to case. Pass `response.head[:]`.
-HeaderValue :: (head_bytes: []u8, name: string) -> (value: string, found: bool) {
+// The value of the `wanted`-th header field with this name (counting from
+// zero), matched without regard to case. Pass `response.head[:]`.
+HeaderValueAt :: (head_bytes: []u8, name: string, wanted: s64) -> (value: string, found: bool) {
     head := TextFromBytes(head_bytes)
+    seen: s64 = 0
     start := TextFind(head, "\r\n")
     while start >= 0 {
         line_start := start + 2
@@ -209,7 +210,10 @@ HeaderValue :: (head_bytes: []u8, name: string) -> (value: string, found: bool) 
         line := head[line_start:line_end]
         colon := TextFind(line, ":")
         if colon > 0 && SameName(line[:colon], name) {
-            return TextTrim(line[colon + 1:]), true
+            if seen == wanted {
+                return TextTrim(line[colon + 1:]), true
+            }
+            seen += 1
         }
         if line_end >= head.count {
             break
@@ -217,6 +221,30 @@ HeaderValue :: (head_bytes: []u8, name: string) -> (value: string, found: bool) 
         start = line_end
     }
     return "", false
+}
+
+// The first value of a header in a response's head, matched without regard
+// to case. Pass `response.head[:]`.
+HeaderValue :: (head_bytes: []u8, name: string) -> (value: string, found: bool) {
+    return HeaderValueAt(head_bytes, name, 0)
+}
+
+// How many header fields carry this name.
+HeaderCount :: (response: *Response, name: string) -> s64 {
+    count: s64 = 0
+    while true {
+        _, found := HeaderValueAt(response.head[:], name, count)
+        if !found {
+            return count
+        }
+        count += 1
+    }
+    return count
+}
+
+// True when exactly one field carries this name, with exactly this value.
+OnlyHeader :: (response: *Response, name: string, value: string) -> bool {
+    return HeaderCount(response, name) == 1 && HeaderIs(response, name, value)
 }
 
 // True when the response carries the header with exactly this value.

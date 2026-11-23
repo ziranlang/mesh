@@ -1,13 +1,15 @@
+// Checks the shared HTTP policy on an in-process native loopback listener.
 policy :: #import "http_policy_native";
 transport :: #import "http_server_native";
 text :: #import "std/byte_text_linux";
 c_string :: #import "std/c_string";
+check :: #import "native_check";
+shared :: #import "policy_check";
+using Vectors :: #import "std/vec"
 
 #scope_file
 c :: #system_library "c";
 mhd :: #system_library "microhttpd";
-Flush :: (stream: *void) -> s32 #foreign c "fflush";
-GetChar :: () -> s32 #foreign c "getchar";
 CreateResponse :: (size: usize, buffer: *u8, mode: s32) -> *void #foreign mhd "MHD_create_response_from_buffer";
 AddHeader :: (response: *void, name: *u8, value: *u8) -> s32 #foreign mhd "MHD_add_response_header";
 Queue :: (connection: *void, status: u32, response: *void) -> s32 #foreign mhd "MHD_queue_response";
@@ -88,17 +90,72 @@ Dispatch :: (context: *void, connection: *void, path: *u8, method: *u8,
     return Reply(connection, 200, body[:], headers[:])
 }
 
+Route :: struct {
+    path: string
+    vary: string
+}
+
+CheckResponses :: (port: u16) {
+    allowed := shared.Allowed()
+    origin := allowed[1]
+    plain: [2]check.Header = .[.{name = "Accept-Encoding", value = "identity"}, .{name = "Origin", value = origin}]
+    refused := check.Request(port, "GET", "/protected", plain[:])
+    defer check.FreeResponse(*refused)
+    check.Check(refused.status == 401 && refused.body.count == 0, "an unauthorized request is refused")
+    check.Check(check.OnlyHeader(*refused, "Access-Control-Allow-Origin", origin), "a refusal still names the origin")
+    check.Check(check.HeaderIs(*refused, "X-Fixture-Downstream", "true"), "the refusal comes from the handler")
+
+    routes: [3]Route = .[
+        .{path = "/protected", vary = "accept-encoding,origin"},
+        .{path = "/varies-by-origin", vary = "accept-encoding,origin"},
+        .{path = "/wildcard", vary = "*"}
+    ]
+    authorized: [3]check.Header = .[
+        .{name = "Accept-Encoding", value = "identity"},
+        .{name = "Origin", value = origin},
+        .{name = "Authorization", value = "Bearer fixture"}
+    ]
+    methods: [2]string = .["GET", "HEAD"]
+    for route: routes {
+        for method: methods {
+            response := check.Request(port, method, route.path, authorized[:])
+            defer check.FreeResponse(*response)
+            expected := ifx method == "GET" then "{}\n" else ""
+            check.Check(response.status == 200 && text.TextFromBytes(response.body[:]) == expected, route.path)
+            check.Check(check.OnlyHeader(*response, "Access-Control-Allow-Origin", origin), "the response names the origin")
+            check.Check(!check.HasHeader(*response, "Access-Control-Allow-Credentials"), "the response allows no credentials")
+            check.Check(check.HeaderIs(*response, "Content-Type", "application/vnd.oai.openapi+json"), "the handler content type")
+            check.Check(check.HeaderIs(*response, "Content-Length", "3"), "the handler length")
+            check.Check(check.OnlyHeader(*response, "Cache-Control", "public, max-age=60"), "the handler cache policy")
+            check.Check(check.HeaderIs(*response, "ETag", "\"fixture\""), "the handler entity tag")
+            vary: Text = shared.VaryTokens(*response)
+            check.Check(TextView(vary) == route.vary, route.path)
+        }
+    }
+
+    rejected := shared.Rejected()
+    stranger: [2]check.Header = .[.{name = "Accept-Encoding", value = "identity"}, .{name = "Origin", value = rejected[2]}]
+    public := check.Request(port, "GET", "/public", stranger[:])
+    defer check.FreeResponse(*public)
+    check.Check(public.status == 200 && text.TextFromBytes(public.body[:]) == "{}\n", "a public route answers any origin")
+    check.Check(!check.HasHeader(*public, "Access-Control-Allow-Origin"), "a public route names no unknown origin")
+    check.Check(!check.HasHeader(*public, "Access-Control-Allow-Credentials"), "a public route allows no credentials")
+    vary: Text = shared.VaryTokens(*public)
+    check.Check(TextView(vary) == "accept-encoding", "a public route varies by encoding only")
+}
+
 #scope_export
 #program_export
 Main :: () -> s32 {
     loopback: [4]u8 = .[127, 0, 0, 1]
     daemon := transport.Start(loopback, 0, 8, null, Dispatch, Completed)
     if daemon == null {
+        print("cannot start the policy fixture\n")
         return 1
     }
     defer transport.Stop(daemon)
-    print("%\n", transport.BoundPort(daemon))
-    unused Flush(null)
-    unused GetChar()
-    return 0
+    port := transport.BoundPort(daemon)
+    shared.CheckPreflight(port)
+    CheckResponses(port)
+    return check.ExitStatus("Native HTTP policy loopback passed")
 }
