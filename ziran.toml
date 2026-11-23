@@ -4,7 +4,7 @@ module_roots = ["src/server", "src/accounts", "src/apps", "src/chat", "src/http"
 
 [toolchain]
 git = "https://git.waozi.xyz/ziranlang/ziran.git"
-ref = "8e8e53bacd207ad8ed9d9a92a96483893e6788d8"
+ref = "c450e3a3f2bd75ef3c9080db71896dfe285f6f98"
 
 [dependencies.shovey]
 git = "https://github.com/waozixyz/shovey.git"
@@ -16,11 +16,11 @@ ref = "cd4a75b3383e49dd5eb10a18b2181fe74b161880"
 
 [dependencies.sqlite]
 git = "https://git.waozi.xyz/ziranlang/sqlite.git"
-ref = "ce8e0ccdf50cf26897cf31d81538654937579f4a"
+ref = "b15b524131484a568734952d5570fab151d0910f"
 
 [dependencies.compression]
 git = "https://git.waozi.xyz/ziranlang/compression.git"
-ref = "4f75a402c58c86648011c30bcb52380993887565"
+ref = "c42011e3af31505b975e0a62eb89988a79c103fc"
 
 [dependencies.oqs]
 git = "https://git.waozi.xyz/ziranlang/oqs.git"

@@ -7,65 +7,25 @@ suite under `tests/_go` is Go.
 
 ## 1. Native server in production
 
-`make test-ziran-native-server` passes locally against the native C build of
-`src/server/server_native.zi`.
+The native server builds from the locked toolchain and packages: Ziran
+`c450e3a3` (rooted child file handles, multi-member gzip), compression
+`c42011e` (zstd streaming encoder) and SQLite `b15b524` (busy and progress
+handlers). CI runs the native server suite and the deploy job ships the
+generated C.
 
-Blocked on unpushed dependencies. The native server added in Mesh `82940cd`
-compiles only with uncommitted work in other checkouts, so it does not build
-from the locked toolchain and packages:
+Remaining: install `libmicrohttpd12t64` on the origin, install the gateway
+from `deploy/gitea-origin.py`, set `deploy/runtime` to `native` and verify the
+live binary.
 
-- ziranlang/ziran `std/file_tree_linux.zi`: `OpenDirectoryHandle`,
-  `OpenChildRegularFile`, `OpenChildDirectory`, `OpenOrCreateChildDirectory`,
-  `OpenNewChildFile`, `RemoveChildFile`, `RenameChild` (edited by an active
-  Ziran lane on 2026-11-22).
-- ziranlang/ziran `std/gzip_linux.zi`: `GzipDecompressMembers` (uncommitted
-  since 2026-11-20).
-- ziranlang/compression `src/zstd_native.zi`: the `ZstdEncoder` pool
-  (uncommitted since 2026-11-20).
-- ziranlang/sqlite `src/SQLite.zi` (uncommitted since 2026-11-20).
+Open gaps between the Go and native servers, each needing its regression test:
 
-When their owners push them, bump the `ziran.toml` pins, run `ziran lock`
-without `ziran.local.toml`, run the Go and native suites, and restore the CI
-steps: the native server suite in `checks` (`make sqlite-native
-microhttpd-native`, then `make test-ziran-native-server` with those
-directories) and `make native-release` plus packaging `build/native-release`
-`*.c`/`*.h` in `deploy`.
+- Referral settlement: the historical Google origin backfill
+  (`BackfillGoogleOrigins`) and the Monero monitor parity noted in
+  `referral_monero.zi:108-110`.
+- `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
 
-1. Close the gaps between the Go and native servers, each with its regression
-   test. Done: `/readyz` direct purchases, chat-usage retention, the Telegram
-   Stars and Google Play suites, the shared capability list, `DAOCHI_*`
-   setting aliases and the four referral routes. Remaining:
-   - Referral settlement. The native worker settles the outbox every 10 s
-     with Go's commissions, holds, capped reversals and debt offsets, and
-     native allocation has Go's referral lots, reversal eligibility and
-     offsets. Remaining: a native test of the debt-offset path, the
-     historical Google origin backfill (`BackfillGoogleOrigins`) and the
-     Monero monitor parity noted in `referral_monero.zi:108-110`.
-   - `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
-2. The generated C in the native build folder includes only libc and compiler
-   headers. `ziran_exe_main.c` is the executable entry. CI already runs the
-   native suite against `make sqlite-native` (SQLite 3.53.4 from the locked
-   source) and `make microhttpd-native` (Debian 1.0.1-4, pinned by sha256).
-   Add `native-release`: copy the generated `*.c`/`*.h` and the SQLite
-   amalgamation into `build/native-release`, which the deploy job adds to the
-   artifact. Add `build-native` for the origin: per-file `cc -O3 -Wno-psabi
-   -pthread` objects plus static SQLite and liboqs, linked with
-   `-l:libmicrohttpd.so.12 -l:libcrypto.so.3 -l:libcurl.so.4 -l:libzstd.so.1
-   -l:libz.so.1 -l:libpcre2-8.so.0`. The Ziran toolchain stays off the origin.
-3. The origin (Debian 13) needs the `libmicrohttpd12t64` 1.0.1-4 runtime
-   package installed. That is the only new host package.
-4. `install.sh` keeps the Go binary at `/opt/mesh/mesh` (its `dew-ratio` and
-   `rescale-dew` commands and `apply-dew-ratio.sh` use it) and installs
-   `/opt/mesh/mesh-native` with its manifest. The drop-in
-   `mesh.service.d/30-runtime.conf` (`ExecStart=` then
-   `ExecStart=/opt/mesh/mesh-native`) selects native. `rollback.sh` restores
-   the previous drop-in state. Manual rollback to Go: remove that drop-in,
-   `systemctl daemon-reload`, `systemctl restart mesh.service`. The origin
-   gateway (`deploy/gitea-origin.py`, installed at
-   `/usr/local/libexec/mesh-gitea-deploy`) also runs `make build-native` and
-   verifies its manifest.
-5. Verify the public `build_version`, `/readyz` and authenticated account and
-   sync routes on the native binary.
+Rollback to Go: remove `/etc/systemd/system/mesh.service.d/30-runtime.conf`,
+run `systemctl daemon-reload` and `systemctl restart mesh.service`.
 
 ## 2. Tooling in Ziran
 
@@ -85,7 +45,8 @@ production without problems.
 
 ## Operations finding
 
-`mesh.service` drop-ins set node sync tokens with `Environment=`. systemd shows
-those values to unprivileged local users through `systemctl show`. Move them
-into the existing `0600` `/etc/mesh/mesh.env`, with the owner's approval for
-the host change.
+The `20-daochi-mesh.conf` and `20-mesh-mesh.conf` drop-ins set an older node
+sync token with `Environment=`, which `systemctl show` reveals to local users.
+`/etc/mesh/mesh.env` overrides it with the token the server uses, so the
+drop-ins have no effect. Back them up and remove them in the native deploy
+window.
