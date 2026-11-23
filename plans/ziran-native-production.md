@@ -39,12 +39,6 @@ Native goes live through `deploy/runtime=native`. A watchdog compares live
 statuses with the three hours of Go traffic before the switch and rolls back
 to Go when a route Go served answers an error status Go never gave it.
 
-Open gaps between the Go and native servers, each needing its regression test:
-
-- Referral settlement: the historical Google origin backfill
-  (`BackfillGoogleOrigins`) and the Monero monitor parity noted in
-  `referral_monero.zi:108-110`.
-- `rescale-dew` and `dew-ratio` stay on the Go binary until ported.
 
 Rollback to Go: remove `/etc/systemd/system/mesh.service.d/30-runtime.conf`,
 run `systemctl daemon-reload` and `systemctl restart mesh.service`.
@@ -65,8 +59,10 @@ native suites already cover.
 
 ## 4. Remove the Go host
 
-Remove `embedded_host.go`, `native/*.go` and the Go-only oracles once nothing
-uses them. Remove the Go build path after the native server has run in
+Port `rescale-dew` and `dew-ratio` to the native binary first: they run only
+on the Go binary, which the deploy keeps installed for them
+(`deploy/apply-dew-ratio.sh`). Remove `embedded_host.go`, `native/*.go` and
+the Go-only oracles once nothing uses them. Remove the Go build path after the native server has run in
 production without problems.
 
 ## Service hardening
