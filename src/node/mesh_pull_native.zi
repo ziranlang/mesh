@@ -167,10 +167,17 @@
             !keys.Sign(configuration.local.seed[:], VecSlice(message, 0, message.count), signature[:]) { return false }
         encoded := binary.EncodeBase64(TextView(signature[:]), true, false)
         if encoded.error != "" { return false }
-        headers: [4]transport.HeaderValue = .[.{name = "X-Mesh-Node-ID", value = identity},
+        signed := TextView(VecSlice(encoded.value, 0, encoded.value.count))
+        // Peers from before the Mesh rename read only the X-Daochi- names, as
+        // with the Go client.
+        headers: [8]transport.HeaderValue = .[.{name = "X-Mesh-Node-ID", value = identity},
+            .{name = "X-Daochi-Node-ID", value = identity},
             .{name = "X-Mesh-Node-Nonce", value = TextView(nonce[:32])},
+            .{name = "X-Daochi-Node-Nonce", value = TextView(nonce[:32])},
             .{name = "X-Mesh-Node-Time", value = timestamp},
-            .{name = "X-Mesh-Node-Signature", value = TextView(VecSlice(encoded.value, 0, encoded.value.count))}]
+            .{name = "X-Daochi-Node-Time", value = timestamp},
+            .{name = "X-Mesh-Node-Signature", value = signed},
+            .{name = "X-Daochi-Node-Signature", value = signed}]
         options: http.Options = .{timeout = 20, maximum = ResponseLimit, stopping = Stopping,
             context = cast(*void)worker, headers = headers[:]}
         return http.Request(configuration.scope, address, ExportPath, body, options, received)
