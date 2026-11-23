@@ -21,13 +21,12 @@ rolled back to Go: installed apps send `X-Daochi-User`, which Go accepts for
 `X-Mesh-User` and native did not. `transport.Header` now accepts the
 `X-Daochi-` alias for every `X-Mesh-` header, with a native check.
 
-Before setting `deploy/runtime` back to `native`:
-
-- Audit every other legacy name Go accepts (Ksync, Inbe and Daochi headers,
-  signature contexts, fields, routes) against native, and add a native check
-  for each gap.
-- Get evidence from real traffic first, for example by mirroring live
-  requests to a native instance on a database copy and comparing statuses.
+Every legacy header and signature context the Go sources name is also named
+in native code, and the native checks send Daochi, Ksync and Inbe user
+headers. Names alone do not prove each route behaves the same, so before
+setting `deploy/runtime` back to `native`, get evidence from real traffic,
+for example by mirroring live requests to a native instance on a database
+copy and comparing statuses.
 
 Smaller differences seen live: unauthenticated `GET /api/v1/account` is 405 on
 native and 404 on Go, and native `/metrics` has 22 metric names where Go has 41.
