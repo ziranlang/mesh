@@ -17,11 +17,13 @@ if [ -f "/var/lib/mesh/backups/mesh.manifest.$STAMP" ]; then
 else
   rm -f /opt/mesh/mesh.manifest.json
 fi
-if [ -f "/var/lib/mesh/backups/mesh.mesh.$STAMP" ]; then
-  install -m 600 "/var/lib/mesh/backups/mesh.mesh.$STAMP" /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf
-elif [ -f "/var/lib/mesh/backups/mesh.mesh-absent.$STAMP" ]; then
-  rm -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf
-fi
+for name in mesh daochi; do
+  if [ -f "/var/lib/mesh/backups/mesh.$name.$STAMP" ]; then
+    install -m 600 "/var/lib/mesh/backups/mesh.$name.$STAMP" "/etc/systemd/system/mesh.service.d/20-$name-mesh.conf"
+  elif [ -f "/var/lib/mesh/backups/mesh.$name-absent.$STAMP" ]; then
+    rm -f "/etc/systemd/system/mesh.service.d/20-$name-mesh.conf"
+  fi
+done
 if [ -f "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP" ]; then
   cp "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP" /opt/mesh/mesh-native
 elif [ -f "/var/lib/mesh/backups/mesh-native-absent.$STAMP" ]; then

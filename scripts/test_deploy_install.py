@@ -36,6 +36,7 @@ class InstallTests(unittest.TestCase):
             "opt/mesh-src/mesh": "new binary", "opt/mesh-src/build/mesh.manifest.json": "new manifest",
             "var/lib/mesh/mesh.db": "paid data", "etc/mesh/mesh.env": "old environment",
             "etc/systemd/system/mesh.service.d/20-mesh-mesh.conf": "old mesh setting",
+            "etc/systemd/system/mesh.service.d/20-daochi-mesh.conf": "old daochi setting",
         }.items():
             (self.root / name).write_text(value)
         self.executable("opt/mesh-src/deploy/migrate-install.py", "")
@@ -71,7 +72,7 @@ pathlib.Path(sys.argv[1]).write_text("new environment")
         path.write_text("#!" + sys.executable + "\n" + body)
         path.chmod(0o755)
 
-    def run_install(self, token="node:secret"):
+    def run_install(self, token=""):
         return subprocess.run(
             ["sh", str(self.root / "opt/mesh-src/deploy/install.sh"), STAMP, "a" * 40, "b" * 40],
             input=token.encode(), env=self.environment, capture_output=True, timeout=10,
@@ -82,18 +83,26 @@ pathlib.Path(sys.argv[1]).write_text("new environment")
         self.assertEqual((self.root / "var/lib/mesh/mesh.db").read_text(), "paid data")
         self.assertEqual((self.root / "etc/mesh/mesh.env").read_text(), "old environment")
 
-    def test_success_backs_up_data_and_treats_secret_as_data(self):
-        token = 'node:quote\"$()\\percent%'
-        result = self.run_install(token)
+    def test_success_backs_up_data_and_removes_token_drop_ins(self):
+        result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual((self.root / "opt/mesh/mesh").read_text(), "new binary")
         self.assertEqual((self.root / "opt/mesh/mesh").stat().st_mode & 0o777, 0o755)
         self.assertEqual((self.root / f"var/lib/mesh/backups/mesh.db.{STAMP}").read_text(), "paid data")
-        setting = self.root / "etc/systemd/system/mesh.service.d/20-mesh-mesh.conf"
-        self.assertIn('$()', setting.read_text())
-        self.assertIn('percent%%', setting.read_text())
-        self.assertEqual(setting.stat().st_mode & 0o777, 0o600)
+        # systemd shows Environment= values to local users; mesh.env keeps the token.
+        for name, value in (("mesh", "old mesh setting"), ("daochi", "old daochi setting")):
+            self.assertFalse((self.root / f"etc/systemd/system/mesh.service.d/20-{name}-mesh.conf").exists())
+            self.assertEqual((self.root / f"var/lib/mesh/backups/mesh.{name}.{STAMP}").read_text(), value)
+
+    def test_deploy_token_is_refused_before_any_change(self):
+        token = 'node:quote\"$()\\percent%'
+        result = self.run_install(token)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"/etc/mesh/mesh.env", result.stderr)
         self.assertNotIn(token.encode(), result.stdout + result.stderr)
+        self.assert_old_install()
+        self.assertEqual((self.root / "etc/systemd/system/mesh.service.d/20-mesh-mesh.conf").read_text(), "old mesh setting")
+        self.assertFalse((self.root / "services.log").exists())
 
     def test_failed_migration_restores_binary_database_environment_and_mesh(self):
         self.environment["FAIL_MIGRATION"] = "1"
@@ -102,6 +111,7 @@ pathlib.Path(sys.argv[1]).write_text("new environment")
         self.assert_old_install()
         self.assertEqual((self.root / "opt/mesh/mesh.manifest.json").read_text(), "old manifest")
         self.assertEqual((self.root / "etc/systemd/system/mesh.service.d/20-mesh-mesh.conf").read_text(), "old mesh setting")
+        self.assertEqual((self.root / "etc/systemd/system/mesh.service.d/20-daochi-mesh.conf").read_text(), "old daochi setting")
         services = (self.root / "services.log").read_text()
         self.assertIn("disable --now mesh-backup-prune.timer", services)
         self.assertIn("enable daochi-backup-prune.timer", services)

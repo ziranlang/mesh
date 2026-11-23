@@ -12,6 +12,12 @@ for revision in "$source_commit" "$expected_commit"; do
   [ "${#revision}" -eq 40 ]
 done
 mesh_token=$(cat)
+# systemd shows Environment= values to local users, so the node sync token
+# lives only in the 0600 /etc/mesh/mesh.env.
+if [ -n "$mesh_token" ]; then
+  echo "Set MESH_NODE_SYNC_TOKEN in /etc/mesh/mesh.env instead of passing it to the deploy" >&2
+  exit 1
+fi
 rollback_ready=0
 service_stopped=0
 finish() {
@@ -62,11 +68,14 @@ service_stopped=1
 sqlite3 "$database" ".backup '/var/lib/mesh/backups/mesh.db.$STAMP'"
 test -s "/var/lib/mesh/backups/mesh.db.$STAMP"
 install -m 600 /etc/mesh/mesh.env "/var/lib/mesh/backups/mesh.env.$STAMP"
-if [ -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf ]; then
-  cp /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf "/var/lib/mesh/backups/mesh.mesh.$STAMP"
-else
-  touch "/var/lib/mesh/backups/mesh.mesh-absent.$STAMP"
-fi
+# Earlier deploys set the node sync token in these drop-ins.
+for name in mesh daochi; do
+  if [ -f "/etc/systemd/system/mesh.service.d/20-$name-mesh.conf" ]; then
+    cp "/etc/systemd/system/mesh.service.d/20-$name-mesh.conf" "/var/lib/mesh/backups/mesh.$name.$STAMP"
+  else
+    touch "/var/lib/mesh/backups/mesh.$name-absent.$STAMP"
+  fi
+done
 if [ -f /opt/mesh/mesh-native ]; then
   cp /opt/mesh/mesh-native "/var/lib/mesh/backups/mesh-native.pre-upgrade.$STAMP"
 else
@@ -113,24 +122,8 @@ if [ "$runtime" = native ]; then
 else
   rm -f /etc/systemd/system/mesh.service.d/30-runtime.conf
 fi
+rm -f /etc/systemd/system/mesh.service.d/20-mesh-mesh.conf /etc/systemd/system/mesh.service.d/20-daochi-mesh.conf
 systemctl daemon-reload
-if [ -n "$mesh_token" ]; then
-  install -d -m 755 /etc/systemd/system/mesh.service.d
-  printf '%s' "$mesh_token" | python3 -c '
-import os, pathlib, sys
-value = sys.stdin.read().strip()
-if any(c in value for c in "\r\n\0"):
-    sys.exit("invalid mesh credential line")
-value = value.replace("\\", "\\\\").replace(chr(34), "\\" + chr(34)).replace("%", "%%")
-path = pathlib.Path("/etc/systemd/system/mesh.service.d/20-mesh-mesh.conf")
-temporary = path.with_suffix(".new")
-fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-with os.fdopen(fd, "w") as output:
-    output.write("[Service]\nEnvironment=" + chr(34) + "MESH_NODE_SYNC_TOKEN=" + value + chr(34) + "\n")
-os.replace(temporary, path)
-'
-  systemctl daemon-reload
-fi
 python3 /opt/mesh-src/scripts/migrate-legacy-env.py /etc/mesh/mesh.env --apply --canonical-only
 sh /opt/mesh-src/deploy/set-environment.sh /opt/mesh-src/deploy/node.env /etc/mesh/mesh.env
 if [ -s /etc/mesh/google-play-service-account.json ]; then

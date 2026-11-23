@@ -144,13 +144,12 @@ jobs:
       - name: Swap binary and restart
         id: swap
         env:
-          MESH_NODE_SYNC_TOKEN: ${{ secrets.MESH_NODE_SYNC_TOKEN || secrets.DAOCHI_NODE_SYNC_TOKEN }}
           EXPECTED_NATIVE_COMMIT: ${{ steps.liboqs.outputs.liboqs_commit }}
         run: |
           DEPLOY_STAMP=$(date -u +%Y%m%dT%H%M%SZ)
           export DEPLOY_STAMP
           echo "stamp=$DEPLOY_STAMP" >> "$GITHUB_OUTPUT"
-          python3 -c 'import json,os,sys; json.dump({"stamp":os.environ["DEPLOY_STAMP"],"source_commit":os.environ["GITHUB_SHA"],"native_commit":os.environ["EXPECTED_NATIVE_COMMIT"],"mesh_token":os.environ["MESH_NODE_SYNC_TOKEN"]},sys.stdout)' |
+          python3 -c 'import json,os,sys; json.dump({"stamp":os.environ["DEPLOY_STAMP"],"source_commit":os.environ["GITHUB_SHA"],"native_commit":os.environ["EXPECTED_NATIVE_COMMIT"],"mesh_token":""},sys.stdout)' |
             ssh mesh-origin python3 /opt/mesh-src/deploy/install.py
 
       - name: Health check (rollback on failure)
