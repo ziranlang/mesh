@@ -198,6 +198,9 @@ test-ziran-native-server: test-ziran-native-http
 		$(BUILD_DIR)/native-tests/http-listener/signing_oracle
 	$(MAKE) -f Makefile test-ziran-native-google-play
 	$(MAKE) -f Makefile test-ziran-native-ledger
+	# CI runs only this target, so it also runs the smaller native programs.
+	$(MAKE) -f Makefile test-ziran-native test-ziran-native-sqlite test-ziran-native-ml-dsa44 \
+		test-ziran-native-account-auth test-ziran-native-http-coding test-ziran-native-embedded
 
 # Signed ledger allocation and referral settlement against in-memory SQLite.
 NATIVE_LEDGER_TESTS := token_payment_ledger referral_settlement
