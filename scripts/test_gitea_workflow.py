@@ -160,6 +160,8 @@ class GiteaWorkflowTest(unittest.TestCase):
         for organization in ("ziranlang", "kryonlabs"):
             self.assertEqual(rewrites[f"https://github.com/{organization}/"],
                              f"url.https://git.waozi.xyz/{organization}/.insteadOf")
+        self.assertEqual(rewrites["https://github.com/open-quantum-safe/liboqs.git"],
+                         "url.https://git.waozi.xyz/vendor/open-quantum-safe-liboqs.git.insteadOf")
 
     def test_pinned_actions_and_job_shell_syntax(self):
         step_groups = [job["steps"] for job in self.jobs.values()]

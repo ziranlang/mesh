@@ -15,9 +15,11 @@ runs:
       shell: bash
       env:
         ZIRAN: ${{ steps.ziran.outputs.ziran }}
-        GIT_CONFIG_COUNT: '2'
+        GIT_CONFIG_COUNT: '3'
         GIT_CONFIG_KEY_0: url.https://git.waozi.xyz/ziranlang/.insteadOf
         GIT_CONFIG_VALUE_0: https://github.com/ziranlang/
         GIT_CONFIG_KEY_1: url.https://git.waozi.xyz/kryonlabs/.insteadOf
         GIT_CONFIG_VALUE_1: https://github.com/kryonlabs/
+        GIT_CONFIG_KEY_2: url.https://git.waozi.xyz/vendor/open-quantum-safe-liboqs.git.insteadOf
+        GIT_CONFIG_VALUE_2: https://github.com/open-quantum-safe/liboqs.git
       run: make generate ZIRAN="$ZIRAN"
