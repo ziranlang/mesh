@@ -314,111 +314,14 @@ jobs:
           touch "$MARKER"
           find "$(dirname "$MARKER")" -type f -mtime +30 -delete
 
-  # Nothing deploys the container image, so it is built and scanned weekly.
-  container:
-    if: github.event_name == 'schedule'
-    runs-on: ${{ vars.MESH_CONTAINER_RUNNER || 'build-mesh' }}
-    steps:
-      - uses: https://github.com/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-          submodules: recursive
-
-      - uses: https://github.com/actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-
-      - name: Generate the Go from the Zi sources
-        uses: ./.gitea/actions/generate
-
-      # A cancelled run skips its image cleanup. The runner refuses jobs below
-      # 2 GiB free in its slot, so earlier job images go before each build.
-      - name: Remove images of earlier runs
-        run: |
-          docker image ls --filter 'reference=mesh:ci-*' --quiet | sort -u | xargs -r docker image rm --force
-          docker image prune --force
-
-      - name: Build container image
-        run: docker build --pull --build-arg VERSION="ci-$GITHUB_SHA" -t "mesh:ci-$GITHUB_RUN_ID" .
-
-      # The CI slice denies private ranges, including Docker's bridge, so a
-      # published port cannot reach the container. A probe in the container's
-      # own network namespace reads it over loopback instead.
-      - name: Verify container starts as a non-root user
-        env:
-          EXPECTED_VERSION: ci-${{ github.sha }}
-          PROBE_IMAGE: busybox:1.37.0@sha256:a7dbc319b1438115a207e11930dc4bb3e643dcb3ec0bdd694bb36cd8fad289ec
-        run: |
-          MESH_TOKEN_SECRET_HEX=$(python3 -c 'import secrets; print(secrets.token_hex(32))')
-          export MESH_TOKEN_SECRET_HEX
-          container=$(docker run -d --read-only --tmpfs /data:uid=65532,gid=65532,mode=0700 -e MESH_TOKEN_SECRET_HEX -e MESH_DB=/data/test.db -e MESH_ADDR=:8080 "mesh:ci-$GITHUB_RUN_ID")
-          trap 'docker logs "$container"; docker rm -f "$container"' EXIT
-          test "$(docker inspect --format '{{.Config.User}}' "$container")" = '65532:65532'
-          probe() {
-            docker run --rm --network "container:$container" "$PROBE_IMAGE" wget -q -O - -T 2 "http://127.0.0.1:8080$1"
-          }
-          docker pull --quiet "$PROBE_IMAGE"
-          ready=false
-          for attempt in $(seq 60); do
-            if probe /readyz > /dev/null; then
-              ready=true
-              break
-            fi
-            sleep 1
-          done
-          if [ "$ready" != true ]; then
-            echo 'container did not become ready'
-            exit 1
-          fi
-          probe /api/v1/node | python3 -c 'import json, os, sys; node = json.load(sys.stdin); assert node["build_version"] == os.environ["EXPECTED_VERSION"], node'
-          docker image rm "$PROBE_IMAGE"
-
-      # The action's own setup checks Trivy out from GitHub with the job token,
-      # which GitHub refuses for a Gitea run, so the pinned release is installed here.
-      - name: Install the pinned image scanner
-        env:
-          TRIVY_VERSION: "0.70.0"
-          TRIVY_SHA256: "8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
-        run: |
-          curl --fail --location --silent --show-error \
-            --output "$RUNNER_TEMP/trivy.tar.gz" \
-            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
-          printf '%s  %s\n' "$TRIVY_SHA256" "$RUNNER_TEMP/trivy.tar.gz" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/trivy-bin"
-          tar --extract --gzip --file "$RUNNER_TEMP/trivy.tar.gz" --directory "$RUNNER_TEMP/trivy-bin" trivy
-          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
-
-      - name: Scan image
-        uses: https://github.com/aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          skip-setup-trivy: 'true'
-          version: v0.70.0
-          image-ref: mesh:ci-${{ github.run_id }}
-          format: sarif
-          output: trivy-results.sarif
-          severity: CRITICAL,HIGH
-          exit-code: '1'
-          ignore-unfixed: false
-          limit-severities-for-sarif: true
-      - name: Preserve the scan report
-        if: always()
-        uses: https://github.com/actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: trivy-sarif
-          path: trivy-results.sarif
-          if-no-files-found: error
-      - name: Remove the job image
-        if: always()
-        run: docker image rm "mesh:ci-$GITHUB_RUN_ID"
-
   deploy:
     needs: [checks, native, scans]
     if: >-
       (github.server_url == 'https://git.waozi.xyz' || github.server_url == 'https://git.waozi.xyz/') &&
       github.repository == 'ziranlang/mesh' && github.ref == 'refs/heads/master' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      vars.MESH_DEPLOY_READY == 'true' && vars.MESH_DEPLOY_RUNNER != ''
-    runs-on: ${{ vars.MESH_DEPLOY_RUNNER || 'build-mesh' }}
+      vars.MESH_DEPLOY_READY == 'true'
+    runs-on: build-native
     permissions:
       contents: read
       actions: read

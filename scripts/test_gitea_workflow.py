@@ -36,9 +36,7 @@ class GiteaWorkflowTest(unittest.TestCase):
         self.assertEqual(self.workflow["permissions"], {"contents": "read"})
         deploy = self.jobs["deploy"]
         self.assertEqual(set(deploy["needs"]), REQUIRED_JOBS)
-        self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy", "container"})
-        # Nothing deploys the container image, so only the weekly run builds it.
-        self.assertEqual(self.jobs["container"]["if"], WEEKLY)
+        self.assertEqual(set(self.jobs), REQUIRED_JOBS | {"deploy"})
         for guard in (
             # Gitea evaluates job conditions with its ROOT_URL, which ends in a slash.
             "(github.server_url == 'https://git.waozi.xyz' || github.server_url == 'https://git.waozi.xyz/')",
@@ -46,7 +44,6 @@ class GiteaWorkflowTest(unittest.TestCase):
             "github.ref == 'refs/heads/master'",
             "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')",
             "vars.MESH_DEPLOY_READY == 'true'",
-            "vars.MESH_DEPLOY_RUNNER != ''",
         ):
             self.assertIn(guard, deploy["if"])
         self.assertNotIn("environment", deploy)
@@ -152,13 +149,6 @@ class GiteaWorkflowTest(unittest.TestCase):
         for path in (path for paths in uploads.values() for path in paths):
             self.assertIn(path, package["run"])
 
-    def test_container_probe_stays_inside_its_network_namespace(self):
-        steps = self.jobs["container"]["steps"]
-        verify = next(step for step in steps if step.get("name") == "Verify container starts as a non-root user")
-        self.assertNotIn(" -p ", verify["run"])
-        self.assertIn('--network "container:$container"', verify["run"])
-        self.assertRegex(verify["env"]["PROBE_IMAGE"], r"^[\w./-]+:[\w.-]+@sha256:[0-9a-f]{64}$")
-
     def test_generated_go_reuses_the_runner_package_cache(self):
         steps = read_yaml(ROOT / ".gitea/actions/generate/action.yml")["runs"]["steps"]
         generate = next(step for step in steps if step.get("name") == "Generate the Go")
@@ -187,18 +177,6 @@ class GiteaWorkflowTest(unittest.TestCase):
                     with self.subTest(step=step.get("name")):
                         bash = re.sub(r"\$\{\{.*?\}\}", "0" * 40, step["run"])
                         subprocess.run(["bash", "-n"], text=True, input=bash, check=True)
-        container = self.jobs["container"]["steps"]
-        build = next(step for step in container if step.get("name") == "Build container image")
-        scan = next(step for step in container if step.get("name") == "Scan image")
-        self.assertIn('mesh:ci-$GITHUB_RUN_ID', build["run"])
-        self.assertEqual(scan["with"]["image-ref"], "mesh:ci-${{ github.run_id }}")
-        self.assertEqual(scan["with"]["exit-code"], "1")
-        self.assertEqual(scan["with"]["severity"], "CRITICAL,HIGH")
-        self.assertEqual(scan["with"]["skip-setup-trivy"], "true")
-        install = next(step for step in container if step.get("name") == "Install the pinned image scanner")
-        self.assertLess(container.index(install), container.index(scan))
-        self.assertRegex(install["env"]["TRIVY_SHA256"], r"^[0-9a-f]{64}$")
-        self.assertLess(install["run"].index("sha256sum --check --strict"), install["run"].index("tar --extract"))
         source = WORKFLOW.read_text()
         for job_id in REQUIRED_JOBS:
             self.assertNotRegex(str(self.jobs[job_id]), r"\$\{\{\s*secrets\.")

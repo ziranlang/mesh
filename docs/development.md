@@ -216,15 +216,15 @@ record envelopes and compression before encryption.
 
 The [canonical Mesh repository](https://git.waozi.xyz/ziranlang/mesh) contains
 `.gitea/workflows/ci.yml` for master pushes, weekly security checks and manual
-runs on Build. Three jobs run side by side on Build's slots. `checks` runs
+runs on Build's native `build-native` host runner; every job runs natively and
+there is no Docker image job. Three jobs run side by side: `checks` runs
 build policy, lint and one Go test run, then builds the Go release; the weekly
 run adds coverage and the race detector. `native` runs the native server
 suite and builds the native release. `scans` runs both vulnerability scans,
 static analysis and dependency licenses, and skips them on a push whose
-scanned inputs already passed on that runner. Each runner keeps its Ziran
+scanned inputs already passed on that runner. The runner keeps its Ziran
 build and the SQLite and libmicrohttpd builds, keyed by their pins, because
-its job cache server is unreachable. The `container` job builds and scans the
-image weekly; nothing deploys it. Production deployment requires `checks`,
+its job cache server is unreachable. Production deployment requires `checks`,
 `native` and `scans`, and `deploy/gitea-origin.py` requires the same job
 names. The deploy job accepts only the canonical repository's `master` and
 checks the current remote revision before transferring source to the origin.
@@ -250,9 +250,9 @@ install the package before changing `deploy/runtime`. The deploy checks
 binaries, not host packages, and must stay free of package installation: its
 tests run the installer on a rootless runner.
 
-The Gitea repository needs an isolated `MESH_CONTAINER_RUNNER` with Docker for
-the weekly image check and an isolated `MESH_DEPLOY_RUNNER` with access to the
-production origin. Set the
+Every workflow job runs natively on Build's `build-native` host runner; there
+is no Docker image job and no `MESH_CONTAINER_RUNNER` or `MESH_DEPLOY_RUNNER`
+variable. Set the
 repository variable `MESH_DEPLOY_READY` to `true` after verifying the runner and
 provisioning the scoped `MESH_SSH_KEY`, `MESH_SSH_HOST`, `MESH_SSH_HOST_KEY` and
 `MESH_SSH_USER` secrets. The workflow uses strict host-key verification and a

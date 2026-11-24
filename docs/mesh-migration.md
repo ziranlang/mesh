@@ -70,9 +70,8 @@ on one volume. For a genuinely fresh installation, explicitly create a volume
 with `docker volume create mesh-data` and set `MESH_DATA_VOLUME=mesh-data`.
 
 Gitea Actions builds and verifies production deployments from `ziranlang/mesh`
-`master`. The `build-mesh` runner uses a repository-scoped Build slot and a
-rootless container engine. Set `MESH_CONTAINER_RUNNER` and `MESH_DEPLOY_RUNNER`
-to that label. Enable `MESH_DEPLOY_READY` after the origin's root-owned
+`master` on Build's native `build-native` host runner; there is no Docker image
+job. Enable `MESH_DEPLOY_READY` after the origin's root-owned
 `deploy/gitea-origin.py` is installed as the new SSH key's forced command.
 The key may request deployment of an artifact from the active canonical Gitea
 run. The origin checks required job conclusions and the revision independently,
