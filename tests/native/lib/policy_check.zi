@@ -9,7 +9,7 @@ using Vectors :: #import "std/vec"
 AllowMethods :: "GET, POST, PUT, PATCH, DELETE, OPTIONS";
 AllowHeaders :: "Authorization, Content-Type, Content-Encoding, X-Mesh-User, X-Mesh-Signature, X-Mesh-Tx, X-Mesh-Delegate, X-Mesh-Client, X-Mesh-Since-Version, X-Mesh-Limit, X-Mesh-Admin, X-Ksync-User, X-Ksync-Signature, X-Ksync-Client, X-Ksync-Since-Version, X-Ksync-Limit, X-Ksync-Admin, X-Inbe-User, X-Inbe-Signature, X-Daochi-User, X-Daochi-Signature, X-Daochi-Tx, X-Daochi-Delegate, X-Daochi-Client, X-Daochi-Since-Version, X-Daochi-Limit, X-Daochi-Admin";
 
-Allowed :: () -> [17]string {
+Allowed :: () -> [19]string {
     return string.[
         "https://mesh-bew.pages.dev",
         "https://mesh.ziran-lang.org",
@@ -21,6 +21,8 @@ Allowed :: () -> [17]string {
         "https://dew.waozi.xyz",
         "https://arcade.waozi.xyz",
         "https://entity.waozi.xyz",
+        "https://jungle.waozi.xyz",
+        "https://dejungle.si",
         "https://waozi.xyz",
         "http://localhost:8080",
         "http://127.0.0.1",
@@ -31,8 +33,9 @@ Allowed :: () -> [17]string {
     ]
 }
 
-Rejected :: () -> [22]string {
+Rejected :: () -> [24]string {
     return string.[
+        "https://dejungle.si.evil", "https://jungle.waozi.xyz.evil",
         "null", "*", "https://unknown.example", "https://mesh.ziran-lang.org.evil",
         "https://mesh.ziran-lang.org:443", "https://mesh.ziran-lang.org/",
         "https://user@mesh.ziran-lang.org", "https://localhost", "http://LOCALHOST",

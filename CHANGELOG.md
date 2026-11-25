@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Allow signed sync requests from Jungle at dejungle.si and jungle.waozi.xyz.
+
 - Prove the native pull client's legacy peer headers with a fixture that accepts only `X-Daochi-Node-*` and verifies the request signature.
 
 - Keep the native `/metrics` families and route labels equal to the Go server, with a parity test that fails on any name, type or label mismatch.

@@ -99,6 +99,8 @@
             origin == "https://uku.waozi.xyz" || origin == "https://shovey.waozi.xyz" ||
             origin == "https://wurm.waozi.xyz" || origin == "https://dew.waozi.xyz" ||
             origin == "https://arcade.waozi.xyz" || origin == "https://entity.waozi.xyz" ||
+            origin == "https://jungle.waozi.xyz" ||
+            origin == "https://dejungle.si" ||
             origin == "https://waozi.xyz" {
             return origin
         }
