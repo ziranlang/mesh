@@ -19,6 +19,8 @@ CheckpointResult :: struct {
     error: Error
 }
 
+ErrCheckpointConflict: Error = errors.New("token checkpoint conflict");
+
 #scope_file
 Buffer :: #type #foreign go_bytes "Buffer";
 RowsResult :: struct {
@@ -98,14 +100,43 @@ Create :: (database: *sql.Database, context: ctx.Context, signer: ed.PrivateKey,
         return result
     }
     root := signing.SHA256Hex(Bytes(buffer))
+    existing := Latest(database, context)
+    if existing.error != null {
+        result.error = existing.error
+        return result
+    }
+    if existing.found {
+        if existing.value.LedgerSeq > sequence {
+            result.error = ErrCheckpointConflict
+            return result
+        }
+        if existing.value.LedgerSeq == sequence {
+            if existing.value.IssuerID == receipts.IssuerID &&
+                existing.value.AssetID == receipts.AssetID &&
+                existing.value.LedgerRoot == root {
+                return existing
+            }
+            result.error = ErrCheckpointConflict
+            return result
+        }
+    }
     message := text.ToBytes(FormatMessage("ksync-token-checkpoint-v1\n%s\n%s\n%d\n%s\n",
         receipts.IssuerID, receipts.AssetID, sequence, root))
     signature := EncodeHex(ed.Sign(signer, message))
     written := Insert(database, context,
-        "INSERT INTO token_checkpoints(ledger_seq,issuer_id,asset_id,ledger_root,signature)\nVALUES(?1,?2,?3,?4,?5)\nON CONFLICT(ledger_seq) DO UPDATE SET\nledger_root=excluded.ledger_root,\nsignature=excluded.signature,\ncreated_at=CURRENT_TIMESTAMP",
+        "INSERT INTO token_checkpoints(ledger_seq,issuer_id,asset_id,ledger_root,signature)\nVALUES(?1,?2,?3,?4,?5)",
         sequence, receipts.IssuerID, receipts.AssetID, root, signature)
     result.error = written.error
     if result.error != null {
+        after := Latest(database, context)
+        if after.error == null &&
+            after.found &&
+            after.value.LedgerSeq == sequence &&
+            after.value.IssuerID == receipts.IssuerID &&
+            after.value.AssetID == receipts.AssetID &&
+            after.value.LedgerRoot == root {
+            return after
+        }
         return result
     }
     return Latest(database, context)

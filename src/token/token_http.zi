@@ -432,6 +432,10 @@ CreateCheckpoint :: (tokens: Tokens, writer: http.ResponseWriter, request: *http
     }
     checkpoint := checkpoints.Create(tokens.database, http.Context(request), signer.value, tokens.issuerUnavailable)
     if checkpoint.error != null {
+        if errors.Is(checkpoint.error, checkpoints.ErrCheckpointConflict) {
+            response.Error(writer, cast(isize)409, "token checkpoint conflict")
+            return
+        }
         LogError("create token checkpoint", "error", checkpoint.error)
         response.Error(writer, cast(isize)500, "token checkpoint failed")
         return

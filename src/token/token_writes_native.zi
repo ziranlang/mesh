@@ -37,6 +37,7 @@ SQL;
     SpendFailed :: "token spend failed";
     CreditFailed :: "token credit failed";
     CheckpointFailed :: "token checkpoint failed";
+    CheckpointConflict :: "token checkpoint conflict";
 
     TakeID :: (id: string, target: []u8) -> bool {
         if id.count != target.count {
@@ -692,6 +693,43 @@ SQL;
             return .{status = 500, error = CheckpointFailed}
         }
         root := TextView(digestHex[:64])
+        matched := false
+        {
+            empty: []sql.Argument
+            existing := sql.Prepare(database, "SELECT ledger_seq,issuer_id,asset_id,ledger_root FROM token_checkpoints ORDER BY ledger_seq DESC LIMIT 1", empty)
+            if existing.status != sqlite.SQLITE_OK {
+                return .{status = 500, error = CheckpointFailed}
+            }
+            defer sqlite.SqliteFinalize(existing.value)
+            step := sqlite.SqliteStep(existing.value)
+            if step == sqlite.SQLITE_ROW {
+                existingSequence := sqlite.SqliteColumnInt64(existing.value, 0)
+                existingIssuer := sql.ColumnText(existing.value, 1)
+                existingAsset := sql.ColumnText(existing.value, 2)
+                existingRoot := sql.ColumnText(existing.value, 3)
+                if existingSequence > sequence {
+                    return .{status = 409, error = CheckpointConflict}
+                }
+                if existingSequence == sequence {
+                    if existingIssuer == ledger.IssuerID &&
+                        existingAsset == ledger.AssetID &&
+                        existingRoot == root {
+                        matched = true
+                    } else {
+                        return .{status = 409, error = CheckpointConflict}
+                    }
+                }
+            } else if step != sqlite.SQLITE_DONE {
+                return .{status = 500, error = CheckpointFailed}
+            }
+        }
+        if matched {
+            latest := ledger.Latest(database, document)
+            if latest.status != 200 {
+                return .{status = 500, error = CheckpointFailed}
+            }
+            return .{status = 200, node = latest.node}
+        }
         digits: [24]u8
         parts: [5]string = .["ksync-token-checkpoint-v1", ledger.IssuerID, ledger.AssetID, numbers.FormatInteger(sequence, digits[:]), root]
         message: Vec(u8)
@@ -705,7 +743,7 @@ SQL;
             return .{status = 500, error = CheckpointFailed}
         }
         row: [5]sql.Argument = .[sql.IntArg(sequence), sql.TextArg(ledger.IssuerID), sql.TextArg(ledger.AssetID), sql.TextArg(root), sql.TextArg(TextView(signature[:128]))]
-        if sql.Execute(database, "INSERT INTO token_checkpoints(ledger_seq,issuer_id,asset_id,ledger_root,signature) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(ledger_seq) DO UPDATE SET ledger_root=excluded.ledger_root,signature=excluded.signature,created_at=CURRENT_TIMESTAMP", row[:]) != sqlite.SQLITE_OK ||
+        if sql.Execute(database, "INSERT INTO token_checkpoints(ledger_seq,issuer_id,asset_id,ledger_root,signature) VALUES(?1,?2,?3,?4,?5)", row[:]) != sqlite.SQLITE_OK ||
             sqlite.SqliteChanges(database) != 1 {
             return .{status = 500, error = CheckpointFailed}
         }
