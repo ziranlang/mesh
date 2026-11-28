@@ -109,7 +109,7 @@ PAGE_SECTION_2;
 <section class="endpoint"><span class="method">GET/DELETE</span><code>/api/v1/publications/{id}</code><p>Fetches a visible publication with its document, or lets its author unpublish it.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete</code><p>Deletes all remote data for the signed sync account without uploading the private key. It is kept on hold for 30 days, restorable with the same key, then deleted permanently.</p></section>
 <section class="endpoint"><span class="method">DELETE</span><code>/api/v1/account</code><p>Legacy signed deletion endpoint kept for older clients.</p></section>
-<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Deletes all remote data for the sync account after verifying exported account key text, with the same 30-day hold.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Puts the account on a 30-day hold after verifying a fresh deletion signature for an encrypted export or checking a legacy plaintext export.</p></section>
 <h2>Signed Message</h2>
 <pre>mesh-sync-v1
 &lt;HTTP_METHOD&gt;

@@ -90,7 +90,7 @@ API access is scoped by account, with explicit shared surfaces:
 - `POST /api/v1/account/alias`
 - `GET /api/v1/account/alias?alias=<name>` (authenticated availability and DEW quote)
 - `POST /api/v1/account/alias/purchase` (explicit premium username purchase)
-- `GET /api/v1/account/export`
+- `GET /api/v1/account/export` (authenticated account data)
 - `GET /api/v1/account/app-grants`
 - `POST /api/v1/account/app-grants`
 - `POST /api/v1/account/app-grants/signed`
@@ -199,7 +199,34 @@ Signed JSON bodies still include `user_id_hash` for compatibility. The server ac
 
 The preferred account deletion endpoint is `POST /api/v1/account/delete`, using the same challenge/signature scheme as login and sync so the private key never leaves the device. `DELETE /api/v1/account` remains supported for older clients that already shipped with that wire shape.
 
-The website deletion endpoint `POST /api/v1/account/delete-with-key` accepts `user_id_hash` plus the full exported account key text. Current exports start with `ksync-account-key-v1`, and legacy account key exports are still accepted. Current key exports include `public_id`, and Mesh rejects a request if that public ID does not match `user_id_hash`. Mesh signs a fixed deletion proof with that private key, verifies it against the registered public key, deletes the account, and does not store the uploaded key.
+Clients create `mesh-account-key-encrypted-v1` exports locally. The file uses these ASCII lines in order, separated by LF, with an optional final LF.
+
+```text
+mesh-account-key-encrypted-v1
+algorithm=ML-DSA-44
+public_id=<64 lowercase hex characters>
+kdf=Argon2id
+memory_kib=65536
+passes=3
+lanes=1
+salt=<32 lowercase hex characters>
+nonce=<48 lowercase hex characters>
+ciphertext=<5152 lowercase hex characters>
+```
+
+`public_id` is the SHA-256 digest of the account public key. Derive a 32-byte key from the UTF-8 passphrase with Argon2id v19 (version `0x13`) and a fresh random 16-byte salt. Seal the raw 2560-byte ML-DSA-44 private key with XChaCha20-Poly1305 and a fresh random 24-byte nonce. Encode the ciphertext followed by its 16-byte authentication tag. The associated data is the exact first three lines, including the LF after `public_id`.
+
+To delete with an encrypted export, open it locally and fetch a fresh nonce from `GET /api/v1/sync/challenge?user_id=<public_id>`. Send `POST /api/v1/account/delete-with-key` with `Content-Type: application/json` and a body containing `user_id_hash` and `exported_key` (the full encrypted file text). Use the decrypted key to sign the following LF-terminated message, with the SHA-256 digest of the exact JSON body and the challenge nonce in lowercase hex. Send the resulting signature as hex or base64 in `X-Mesh-Signature`. The node verifies it against the registered account key and consumes the challenge on successful verification.
+
+```text
+mesh-sync-v1
+POST
+/api/v1/account/delete-with-key
+<sha256 hex of exact JSON body bytes>
+<challenge nonce hex>
+```
+
+Existing plaintext exports (`ksync-account-key-v1`, `lyra-account-key-v1`, `account-key-v1`, and `inbe-sync-key-v1`) still work with the same JSON fields. For these files, Mesh verifies possession using the uploaded key and discards it after the request.
 
 ## Build
 

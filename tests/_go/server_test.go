@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"maps"
 	"net"
@@ -3684,6 +3685,13 @@ func TestClientWebSocketFrameValidation(t *testing.T) {
 	}
 }
 
+func encryptedKeyFixture(publicID string) string {
+	// Mesh validates the envelope framing and treats the sealed bytes as opaque.
+	return "mesh-account-key-encrypted-v1\nalgorithm=ML-DSA-44\npublic_id=" + publicID +
+		"\nkdf=Argon2id\nmemory_kib=65536\npasses=3\nlanes=1\nsalt=" + strings.Repeat("12", 16) +
+		"\nnonce=" + strings.Repeat("34", 24) + "\nciphertext=" + strings.Repeat("ab", 2576)
+}
+
 func TestParseExportedSyncKey(t *testing.T) {
 	privateKey := bytes.Repeat([]byte{0x64}, mlDSA44PrivateKeySize)
 	publicID := strings.Repeat("a", 64)
@@ -3705,6 +3713,27 @@ func TestParseExportedSyncKey(t *testing.T) {
 		if !bytes.Equal(parsed.PrivateKey, privateKey) {
 			t.Fatalf("%s parsed private key mismatch", header)
 		}
+	}
+	encrypted := encryptedKeyFixture(publicID)
+	for _, input := range []string{encrypted, encrypted + "\n"} {
+		result := SyncRequest_ParseExportedKey(input)
+		if result.Error != nil || !result.Value.Encrypted || result.Value.PublicID != publicID || len(result.Value.PrivateKey) != 0 {
+			t.Fatalf("encrypted key parse = %#v", result)
+		}
+	}
+	for _, change := range [][2]string{
+		{"ML-DSA-44", "ML-DSA-65"}, {"Argon2id", "Argon2i"}, {"65536", "65535"},
+		{"passes=3", "passes=2"}, {"lanes=1", "lanes=2"}, {publicID, strings.ToUpper(publicID)},
+		{"salt=12", "salt="}, {"nonce=34", "nonce="}, {"ciphertext=ab", "ciphertext=a"},
+		{"ciphertext=ab", "ciphertext=ag"}, {"ciphertext=ab", "ciphertext=AB"},
+		{"\nkdf=", "\nprivate_key=00\nkdf="}, {"\n", "\r\n"},
+	} {
+		if result := SyncRequest_ParseExportedKey(strings.Replace(encrypted, change[0], change[1], 1)); result.Error == nil {
+			t.Errorf("accepted invalid encrypted account key with %q changed to %q", change[0], change[1])
+		}
+	}
+	if result := SyncRequest_ParseExportedKey(encrypted + "\n\n"); result.Error == nil {
+		t.Error("accepted extra data after encrypted key")
 	}
 }
 
@@ -3835,11 +3864,18 @@ func TestUnknownOriginDoesNotGetCORS(t *testing.T) {
 }
 
 func TestDeleteWithExportedKeyDeletesAccount(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) { checkDeleteWithExportedKey(t, false) })
+	t.Run("encrypted", func(t *testing.T) { checkDeleteWithExportedKey(t, true) })
+}
+
+func checkDeleteWithExportedKey(t *testing.T, encrypted bool) {
+	t.Helper()
 	publicKey, privateKey, err := generateMLDSA44Keypair()
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := OpenStore(filepath.Join(t.TempDir(), "ksync-delete-key-test.db"))
+	dbPath := filepath.Join(t.TempDir(), "ksync-delete-key-test.db")
+	store, err := OpenStore(dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3851,7 +3887,7 @@ func TestDeleteWithExportedKeyDeletesAccount(t *testing.T) {
 	server := NewServer(Config{
 		Addr:         "127.0.0.1:0",
 		BaseURL:      "http://127.0.0.1:0",
-		DBPath:       "test.db",
+		DBPath:       dbPath,
 		ChallengeTTL: time.Minute,
 		MaxBodyBytes: 1 << 20,
 	}, store, verifier)
@@ -3870,14 +3906,45 @@ func TestDeleteWithExportedKeyDeletesAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	keyText := "account-key-v1\nalgorithm=ML-DSA-44\npublic_id=" + userID + "\nprivate_key=" + hex.EncodeToString(privateKey) + "\n"
+	if encrypted {
+		keyText = encryptedKeyFixture(userID)
+	}
 	body, err := json.Marshal(DeleteWithKeyRequest{UserIDHash: userID, ExportedKey: keyText})
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/delete-with-key", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	res := httptest.NewRecorder()
-	handler.ServeHTTP(res, req)
+	const path = "/api/v1/account/delete-with-key"
+	post := func(payload []byte, signature string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, bytes.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+		if signature != "" {
+			req.Header.Set("X-Mesh-Signature", signature)
+		}
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+	var proof string
+	if encrypted {
+		res := post(body, "")
+		if res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "missing X-Mesh-Signature") {
+			t.Fatalf("unsigned delete status = %d body=%s", res.Code, res.Body.String())
+		}
+		nonce := issueChallenge(t, handler, "", userID)
+		digest := sha256.Sum256(body)
+		message := fmt.Sprintf("mesh-sync-v1\nPOST\n%s\n%x\n%s\n", path, digest, nonce)
+		signed, err := signWithPrivateKey([]byte(message), privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		proof = hex.EncodeToString(signed)
+		res = post(append(bytes.Clone(body), '\n'), proof)
+		if res.Code != http.StatusUnauthorized {
+			t.Fatalf("tampered delete status = %d body=%s", res.Code, res.Body.String())
+		}
+		assertCount(t, store, "server_users", 1)
+	}
+	res := post(body, proof)
 	if res.Code != http.StatusOK {
 		t.Fatalf("delete-with-key status = %d body=%s", res.Code, res.Body.String())
 	}

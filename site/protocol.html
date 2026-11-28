@@ -102,7 +102,7 @@
 
     <section>
       <h2>Private key boundary</h2>
-      <p>Normal login, sync, signed transactions, and account deletion do not upload the account private key. The website deletion helper can accept an exported account key file for recovery and support cases; it signs a fixed deletion proof, verifies that proof against the registered public key, deletes the account data, and does not store the uploaded key.</p>
+      <p>Clients unlock encrypted account key exports locally and sign a fresh deletion challenge. Mesh verifies the signature against the registered public key. Existing plaintext exports still work with the recovery endpoint, which verifies and discards the uploaded key.</p>
       <p>This distinction matters for the security claim: Mesh's account authority is post-quantum through ML-DSA-44 signatures, while encrypted record confidentiality is provided by client-side ciphertext that the relay is designed to move without reading.</p>
     </section>
 

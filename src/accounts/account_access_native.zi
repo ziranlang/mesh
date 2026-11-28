@@ -349,7 +349,7 @@
         twofaCode := TextView(twofaText)
         if withKey {
             key: Text = json.JsonString(*document, keyNode)
-            return DeleteExportedKey(access, connection, method, user, wire.TrimSpace(TextView(key)), twofaCode)
+            return DeleteExportedKey(access, connection, method, user, TextView(key), twofaCode, payload)
         }
         header := bearer.UserHeader(connection)
         if header.value == "" {
@@ -391,12 +391,13 @@
         return DeleteAccount(access, connection, method, subject)
     }
 
-    DeleteExportedKey :: (access: *AccountAccess, connection: *void, method: string, user: string, key: string, twofaCode: string) -> s32 {
+    DeleteExportedKey :: (access: *AccountAccess, connection: *void, method: string, user: string,
+        key: string, twofaCode: string, payload: []u8) -> s32 {
         normalized: [64]u8
         if !identity.NormalizeUserID(user, normalized[:]) {
             return ErrorReply(access, connection, method, 400, "invalid user_id_hash")
         }
-        if key == "" {
+        if wire.TrimSpace(key) == "" {
             return ErrorReply(access, connection, method, 400, "exported_key required")
         }
         now := clock.MonotonicMilliseconds()
@@ -424,7 +425,7 @@
         if !account.found {
             return ErrorReply(access, connection, method, 404, "sync account not found")
         }
-        exported := exportedKey.Parse(key)
+        exported := exportedKey.Parse(exportedKey.TrimLegacyWhitespace(key))
         privateKey := VecSlice(exported.privateKey, 0, exported.privateKey.count)
         defer oqs.Cleanse(privateKey)
         if exported.error != "" {
@@ -433,15 +434,31 @@
         if exported.hasPublicID && TextView(exported.publicID[:]) != accountID {
             return ErrorReply(access, connection, method, 400, "exported key public_id does not match user_id_hash")
         }
-        message: Vec(u8)
-        if !BuilderAppend(message, "inbe-delete-account-v1\n") || !BuilderAppend(message, accountID) || !BuilderAppend(message, "\n") {
-            return 0
-        }
-        bytes := VecSlice(message, 0, message.count)
-        signatureBytes: [sizes.mlDSA44SignatureSize]u8
-        if account.count != sizes.mlDSA44PublicKeySize || !signing.Sign(privateKey, bytes, signatureBytes[:]) ||
-            !settings.verify(account.bytes[:], bytes, signatureBytes[:]) {
-            return ErrorReply(access, connection, method, 401, "exported key does not match sync account")
+        if exported.encrypted {
+            signed := SignedHeader(connection)
+            if signed.value == "" {
+                return ErrorReply(access, connection, method, 400, "missing X-Mesh-Signature")
+            }
+            // The account database lock is already held.
+            proof := signature.Authenticate(settings.database, *access.challenges, settings.verify,
+                accountID, "", signed.value, signed.context, method, DeleteWithKeyRoute, payload)
+            if proof.databaseError != sqlite.SQLITE_OK {
+                return ErrorReply(access, connection, method, 500, "authentication failed")
+            }
+            if !proof.authenticated {
+                return ErrorReply(access, connection, method, proof.status, proof.message)
+            }
+        } else {
+            message: Vec(u8)
+            if !BuilderAppend(message, "inbe-delete-account-v1\n") || !BuilderAppend(message, accountID) || !BuilderAppend(message, "\n") {
+                return 0
+            }
+            bytes := VecSlice(message, 0, message.count)
+            signatureBytes: [sizes.mlDSA44SignatureSize]u8
+            if account.count != sizes.mlDSA44PublicKeySize || !signing.Sign(privateKey, bytes, signatureBytes[:]) ||
+                !settings.verify(account.bytes[:], bytes, signatureBytes[:]) {
+                return ErrorReply(access, connection, method, 401, "exported key does not match sync account")
+            }
         }
         twofaStatus := twofa.CheckRequest(settings.database, *access.limiter, settings.secret,
             connection, accountID, twofaCode, calendar.UnixMilliseconds() / 1000)

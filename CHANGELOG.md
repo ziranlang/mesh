@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Support encrypted account key exports and client-signed account deletion, with compatibility for existing plaintext exports.
+
 - Allow signed sync requests from Jungle at dejungle.si and jungle.waozi.xyz.
 
 - Prove the native pull client's legacy peer headers with a fixture that accepts only `X-Daochi-Node-*` and verifies the request signature.

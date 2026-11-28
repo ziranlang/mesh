@@ -135,7 +135,7 @@ a{color:#0b625d}
 <section class="endpoint"><span class="method">GET/DELETE</span><code>/api/v1/publications/{id}</code><p>Fetches a visible publication with its document, or lets its author unpublish it.</p></section>
 <section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete</code><p>Deletes all remote data for the signed sync account without uploading the private key. It is kept on hold for 30 days, restorable with the same key, then deleted permanently.</p></section>
 <section class="endpoint"><span class="method">DELETE</span><code>/api/v1/account</code><p>Legacy signed deletion endpoint kept for older clients.</p></section>
-<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Deletes all remote data for the sync account after verifying exported account key text, with the same 30-day hold.</p></section>
+<section class="endpoint"><span class="method">POST</span><code>/api/v1/account/delete-with-key</code><p>Puts the account on a 30-day hold after verifying a fresh deletion signature for an encrypted export or checking a legacy plaintext export.</p></section>
 <h2>Signed Message</h2>
 <pre>mesh-sync-v1
 &lt;HTTP_METHOD&gt;
@@ -740,7 +740,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/account/export": map[string]any{
 				"get": map[string]any{
 					"summary":     "Export authenticated account data",
-					"description": "Bearer-authenticated read-only dump of all Mesh rows owned by or directly attached to the authenticated account.",
+					"description": "Bearer-authenticated read-only dump of all Mesh rows owned by or directly attached to the authenticated account. Clients generate account key exports locally.",
 					"parameters":  baselineBearerHeaderParameters(),
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Account data export"},
@@ -797,7 +797,7 @@ func baselineOpenAPISpec() map[string]any {
 			"/api/v1/account/delete-with-key": map[string]any{
 				"post": map[string]any{
 					"summary":     "Delete remote account using exported key",
-					"description": "Accepts exported account key text. Current ksync-account-key-v1 keys and legacy account key export formats are supported. The account stops syncing, counting toward storage and appearing to others at once; its data is kept on hold for 30 days and then deleted permanently. Logging in again with restore set brings it back while it is on hold.",
+					"description": "For mesh-account-key-encrypted-v1 files, decrypt locally, get a fresh nonce from GET /api/v1/sync/challenge?user_id=<user_id_hash>, and send the encrypted export with X-Mesh-Signature. Sign the mesh-sync-v1 message for POST /api/v1/account/delete-with-key using the exact JSON body and the nonce. Legacy plaintext exports remain supported. The account stops syncing and its data goes on hold for 30 days. Sign in with restore set to recover the account during the hold.",
 					"requestBody": map[string]any{
 						"required": true,
 						"content": map[string]any{
@@ -807,7 +807,7 @@ func baselineOpenAPISpec() map[string]any {
 					"responses": map[string]any{
 						"200": map[string]any{"description": "Remote data deleted"},
 						"400": map[string]any{"description": "Invalid request or exported key"},
-						"401": map[string]any{"description": "Exported key does not match sync account"},
+						"401": map[string]any{"description": "Signature or legacy key rejected"},
 						"404": map[string]any{"description": "Sync account not found"},
 					},
 				},
@@ -1234,7 +1234,7 @@ func baselineOpenAPISpec() map[string]any {
 					"required": []string{"user_id_hash", "exported_key"},
 					"properties": map[string]any{
 						"user_id_hash": map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$"},
-						"exported_key": map[string]any{"type": "string", "description": "Full text of the exported account key file."},
+						"exported_key": map[string]any{"type": "string", "description": "Full text of the encrypted mesh-account-key-encrypted-v1 export or an existing legacy plaintext export. The encrypted export public_id must match user_id_hash."},
 					},
 				},
 				"AliasRequest": map[string]any{

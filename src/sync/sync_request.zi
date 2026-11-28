@@ -36,6 +36,7 @@ DeleteRequestResult :: struct {
 }
 
 DeleteWithKeyRequestResult :: struct {
+    body: []u8
     value: DeleteWithKeyRequest
     error: Error
 }
@@ -47,6 +48,7 @@ RequestSignature :: struct {
 
 ExportedAccountKey :: struct {
     publicID: string
+    encrypted: bool
     privateKey: []u8
 }
 
@@ -218,7 +220,7 @@ ReadDeleteWithKey :: (writer: http.ResponseWriter, request: *http.Request, limit
         return result
     }
     result.value.UserIDHash = ToLower(TrimSpace(result.value.UserIDHash))
-    result.value.ExportedKey = TrimSpace(result.value.ExportedKey)
+    result.value.ExportedKey = exported_key.TrimLegacyWhitespace(result.value.ExportedKey)
     if !identity.ValidUserID(result.value.UserIDHash) {
         result.error = errors.New("invalid user_id_hash")
         return result
@@ -226,6 +228,7 @@ ReadDeleteWithKey :: (writer: http.ResponseWriter, request: *http.Request, limit
     if result.value.ExportedKey == "" {
         result.error = errors.New("exported_key required")
     }
+    result.body = read.value
     return result
 }
 
@@ -249,7 +252,8 @@ ParseExportedKey :: (value: string) -> ExportedAccountKeyResult {
     if parsed.hasPublicID {
         result.value.publicID = text.FromBytes(parsed.publicID[:])
     }
-    result.value.privateKey = text.ToBytes(TextView(VecSlice(parsed.privateKey, 0, parsed.privateKey.count)))
+    result.value.encrypted = parsed.encrypted
+    result.value.privateKey = VecSlice(parsed.privateKey, 0, parsed.privateKey.count)
     return result
 }
 

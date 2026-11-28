@@ -1073,6 +1073,18 @@ def check_signed_login(host, port, database, oracle, server_mode=False):
             assert request("POST", delete_with_key, key_file(keys["PrivateKey"])) == (200, {"status": "deleted"})
             status, restored = request("POST", path, payload, proof(payload))
             assert status == 200 and restored["account_alias"] == "RestoredName"
+            encrypted_key = "\n".join((
+                "mesh-account-key-encrypted-v1", "algorithm=ML-DSA-44", f"public_id={user}",
+                "kdf=Argon2id", "memory_kib=65536", "passes=3", "lanes=1", "salt=" + "12" * 16,
+                "nonce=" + "34" * 24, "ciphertext=" + "ab" * 2576, ""))
+            encrypted_body = json.dumps({"user_id_hash": user, "exported_key": encrypted_key}).encode()
+            signed_delete = proof(encrypted_body, delete_with_key)
+            assert request("POST", delete_with_key, encrypted_body, signed_delete) == (200, {"status": "deleted"})
+            assert held_file.is_file()
+            status, restored = request("POST", path, payload, proof(payload))
+            assert status == 200 and restored["account_alias"] == "RestoredName"
+            status, response = request("POST", delete_with_key, encrypted_body, signed_delete)
+            assert (status, response["error"]) in ((400, "missing or expired challenge"), (401, "signature rejected"))
             assert live_blob.read_bytes() == b"blob on hold" and not held_file.exists()
 
         # A separate connecting client gets its own bucket for the same user.

@@ -2,17 +2,75 @@ wire :: #import "wire_text";
 identity :: #import "identity";
 binary :: #import "binary_codec";
 codec :: #import "codec";
+tools :: #import "std/text_tools";
 #import "std/vec"
 
 ExportedKey :: struct {
     publicID: [64]u8
     hasPublicID: bool
+    encrypted: bool
     privateKey: Vec(u8)
     error: string
 }
 
+#scope_file
+EncryptedHeader :: "mesh-account-key-encrypted-v1";
+EncryptedPrefix :: "mesh-account-key-encrypted-v1\nalgorithm=ML-DSA-44\npublic_id=";
+EncryptedKDF :: "\nkdf=Argon2id\nmemory_kib=65536\npasses=3\nlanes=1\nsalt=";
+
+LowerHex :: (value: string) -> bool {
+    for byte: value {
+        if !(byte >= #char "0" && byte <= #char "9") && !(byte >= #char "a" && byte <= #char "f") {
+            return false
+        }
+    }
+    return true
+}
+
+ParseEncrypted :: (value: string) -> ExportedKey {
+    idStart := EncryptedPrefix.count
+    idEnd := idStart + 64
+    saltStart := idEnd + EncryptedKDF.count
+    saltEnd := saltStart + 16 * 2
+    nonceLine := "\nnonce="
+    nonceStart := saltEnd + nonceLine.count
+    nonceEnd := nonceStart + 24 * 2
+    ciphertextLine := "\nciphertext="
+    ciphertextStart := nonceEnd + ciphertextLine.count
+    ciphertextEnd := ciphertextStart + (codec.mlDSA44PrivateKeySize + 16) * 2
+    if value.count == ciphertextEnd + 1 && value[ciphertextEnd:] == "\n" {
+        value = value[:ciphertextEnd]
+    }
+    if value.count != ciphertextEnd || !tools.TextHasPrefix(value, EncryptedPrefix) ||
+        !LowerHex(value[idStart:idEnd]) || value[idEnd:saltStart] != EncryptedKDF ||
+        !LowerHex(value[saltStart:saltEnd]) || value[saltEnd:nonceStart] != nonceLine ||
+        !LowerHex(value[nonceStart:nonceEnd]) || value[nonceEnd:ciphertextStart] != ciphertextLine ||
+        !LowerHex(value[ciphertextStart:ciphertextEnd]) {
+        return .{error = "invalid encrypted account key file"}
+    }
+    result: ExportedKey
+    for index: 0..63 {
+        result.publicID[index] = value[idStart + index]
+    }
+    result.hasPublicID = true
+    result.encrypted = true
+    return result
+}
+
+#scope_export
+TrimLegacyWhitespace :: (value: string) -> string {
+    trimmed := wire.TrimSpace(value)
+    if wire.TrimSpace(wire.Cut(trimmed, #char "\n").before) == EncryptedHeader {
+        return value
+    }
+    return trimmed
+}
+
 Parse :: (value: string) -> ExportedKey {
     first := wire.Cut(value, #char "\n")
+    if first.before == EncryptedHeader {
+        return ParseEncrypted(value)
+    }
     header := wire.TrimSpace(first.before)
     if header != "ksync-account-key-v1" && header != "lyra-account-key-v1" &&
         header != "account-key-v1" && header != "inbe-sync-key-v1" {
