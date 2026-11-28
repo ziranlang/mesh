@@ -14,6 +14,7 @@ identity :: #import "identity";
 accounts :: #import "account_keys";
 state :: #import "account_state";
 holds :: #import "account_hold";
+twofa :: #import "account_2fa";
 clients :: #import "sync_clients";
 profile :: #import "account_profile";
 token :: #import "token";
@@ -50,6 +51,12 @@ AccountAccess :: struct {
 }
 
 #scope_file
+LoginBodyCode :: (value: *protocol.LoginRequest) -> string {
+    if value.TotpCode != "" { return value.TotpCode }
+    if value.RecoveryCode != "" { return value.RecoveryCode }
+    return value.TwoFactorCode
+}
+
 ToLower :: (value: string) -> string #foreign strings;
 Join :: (parts: []string, separator: string) -> string #foreign strings;
 EncodeHex :: (value: []u8) -> string #foreign hex "EncodeToString";
@@ -153,6 +160,10 @@ Login :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Req
         return
     }
     context := http.Context(request)
+    if !twofa.Gate(access.database, context, access.limiter, request, access.configuration.TokenSecret,
+        value.UserIDHash, LoginBodyCode(*value), clock.Unix(clock.Now()), writer) {
+        return
+    }
     if value.Restore {
         // A failed restore must not leave a new empty account in its way.
         restored := holds.Restore(access.database, context, access.configuration.DBPath, value.UserIDHash)

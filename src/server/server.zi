@@ -14,6 +14,7 @@ auth_errors :: #import "authentication_error";
 http_auth :: #import "http_auth";
 sessions :: #import "auth_sessions";
 access :: #import "account_access";
+twofa :: #import "account_2fa";
 account_signature :: #import "account_signature";
 operations :: #import "operational_http";
 tokens :: #import "token_http";
@@ -142,6 +143,10 @@ New :: (configuration: config.Config, store: *storage.Store, verifier: *verifica
     authSessionsError := sessions.Initialize(store.database, ctx.Background(), configuration.TokenTTL)
     if authSessionsError != null {
         Panic(authSessionsError)
+    }
+    twofaSchemaError := twofa.Initialize(store.database, ctx.Background())
+    if twofaSchemaError != null {
+        Panic(twofaSchemaError)
     }
     identity := node.New(configuration.NodeIdentityPrivateKey)
     if identity.error != null {

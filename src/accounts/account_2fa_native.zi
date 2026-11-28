@@ -9,11 +9,11 @@
     limiting :: #import "rate_limit_native";
     coding :: #import "content_coding_native";
     limits :: #import "server_limits";
+    verify :: #import "account_2fa_verify";
     wire :: #import "wire_text";
     format :: #import "timestamp_format";
     totp :: #import "crypto/totp";
     chacha :: #import "crypto/chacha20";
-    kdf :: #import "crypto/kdf";
     sha :: #import "crypto/sha256";
     wipe :: #import "crypto/wipe";
     random :: #import "std/random_linux";
@@ -22,14 +22,6 @@
     mutex :: #import "std/mutex_linux";
     json :: #import "std/json_document";
     #import "std/vec"
-
-    VerifyStatus :: enum {
-        Allowed :: 0
-        Missing :: 1
-        Invalid :: 2
-        RateLimited :: 3
-        Error :: 4
-    }
 
     MaxRequestBytes :: 4096;
 
@@ -42,12 +34,6 @@
 
     PendingLifetimeSeconds :: 600;
     RecoveryCodeCount :: 10;
-    RateWindowMs :: 900000; // 15 minutes
-    UserRateLimit :: 10;
-    AddressRateLimit :: 30;
-    RawSecretBytes :: 20;
-    SealedSecretBytes :: 60; // 24-byte nonce + 20-byte secret + 16-byte tag
-    SealedSecretHex :: 120;
 
     NoStoreReply :: (connection: *void, status: u32, document: *json.JsonDocument, root: s32) -> s32 {
         headers: [1]transport.HeaderValue = .[.{name = "Cache-Control", value = "private, no-store"}]
@@ -65,103 +51,22 @@
         return format.UTC(.{seconds = now / 1000, nanoseconds = cast(s32)(now % 1000) * 1000000, valid = true}, target)
     }
 
-    DeriveSecretKey :: (serverSecret: []u8, user: string, keyOut: []u8) -> bool {
-        if serverSecret.count == 0 || user.count == 0 || keyOut.count != 32 { return false }
-        salt := "mesh-2fa-totp-key-v1"
-        saltBytes: [20]u8
-        for i: 0..19 { saltBytes[i] = salt[i] }
-        infoBytes: [64]u8
-        if user.count != 64 { return false }
-        for i: 0..63 { infoBytes[i] = user[i] }
-        return kdf.HkdfSha256(saltBytes[:], serverSecret, infoBytes[:], keyOut)
-    }
-
-    BuildAad :: (user: string, out: []u8) -> s64 {
-        prefix := "mesh-2fa-totp-v1\n"
-        if user.count != 64 || out.count < prefix.count + 64 { return -1 }
-        for i: 0..prefix.count-1 { out[i] = prefix[i] }
-        for i: 0..63 { out[prefix.count + i] = user[i] }
-        return prefix.count + 64
-    }
-
     SealSecret :: (serverSecret: []u8, user: string, rawSecret: []u8, hexOut: []u8) -> bool {
-        if rawSecret.count != RawSecretBytes || hexOut.count < SealedSecretHex + 1 { return false }
+        if rawSecret.count != verify.RawSecretBytes || hexOut.count < verify.SealedSecretHex + 1 { return false }
         key: [32]u8
         defer wipe.SecureWipe(key[:])
-        if !DeriveSecretKey(serverSecret, user, key[:]) { return false }
+        if !verify.DeriveSecretKey(serverSecret, user, key[:]) { return false }
         nonce: [24]u8
         if !random.FillSecure(nonce[:]) { return false }
         aad: [96]u8
-        aadLen := BuildAad(user, aad[:])
+        aadLen := verify.BuildAad(user, aad[:])
         if aadLen < 0 { return false }
-        sealed: [SealedSecretBytes]u8
+        sealed: [verify.SealedSecretBytes]u8
         defer wipe.SecureWipe(sealed[:])
         for i: 0..23 { sealed[i] = nonce[i] }
         written := chacha.XChaCha20Poly1305SealBytes(key[:], nonce[:], rawSecret, aad[:aadLen], sealed[24:])
-        if written != RawSecretBytes + 16 { return false }
-        return sha.BytesToHex(*sealed[0], SealedSecretBytes, *hexOut[0], hexOut.count) == 1
-    }
-
-    HexNibble :: (ch: u8) -> s32 {
-        if ch >= cast(u8)48 && ch <= cast(u8)57 { return cast(s32)(ch - cast(u8)48) }
-        if ch >= cast(u8)97 && ch <= cast(u8)102 { return cast(s32)(ch - cast(u8)97) + 10 }
-        if ch >= cast(u8)65 && ch <= cast(u8)70 { return cast(s32)(ch - cast(u8)65) + 10 }
-        return -1
-    }
-
-    DecodeHex :: (text: string, out: []u8) -> bool {
-        if text.count != out.count * 2 { return false }
-        for i: 0..out.count-1 {
-            hi := HexNibble(text[i * 2])
-            lo := HexNibble(text[i * 2 + 1])
-            if hi < 0 || lo < 0 { return false }
-            out[i] = cast(u8)(hi * 16 + lo)
-        }
-        return true
-    }
-
-    OpenSecret :: (serverSecret: []u8, user: string, hexIn: string, rawOut: []u8) -> bool {
-        if rawOut.count != RawSecretBytes || hexIn.count != SealedSecretHex { return false }
-        sealed: [SealedSecretBytes]u8
-        defer wipe.SecureWipe(sealed[:])
-        if !DecodeHex(hexIn, sealed[:]) { return false }
-        key: [32]u8
-        defer wipe.SecureWipe(key[:])
-        if !DeriveSecretKey(serverSecret, user, key[:]) { return false }
-        aad: [96]u8
-        aadLen := BuildAad(user, aad[:])
-        if aadLen < 0 { return false }
-        opened := chacha.XChaCha20Poly1305OpenBytes(key[:], sealed[:24], sealed[24:], aad[:aadLen], rawOut)
-        return opened == RawSecretBytes
-    }
-
-    NormalizeRecoveryCode :: (text: string, out: []u8) -> bool {
-        if out.count < 16 { return false }
-        written: s64 = 0
-        for i: 0..text.count-1 {
-            ch := text[i]
-            if ch == cast(u8)32 || ch == cast(u8)45 || ch == cast(u8)9 { continue }
-            if ch >= cast(u8)97 && ch <= cast(u8)102 { ch -= cast(u8)32 }
-            if !((ch >= cast(u8)48 && ch <= cast(u8)57) || (ch >= cast(u8)65 && ch <= cast(u8)70)) {
-                return false
-            }
-            if written >= 16 { return false }
-            out[written] = ch
-            written += 1
-        }
-        return written == 16
-    }
-
-    HashRecoveryCode :: (user: string, canonical16: []u8, hexOut: []u8) -> bool {
-        if user.count != 64 || canonical16.count != 16 || hexOut.count < 65 { return false }
-        payload: Vec(u8)
-        if !BuilderAppend(payload, "mesh-2fa-recovery-v1\n") || !BuilderAppend(payload, user) ||
-            !BuilderAppend(payload, "\n") || !BuilderAppend(payload, TextView(canonical16)) {
-            return false
-        }
-        digest := sha.Sha256Of(TextView(VecSlice(payload, 0, payload.count)))
-        defer wipe.SecureWipe(digest[:])
-        return sha.BytesToHex(*digest[0], digest.count, *hexOut[0], hexOut.count) == 1
+        if written != verify.RawSecretBytes + 16 { return false }
+        return sha.BytesToHex(*sealed[0], verify.SealedSecretBytes, *hexOut[0], hexOut.count) == 1
     }
 
     FormatRecoveryCode :: (raw8: []u8, formatted19: []u8, canonical16: []u8) -> bool {
@@ -201,7 +106,7 @@
             defer wipe.SecureWipe(canonical[:])
             if !FormatRecoveryCode(raw[:], formatted[:], canonical[:]) { return false }
             hashHex: [65]u8
-            if !HashRecoveryCode(user, canonical[:], hashHex[:]) { return false }
+            if !verify.HashRecoveryCode(user, canonical[:], hashHex[:]) { return false }
             insArgs: [2]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(hashHex[:64]))]
             if sql.Execute(database, queries.InsertRecoveryCode, insArgs[:]) != sqlite.SQLITE_OK {
                 return false
@@ -219,14 +124,16 @@
         ip := address.FromRequest(connection)
         ipBucket: Vec(u8)
         userBucket: Vec(u8)
-        if !BuilderAppend(ipBucket, "2fa:ip:") || !BuilderAppend(ipBucket, TextView(ip.bytes[:ip.count])) ||
-            !BuilderAppend(userBucket, "2fa:user:") || !BuilderAppend(userBucket, user) {
+        if !BuilderAppend(ipBucket, verify.AddressBucketPrefix) || !BuilderAppend(ipBucket, TextView(ip.bytes[:ip.count])) ||
+            !BuilderAppend(userBucket, verify.UserBucketPrefix) || !BuilderAppend(userBucket, user) {
             return false
         }
-        if !limiting.Allow(limiter, TextView(VecSlice(ipBucket, 0, ipBucket.count)), AddressRateLimit, RateWindowMs, now) {
+        if !limiting.Allow(limiter, TextView(VecSlice(ipBucket, 0, ipBucket.count)), verify.AddressRateLimit,
+            verify.RateWindowSeconds * 1000, now) {
             return false
         }
-        return limiting.Allow(limiter, TextView(VecSlice(userBucket, 0, userBucket.count)), UserRateLimit, RateWindowMs, now)
+        return limiting.Allow(limiter, TextView(VecSlice(userBucket, 0, userBucket.count)), verify.UserRateLimit,
+            verify.RateWindowSeconds * 1000, now)
     }
 
     RevokeOthers :: (database: *void, connection: *void, user: string) -> bool {
@@ -280,12 +187,12 @@
     }
 
     HeaderCode :: (connection: *void) -> string {
-        return wire.TrimSpace(transport.Header(connection, "X-Mesh-2FA"))
+        return wire.TrimSpace(transport.Header(connection, verify.HeaderName))
     }
 
     // Caller must hold databaseLock.
     CheckRequest :: (database: *void, limiter: *limiting.RateLimiter, serverSecret: []u8,
-        connection: *void, user: string, bodyCode: string, nowUnix: s64) -> VerifyStatus {
+        connection: *void, user: string, bodyCode: string, nowUnix: s64) -> verify.VerifyStatus {
         args: [1]sql.Argument = .[sql.TextArg(user)]
         stmt := sql.Prepare(database, queries.ReadState, args[:])
         if stmt.status != sqlite.SQLITE_OK { return .Error }
@@ -304,40 +211,25 @@
         if !Allow2FA(limiter, connection, user) { return .RateLimited }
 
         // Copy secretEnc out before finalizing or mutating DB.
-        encBuf: [SealedSecretHex]u8
-        if secretEnc.count != SealedSecretHex { return .Error }
-        for i: 0..SealedSecretHex-1 { encBuf[i] = secretEnc[i] }
+        encBuf: [verify.SealedSecretHex]u8
+        if secretEnc.count != verify.SealedSecretHex { return .Error }
+        for i: 0..verify.SealedSecretHex-1 { encBuf[i] = secretEnc[i] }
 
-        // 1. Try 6-digit TOTP code.
-        digitsBuf: [8]u8
-        if totp.NormalizeCode(code, totp.TOTP_DEFAULT_DIGITS, digitsBuf[:]) == cast(s64)totp.TOTP_DEFAULT_DIGITS {
-            rawSecret: [RawSecretBytes]u8
-            defer wipe.SecureWipe(rawSecret[:])
-            if !OpenSecret(serverSecret, user, TextView(encBuf[:]), rawSecret[:]) {
+        hashHex: [65]u8
+        evaluated := verify.Evaluate(serverSecret, user, code, TextView(encBuf[:]), lastStep,
+            nowUnix, hashHex[:])
+        if evaluated.decision == .AdvanceTotp {
+            advArgs: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(evaluated.step), sql.IntArg(nowUnix)]
+            if sql.Execute(database, queries.AdvanceStep, advArgs[:]) != sqlite.SQLITE_OK {
                 return .Error
             }
-            verified := totp.VerifyTotp(rawSecret[:], code, nowUnix, totp.TOTP_DEFAULT_PERIOD,
-                totp.TOTP_DEFAULT_DIGITS, totp.TOTP_DEFAULT_SKEW, lastStep)
-            if verified.valid {
-                advArgs: [3]sql.Argument = .[sql.TextArg(user), sql.IntArg(verified.step), sql.IntArg(nowUnix)]
-                if sql.Execute(database, queries.AdvanceStep, advArgs[:]) != sqlite.SQLITE_OK {
-                    return .Error
-                }
-                if sqlite.SqliteChanges(database) == 1 {
-                    return .Allowed
-                }
-                return .Invalid
+            if sqlite.SqliteChanges(database) == 1 {
+                return .Allowed
             }
             return .Invalid
         }
-
-        // 2. Try 16-hex recovery code.
-        canonical: [16]u8
-        defer wipe.SecureWipe(canonical[:])
-        if NormalizeRecoveryCode(code, canonical[:]) {
-            hashHex: [65]u8
-            if !HashRecoveryCode(user, canonical[:], hashHex[:]) { return .Error }
-            recArgs: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(hashHex[:64])), sql.IntArg(nowUnix)]
+        if evaluated.decision == .ConsumeRecovery {
+            recArgs: [3]sql.Argument = .[sql.TextArg(user), sql.TextArg(evaluated.recoveryHash), sql.IntArg(nowUnix)]
             if sql.Execute(database, queries.ConsumeRecoveryCode, recArgs[:]) != sqlite.SQLITE_OK {
                 return .Error
             }
@@ -345,10 +237,10 @@
                 return .Allowed
             }
         }
-        return .Invalid
+        return evaluated.status
     }
 
-    WriteRejected :: (connection: *void, status: VerifyStatus) -> s32 {
+    WriteRejected :: (connection: *void, status: verify.VerifyStatus) -> s32 {
         if status == .Missing {
             doc: json.JsonDocument
             root := json.JsonNewObject(*doc)
@@ -488,17 +380,17 @@
     }
 
     HandleSetup :: (database: *void, serverSecret: []u8, connection: *void, user: string, nowUnix: s64) -> s32 {
-        rawSecret: [RawSecretBytes]u8
+        rawSecret: [verify.RawSecretBytes]u8
         defer wipe.SecureWipe(rawSecret[:])
         if !random.FillSecure(rawSecret[:]) {
             return NoStoreError(connection, 500, "2fa setup failed")
         }
-        encHex: [SealedSecretHex + 1]u8
+        encHex: [verify.SealedSecretHex + 1]u8
         if !SealSecret(serverSecret, user, rawSecret[:], encHex[:]) {
             return NoStoreError(connection, 500, "2fa setup failed")
         }
         expiresAt := nowUnix + PendingLifetimeSeconds
-        args: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(encHex[:SealedSecretHex])),
+        args: [4]sql.Argument = .[sql.TextArg(user), sql.TextArg(TextView(encHex[:verify.SealedSecretHex])),
             sql.IntArg(expiresAt), sql.IntArg(nowUnix)]
         if sql.Execute(database, queries.UpsertPending, args[:]) != sqlite.SQLITE_OK {
             return NoStoreError(connection, 500, "2fa setup failed")
@@ -552,19 +444,19 @@
         enabled := sqlite.SqliteColumnInt64(stmt.value, 0)
         pendingEnc := sql.ColumnText(stmt.value, 2)
         pendingExp := sqlite.SqliteColumnInt64(stmt.value, 3)
-        encBuf: [SealedSecretHex]u8
-        hasPending := pendingEnc.count == SealedSecretHex
+        encBuf: [verify.SealedSecretHex]u8
+        hasPending := pendingEnc.count == verify.SealedSecretHex
         if hasPending {
-            for i: 0..SealedSecretHex-1 { encBuf[i] = pendingEnc[i] }
+            for i: 0..verify.SealedSecretHex-1 { encBuf[i] = pendingEnc[i] }
         }
         unused sqlite.SqliteFinalize(stmt.value)
 
         if enabled != 0 { return NoStoreError(connection, 409, "2fa already enabled") }
         if !hasPending || pendingExp < nowUnix { return NoStoreError(connection, 400, "no pending 2fa setup") }
 
-        rawSecret: [RawSecretBytes]u8
+        rawSecret: [verify.RawSecretBytes]u8
         defer wipe.SecureWipe(rawSecret[:])
-        if !OpenSecret(serverSecret, user, TextView(encBuf[:]), rawSecret[:]) {
+        if !verify.OpenSecret(serverSecret, user, TextView(encBuf[:]), rawSecret[:]) {
             return NoStoreError(connection, 500, "2fa confirm failed")
         }
         verified := totp.VerifyTotp(rawSecret[:], code, nowUnix, totp.TOTP_DEFAULT_PERIOD,

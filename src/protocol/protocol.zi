@@ -18,6 +18,11 @@ LoginRequest :: struct {
     PublicKey: string #go_tag "json:\"public_key,omitempty\""
     // Brings back an account deleted within its hold, before any new data.
     Restore: bool #go_tag "json:\"restore,omitempty\""
+    // Two-factor code: a 6-digit TOTP value or a 16-hex recovery code. The
+    // X-Mesh-2FA header carries the same values and wins when both are sent.
+    TotpCode: string #go_tag "json:\"totp_code,omitempty\""
+    RecoveryCode: string #go_tag "json:\"recovery_code,omitempty\""
+    TwoFactorCode: string #go_tag "json:\"two_factor_code,omitempty\""
 }
 
 LoginResponse :: struct {

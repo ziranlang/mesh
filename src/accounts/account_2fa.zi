@@ -1,0 +1,169 @@
+// Go-target two-factor gate for account login. It enforces the same
+// server_account_2fa state, codes, limits and status responses as the native
+// server: the verification semantics come from the shared
+// account_2fa_verify module and the statements from account_2fa_queries.
+#import "std/go_types"
+sql :: #import "std/sql_go";
+ctx :: #import "std/context_go";
+errors :: #import "std/errors_go";
+http :: #import "std/http_go";
+response :: #import "response";
+wire :: #import "wire_text";
+clock :: #import "std/time_go";
+rate :: #import "rate_limit";
+address :: #import "client_address";
+queries :: #import "account_2fa_queries";
+verify :: #import "account_2fa_verify";
+go_strings :: #system_library "go:strings";
+builtin :: #system_library "go:builtin";
+
+RequiredResponse :: struct {
+    Message: string #go_tag "json:\"error\""
+    Methods: []string #go_tag "json:\"methods\""
+}
+
+#scope_file
+Join :: (parts: []string, separator: string) -> string #foreign go_strings;
+AllocateMethods :: (count: isize) -> []string #foreign builtin "make";
+
+NoStore :: (writer: http.ResponseWriter) {
+    http.SetHeader(http.ResponseHeaders(writer), "Cache-Control", "private, no-store")
+}
+
+NoStoreError :: (writer: http.ResponseWriter, status: isize, message: string) {
+    NoStore(writer)
+    response.Error(writer, status, message)
+}
+
+#scope_export
+Initialize :: (database: *sql.Database, context: ctx.Context) -> Error {
+    empty: []Any
+    schema := sql.Exec(database, context, queries.Schema, empty[:])
+    return schema.error
+}
+
+HeaderCode :: (request: *http.Request) -> string {
+    return wire.TrimSpace(http.HeaderValue(http.Headers(request), verify.HeaderName))
+}
+
+// Mirrors the native gate: the IP bucket is checked first, then the account
+// bucket, both from the same 15-minute window the confirm endpoint uses.
+Allow :: (limiter: *rate.RateLimiter, request: *http.Request, user: string) -> bool {
+    ipParts: [2]string = .[verify.AddressBucketPrefix, address.FromRequest(request)]
+    window := cast(clock.Duration)(verify.RateWindowSeconds * 1000000000)
+    if !rate.Allow(limiter, Join(ipParts[:], ""), cast(isize)verify.AddressRateLimit, window) {
+        return false
+    }
+    userParts: [2]string = .[verify.UserBucketPrefix, user]
+    return rate.Allow(limiter, Join(userParts[:], ""), cast(isize)verify.UserRateLimit, window)
+}
+
+// Same status semantics as the native CheckRequest. Callers must run this
+// after signature verification and before any session or account write.
+CheckRequest :: (database: *sql.Database, context: ctx.Context, limiter: *rate.RateLimiter,
+    request: *http.Request, serverSecret: []u8, user: string, bodyCode: string,
+    nowUnix: s64) -> verify.VerifyStatus {
+    schemaError := Initialize(database, context)
+    if schemaError != null {
+        return verify.VerifyStatus.Error
+    }
+    arguments: [1]Any = .[user]
+    enabled: s64
+    secretEnc: string
+    pendingEnc: string
+    pendingExpiresAt: s64
+    lastStep: s64
+    destinations: [5]Any = .[*enabled, *secretEnc, *pendingEnc, *pendingExpiresAt, *lastStep]
+    scanError := sql.ScanRow(sql.QueryRow(database, context, queries.ReadState, arguments[:]),
+        destinations[:])
+    if errors.Is(scanError, sql.NoRows()) {
+        return verify.VerifyStatus.Allowed
+    }
+    if scanError != null {
+        return verify.VerifyStatus.Error
+    }
+    if enabled == 0 {
+        return verify.VerifyStatus.Allowed
+    }
+
+    code := HeaderCode(request)
+    if code == "" {
+        code = wire.TrimSpace(bodyCode)
+    }
+    if code == "" {
+        return verify.VerifyStatus.Missing
+    }
+    if !Allow(limiter, request, user) {
+        return verify.VerifyStatus.RateLimited
+    }
+
+    recoveryHash: [65]u8
+    evaluated := verify.Evaluate(serverSecret, user, code, secretEnc, lastStep, nowUnix,
+        recoveryHash[:])
+    if evaluated.decision == verify.Decision.AdvanceTotp {
+        advanced: [3]Any = .[user, evaluated.step, nowUnix]
+        advance := sql.Exec(database, context, queries.AdvanceStep, advanced[:])
+        if advance.error != null {
+            return verify.VerifyStatus.Error
+        }
+        affected := sql.RowsAffected(advance.value)
+        if affected.error != null {
+            return verify.VerifyStatus.Error
+        }
+        if affected.value == 1 {
+            return verify.VerifyStatus.Allowed
+        }
+        return verify.VerifyStatus.Invalid
+    }
+    if evaluated.decision == verify.Decision.ConsumeRecovery {
+        consumed: [3]Any = .[user, evaluated.recoveryHash, nowUnix]
+        consume := sql.Exec(database, context, queries.ConsumeRecoveryCode, consumed[:])
+        if consume.error != null {
+            return verify.VerifyStatus.Error
+        }
+        affected := sql.RowsAffected(consume.value)
+        if affected.error != null {
+            return verify.VerifyStatus.Error
+        }
+        if affected.value == 1 {
+            return verify.VerifyStatus.Allowed
+        }
+    }
+    return evaluated.status
+}
+
+WriteRejected :: (writer: http.ResponseWriter, status: verify.VerifyStatus) {
+    if status == verify.VerifyStatus.Missing {
+        NoStore(writer)
+        value: RequiredResponse
+        value.Message = "2fa_required"
+        value.Methods = AllocateMethods(cast(isize)2)
+        value.Methods[0] = "totp"
+        value.Methods[1] = "recovery_code"
+        response.JSON(writer, cast(isize)401, value)
+        return
+    }
+    if status == verify.VerifyStatus.RateLimited {
+        NoStoreError(writer, cast(isize)429, "2fa rate limit exceeded")
+        return
+    }
+    if status == verify.VerifyStatus.Invalid {
+        NoStoreError(writer, cast(isize)401, "invalid 2fa code")
+        return
+    }
+    NoStoreError(writer, cast(isize)500, "2fa verification failed")
+}
+
+// Gate runs the login check and writes the rejection itself. It returns
+// false when login must not continue.
+Gate :: (database: *sql.Database, context: ctx.Context, limiter: *rate.RateLimiter,
+    request: *http.Request, serverSecret: []u8, user: string, bodyCode: string,
+    nowUnix: s64, writer: http.ResponseWriter) -> bool {
+    status := CheckRequest(database, context, limiter, request, serverSecret, user,
+        bodyCode, nowUnix)
+    if status == verify.VerifyStatus.Allowed {
+        return true
+    }
+    WriteRejected(writer, status)
+    return false
+}

@@ -123,7 +123,7 @@ func TestZiranProtocolRecordsKeepReleasedLayout(t *testing.T) {
 				"SyncResponse":         {"AccountStorage": "*main.AccountStorage", "PackageSequence": "int64"},
 				"EncryptedRecord":      {"PackedNonce": "string", "PackedCiphertext": "string", "FreeBytes": "int64"},
 				"FriendStatRow":        {"GameIcon": "int"},
-				"LoginRequest":         {"Restore": "bool"},
+				"LoginRequest":         {"Restore": "bool", "TotpCode": "string", "RecoveryCode": "string", "TwoFactorCode": "string"},
 				"LoginResponse":        {"HeldUntil": "int64"},
 				"TokenBalanceResponse": {"SharedBalance": "int64", "ScopedBalance": "int64", "SpendableBalance": "int64"},
 			}
