@@ -253,6 +253,7 @@ Devices :: (server: *Server) -> devices.Devices #go_method "devices" {
     result.counters = server.metrics
     result.verify = server.verifier.verify
     result.replayError = errSignedTxReplay
+    result.limiter = server.limiter
     return result
 }
 

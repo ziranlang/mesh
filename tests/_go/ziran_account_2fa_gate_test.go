@@ -1,12 +1,14 @@
 package main
 
-// Go-target 2FA login-gate parity check. The native server enforces the same
-// gate in account_2fa_native; these cases keep the generated Go login from
-// drifting again (statuses, headers, codes, replay guard, recovery codes and
-// the 10-per-account rate limit).
+// Go-target 2FA gate parity check. The native server enforces the same gate
+// in account_2fa_native; these cases keep the generated Go login, account
+// deletion and device registration from drifting again (statuses, headers,
+// codes, replay guard, recovery codes and the 10-per-account rate limit).
 
 import (
 	"bytes"
+	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha1"
 	"crypto/sha256"
@@ -103,6 +105,54 @@ func gateResetStep(t *testing.T, store *Store, userID string) {
 	if _, err := store.Database.Exec("UPDATE server_account_2fa SET last_used_step=-1 WHERE user_id_hash=?1", userID); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// gateDelete submits a signed account-deletion request with an optional
+// X-Mesh-2FA header and optional extra JSON body fields. A fresh challenge
+// is issued first because the signature check requires one to be outstanding.
+func gateDelete(t *testing.T, handler http.Handler, method, path, userID, signature, headerCode, bodyExtra string) *httptest.ResponseRecorder {
+	t.Helper()
+	challengeReq := httptest.NewRequest(http.MethodGet, "/api/v1/sync/challenge?user_id="+userID, nil)
+	challengeRes := httptest.NewRecorder()
+	handler.ServeHTTP(challengeRes, challengeReq)
+	if challengeRes.Code != http.StatusOK {
+		t.Fatalf("challenge status = %d body=%s", challengeRes.Code, challengeRes.Body.String())
+	}
+	body := []byte(fmt.Sprintf(`{"user_id_hash":"%s"%s}`, userID, bodyExtra))
+	req := httptest.NewRequest(method, path, bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Mesh-User", userID)
+	req.Header.Set("X-Mesh-Signature", signature)
+	if headerCode != "" {
+		req.Header.Set("X-Mesh-2FA", headerCode)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	return res
+}
+
+// gateDeleteWithKey submits a delete-with-key request with an optional
+// X-Mesh-2FA header and body codes; the legacy key flow needs no challenge.
+func gateDeleteWithKey(t *testing.T, handler http.Handler, userID, keyText, headerCode, totpCode, recoveryCode string) *httptest.ResponseRecorder {
+	t.Helper()
+	request := DeleteWithKeyRequest{
+		UserIDHash:   userID,
+		ExportedKey:  keyText,
+		TotpCode:     totpCode,
+		RecoveryCode: recoveryCode,
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/account/delete-with-key", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if headerCode != "" {
+		req.Header.Set("X-Mesh-2FA", headerCode)
+	}
+	res := httptest.NewRecorder()
+	handler.ServeHTTP(res, req)
+	return res
 }
 
 func TestZiranAccountTwoFactorLoginGate(t *testing.T) {
@@ -215,5 +265,188 @@ func TestZiranAccountTwoFactorLoginGate(t *testing.T) {
 	}
 	if got := res.Header().Get("Cache-Control"); got != "private, no-store" {
 		t.Fatalf("rate-limited cache-control = %q", got)
+	}
+}
+
+func TestZiranAccountTwoFactorDeleteGate(t *testing.T) {
+	server, store, _ := testServer(t)
+	handler := server.Routes()
+	raw := bytes.Repeat([]byte{0x43}, 20)
+	step := uint64(time.Now().Unix() / 30)
+
+	doneUser, doneKey, doneSig := gateIdentity(t, 0x33)
+	if token, _ := loginWithKey(t, handler, "", doneUser, doneKey, doneSig); token == "" {
+		t.Fatal("initial login failed")
+	}
+	gateEnableTotp(t, store, doneUser, raw)
+
+	// Missing code: 401 2fa_required with methods list and no-store, and
+	// the account itself must survive.
+	res := gateDelete(t, handler, http.MethodDelete, "/api/v1/account", doneUser, doneSig, "", "")
+	want := `{"error":"2fa_required","methods":["totp","recovery_code"]}` + "\n"
+	if res.Code != http.StatusUnauthorized || res.Body.String() != want {
+		t.Fatalf("missing-code delete status = %d body=%q", res.Code, res.Body.String())
+	}
+	if got := res.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("missing-code delete cache-control = %q", got)
+	}
+	assertCount(t, store, "server_users", 1)
+
+	// The signature check runs before the 2FA gate.
+	res = gateDelete(t, handler, http.MethodDelete, "/api/v1/account", doneUser, doneSig[:len(doneSig)-2], "", "")
+	if res.Code == http.StatusOK || strings.Contains(res.Body.String(), "2fa_required") {
+		t.Fatalf("bad-signature delete status = %d body=%s", res.Code, res.Body.String())
+	}
+
+	// Invalid 6-digit code in the body keeps the account.
+	res = gateDelete(t, handler, http.MethodPost, "/api/v1/account/delete", doneUser, doneSig, "", `,"totp_code":"999999"`)
+	if res.Code != http.StatusUnauthorized || !strings.Contains(res.Body.String(), "invalid 2fa code") {
+		t.Fatalf("invalid-code delete status = %d body=%s", res.Code, res.Body.String())
+	}
+	assertCount(t, store, "server_users", 1)
+
+	// A valid header code deletes the account through the POST variant.
+	code := gateHOTP(raw, step)
+	res = gateDelete(t, handler, http.MethodPost, "/api/v1/account/delete", doneUser, doneSig, code, "")
+	if res.Code != http.StatusOK || res.Body.String() != `{"status":"deleted"}`+"\n" {
+		t.Fatalf("totp delete status = %d body=%q", res.Code, res.Body.String())
+	}
+	assertCount(t, store, "server_users", 0)
+
+	// The delete gate shares the 10-per-account limit with logins.
+	limitUser, limitKey, limitSig := gateIdentity(t, 0x36)
+	loginWithKey(t, handler, "", limitUser, limitKey, limitSig)
+	gateEnableTotp(t, store, limitUser, raw)
+	for i := 0; i < 10; i++ {
+		attempt := gateDelete(t, handler, http.MethodDelete, "/api/v1/account", limitUser, limitSig, "", `,"totp_code":"999999"`)
+		if attempt.Code != http.StatusUnauthorized {
+			t.Fatalf("delete rate-limit attempt %d status = %d body=%s", i+1, attempt.Code, attempt.Body.String())
+		}
+	}
+	res = gateDelete(t, handler, http.MethodDelete, "/api/v1/account", limitUser, limitSig, "", `,"totp_code":"999999"`)
+	if res.Code != http.StatusTooManyRequests || !strings.Contains(res.Body.String(), "2fa rate limit exceeded") {
+		t.Fatalf("rate-limited delete status = %d body=%s", res.Code, res.Body.String())
+	}
+	if got := res.Header().Get("Cache-Control"); got != "private, no-store" {
+		t.Fatalf("rate-limited delete cache-control = %q", got)
+	}
+	assertCount(t, store, "server_users", 1)
+}
+
+func TestZiranAccountTwoFactorDeleteWithKeyGate(t *testing.T) {
+	server, store, _ := testServer(t)
+	handler := server.Routes()
+	raw := bytes.Repeat([]byte{0x44}, 20)
+
+	// A real keypair signs the legacy deletion proof with access.sign; the
+	// fixed-length test signature registers the account.
+	publicKey, privateKey, err := generateMLDSA44Keypair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	userHash := sha256.Sum256(publicKey)
+	userID := hex.EncodeToString(userHash[:])
+	signature := hex.EncodeToString(bytes.Repeat([]byte{0x34 + 0x11}, mlDSA44SignatureSize))
+	if token, _ := loginWithKey(t, handler, "", userID, hex.EncodeToString(publicKey), signature); token == "" {
+		t.Fatal("initial login failed")
+	}
+	gateEnableTotp(t, store, userID, raw)
+	keyText := "account-key-v1\nalgorithm=ML-DSA-44\npublic_id=" + userID + "\nprivate_key=" + hex.EncodeToString(privateKey) + "\n"
+
+	// Missing code: the verified exported key alone cannot delete.
+	res := gateDeleteWithKey(t, handler, userID, keyText, "", "", "")
+	want := `{"error":"2fa_required","methods":["totp","recovery_code"]}` + "\n"
+	if res.Code != http.StatusUnauthorized || res.Body.String() != want {
+		t.Fatalf("missing-code delete-with-key status = %d body=%q", res.Code, res.Body.String())
+	}
+	assertCount(t, store, "server_users", 1)
+
+	// Invalid code in the body keeps the account.
+	res = gateDeleteWithKey(t, handler, userID, keyText, "", "999999", "")
+	if res.Code != http.StatusUnauthorized || !strings.Contains(res.Body.String(), "invalid 2fa code") {
+		t.Fatalf("invalid-code delete-with-key status = %d body=%s", res.Code, res.Body.String())
+	}
+	assertCount(t, store, "server_users", 1)
+
+	// A formatted recovery code is normalized, then deletes the account.
+	canonical := "B1C2D3E4F5081726"
+	digest := sha256.Sum256([]byte("mesh-2fa-recovery-v1\n" + userID + "\n" + canonical))
+	if _, err := store.Database.Exec("INSERT INTO server_account_2fa_recovery(user_id_hash, code_hash, used_at) VALUES(?1, ?2, 0)", userID, hex.EncodeToString(digest[:])); err != nil {
+		t.Fatal(err)
+	}
+	res = gateDeleteWithKey(t, handler, userID, keyText, "", "", "b1c2-d3e4 f508-1726")
+	if res.Code != http.StatusOK || res.Body.String() != `{"status":"deleted"}`+"\n" {
+		t.Fatalf("recovery delete-with-key status = %d body=%q", res.Code, res.Body.String())
+	}
+	assertCount(t, store, "server_users", 0)
+}
+
+func TestZiranAccountTwoFactorDeviceRegistrationGate(t *testing.T) {
+	server, store, _ := testServer(t)
+	handler := server.Routes()
+	raw := bytes.Repeat([]byte{0x45}, 20)
+	step := uint64(time.Now().Unix() / 30)
+
+	identity := newTestIdentity(t, handler, 0x35)
+	gateEnableTotp(t, store, identity.UserID, raw)
+	publicKey, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := DeviceRegistrationRequest{
+		AppID:     "inbe",
+		KeyID:     "device-key-1",
+		ClientID:  "test-client-1",
+		PublicKey: hex.EncodeToString(publicKey),
+		Nonce:     "register-device-1",
+		ExpiresAt: time.Now().Add(time.Minute).Unix(),
+		Signature: identity.Signature,
+	}
+	registrationBody, err := json.Marshal(registration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	register := func(headerCode string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/account/devices", bytes.NewReader(registrationBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+identity.Token)
+		if headerCode != "" {
+			req.Header.Set("X-Mesh-2FA", headerCode)
+		}
+		res := httptest.NewRecorder()
+		handler.ServeHTTP(res, req)
+		return res
+	}
+	activeCheck := func() DeviceKeyResult {
+		return DeviceKeys_Active(store.Database, context.Background(), identity.UserID, "inbe", "device-key-1")
+	}
+
+	// Missing code: registration is rejected before any device row exists.
+	want := `{"error":"2fa_required","methods":["totp","recovery_code"]}` + "\n"
+	res := register("")
+	if res.Code != http.StatusUnauthorized || res.Body.String() != want {
+		t.Fatalf("missing-code registration status = %d body=%q", res.Code, res.Body.String())
+	}
+	if active := activeCheck(); active.Error != nil || active.Found {
+		t.Fatalf("device registered despite 2fa_required: found=%v err=%v", active.Found, active.Error)
+	}
+
+	// Reads are not gated.
+	listReq := httptest.NewRequest(http.MethodGet, "/api/v1/account/devices", nil)
+	listReq.Header.Set("Authorization", "Bearer "+identity.Token)
+	listRes := httptest.NewRecorder()
+	handler.ServeHTTP(listRes, listReq)
+	if listRes.Code != http.StatusOK {
+		t.Fatalf("device list status = %d body=%s", listRes.Code, listRes.Body.String())
+	}
+
+	// A valid header code registers the device.
+	code := gateHOTP(raw, step)
+	res = register(code)
+	if res.Code != http.StatusOK {
+		t.Fatalf("totp registration status = %d body=%s", res.Code, res.Body.String())
+	}
+	if active := activeCheck(); active.Error != nil || !active.Found {
+		t.Fatalf("registered device not active: found=%v err=%v", active.Found, active.Error)
 	}
 }

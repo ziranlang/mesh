@@ -158,6 +158,11 @@ SyncAuditEntry :: struct {
 
 DeleteRequest :: struct {
     UserIDHash: string #go_tag "json:\"user_id_hash\""
+    // Two-factor code: a 6-digit TOTP value or a 16-hex recovery code. The
+    // X-Mesh-2FA header carries the same values and wins when both are sent.
+    TotpCode: string #go_tag "json:\"totp_code,omitempty\""
+    RecoveryCode: string #go_tag "json:\"recovery_code,omitempty\""
+    TwoFactorCode: string #go_tag "json:\"two_factor_code,omitempty\""
 }
 
 AliasRequest :: struct {
@@ -515,6 +520,11 @@ FriendStatRow :: struct {
 DeleteWithKeyRequest :: struct {
     UserIDHash: string #go_tag "json:\"user_id_hash\""
     ExportedKey: string #go_tag "json:\"exported_key,omitempty\""
+    // Two-factor code: a 6-digit TOTP value or a 16-hex recovery code. The
+    // X-Mesh-2FA header carries the same values and wins when both are sent.
+    TotpCode: string #go_tag "json:\"totp_code,omitempty\""
+    RecoveryCode: string #go_tag "json:\"recovery_code,omitempty\""
+    TwoFactorCode: string #go_tag "json:\"two_factor_code,omitempty\""
 }
 
 MeditationLog :: struct {

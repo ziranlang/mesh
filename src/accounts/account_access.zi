@@ -51,10 +51,12 @@ AccountAccess :: struct {
 }
 
 #scope_file
-LoginBodyCode :: (value: *protocol.LoginRequest) -> string {
-    if value.TotpCode != "" { return value.TotpCode }
-    if value.RecoveryCode != "" { return value.RecoveryCode }
-    return value.TwoFactorCode
+// First nonempty of the accepted 2FA body fields, in totp_code,
+// recovery_code, two_factor_code order; empty when none was sent.
+TwoFactorBodyCode :: (totpCode: string, recoveryCode: string, twoFactorCode: string) -> string {
+    if totpCode != "" { return totpCode }
+    if recoveryCode != "" { return recoveryCode }
+    return twoFactorCode
 }
 
 ToLower :: (value: string) -> string #foreign strings;
@@ -161,7 +163,8 @@ Login :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Req
     }
     context := http.Context(request)
     if !twofa.Gate(access.database, context, access.limiter, request, access.configuration.TokenSecret,
-        value.UserIDHash, LoginBodyCode(*value), clock.Unix(clock.Now()), writer) {
+        value.UserIDHash, TwoFactorBodyCode(value.TotpCode, value.RecoveryCode, value.TwoFactorCode),
+        clock.Unix(clock.Now()), writer) {
         return
     }
     if value.Restore {
@@ -269,6 +272,14 @@ Delete :: (access: AccountAccess, writer: http.ResponseWriter, request: *http.Re
         http_auth.Respond(writer, access.counters, authenticated.authentication)
         return
     }
+    // Deleting an account is as sensitive as logging in, so it passes the
+    // same shared 2FA gate before the hold deletion runs.
+    if !twofa.Gate(access.database, http.Context(request), access.limiter, request,
+        access.configuration.TokenSecret, value.UserIDHash,
+        TwoFactorBodyCode(value.TotpCode, value.RecoveryCode, value.TwoFactorCode),
+        clock.Unix(clock.Now()), writer) {
+        return
+    }
     error = holds.Delete(access.database, http.Context(request), access.configuration.DBPath,
         value.UserIDHash, clock.Now())
     if error != null {
@@ -329,6 +340,14 @@ DeleteWithKey :: (access: AccountAccess, writer: http.ResponseWriter, request: *
             response.Error(writer, cast(isize)401, "exported key does not match sync account")
             return
         }
+    }
+    // The exported key alone must not bypass two-factor verification, so
+    // the same shared gate runs after the key or signature is verified.
+    if !twofa.Gate(access.database, http.Context(request), access.limiter, request,
+        access.configuration.TokenSecret, value.UserIDHash,
+        TwoFactorBodyCode(value.TotpCode, value.RecoveryCode, value.TwoFactorCode),
+        clock.Unix(clock.Now()), writer) {
+        return
     }
     error := holds.Delete(access.database, http.Context(request), access.configuration.DBPath,
         value.UserIDHash, clock.Now())

@@ -118,6 +118,8 @@ func TestZiranProtocolRecordsKeepReleasedLayout(t *testing.T) {
 			fields, found := fixture.Records[typ.Name()]
 			extensions := map[string]map[string]string{
 				"AppManifest":          {"ManifestSequence": "int64", "LANOnly": "bool", "LANNetworks": "[]string", "RegistrationNodeID": "string"},
+				"DeleteRequest":        {"TotpCode": "string", "RecoveryCode": "string", "TwoFactorCode": "string"},
+				"DeleteWithKeyRequest": {"TotpCode": "string", "RecoveryCode": "string", "TwoFactorCode": "string"},
 				"MoneroDeposit":        {"UsdCents": "int64", "UsdUpdatedAt": "int64", "UsdSources": "string"},
 				"NodeSyncPolicy":       {"Accounts": "[]string"},
 				"SyncResponse":         {"AccountStorage": "*main.AccountStorage", "PackageSequence": "int64"},

@@ -5,8 +5,11 @@ auth :: #import "authentication";
 http_auth :: #import "http_auth";
 http_body :: #import "http_body";
 response :: #import "response";
+twofa :: #import "account_2fa";
+rate :: #import "rate_limit";
 http :: #import "std/http_go";
 sql :: #import "std/sql_go";
+clock :: #import "std/time_go";
 keys :: #import "device_keys";
 json :: #import "std/json_go";
 errors :: #import "std/errors_go";
@@ -18,6 +21,7 @@ Devices :: struct {
     counters: *metrics.ServerMetrics
     verify: auth.VerifySignature
     replayError: Error
+    limiter: *rate.RateLimiter
 }
 
 #scope_file
@@ -49,6 +53,13 @@ Route :: (devices: Devices, writer: http.ResponseWriter, request: *http.Request)
     }
     if method == "DELETE" {
         Revoke(devices, writer, request, user.value)
+        return
+    }
+    // Device registration is a sensitive write, so it passes the same
+    // shared 2FA gate as logins and deletions; the code arrives in the
+    // X-Mesh-2FA header only.
+    if !twofa.Gate(devices.database, http.Context(request), devices.limiter, request,
+        devices.configuration.TokenSecret, user.value, "", clock.Unix(clock.Now()), writer) {
         return
     }
     body := http_body.ReadJSON(writer, request, devices.configuration.MaxBodyBytes)
